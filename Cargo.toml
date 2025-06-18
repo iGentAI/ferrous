@@ -1,0 +1,25 @@
+[package]
+name = "ferrous"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ferrous Contributors"]
+description = "A Redis-compatible in-memory database server written in pure Rust"
+repository = "https://github.com/ferrous-db/ferrous"
+license = "MIT OR Apache-2.0"
+keywords = ["redis", "database", "cache", "nosql"]
+categories = ["database", "caching"]
+
+[dependencies]
+rand = "0.8.5"
+
+[dev-dependencies]
+# Only for testing and benchmarking
+
+[profile.release]
+lto = true
+opt-level = 3
+codegen-units = 1
+
+[profile.bench]
+lto = true
+opt-level = 3
