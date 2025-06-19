@@ -8,6 +8,7 @@ use std::io::{Read, Write, ErrorKind};
 use std::time::Instant;
 use crate::error::{FerrousError, Result};
 use crate::protocol::{RespParser, RespFrame, serialize_resp_frame};
+use crate::storage::commands::transactions::TransactionState;
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +51,9 @@ pub struct Connection {
     
     /// Selected database (default 0)
     pub db_index: usize,
+    
+    /// Transaction state
+    pub transaction_state: TransactionState,
 }
 
 impl Connection {
@@ -70,6 +74,7 @@ impl Connection {
             write_buffer: Vec::with_capacity(4096),
             last_activity: Instant::now(),
             db_index: 0,
+            transaction_state: TransactionState::default(),
         })
     }
     

@@ -180,23 +180,23 @@ Based on our benchmark comparison between Ferrous v0.1.0 (Phase 1-3) and Redis (
 
 | Command | Valkey Baseline | Ferrous Current | Ferrous Target | Notes |
 |---------|-----------------|-----------------|----------------|-------|
-| SET | ~73,500 ops/sec | ~42,300 ops/sec | ≥73,500 ops/sec | Single-threaded client |
-| GET | ~72,500 ops/sec | ~44,600 ops/sec | ≥72,500 ops/sec | Single-threaded client |
-| Pipeline PING | ~650,000 ops/sec | Not fully supported | ≥650,000 ops/sec | Priority improvement area |
-| Concurrent (50 clients) | ~73,000 ops/sec | Not fully supported | ≥73,000 ops/sec | Critical for production use |
-| Latency (avg) | 0.04-0.05ms | 0.11-0.14ms | ≤0.05ms | Lower is better |
+| SET | ~73,500 ops/sec | ~49,750 ops/sec | ≥73,500 ops/sec | ~68% of target |
+| GET | ~72,500 ops/sec | ~55,250 ops/sec | ≥72,500 ops/sec | ~76% of target |
+| Pipeline PING | ~650,000 ops/sec | Not supported | ≥650,000 ops/sec | Priority improvement area |
+| Concurrent (50 clients) | ~73,000 ops/sec | Not supported | ≥73,000 ops/sec | Critical for production use |
+| Latency (avg) | 0.04-0.05ms | ~0.16ms | ≤0.05ms | 3x higher than target |
 
 Performance gap analysis:
-- Basic operations (SET/GET): Currently at ~60% of Redis performance
-- Pipeline operations: Currently not fully supported, critical for high throughput
+- Basic operations (SET/GET): Currently at ~70% of Redis performance
+- Pipeline operations: Currently not supported, critical for high throughput
 - Concurrent clients: Currently limited support for high client counts
-- Latency: Currently 2-3x higher than Redis
+- Latency: Currently 3x higher than Redis
 
 Current phase performance is promising for a debug build with minimal optimization. The next phase should focus on:
-1. Fixing pipeline support for high-throughput operations (~10x improvement)
+1. Implementing pipeline support for high-throughput operations (~10x improvement)
 2. Improving concurrent client handling 
 3. Optimizing command processing to reduce latency
-4. Implementing remaining data structures with performance parity goals
+4. Building in release mode for 30-50% performance improvement
 
 Note: All measurements were taken with debug builds on the same hardware. Release builds are expected to show 30-50% better performance.
 

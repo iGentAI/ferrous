@@ -8,6 +8,8 @@ use std::thread;
 use crate::error::{FerrousError, Result};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, GetResult, RdbEngine, StorageMonitor, RdbConfig};
+use crate::storage::commands::{transactions, aof};
+use crate::storage::{aof::AofEngine, AofConfig};
 use crate::pubsub::{PubSubManager, format_message, format_pmessage, 
                     format_subscribe_response, format_psubscribe_response,
                     format_unsubscribe_response, format_punsubscribe_response};
@@ -29,6 +31,8 @@ pub struct Server {
     storage_monitor: Option<StorageMonitor>,
     /// Pub/sub manager
     pubsub: Arc<PubSubManager>,
+    /// AOF persistence engine
+    aof_engine: Option<Arc<AofEngine>>,
 }
 
 impl Server {
@@ -46,6 +50,17 @@ impl Server {
         // Create RDB engine with default config
         let rdb_config = RdbConfig::default();
         let rdb_engine = Arc::new(RdbEngine::new(rdb_config.clone()));
+        
+        // Create AOF engine with default config
+        let aof_config = AofConfig::default();
+        let aof_engine = if aof_config.enabled {
+            let engine = Arc::new(AofEngine::new(aof_config));
+            engine.init()?;
+            engine.load(&storage)?;
+            Some(engine)
+        } else {
+            None
+        };
         
         // Create storage monitor
         let mut monitor = StorageMonitor::new();
@@ -71,6 +86,7 @@ impl Server {
             rdb_engine: Some(rdb_engine),
             storage_monitor: Some(monitor),
             pubsub,
+            aof_engine,
         })
     }
     
@@ -267,47 +283,224 @@ impl Server {
                     _ => return Ok(RespFrame::error("ERR invalid command format")),
                 };
                 
-                // Route to command handler
+                // Get connection state
+                let (db_index, in_transaction) = {
+                    let connections = self.connections.lock().unwrap();
+                    connections.get(&conn_id)
+                        .map(|c| (c.db_index, c.transaction_state.in_transaction))
+                        .unwrap_or((0, false))
+                };
+                
+                // Handle transaction control commands and connection-specific commands
                 match command.as_str() {
-                    "PING" => self.handle_ping(parts),
-                    "ECHO" => self.handle_echo(parts),
-                    "SET" => self.handle_set(parts),
-                    "GET" => self.handle_get(parts),
-                    "INCR" => self.handle_incr(parts),
-                    "DECR" => self.handle_decr(parts),
-                    "INCRBY" => self.handle_incrby(parts),
-                    "DEL" => self.handle_del(parts),
-                    "EXISTS" => self.handle_exists(parts),
-                    "EXPIRE" => self.handle_expire(parts),
-                    "TTL" => self.handle_ttl(parts),
-                    // Sorted set commands
-                    "ZADD" => self.handle_zadd(parts),
-                    "ZREM" => self.handle_zrem(parts),
-                    "ZSCORE" => self.handle_zscore(parts),
-                    "ZRANK" => self.handle_zrank(parts),
-                    "ZREVRANK" => self.handle_zrevrank(parts),
-                    "ZRANGE" => self.handle_zrange(parts),
-                    "ZREVRANGE" => self.handle_zrevrange(parts),
-                    "ZRANGEBYSCORE" => self.handle_zrangebyscore(parts),
-                    "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(parts),
-                    "ZCOUNT" => self.handle_zcount(parts),
-                    "ZINCRBY" => self.handle_zincrby(parts),
-                    // RDB commands
-                    "SAVE" => self.handle_save(parts),
-                    "BGSAVE" => self.handle_bgsave(parts),
-                    "LASTSAVE" => self.handle_lastsave(parts),
-                    // Pub/Sub commands
-                    "PUBLISH" => self.handle_publish(parts),
-                    "SUBSCRIBE" => self.handle_subscribe(parts, conn_id),
-                    "UNSUBSCRIBE" => self.handle_unsubscribe(parts, conn_id),
-                    "PSUBSCRIBE" => self.handle_psubscribe(parts, conn_id),
-                    "PUNSUBSCRIBE" => self.handle_punsubscribe(parts, conn_id),
-                    "QUIT" => Ok(RespFrame::ok()),
-                    _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command))),
+                    "MULTI" => {
+                        let mut connections = self.connections.lock().unwrap();
+                        if let Some(conn) = connections.get_mut(&conn_id) {
+                            return transactions::handle_multi(conn);
+                        }
+                        return Ok(RespFrame::error("ERR connection not found"));
+                    }
+                    "EXEC" => {
+                        return self.handle_exec(conn_id);
+                    }
+                    "DISCARD" => {
+                        let mut connections = self.connections.lock().unwrap();
+                        if let Some(conn) = connections.get_mut(&conn_id) {
+                            return transactions::handle_discard(conn);
+                        }
+                        return Ok(RespFrame::error("ERR connection not found"));
+                    }
+                    "WATCH" => {
+                        let mut connections = self.connections.lock().unwrap();
+                        if let Some(conn) = connections.get_mut(&conn_id) {
+                            return transactions::handle_watch(conn, parts);
+                        }
+                        return Ok(RespFrame::error("ERR connection not found"));
+                    }
+                    "UNWATCH" => {
+                        let mut connections = self.connections.lock().unwrap();
+                        if let Some(conn) = connections.get_mut(&conn_id) {
+                            return transactions::handle_unwatch(conn);
+                        }
+                        return Ok(RespFrame::error("ERR connection not found"));
+                    }
+                    "PUBLISH" => return self.handle_publish(parts),
+                    "SUBSCRIBE" => return self.handle_subscribe(parts, conn_id),
+                    "UNSUBSCRIBE" => return self.handle_unsubscribe(parts, conn_id),
+                    "PSUBSCRIBE" => return self.handle_psubscribe(parts, conn_id),
+                    "PUNSUBSCRIBE" => return self.handle_punsubscribe(parts, conn_id),
+                    _ => {}
                 }
+                
+                // Check if we should queue the command
+                if in_transaction && transactions::should_queue_command(&command) {
+                    let mut connections = self.connections.lock().unwrap();
+                    if let Some(conn) = connections.get_mut(&conn_id) {
+                        return transactions::queue_command(conn, parts.to_vec());
+                    }
+                }
+                
+                // Process normal command
+                self.process_normal_command(parts, db_index)
             }
             _ => Ok(RespFrame::error("ERR invalid request format")),
         }
+    }
+    
+    /// Handle EXEC command - execute queued transaction commands
+    fn handle_exec(&mut self, conn_id: u64) -> Result<RespFrame> {
+        // Get queued commands and clear transaction state
+        let (commands, db_index, aborted) = {
+            let mut connections = self.connections.lock().unwrap();
+            if let Some(conn) = connections.get_mut(&conn_id) {
+                if !conn.transaction_state.in_transaction {
+                    return Ok(RespFrame::error("ERR EXEC without MULTI"));
+                }
+                
+                let commands = std::mem::take(&mut conn.transaction_state.queued_commands);
+                let db_index = conn.db_index;
+                let aborted = conn.transaction_state.aborted;
+                
+                conn.transaction_state.in_transaction = false;
+                conn.transaction_state.watched_keys.clear();
+                conn.transaction_state.aborted = false;
+                
+                (commands, db_index, aborted)
+            } else {
+                return Ok(RespFrame::error("ERR connection not found"));
+            }
+        };
+        
+        if aborted {
+            return Ok(RespFrame::null_array());
+        }
+        
+        // Execute all commands
+        let mut results = Vec::new();
+        for cmd_parts in commands {
+            match self.process_normal_command(&cmd_parts, db_index) {
+                Ok(response) => results.push(response),
+                Err(e) => results.push(RespFrame::error(e.to_string())),
+            }
+        }
+        
+        Ok(RespFrame::Array(Some(results)))
+    }
+    
+    /// Process a normal (non-transaction) command
+    fn process_normal_command(&mut self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        // Extract command name
+        let cmd_frame = &parts[0];
+        let command = match cmd_frame {
+            RespFrame::BulkString(Some(bytes)) => {
+                String::from_utf8_lossy(bytes).to_uppercase()
+            }
+            _ => return Ok(RespFrame::error("ERR invalid command format")),
+        };
+        
+        // Log to AOF for write commands
+        if let Some(aof) = &self.aof_engine {
+            if self.is_write_command(&command) {
+                if let Err(e) = aof.append_command(parts) {
+                    eprintln!("Failed to append to AOF: {}", e);
+                }
+            }
+        }
+        
+        // Route to command handler
+        match command.as_str() {
+            "PING" => self.handle_ping(parts),
+            "ECHO" => self.handle_echo(parts),
+            "SET" => self.handle_set(parts, db),
+            "GET" => self.handle_get(parts, db),
+            "INCR" => self.handle_incr(parts, db),
+            "DECR" => self.handle_decr(parts, db),
+            "INCRBY" => self.handle_incrby(parts, db),
+            "DEL" => self.handle_del(parts, db),
+            "EXISTS" => self.handle_exists(parts, db),
+            "EXPIRE" => self.handle_expire(parts, db),
+            "TTL" => self.handle_ttl(parts, db),
+            // Additional string commands
+            "MGET" => crate::storage::commands::strings::handle_mget(&self.storage, db, parts),
+            "MSET" => crate::storage::commands::strings::handle_mset(&self.storage, db, parts),
+            "GETSET" => crate::storage::commands::strings::handle_getset(&self.storage, db, parts),
+            "APPEND" => crate::storage::commands::strings::handle_append(&self.storage, db, parts),
+            "STRLEN" => crate::storage::commands::strings::handle_strlen(&self.storage, db, parts),
+            "GETRANGE" => crate::storage::commands::strings::handle_getrange(&self.storage, db, parts),
+            "SETRANGE" => crate::storage::commands::strings::handle_setrange(&self.storage, db, parts),
+            "TYPE" => crate::storage::commands::strings::handle_type(&self.storage, db, parts),
+            "RENAME" => crate::storage::commands::strings::handle_rename(&self.storage, db, parts),
+            "KEYS" => crate::storage::commands::strings::handle_keys(&self.storage, db, parts),
+            "PEXPIRE" => crate::storage::commands::strings::handle_pexpire(&self.storage, db, parts),
+            "PTTL" => crate::storage::commands::strings::handle_pttl(&self.storage, db, parts),
+            "PERSIST" => crate::storage::commands::strings::handle_persist(&self.storage, db, parts),
+            // List commands
+            "LPUSH" => crate::storage::commands::lists::handle_lpush(&self.storage, db, parts),
+            "RPUSH" => crate::storage::commands::lists::handle_rpush(&self.storage, db, parts),
+            "LPOP" => crate::storage::commands::lists::handle_lpop(&self.storage, db, parts),
+            "RPOP" => crate::storage::commands::lists::handle_rpop(&self.storage, db, parts),
+            "LLEN" => crate::storage::commands::lists::handle_llen(&self.storage, db, parts),
+            "LRANGE" => crate::storage::commands::lists::handle_lrange(&self.storage, db, parts),
+            "LINDEX" => crate::storage::commands::lists::handle_lindex(&self.storage, db, parts),
+            "LSET" => crate::storage::commands::lists::handle_lset(&self.storage, db, parts),
+            "LTRIM" => crate::storage::commands::lists::handle_ltrim(&self.storage, db, parts),
+            "LREM" => crate::storage::commands::lists::handle_lrem(&self.storage, db, parts),
+            // Set commands
+            "SADD" => crate::storage::commands::sets::handle_sadd(&self.storage, db, parts),
+            "SREM" => crate::storage::commands::sets::handle_srem(&self.storage, db, parts),
+            "SMEMBERS" => crate::storage::commands::sets::handle_smembers(&self.storage, db, parts),
+            "SISMEMBER" => crate::storage::commands::sets::handle_sismember(&self.storage, db, parts),
+            "SCARD" => crate::storage::commands::sets::handle_scard(&self.storage, db, parts),
+            "SUNION" => crate::storage::commands::sets::handle_sunion(&self.storage, db, parts),
+            "SINTER" => crate::storage::commands::sets::handle_sinter(&self.storage, db, parts),
+            "SDIFF" => crate::storage::commands::sets::handle_sdiff(&self.storage, db, parts),
+            "SRANDMEMBER" => crate::storage::commands::sets::handle_srandmember(&self.storage, db, parts),
+            "SPOP" => crate::storage::commands::sets::handle_spop(&self.storage, db, parts),
+            // Hash commands
+            "HSET" => crate::storage::commands::hashes::handle_hset(&self.storage, db, parts),
+            "HGET" => crate::storage::commands::hashes::handle_hget(&self.storage, db, parts),
+            "HMSET" => crate::storage::commands::hashes::handle_hmset(&self.storage, db, parts),
+            "HMGET" => crate::storage::commands::hashes::handle_hmget(&self.storage, db, parts),
+            "HGETALL" => crate::storage::commands::hashes::handle_hgetall(&self.storage, db, parts),
+            "HDEL" => crate::storage::commands::hashes::handle_hdel(&self.storage, db, parts),
+            "HLEN" => crate::storage::commands::hashes::handle_hlen(&self.storage, db, parts),
+            "HEXISTS" => crate::storage::commands::hashes::handle_hexists(&self.storage, db, parts),
+            "HKEYS" => crate::storage::commands::hashes::handle_hkeys(&self.storage, db, parts),
+            "HVALS" => crate::storage::commands::hashes::handle_hvals(&self.storage, db, parts),
+            "HINCRBY" => crate::storage::commands::hashes::handle_hincrby(&self.storage, db, parts),
+            // Sorted set commands
+            "ZADD" => self.handle_zadd(parts, db),
+            "ZREM" => self.handle_zrem(parts, db),
+            "ZSCORE" => self.handle_zscore(parts, db),
+            "ZRANK" => self.handle_zrank(parts, db),
+            "ZREVRANK" => self.handle_zrevrank(parts, db),
+            "ZRANGE" => self.handle_zrange(parts, db),
+            "ZREVRANGE" => self.handle_zrevrange(parts, db),
+            "ZRANGEBYSCORE" => self.handle_zrangebyscore(parts, db),
+            "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(parts, db),
+            "ZCOUNT" => self.handle_zcount(parts, db),
+            "ZINCRBY" => self.handle_zincrby(parts, db),
+            // RDB commands
+            "SAVE" => self.handle_save(parts),
+            "BGSAVE" => self.handle_bgsave(parts),
+            "LASTSAVE" => self.handle_lastsave(parts),
+            // AOF commands
+            "BGREWRITEAOF" => aof::handle_bgrewriteaof(self.aof_engine.as_ref()),
+            "QUIT" => Ok(RespFrame::ok()),
+            _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command))),
+        }
+    }
+    
+    /// Check if a command is a write command that should be logged to AOF
+    fn is_write_command(&self, command: &str) -> bool {
+        matches!(command,
+            "SET" | "DEL" | "EXPIRE" | "INCR" | "DECR" | "INCRBY" |
+            "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET" | "LREM" | "LTRIM" |
+            "SADD" | "SREM" | "SPOP" | 
+            "HSET" | "HDEL" | "HINCRBY" |
+            "ZADD" | "ZREM" | "ZINCRBY" |
+            "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "PERSIST"
+        )
     }
 
     /// Record a data change for auto-save monitoring
@@ -534,7 +727,7 @@ impl Server {
     }
     
     /// Handle ZADD command
-    fn handle_zadd(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zadd(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZADD key score member [score member ...]
         if parts.len() < 4 || parts.len() % 2 != 0 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zadd' command"));
@@ -566,7 +759,7 @@ impl Server {
             };
             
             // Add to sorted set 
-            if self.storage.zadd(0, key.clone(), member, score)? {
+            if self.storage.zadd(db, key.clone(), member, score)? {
                 new_members += 1;
                 // Record change for auto-save
                 self.record_change();
@@ -577,7 +770,7 @@ impl Server {
     }
     
     /// Handle ZREM command
-    fn handle_zrem(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrem(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREM key member [member ...]
         if parts.len() < 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrem' command"));
@@ -599,7 +792,7 @@ impl Server {
             };
             
             // Remove from sorted set
-            if self.storage.zrem(0, key, member)? {
+            if self.storage.zrem(db, key, member)? {
                 removed += 1;
             }
         }
@@ -608,7 +801,7 @@ impl Server {
     }
     
     /// Handle ZSCORE command
-    fn handle_zscore(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zscore(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZSCORE key member
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zscore' command"));
@@ -627,7 +820,7 @@ impl Server {
         };
         
         // Get score
-        match self.storage.zscore(0, key, member)? {
+        match self.storage.zscore(db, key, member)? {
             Some(score) => {
                 // Convert f64 to string with Redis protocol formatting
                 let score_str = format!("{}", score);
@@ -638,7 +831,7 @@ impl Server {
     }
     
     /// Handle ZRANK command
-    fn handle_zrank(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrank(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZRANK key member
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrank' command"));
@@ -657,14 +850,14 @@ impl Server {
         };
         
         // Get rank
-        match self.storage.zrank(0, key, member, false)? {
+        match self.storage.zrank(db, key, member, false)? {
             Some(rank) => Ok(RespFrame::Integer(rank as i64)),
             None => Ok(RespFrame::null_bulk()), // Member not found or key doesn't exist
         }
     }
     
     /// Handle ZREVRANK command
-    fn handle_zrevrank(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrevrank(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREVRANK key member
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrevrank' command"));
@@ -683,14 +876,14 @@ impl Server {
         };
         
         // Get rank (reversed)
-        match self.storage.zrank(0, key, member, true)? {
+        match self.storage.zrank(db, key, member, true)? {
             Some(rank) => Ok(RespFrame::Integer(rank as i64)),
             None => Ok(RespFrame::null_bulk()), // Member not found or key doesn't exist
         }
     }
     
     /// Handle ZRANGE command
-    fn handle_zrange(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrange(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZRANGE key start stop [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrange' command"));
@@ -733,7 +926,7 @@ impl Server {
         };
         
         // Get range
-        let members = self.storage.zrange(0, key, start, stop, false)?;
+        let members = self.storage.zrange(db, key, start, stop, false)?;
         
         // Format response
         if with_scores {
@@ -754,7 +947,7 @@ impl Server {
     }
     
     /// Handle ZREVRANGE command
-    fn handle_zrevrange(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrevrange(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREVRANGE key start stop [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrevrange' command"));
@@ -797,7 +990,7 @@ impl Server {
         };
         
         // Get range in reverse order
-        let members = self.storage.zrange(0, key, start, stop, true)?;
+        let members = self.storage.zrange(db, key, start, stop, true)?;
         
         // Format response
         if with_scores {
@@ -818,7 +1011,7 @@ impl Server {
     }
     
     /// Handle ZRANGEBYSCORE command
-    fn handle_zrangebyscore(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrangebyscore(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZRANGEBYSCORE key min max [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrangebyscore' command"));
@@ -861,7 +1054,7 @@ impl Server {
         };
         
         // Get range by score
-        let members = self.storage.zrangebyscore(0, key, min_score, max_score, false)?;
+        let members = self.storage.zrangebyscore(db, key, min_score, max_score, false)?;
         
         // Format response
         if with_scores {
@@ -882,7 +1075,7 @@ impl Server {
     }
     
     /// Handle ZREVRANGEBYSCORE command
-    fn handle_zrevrangebyscore(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrevrangebyscore(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREVRANGEBYSCORE key max min [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrevrangebyscore' command"));
@@ -925,7 +1118,7 @@ impl Server {
         };
         
         // Get range by score in reverse order
-        let members = self.storage.zrangebyscore(0, key, min_score, max_score, true)?;
+        let members = self.storage.zrangebyscore(db, key, min_score, max_score, true)?;
         
         // Format response
         if with_scores {
@@ -946,7 +1139,7 @@ impl Server {
     }
     
     /// Handle ZCOUNT command
-    fn handle_zcount(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zcount(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZCOUNT key min max
         if parts.len() != 4 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zcount' command"));
@@ -981,13 +1174,13 @@ impl Server {
         };
         
         // Get count
-        let count = self.storage.zcount(0, key, min_score, max_score)?;
+        let count = self.storage.zcount(db, key, min_score, max_score)?;
         
         Ok(RespFrame::Integer(count as i64))
     }
     
     /// Handle ZINCRBY command
-    fn handle_zincrby(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zincrby(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZINCRBY key increment member
         if parts.len() != 4 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zincrby' command"));
@@ -1017,7 +1210,7 @@ impl Server {
         };
         
         // Increment score
-        let new_score = self.storage.zincrby(0, key, member, increment)?;
+        let new_score = self.storage.zincrby(db, key, member, increment)?;
         
         // Return new score as bulk string (Redis protocol format)
         Ok(RespFrame::from_string(new_score.to_string()))
@@ -1044,8 +1237,8 @@ impl Server {
         }
     }
     
-    /// Handle SET command - now with actual storage
-    fn handle_set(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    /// Handle SET command
+    fn handle_set(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() < 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'set' command"));
         }
@@ -1119,14 +1312,14 @@ impl Server {
         
         // Check NX condition
         if nx {
-            if self.storage.exists(0, &key)? {
+            if self.storage.exists(db, &key)? {
                 return Ok(RespFrame::null_bulk());
             }
         }
         
         // Check XX condition
         if xx {
-            if !self.storage.exists(0, &key)? {
+            if !self.storage.exists(db, &key)? {
                 return Ok(RespFrame::null_bulk());
             }
         }
@@ -1134,10 +1327,10 @@ impl Server {
         // Set the value
         match expiration {
             Some(expires_in) => {
-                self.storage.set_string_ex(0, key, value, expires_in)?;
+                self.storage.set_string_ex(db, key, value, expires_in)?;
             }
             None => {
-                self.storage.set_string(0, key, value)?;
+                self.storage.set_string(db, key, value)?;
             }
         }
         
@@ -1147,8 +1340,8 @@ impl Server {
         Ok(RespFrame::ok())
     }
     
-    /// Handle GET command - now with actual storage
-    fn handle_get(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    /// Handle GET command
+    fn handle_get(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'get' command"));
         }
@@ -1160,14 +1353,14 @@ impl Server {
         };
         
         // Get the value
-        match self.storage.get_string(0, key)? {
+        match self.storage.get_string(db, key)? {
             Some(value) => Ok(RespFrame::from_bytes(value)),
             None => Ok(RespFrame::null_bulk()),
         }
     }
     
     /// Handle INCR command
-    fn handle_incr(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_incr(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'incr' command"));
         }
@@ -1177,14 +1370,14 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid key format")),
         };
         
-        match self.storage.incr(0, key) {
+        match self.storage.incr(db, key) {
             Ok(new_value) => Ok(RespFrame::Integer(new_value)),
             Err(e) => Ok(RespFrame::error(e.to_string())),
         }
     }
     
     /// Handle DECR command
-    fn handle_decr(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_decr(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'decr' command"));
         }
@@ -1194,14 +1387,14 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid key format")),
         };
         
-        match self.storage.incr_by(0, key, -1) {
+        match self.storage.incr_by(db, key, -1) {
             Ok(new_value) => Ok(RespFrame::Integer(new_value)),
             Err(e) => Ok(RespFrame::error(e.to_string())),
         }
     }
     
     /// Handle INCRBY command
-    fn handle_incrby(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_incrby(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'incrby' command"));
         }
@@ -1221,14 +1414,14 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid increment format")),
         };
         
-        match self.storage.incr_by(0, key, increment) {
+        match self.storage.incr_by(db, key, increment) {
             Ok(new_value) => Ok(RespFrame::Integer(new_value)),
             Err(e) => Ok(RespFrame::error(e.to_string())),
         }
     }
     
     /// Handle DEL command
-    fn handle_del(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_del(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() < 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'del' command"));
         }
@@ -1241,7 +1434,7 @@ impl Server {
                 _ => continue, // Skip invalid keys
             };
             
-            if self.storage.delete(0, key)? {
+            if self.storage.delete(db, key)? {
                 deleted += 1;
                 // Record change for auto-save
                 self.record_change();
@@ -1252,7 +1445,7 @@ impl Server {
     }
     
     /// Handle EXISTS command
-    fn handle_exists(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_exists(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() < 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'exists' command"));
         }
@@ -1265,7 +1458,7 @@ impl Server {
                 _ => continue, // Skip invalid keys
             };
             
-            if self.storage.exists(0, key)? {
+            if self.storage.exists(db, key)? {
                 count += 1;
             }
         }
@@ -1274,7 +1467,7 @@ impl Server {
     }
     
     /// Handle EXPIRE command
-    fn handle_expire(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_expire(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'expire' command"));
         }
@@ -1294,12 +1487,12 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid seconds format")),
         };
         
-        let result = self.storage.expire(0, key, Duration::from_secs(seconds))?;
+        let result = self.storage.expire(db, key, Duration::from_secs(seconds))?;
         Ok(RespFrame::Integer(if result { 1 } else { 0 }))
     }
     
     /// Handle TTL command
-    fn handle_ttl(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_ttl(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'ttl' command"));
         }
@@ -1309,7 +1502,7 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid key format")),
         };
         
-        match self.storage.ttl(0, key)? {
+        match self.storage.ttl(db, key)? {
             Some(duration) => {
                 if duration.as_secs() == 0 && duration.subsec_millis() == 0 {
                     Ok(RespFrame::Integer(-2)) // Key expired
@@ -1318,7 +1511,7 @@ impl Server {
                 }
             }
             None => {
-                if self.storage.exists(0, key)? {
+                if self.storage.exists(db, key)? {
                     Ok(RespFrame::Integer(-1)) // Key exists but no expiration
                 } else {
                     Ok(RespFrame::Integer(-2)) // Key doesn't exist
