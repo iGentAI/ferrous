@@ -8,6 +8,7 @@ use std::io::{Read, Write, ErrorKind};
 use std::time::Instant;
 use crate::error::{FerrousError, Result};
 use crate::protocol::{RespParser, RespFrame, serialize_resp_frame};
+use crate::storage::commands::transactions::TransactionState;
 
 /// Connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,11 +46,17 @@ pub struct Connection {
     /// Write buffer
     write_buffer: Vec<u8>,
     
+    /// Write buffer offset (for partial writes)
+    write_offset: usize,
+    
     /// Last activity timestamp
     pub last_activity: Instant,
     
     /// Selected database (default 0)
     pub db_index: usize,
+    
+    /// Transaction state
+    pub transaction_state: TransactionState,
 }
 
 impl Connection {
@@ -58,7 +65,7 @@ impl Connection {
         // Set non-blocking mode
         stream.set_nonblocking(true)?;
         
-        // Set TCP nodelay
+        // Set TCP nodelay for low latency
         stream.set_nodelay(true)?;
         
         Ok(Connection {
@@ -67,16 +74,18 @@ impl Connection {
             addr,
             state: ConnectionState::Connected,
             parser: RespParser::new(),
-            write_buffer: Vec::with_capacity(4096),
+            write_buffer: Vec::with_capacity(16384), // Larger initial capacity for better pipelining
+            write_offset: 0,
             last_activity: Instant::now(),
             db_index: 0,
+            transaction_state: TransactionState::default(),
         })
     }
     
     /// Read data from the connection
     /// Returns true if data was read, false if would block
     pub fn read(&mut self) -> Result<bool> {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; 8192]; // Larger read buffer for better pipelining
         
         match self.stream.read(&mut buf) {
             Ok(0) => {
@@ -104,52 +113,75 @@ impl Connection {
     
     /// Send a frame to the client
     pub fn send_frame(&mut self, frame: &RespFrame) -> Result<()> {
-        self.write_buffer.clear();
+        // Serialize directly to the write buffer without clearing it
         serialize_resp_frame(frame, &mut self.write_buffer)?;
-        self.flush()
+        // Don't flush here - let the caller decide when to flush
+        Ok(())
     }
     
     /// Send raw bytes to the client
     pub fn send_raw(&mut self, data: &[u8]) -> Result<()> {
         self.write_buffer.extend_from_slice(data);
-        self.flush()
+        Ok(())
     }
     
     /// Flush the write buffer
     pub fn flush(&mut self) -> Result<()> {
-        if self.write_buffer.is_empty() {
+        if self.write_offset >= self.write_buffer.len() {
+            // Nothing to write
+            self.write_buffer.clear();
+            self.write_offset = 0;
             return Ok(());
         }
         
-        let mut written = 0;
-        while written < self.write_buffer.len() {
-            match self.stream.write(&self.write_buffer[written..]) {
+        let mut attempts = 0;
+        const MAX_ATTEMPTS: usize = 3;
+        
+        while self.write_offset < self.write_buffer.len() && attempts < MAX_ATTEMPTS {
+            match self.stream.write(&self.write_buffer[self.write_offset..]) {
+                Ok(0) => {
+                    // Can't write, connection might be closed
+                    return Err(FerrousError::Connection("Cannot write to connection".into()));
+                }
                 Ok(n) => {
-                    written += n;
+                    self.write_offset += n;
                     self.last_activity = Instant::now();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    // Can't write more right now
-                    break;
+                    // Can't write more right now, maintain offset
+                    attempts += 1;
+                    // A short yield to give the socket a chance to become writable
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {
+                    // Retry
+                    attempts += 1;
+                    continue;
                 }
                 Err(e) => return Err(e.into()),
             }
         }
         
-        // Remove written data
-        self.write_buffer.drain(..written);
+        // Clear buffer if everything was written
+        if self.write_offset >= self.write_buffer.len() {
+            self.write_buffer.clear();
+            self.write_offset = 0;
+        }
         
         Ok(())
     }
     
     /// Check if the connection has data to write
     pub fn has_pending_writes(&self) -> bool {
-        !self.write_buffer.is_empty()
+        self.write_offset < self.write_buffer.len()
     }
     
     /// Close the connection
     pub fn close(&mut self) -> Result<()> {
         self.state = ConnectionState::Closing;
+        // Try to flush remaining data before closing
+        let _ = self.flush();
         self.stream.shutdown(std::net::Shutdown::Both)?;
         Ok(())
     }

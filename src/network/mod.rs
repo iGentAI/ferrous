@@ -30,6 +30,10 @@ pub struct NetworkConfig {
     
     /// TCP keepalive interval in seconds
     pub tcp_keepalive: Option<u64>,
+    
+    /// Optional password for authentication
+    /// If None, no authentication is required
+    pub password: Option<String>,
 }
 
 impl Default for NetworkConfig {
@@ -41,6 +45,7 @@ impl Default for NetworkConfig {
             tcp_backlog: 511,
             timeout: 0, // 0 means no timeout
             tcp_keepalive: Some(300), // 5 minutes
+            password: None, // No password by default
         }
     }
 }

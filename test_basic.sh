@@ -3,21 +3,24 @@
 
 echo "Testing Ferrous with redis-cli..."
 
+# Set password for authentication
+PASSWORD="mysecretpassword"
+
 # Test PING command
 echo "Testing PING..."
-redis-cli -p 6379 PING
+redis-cli -a $PASSWORD -p 6379 PING
 
 # Test ECHO command
 echo "Testing ECHO..."
-redis-cli -p 6379 ECHO "Hello Ferrous"
+redis-cli -a $PASSWORD -p 6379 ECHO "Hello Ferrous"
 
 # Test SET and GET (basic)
 echo "Testing SET/GET..."
-redis-cli -p 6379 SET test "value"
-redis-cli -p 6379 GET test
+redis-cli -a $PASSWORD -p 6379 SET test "value"
+redis-cli -a $PASSWORD -p 6379 GET test
 
 # Test QUIT
 echo "Testing QUIT..."
-echo "QUIT" | redis-cli -p 6379
+echo "QUIT" | redis-cli -a $PASSWORD -p 6379
 
 echo "Basic tests completed!"

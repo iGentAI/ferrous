@@ -23,8 +23,14 @@ fn run() -> Result<()> {
     println!("Starting Ferrous - Redis-compatible server in Rust");
     println!("Version: {}", env!("CARGO_PKG_VERSION"));
     
-    // Create server with default config
-    let config = NetworkConfig::default();
+    // Create server with config that includes password
+    let mut config = NetworkConfig::default();
+    
+    // For testing authentication, enable password protection
+    config.password = Some("mysecretpassword".to_string());
+    
+    println!("Authentication enabled with password: 'mysecretpassword'");
+    
     let mut server = Server::with_config(config)?;
     
     // Run the server

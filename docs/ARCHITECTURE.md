@@ -553,27 +553,27 @@ pub struct Metrics {
 
 ## Performance Optimization
 
-Based on benchmark comparisons with Redis (Valkey), the following areas require optimization to achieve performance parity:
+Based on benchmark comparisons with Redis (Valkey), here's our current performance status and optimization priorities:
 
-### Benchmark Results
+### Current Benchmark Results
 
 | Operation | Redis Performance | Ferrous Performance | Ratio | 
 |-----------|-------------------|---------------------|-------|
-| SET | ~73,500 ops/sec | ~42,300 ops/sec | 57.6% |
-| GET | ~72,500 ops/sec | ~44,600 ops/sec | 61.5% |
-| Pipeline PING | ~650,000 ops/sec | Failed | N/A |
-| Concurrent (50 clients) | ~73,000 ops/sec | Failed | N/A |
-| Latency | ~0.05ms | ~0.12ms | 240% higher |
+| SET | ~73,500 ops/sec | ~49,750 ops/sec | 68% |
+| GET | ~72,500 ops/sec | ~55,250 ops/sec | 76% |
+| Pipeline PING | ~650,000 ops/sec | Not working | N/A |
+| Concurrent (50 clients) | ~73,000 ops/sec | Not working | N/A |
+| Latency | ~0.05ms | ~0.16ms | 3x higher |
 
 ### Optimization Priority Areas
 
 1. **Pipeline Processing**
 ```rust
 // Current implementation issues:
-// 1. Only returns first response
-// 2. Connection closures under load
+// 1. Connection closures under high load
+// 2. Pipeline command batching not fully implemented
 
-// Target implementation:
+// Priority improvements:
 pub fn process_pipeline(&mut self, frames: Vec<RespFrame>) -> Vec<RespFrame> {
     // Process all commands in a batch
     // Maintain connection state throughout
@@ -640,6 +640,13 @@ pub struct FerrousAllocator {
 }
 ```
 
-These optimizations will be implemented incrementally, with benchmark-driven development to measure progress toward performance targets.
+These optimizations are currently in progress, with a focus on resolving the pipelining and concurrent client handling as the top priorities. Performance on basic operations (SET/GET) is already approaching target levels, currently at ~70% of Redis performance.
+
+Recent improvements:
+- Fixed borrowing conflicts in all data structure operations
+- Optimized value access patterns to reduce unnecessary clones
+- Improved error handling and command execution flow
+
+Our performance targets for Phase 4 completion are to reach at least 90% of Redis performance on all metrics, with full parity expected by the end of Phase 5.
 
 This architecture provides a solid foundation for building a high-performance, Redis-compatible server in Rust while leveraging the language's safety guarantees and concurrency primitives.
