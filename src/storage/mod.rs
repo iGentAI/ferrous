@@ -9,6 +9,8 @@ pub mod memory;
 pub mod skiplist;
 pub mod rdb;
 pub mod monitor;
+pub mod aof;
+pub mod commands;
 
 pub use engine::{StorageEngine, GetResult};
 pub use value::{Value, ValueType, StringEncoding, StoredValue, ValueMetadata};
@@ -16,6 +18,7 @@ pub use memory::{MemoryManager, EvictionPolicy};
 pub use skiplist::SkipList;
 pub use rdb::{RdbEngine, RdbConfig};
 pub use monitor::StorageMonitor;
+pub use aof::{AofEngine, AofConfig};
 
 /// Database index type
 pub type DatabaseIndex = usize;

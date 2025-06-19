@@ -33,6 +33,27 @@ impl RespParser {
             return Ok(None);
         }
         
+        // Special handling for raw protocol (e.g., redis-benchmark sometimes sends raw "PING")
+        if self.position + 4 <= self.buffer.len() && 
+           &self.buffer[self.position..self.position+4] == b"PING" {
+            // Found a raw PING command, consume it
+            self.position += 4;
+            
+            // Skip trailing whitespace or newlines if present
+            while self.position < self.buffer.len() && 
+                  (self.buffer[self.position] == b' ' || 
+                   self.buffer[self.position] == b'\r' || 
+                   self.buffer[self.position] == b'\n') {
+                self.position += 1;
+            }
+            
+            // Return a properly formatted PING command
+            return Ok(Some(RespFrame::Array(Some(vec![
+                RespFrame::BulkString(Some(Arc::new(b"PING".to_vec())))
+            ]))));
+        }
+        
+        // Handle normal RESP protocol
         match parse_frame(&self.buffer[self.position..])? {
             Some((frame, consumed)) => {
                 self.position += consumed;

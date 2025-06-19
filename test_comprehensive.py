@@ -16,6 +16,7 @@ class FerrousTest:
         self.port = port
         self.passed = 0
         self.failed = 0
+        self.password = "mysecretpassword"
         
     def send_raw(self, data):
         """Send raw bytes and receive response"""
@@ -23,6 +24,13 @@ class FerrousTest:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect((self.host, self.port))
+            
+            # First send AUTH command
+            auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len(self.password)}\r\n{self.password}\r\n".encode()
+            s.sendall(auth_cmd)
+            auth_response = s.recv(4096)
+            
+            # Then send the actual command
             s.sendall(data)
             response = s.recv(4096)
             s.close()
@@ -171,12 +179,22 @@ class FerrousTest:
 def test_multiple_clients():
     """Test multiple client connections"""
     print("\n[TEST] Multiple concurrent clients")
+    password = "mysecretpassword"
     
     def client_work(client_id, results):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect(('127.0.0.1', 6379))
+            
+            # Authenticate first
+            auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len(password)}\r\n{password}\r\n".encode()
+            s.sendall(auth_cmd)
+            auth_response = s.recv(1024)
+            if not auth_response.startswith(b"+OK"):
+                results[client_id] = (False, False)
+                s.close()
+                return
             
             # Send PING
             s.sendall(b"*1\r\n$4\r\nPING\r\n")
@@ -250,6 +268,7 @@ def test_malformed_input():
 def test_performance():
     """Basic performance test"""
     print("\n[TEST] Basic performance test")
+    password = "mysecretpassword"
     
     start_time = time.time()
     
@@ -257,6 +276,14 @@ def test_performance():
         # Send 1000 PING commands
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.connect(('127.0.0.1', 6379))
+        
+        # Authenticate first
+        auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len(password)}\r\n{password}\r\n".encode()
+        s.sendall(auth_cmd)
+        auth_response = s.recv(1024)
+        if not auth_response.startswith(b"+OK"):
+            print("  ❌ FAILED: Authentication failed")
+            return False
         
         for i in range(1000):
             s.sendall(b"*1\r\n$4\r\nPING\r\n")

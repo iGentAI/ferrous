@@ -1,25 +1,143 @@
 //! Main server implementation
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::thread;
 use crate::error::{FerrousError, Result};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, GetResult, RdbEngine, StorageMonitor, RdbConfig};
+use crate::storage::commands::{transactions, aof};
+use crate::storage::{aof::AofEngine, AofConfig};
 use crate::pubsub::{PubSubManager, format_message, format_pmessage, 
                     format_subscribe_response, format_psubscribe_response,
                     format_unsubscribe_response, format_punsubscribe_response};
-use super::{Listener, Connection, NetworkConfig};
+use super::{Listener, Connection, ConnectionState, NetworkConfig};
 
 /// Connection ID generator
 static CONN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Number of shards for connection storage
+const CONNECTION_SHARDS: usize = 16;
+
+/// Sharded connection storage for better concurrency
+struct ShardedConnections {
+    shards: Vec<Arc<Mutex<HashMap<u64, Connection>>>>,
+}
+
+impl ShardedConnections {
+    fn new() -> Self {
+        let mut shards = Vec::with_capacity(CONNECTION_SHARDS);
+        for _ in 0..CONNECTION_SHARDS {
+            shards.push(Arc::new(Mutex::new(HashMap::new())));
+        }
+        ShardedConnections { shards }
+    }
+    
+    fn get_shard(&self, id: u64) -> &Arc<Mutex<HashMap<u64, Connection>>> {
+        let shard_idx = (id as usize) % CONNECTION_SHARDS;
+        &self.shards[shard_idx]
+    }
+    
+    fn insert(&self, id: u64, connection: Connection) {
+        let shard = self.get_shard(id);
+        let mut connections = shard.lock().unwrap();
+        connections.insert(id, connection);
+    }
+    
+    fn remove(&self, id: u64) -> Option<Connection> {
+        let shard = self.get_shard(id);
+        let mut connections = shard.lock().unwrap();
+        connections.remove(&id)
+    }
+    
+    fn with_connection<F, R>(&self, id: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Connection) -> R,
+    {
+        let shard = self.get_shard(id);
+        
+        // Try to acquire lock with a timeout to prevent deadlocks
+        match shard.try_lock() {
+            Ok(mut connections) => connections.get_mut(&id).map(f),
+            Err(_) => {
+                // If we can't get the lock immediately, use regular lock
+                let mut connections = shard.lock().unwrap();
+                connections.get_mut(&id).map(f)
+            }
+        }
+    }
+    
+    fn total_connections(&self) -> usize {
+        self.shards.iter()
+            .filter_map(|shard| shard.try_lock().ok())
+            .map(|connections| connections.len())
+            .sum()
+    }
+    
+    fn all_connection_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        for shard in &self.shards {
+            if let Ok(connections) = shard.try_lock() {
+                ids.extend(connections.keys().copied());
+            }
+            // Skip locked shards to prevent blocking
+        }
+        ids
+    }
+    
+    /// Count active shards
+    fn active_shards(&self) -> usize {
+        self.shards.iter()
+            .filter_map(|shard| shard.try_lock().ok())
+            .filter(|connections| !connections.is_empty())
+            .count()
+    }
+}
+
+/// Server statistics for monitoring
+pub struct ServerStats {
+    /// Total number of connections received
+    pub total_connections_received: AtomicU64,
+    /// Total number of commands processed
+    pub total_commands_processed: AtomicU64,
+    /// Total number of keyspace hits
+    pub keyspace_hits: AtomicU64,
+    /// Total number of keyspace misses
+    pub keyspace_misses: AtomicU64,
+    /// Peak memory usage
+    pub peak_memory: AtomicUsize,
+    /// Number of blocked clients
+    pub blocked_clients: AtomicU64,
+    /// Total number of successful authentications
+    pub auth_successes: AtomicU64,
+    /// Total number of failed authentication attempts
+    pub auth_failures: AtomicU64,
+    /// Number of pending writes
+    pub pending_writes: AtomicU64,
+}
+
+impl ServerStats {
+    fn new() -> Self {
+        Self {
+            total_connections_received: AtomicU64::new(0),
+            total_commands_processed: AtomicU64::new(0),
+            keyspace_hits: AtomicU64::new(0),
+            keyspace_misses: AtomicU64::new(0),
+            peak_memory: AtomicUsize::new(0),
+            blocked_clients: AtomicU64::new(0),
+            auth_successes: AtomicU64::new(0),
+            auth_failures: AtomicU64::new(0),
+            pending_writes: AtomicU64::new(0),
+        }
+    }
+}
+
 /// Main server struct
 pub struct Server {
     listener: Listener,
-    connections: Arc<Mutex<HashMap<u64, Connection>>>,
+    connections: Arc<ShardedConnections>,
     config: NetworkConfig,
     /// Storage engine for Redis data
     storage: Arc<StorageEngine>,
@@ -29,6 +147,14 @@ pub struct Server {
     storage_monitor: Option<StorageMonitor>,
     /// Pub/sub manager
     pubsub: Arc<PubSubManager>,
+    /// AOF persistence engine
+    aof_engine: Option<Arc<AofEngine>>,
+    /// Connections with pending writes
+    pending_writes: Arc<Mutex<Vec<u64>>>,
+    /// Server statistics
+    stats: Arc<ServerStats>,
+    /// Server start time
+    start_time: SystemTime,
 }
 
 impl Server {
@@ -40,18 +166,32 @@ impl Server {
     /// Create a new server with custom config
     pub fn with_config(config: NetworkConfig) -> Result<Self> {
         let listener = Listener::bind(config.clone())?;
-        let connections = Arc::new(Mutex::new(HashMap::new()));
+        let connections = Arc::new(ShardedConnections::new());
         let storage = StorageEngine::new();
         
         // Create RDB engine with default config
         let rdb_config = RdbConfig::default();
         let rdb_engine = Arc::new(RdbEngine::new(rdb_config.clone()));
         
+        // Create AOF engine with default config
+        let aof_config = AofConfig::default();
+        let aof_engine = if aof_config.enabled {
+            let engine = Arc::new(AofEngine::new(aof_config));
+            engine.init()?;
+            engine.load(&storage)?;
+            Some(engine)
+        } else {
+            None
+        };
+        
         // Create storage monitor
         let mut monitor = StorageMonitor::new();
         
         // Create pub/sub manager
         let pubsub = PubSubManager::new();
+        
+        // Create server stats
+        let stats = Arc::new(ServerStats::new());
         
         // Load existing RDB if available
         if let Err(e) = rdb_engine.load(&storage) {
@@ -71,6 +211,10 @@ impl Server {
             rdb_engine: Some(rdb_engine),
             storage_monitor: Some(monitor),
             pubsub,
+            aof_engine,
+            pending_writes: Arc::new(Mutex::new(Vec::new())),
+            stats,
+            start_time: SystemTime::now(),
         })
     }
     
@@ -88,106 +232,183 @@ impl Server {
     pub fn run(&mut self) -> Result<()> {
         println!("Ferrous server v{} ready to accept connections", env!("CARGO_PKG_VERSION"));
         
+        // Track adaptive sleep intervals
+        let mut cycles_without_work = 0;
+        
         loop {
-            // Accept new connections
-            self.accept_connections()?;
+            let mut did_work = false;
+            
+            // Accept new connections with a limit per iteration
+            for _ in 0..10 { // Process up to 10 new connections per iteration
+                if self.accept_single_connection()? {
+                    did_work = true;
+                } else {
+                    break; // No more pending connections
+                }
+            }
             
             // Process existing connections
-            self.process_connections()?;
+            if self.process_connections()? {
+                did_work = true;
+            }
+            
+            // Process connections with pending writes
+            if self.process_pending_writes()? {
+                did_work = true;
+            }
             
             // Clean up closed connections
             self.cleanup_connections()?;
             
-            // Small sleep to prevent busy waiting
-            thread::sleep(Duration::from_micros(100));
+            // Adaptive sleep to balance CPU usage and responsiveness
+            if did_work {
+                cycles_without_work = 0;
+                // Yield to other threads without sleeping
+                thread::yield_now();
+            } else {
+                cycles_without_work += 1;
+                // Progressive backoff when idle
+                let sleep_duration = match cycles_without_work {
+                    0..=10 => Duration::from_micros(10),
+                    11..=100 => Duration::from_micros(100),
+                    _ => Duration::from_millis(1),
+                };
+                thread::sleep(sleep_duration);
+            }
         }
     }
     
-    /// Accept new connections
-    fn accept_connections(&mut self) -> Result<()> {
-        while let Some((stream, addr)) = self.listener.accept()? {
+    /// Accept a single new connection
+    /// Returns true if connection was accepted, false if would block
+    fn accept_single_connection(&mut self) -> Result<bool> {
+        if let Some((stream, addr)) = self.listener.accept()? {
             let id = CONN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
             
+            // Update statistics
+            self.stats.total_connections_received.fetch_add(1, Ordering::Relaxed);
+            
             // Check max clients limit
-            {
-                let connections = self.connections.lock().unwrap();
-                if connections.len() >= self.config.max_clients {
-                    println!("Max clients reached, rejecting connection from {}", addr);
-                    drop(stream); // Close connection
-                    continue;
-                }
+            if self.connections.total_connections() >= self.config.max_clients {
+                println!("Max clients reached, rejecting connection from {}", addr);
+                drop(stream); // Close connection
+                return Ok(true);
             }
             
             // Create new connection
             match Connection::new(id, stream, addr) {
-                Ok(conn) => {
+                Ok(mut conn) => {
+                    // Set initial state based on auth requirement
+                    if self.config.password.is_some() {
+                        conn.state = ConnectionState::Connected; // Requires auth
+                    } else {
+                        conn.state = ConnectionState::Authenticated; // No auth required
+                    }
+                    
                     println!("Client {} connected from {}", id, addr);
-                    let mut connections = self.connections.lock().unwrap();
-                    connections.insert(id, conn);
+                    self.connections.insert(id, conn);
                 }
                 Err(e) => {
                     eprintln!("Failed to create connection: {}", e);
                 }
             }
+            
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        
+    }
+    
+    /// Accept new connections
+    fn accept_connections(&mut self) -> Result<()> {
+        while self.accept_single_connection()? {}
         Ok(())
     }
     
     /// Process all connections
-    fn process_connections(&mut self) -> Result<()> {
+    /// Returns true if any work was done
+    fn process_connections(&mut self) -> Result<bool> {
         let mut to_remove = Vec::new();
+        let mut connections_with_writes = Vec::new();
+        let mut did_work = false;
         
-        // Clone the connections to avoid holding the lock too long
-        let conn_ids: Vec<u64> = {
-            let connections = self.connections.lock().unwrap();
-            connections.keys().cloned().collect()
-        };
+        // Get all connection IDs
+        let conn_ids = self.connections.all_connection_ids();
         
         for id in conn_ids {
             // Process each connection
             match self.process_connection(id) {
-                Ok(_) => {}
+                Ok(has_pending_writes) => {
+                    did_work = true;
+                    if has_pending_writes {
+                        connections_with_writes.push(id);
+                    }
+                }
                 Err(e) => {
+                    // Error processing connection - mark for removal
                     eprintln!("Error processing connection {}: {}", id, e);
                     to_remove.push(id);
                 }
             }
         }
         
+        // Update pending writes list
+        if !connections_with_writes.is_empty() {
+            let mut pending = self.pending_writes.lock().unwrap();
+            pending.extend(connections_with_writes);
+            self.stats.pending_writes.store(pending.len() as u64, Ordering::Relaxed);
+        }
+        
         // Remove failed connections
-        if !to_remove.is_empty() {
-            let mut connections = self.connections.lock().unwrap();
-            for id in to_remove {
-                if let Some(conn) = connections.remove(&id) {
-                    println!("Client {} disconnected from {}", id, conn.addr);
+        for id in to_remove {
+            if let Some(conn) = self.connections.remove(id) {
+                println!("Client {} disconnected from {}", id, conn.addr);
+                
+                // Clean up any pub/sub subscriptions
+                if let Err(e) = self.pubsub.unsubscribe_all(id) {
+                    eprintln!("Error cleaning up subscriptions for connection {}: {}", id, e);
                 }
             }
         }
         
-        Ok(())
+        Ok(did_work)
     }
     
     /// Process a single connection
-    fn process_connection(&mut self, id: u64) -> Result<()> {
+    /// Returns Ok(true) if connection has pending writes
+    fn process_connection(&mut self, id: u64) -> Result<bool> {
         // Read and parse frames without holding the lock during processing
         let mut frames_to_process = Vec::new();
         let mut should_close = false;
         let mut timeout_check = false;
+        let mut conn_closed = false;
         
         // First phase: read and parse with the lock
-        {
-            let mut connections = self.connections.lock().unwrap();
-            let conn = connections.get_mut(&id).ok_or_else(|| {
-                FerrousError::Internal("Connection not found".into())
-            })?;
+        let read_result = self.connections.with_connection(id, |conn| -> Result<()> {
+            // Try to flush any pending writes first to avoid buffer buildup
+            if conn.has_pending_writes() {
+                match conn.flush() {
+                    Ok(_) => {},
+                    Err(e) if matches!(e, FerrousError::Connection(_)) => {
+                        conn_closed = true;
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             
             // Read data from connection
             match conn.read() {
                 Ok(true) => {
-                    // Data was read, try to parse frames
-                    while let Some(frame) = conn.parse_frame()? {
-                        frames_to_process.push(frame);
+                    // Data was read, try to parse all available frames
+                    loop {
+                        match conn.parse_frame() {
+                            Ok(Some(frame)) => frames_to_process.push(frame),
+                            Ok(None) => break, // No more complete frames
+                            Err(e) => {
+                                conn.close()?;
+                                return Err(e);
+                            }
+                        }
                     }
                 }
                 Ok(false) => {
@@ -204,11 +425,24 @@ impl Server {
             if self.config.timeout > 0 {
                 timeout_check = conn.idle_time() > Duration::from_secs(self.config.timeout);
             }
+            
+            Ok(())
+        });
+        
+        if let Some(Err(e)) = read_result {
+            if conn_closed {
+                // Connection was closed, don't try to process further
+                return Err(e);
+            }
+            return Err(e);
         }
         
         // Second phase: process frames without the lock
         let mut responses = Vec::new();
         for frame in frames_to_process {
+            // Process each frame and increment command counter
+            self.stats.total_commands_processed.fetch_add(1, Ordering::Relaxed);
+            
             // We need to check if this is a QUIT command
             if let RespFrame::Array(Some(parts)) = &frame {
                 if !parts.is_empty() {
@@ -225,23 +459,27 @@ impl Server {
         }
         
         // Third phase: send responses and handle state changes
-        {
-            let mut connections = self.connections.lock().unwrap();
-            let conn = connections.get_mut(&id).ok_or_else(|| {
-                FerrousError::Internal("Connection not found".into())
-            })?;
-            
-            // Send all responses
+        let has_pending_writes = self.connections.with_connection(id, |conn| -> Result<bool> {
+            // Send all responses without flushing between them (for pipelining)
             for response in responses {
                 conn.send_frame(&response)?;
             }
             
-            // Try to flush any pending writes
-            conn.flush()?;
+            // Now try to flush all at once
+            match conn.flush() {
+                Ok(_) => {},
+                Err(e) => {
+                    // Connection error during flush - don't abort processing for other connections
+                    if matches!(e, FerrousError::Connection(_)) {
+                        conn.state = ConnectionState::Closing;
+                    }
+                    return Err(e);
+                }
+            }
             
             // Handle QUIT command
             if should_close {
-                conn.state = super::ConnectionState::Closing;
+                conn.state = ConnectionState::Closing;
             }
             
             // Handle timeout
@@ -249,13 +487,66 @@ impl Server {
                 conn.close()?;
                 return Err(FerrousError::Connection("Connection timed out".into()));
             }
+            
+            Ok(conn.has_pending_writes())
+        }).unwrap_or(Ok(false))?;
+        
+        Ok(has_pending_writes)
+    }
+    
+    /// Process connections with pending writes
+    /// Returns true if any work was done
+    fn process_pending_writes(&mut self) -> Result<bool> {
+        let pending_ids: Vec<u64> = {
+            let mut pending = self.pending_writes.lock().unwrap();
+            let ids = std::mem::take(&mut *pending);
+            self.stats.pending_writes.store(0, Ordering::Relaxed);
+            ids
+        };
+        
+        if pending_ids.is_empty() {
+            return Ok(false);
         }
         
-        Ok(())
+        let mut still_pending = Vec::new();
+        let mut did_work = !pending_ids.is_empty();
+        
+        for id in &pending_ids {
+            let result = self.connections.with_connection(*id, |conn| -> Result<bool> {
+                match conn.flush() {
+                    Ok(_) => Ok(conn.has_pending_writes()),
+                    Err(e) if matches!(e, FerrousError::Connection(_)) => {
+                        // Connection error - mark for closing
+                        conn.state = ConnectionState::Closing;
+                        Err(e)
+                    }
+                    Err(e) => Err(e),
+                }
+            });
+            
+            match result {
+                Some(Ok(true)) => still_pending.push(*id), // Still has pending writes
+                Some(Err(e)) => {
+                    // Connection error - will be cleaned up in cleanup phase
+                    eprintln!("Error flushing connection {}: {}", id, e);
+                }
+                _ => {} // Connection gone or all data flushed
+            }
+        }
+        
+        // Put back connections that still have pending writes
+        if !still_pending.is_empty() {
+            let mut pending = self.pending_writes.lock().unwrap();
+            pending.extend(still_pending);
+            self.stats.pending_writes.store(pending.len() as u64, Ordering::Relaxed);
+        }
+        
+        Ok(did_work)
     }
     
     /// Process a RESP frame and generate a response
     fn process_frame(&mut self, frame: RespFrame, conn_id: u64) -> Result<RespFrame> {
+        
         match &frame {
             RespFrame::Array(Some(parts)) if !parts.is_empty() => {
                 // Extract command name
@@ -267,47 +558,290 @@ impl Server {
                     _ => return Ok(RespFrame::error("ERR invalid command format")),
                 };
                 
-                // Route to command handler
-                match command.as_str() {
-                    "PING" => self.handle_ping(parts),
-                    "ECHO" => self.handle_echo(parts),
-                    "SET" => self.handle_set(parts),
-                    "GET" => self.handle_get(parts),
-                    "INCR" => self.handle_incr(parts),
-                    "DECR" => self.handle_decr(parts),
-                    "INCRBY" => self.handle_incrby(parts),
-                    "DEL" => self.handle_del(parts),
-                    "EXISTS" => self.handle_exists(parts),
-                    "EXPIRE" => self.handle_expire(parts),
-                    "TTL" => self.handle_ttl(parts),
-                    // Sorted set commands
-                    "ZADD" => self.handle_zadd(parts),
-                    "ZREM" => self.handle_zrem(parts),
-                    "ZSCORE" => self.handle_zscore(parts),
-                    "ZRANK" => self.handle_zrank(parts),
-                    "ZREVRANK" => self.handle_zrevrank(parts),
-                    "ZRANGE" => self.handle_zrange(parts),
-                    "ZREVRANGE" => self.handle_zrevrange(parts),
-                    "ZRANGEBYSCORE" => self.handle_zrangebyscore(parts),
-                    "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(parts),
-                    "ZCOUNT" => self.handle_zcount(parts),
-                    "ZINCRBY" => self.handle_zincrby(parts),
-                    // RDB commands
-                    "SAVE" => self.handle_save(parts),
-                    "BGSAVE" => self.handle_bgsave(parts),
-                    "LASTSAVE" => self.handle_lastsave(parts),
-                    // Pub/Sub commands
-                    "PUBLISH" => self.handle_publish(parts),
-                    "SUBSCRIBE" => self.handle_subscribe(parts, conn_id),
-                    "UNSUBSCRIBE" => self.handle_unsubscribe(parts, conn_id),
-                    "PSUBSCRIBE" => self.handle_psubscribe(parts, conn_id),
-                    "PUNSUBSCRIBE" => self.handle_punsubscribe(parts, conn_id),
-                    "QUIT" => Ok(RespFrame::ok()),
-                    _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command))),
+                // Get connection state
+                let conn_state = self.connections.with_connection(conn_id, |conn| {
+                    (conn.db_index, conn.transaction_state.in_transaction, conn.state)
+                }).unwrap_or((0, false, ConnectionState::Closing));
+                
+                let (db_index, in_transaction, conn_status) = conn_state;
+                
+                // Check if authentication is required
+                if self.config.password.is_some() && conn_status != ConnectionState::Authenticated {
+                    // Only AUTH, PING and QUIT commands are allowed when not authenticated
+                    match command.as_str() {
+                        "AUTH" => return self.handle_auth(parts, conn_id),
+                        "PING" => return self.handle_ping(parts), // Allow PING for monitoring
+                        "QUIT" => return Ok(RespFrame::ok()),
+                        _ => return Ok(RespFrame::error("NOAUTH Authentication required")),
+                    }
                 }
+                
+                // Handle transaction control commands and connection-specific commands
+                match command.as_str() {
+                    "MULTI" => {
+                        return self.connections.with_connection(conn_id, |conn| {
+                            transactions::handle_multi(conn)
+                        }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
+                    }
+                    "EXEC" => {
+                        return self.handle_exec(conn_id);
+                    }
+                    "DISCARD" => {
+                        return self.connections.with_connection(conn_id, |conn| {
+                            transactions::handle_discard(conn)
+                        }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
+                    }
+                    "WATCH" => {
+                        return self.connections.with_connection(conn_id, |conn| {
+                            transactions::handle_watch(conn, parts)
+                        }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
+                    }
+                    "UNWATCH" => {
+                        return self.connections.with_connection(conn_id, |conn| {
+                            transactions::handle_unwatch(conn)
+                        }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
+                    }
+                    "PUBLISH" => return self.handle_publish(parts),
+                    "SUBSCRIBE" => return self.handle_subscribe(parts, conn_id),
+                    "UNSUBSCRIBE" => return self.handle_unsubscribe(parts, conn_id),
+                    "PSUBSCRIBE" => return self.handle_psubscribe(parts, conn_id),
+                    "PUNSUBSCRIBE" => return self.handle_punsubscribe(parts, conn_id),
+                    "AUTH" => return self.handle_auth(parts, conn_id), // Handle AUTH after authentication too
+                    _ => {}
+                }
+                
+                // Check if we should queue the command
+                if in_transaction && transactions::should_queue_command(&command) {
+                    return self.connections.with_connection(conn_id, |conn| {
+                        transactions::queue_command(conn, parts.to_vec())
+                    }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
+                }
+                
+                // Process normal command
+                self.process_normal_command(parts, db_index)
             }
             _ => Ok(RespFrame::error("ERR invalid request format")),
         }
+    }
+    
+    /// Handle EXEC command - execute queued transaction commands
+    fn handle_exec(&mut self, conn_id: u64) -> Result<RespFrame> {
+        // Get queued commands and clear transaction state
+        let (commands, db_index, aborted) = {
+            let result = self.connections.with_connection(conn_id, |conn| {
+                if !conn.transaction_state.in_transaction {
+                    return None;
+                }
+                
+                let commands = std::mem::take(&mut conn.transaction_state.queued_commands);
+                let db_index = conn.db_index;
+                let aborted = conn.transaction_state.aborted;
+                
+                conn.transaction_state.in_transaction = false;
+                conn.transaction_state.watched_keys.clear();
+                conn.transaction_state.aborted = false;
+                
+                Some((commands, db_index, aborted))
+            });
+            
+            match result {
+                Some(Some(data)) => data,
+                _ => return Ok(RespFrame::error("ERR EXEC without MULTI")),
+            }
+        };
+        
+        if aborted {
+            return Ok(RespFrame::null_array());
+        }
+        
+        // Execute all commands
+        let mut results = Vec::new();
+        for cmd_parts in commands {
+            match self.process_command_parts(&cmd_parts, db_index) {
+                Ok(response) => results.push(response),
+                Err(e) => results.push(RespFrame::error(e.to_string())),
+            }
+        }
+        
+        Ok(RespFrame::Array(Some(results)))
+    }
+    
+    /// Helper method to process a Vec<RespFrame> in a transaction
+    fn process_command_parts(&mut self, parts: &Vec<RespFrame>, db: usize) -> Result<RespFrame> {
+        self.process_normal_command(parts, db)
+    }
+
+    /// Process a normal (non-transaction) command
+    fn process_normal_command(&mut self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        // Extract command name
+        let cmd_frame = &parts[0];
+        let command = match cmd_frame {
+            RespFrame::BulkString(Some(bytes)) => {
+                String::from_utf8_lossy(bytes).to_uppercase()
+            }
+            _ => return Ok(RespFrame::error("ERR invalid command format")),
+        };
+        
+        // Log to AOF for write commands
+        if let Some(aof) = &self.aof_engine {
+            if self.is_write_command(&command) {
+                if let Err(e) = aof.append_command(parts) {
+                    eprintln!("Failed to append to AOF: {}", e);
+                }
+            }
+        }
+        
+        // Route to command handler
+        match command.as_str() {
+            "PING" => self.handle_ping(parts),
+            "ECHO" => self.handle_echo(parts),
+            "SET" => self.handle_set(parts, db),
+            "GET" => self.handle_get(parts, db),
+            "INCR" => self.handle_incr(parts, db),
+            "DECR" => self.handle_decr(parts, db),
+            "INCRBY" => self.handle_incrby(parts, db),
+            "DEL" => self.handle_del(parts, db),
+            "EXISTS" => self.handle_exists(parts, db),
+            "EXPIRE" => self.handle_expire(parts, db),
+            "TTL" => self.handle_ttl(parts, db),
+            // Handle CONFIG command - key for benchmarking compatibility
+            "CONFIG" => crate::storage::commands::config::handle_config(parts),
+            // Additional string commands
+            "MGET" => crate::storage::commands::strings::handle_mget(&self.storage, db, parts),
+            "MSET" => crate::storage::commands::strings::handle_mset(&self.storage, db, parts),
+            "GETSET" => crate::storage::commands::strings::handle_getset(&self.storage, db, parts),
+            "APPEND" => crate::storage::commands::strings::handle_append(&self.storage, db, parts),
+            "STRLEN" => crate::storage::commands::strings::handle_strlen(&self.storage, db, parts),
+            "GETRANGE" => crate::storage::commands::strings::handle_getrange(&self.storage, db, parts),
+            "SETRANGE" => crate::storage::commands::strings::handle_setrange(&self.storage, db, parts),
+            "TYPE" => crate::storage::commands::strings::handle_type(&self.storage, db, parts),
+            "RENAME" => crate::storage::commands::strings::handle_rename(&self.storage, db, parts),
+            "KEYS" => crate::storage::commands::strings::handle_keys(&self.storage, db, parts),
+            "PEXPIRE" => crate::storage::commands::strings::handle_pexpire(&self.storage, db, parts),
+            "PTTL" => crate::storage::commands::strings::handle_pttl(&self.storage, db, parts),
+            "PERSIST" => crate::storage::commands::strings::handle_persist(&self.storage, db, parts),
+            // List commands
+            "LPUSH" => crate::storage::commands::lists::handle_lpush(&self.storage, db, parts),
+            "RPUSH" => crate::storage::commands::lists::handle_rpush(&self.storage, db, parts),
+            "LPOP" => crate::storage::commands::lists::handle_lpop(&self.storage, db, parts),
+            "RPOP" => crate::storage::commands::lists::handle_rpop(&self.storage, db, parts),
+            "LLEN" => crate::storage::commands::lists::handle_llen(&self.storage, db, parts),
+            "LRANGE" => crate::storage::commands::lists::handle_lrange(&self.storage, db, parts),
+            "LINDEX" => crate::storage::commands::lists::handle_lindex(&self.storage, db, parts),
+            "LSET" => crate::storage::commands::lists::handle_lset(&self.storage, db, parts),
+            "LTRIM" => crate::storage::commands::lists::handle_ltrim(&self.storage, db, parts),
+            "LREM" => crate::storage::commands::lists::handle_lrem(&self.storage, db, parts),
+            // Set commands
+            "SADD" => crate::storage::commands::sets::handle_sadd(&self.storage, db, parts),
+            "SREM" => crate::storage::commands::sets::handle_srem(&self.storage, db, parts),
+            "SMEMBERS" => crate::storage::commands::sets::handle_smembers(&self.storage, db, parts),
+            "SISMEMBER" => crate::storage::commands::sets::handle_sismember(&self.storage, db, parts),
+            "SCARD" => crate::storage::commands::sets::handle_scard(&self.storage, db, parts),
+            "SUNION" => crate::storage::commands::sets::handle_sunion(&self.storage, db, parts),
+            "SINTER" => crate::storage::commands::sets::handle_sinter(&self.storage, db, parts),
+            "SDIFF" => crate::storage::commands::sets::handle_sdiff(&self.storage, db, parts),
+            "SRANDMEMBER" => crate::storage::commands::sets::handle_srandmember(&self.storage, db, parts),
+            "SPOP" => crate::storage::commands::sets::handle_spop(&self.storage, db, parts),
+            // Hash commands
+            "HSET" => crate::storage::commands::hashes::handle_hset(&self.storage, db, parts),
+            "HGET" => crate::storage::commands::hashes::handle_hget(&self.storage, db, parts),
+            "HMSET" => crate::storage::commands::hashes::handle_hmset(&self.storage, db, parts),
+            "HMGET" => crate::storage::commands::hashes::handle_hmget(&self.storage, db, parts),
+            "HGETALL" => crate::storage::commands::hashes::handle_hgetall(&self.storage, db, parts),
+            "HDEL" => crate::storage::commands::hashes::handle_hdel(&self.storage, db, parts),
+            "HLEN" => crate::storage::commands::hashes::handle_hlen(&self.storage, db, parts),
+            "HEXISTS" => crate::storage::commands::hashes::handle_hexists(&self.storage, db, parts),
+            "HKEYS" => crate::storage::commands::hashes::handle_hkeys(&self.storage, db, parts),
+            "HVALS" => crate::storage::commands::hashes::handle_hvals(&self.storage, db, parts),
+            "HINCRBY" => crate::storage::commands::hashes::handle_hincrby(&self.storage, db, parts),
+            // Sorted set commands
+            "ZADD" => self.handle_zadd(parts, db),
+            "ZREM" => self.handle_zrem(parts, db),
+            "ZSCORE" => self.handle_zscore(parts, db),
+            "ZRANK" => self.handle_zrank(parts, db),
+            "ZREVRANK" => self.handle_zrevrank(parts, db),
+            "ZRANGE" => self.handle_zrange(parts, db),
+            "ZREVRANGE" => self.handle_zrevrange(parts, db),
+            "ZRANGEBYSCORE" => self.handle_zrangebyscore(parts, db),
+            "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(parts, db),
+            "ZCOUNT" => self.handle_zcount(parts, db),
+            "ZINCRBY" => self.handle_zincrby(parts, db),
+            // RDB commands
+            "SAVE" => self.handle_save(parts),
+            "BGSAVE" => self.handle_bgsave(parts),
+            "LASTSAVE" => self.handle_lastsave(parts),
+            // AOF commands
+            "BGREWRITEAOF" => aof::handle_bgrewriteaof(self.aof_engine.as_ref()),
+            // Monitoring commands
+            "INFO" => crate::storage::commands::monitor::handle_info(
+                &self.storage,
+                &self.stats,
+                self.start_time,
+                self.connections.total_connections(),
+                self.config.max_clients,
+                parts
+            ),
+            // Auth command  
+            "AUTH" => self.handle_auth(parts, 0), // Special handling for AUTH in process_frame
+            "QUIT" => Ok(RespFrame::ok()),
+            _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command))),
+        }
+    }
+    
+    /// Handle AUTH command
+    fn handle_auth(&self, parts: &[RespFrame], conn_id: u64) -> Result<RespFrame> {
+        // AUTH password
+        if parts.len() != 2 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'auth' command"));
+        }
+        
+        // Extract password
+        let provided_password = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match String::from_utf8(bytes.to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => return Ok(RespFrame::error("ERR invalid password format")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR invalid password format")),
+        };
+        
+        // Check if server requires authentication
+        match &self.config.password {
+            Some(server_password) => {
+                if provided_password == *server_password {
+                    // Authentication successful
+                    self.stats.auth_successes.fetch_add(1, Ordering::Relaxed);
+                    
+                    // Update connection state
+                    self.connections.with_connection(conn_id, |conn| {
+                        conn.state = ConnectionState::Authenticated;
+                    });
+                    
+                    Ok(RespFrame::ok())
+                } else {
+                    // Authentication failed
+                    self.stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    Ok(RespFrame::error("ERR invalid password"))
+                }
+            }
+            None => {
+                // No password set on server
+                Ok(RespFrame::error("ERR Client sent AUTH, but no password is set"))
+            }
+        }
+    }
+    
+    /// Check if a command is a write command that should be logged to AOF
+    fn is_write_command(&self, command: &str) -> bool {
+        matches!(command,
+            "SET" | "DEL" | "EXPIRE" | "INCR" | "DECR" | "INCRBY" |
+            "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET" | "LREM" | "LTRIM" |
+            "SADD" | "SREM" | "SPOP" | 
+            "HSET" | "HDEL" | "HINCRBY" |
+            "ZADD" | "ZREM" | "ZINCRBY" |
+            "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "PERSIST"
+        )
     }
 
     /// Record a data change for auto-save monitoring
@@ -339,19 +873,17 @@ impl Server {
         
         // Send message to all subscribers
         if num_receivers > 0 {
-            let mut connections = self.connections.lock().unwrap();
-            
             for (conn_id, pattern) in receivers {
-                if let Some(conn) = connections.get_mut(&conn_id) {
-                    let frame = if let Some(pat) = pattern {
-                        format_pmessage(&pat, channel, message)
-                    } else {
-                        format_message(channel, message)
-                    };
-                    
-                    // Best effort delivery - ignore errors
-                    let _ = conn.send_frame(&frame);
-                }
+                let frame = if let Some(pat) = pattern {
+                    format_pmessage(&pat, channel, message)
+                } else {
+                    format_message(channel, message)
+                };
+                
+                // Best effort delivery - ignore errors
+                let _ = self.connections.with_connection(conn_id, |conn| {
+                    conn.send_frame(&frame)
+                });
             }
         }
         
@@ -534,7 +1066,7 @@ impl Server {
     }
     
     /// Handle ZADD command
-    fn handle_zadd(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zadd(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZADD key score member [score member ...]
         if parts.len() < 4 || parts.len() % 2 != 0 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zadd' command"));
@@ -566,7 +1098,7 @@ impl Server {
             };
             
             // Add to sorted set 
-            if self.storage.zadd(0, key.clone(), member, score)? {
+            if self.storage.zadd(db, key.clone(), member, score)? {
                 new_members += 1;
                 // Record change for auto-save
                 self.record_change();
@@ -577,7 +1109,7 @@ impl Server {
     }
     
     /// Handle ZREM command
-    fn handle_zrem(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrem(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREM key member [member ...]
         if parts.len() < 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrem' command"));
@@ -599,7 +1131,7 @@ impl Server {
             };
             
             // Remove from sorted set
-            if self.storage.zrem(0, key, member)? {
+            if self.storage.zrem(db, key, member)? {
                 removed += 1;
             }
         }
@@ -608,7 +1140,7 @@ impl Server {
     }
     
     /// Handle ZSCORE command
-    fn handle_zscore(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zscore(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZSCORE key member
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zscore' command"));
@@ -627,7 +1159,7 @@ impl Server {
         };
         
         // Get score
-        match self.storage.zscore(0, key, member)? {
+        match self.storage.zscore(db, key, member)? {
             Some(score) => {
                 // Convert f64 to string with Redis protocol formatting
                 let score_str = format!("{}", score);
@@ -638,7 +1170,7 @@ impl Server {
     }
     
     /// Handle ZRANK command
-    fn handle_zrank(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrank(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZRANK key member
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrank' command"));
@@ -657,14 +1189,14 @@ impl Server {
         };
         
         // Get rank
-        match self.storage.zrank(0, key, member, false)? {
+        match self.storage.zrank(db, key, member, false)? {
             Some(rank) => Ok(RespFrame::Integer(rank as i64)),
             None => Ok(RespFrame::null_bulk()), // Member not found or key doesn't exist
         }
     }
     
     /// Handle ZREVRANK command
-    fn handle_zrevrank(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrevrank(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREVRANK key member
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrevrank' command"));
@@ -683,14 +1215,14 @@ impl Server {
         };
         
         // Get rank (reversed)
-        match self.storage.zrank(0, key, member, true)? {
+        match self.storage.zrank(db, key, member, true)? {
             Some(rank) => Ok(RespFrame::Integer(rank as i64)),
             None => Ok(RespFrame::null_bulk()), // Member not found or key doesn't exist
         }
     }
     
     /// Handle ZRANGE command
-    fn handle_zrange(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrange(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZRANGE key start stop [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrange' command"));
@@ -733,7 +1265,7 @@ impl Server {
         };
         
         // Get range
-        let members = self.storage.zrange(0, key, start, stop, false)?;
+        let members = self.storage.zrange(db, key, start, stop, false)?;
         
         // Format response
         if with_scores {
@@ -754,7 +1286,7 @@ impl Server {
     }
     
     /// Handle ZREVRANGE command
-    fn handle_zrevrange(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrevrange(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREVRANGE key start stop [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrevrange' command"));
@@ -797,7 +1329,7 @@ impl Server {
         };
         
         // Get range in reverse order
-        let members = self.storage.zrange(0, key, start, stop, true)?;
+        let members = self.storage.zrange(db, key, start, stop, true)?;
         
         // Format response
         if with_scores {
@@ -818,7 +1350,7 @@ impl Server {
     }
     
     /// Handle ZRANGEBYSCORE command
-    fn handle_zrangebyscore(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrangebyscore(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZRANGEBYSCORE key min max [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrangebyscore' command"));
@@ -861,7 +1393,7 @@ impl Server {
         };
         
         // Get range by score
-        let members = self.storage.zrangebyscore(0, key, min_score, max_score, false)?;
+        let members = self.storage.zrangebyscore(db, key, min_score, max_score, false)?;
         
         // Format response
         if with_scores {
@@ -882,7 +1414,7 @@ impl Server {
     }
     
     /// Handle ZREVRANGEBYSCORE command
-    fn handle_zrevrangebyscore(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zrevrangebyscore(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZREVRANGEBYSCORE key max min [WITHSCORES]
         if parts.len() < 4 || parts.len() > 5 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zrevrangebyscore' command"));
@@ -925,7 +1457,7 @@ impl Server {
         };
         
         // Get range by score in reverse order
-        let members = self.storage.zrangebyscore(0, key, min_score, max_score, true)?;
+        let members = self.storage.zrangebyscore(db, key, min_score, max_score, true)?;
         
         // Format response
         if with_scores {
@@ -946,7 +1478,7 @@ impl Server {
     }
     
     /// Handle ZCOUNT command
-    fn handle_zcount(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zcount(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZCOUNT key min max
         if parts.len() != 4 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zcount' command"));
@@ -962,7 +1494,9 @@ impl Server {
         let min_score = match &parts[2] {
             RespFrame::BulkString(Some(bytes)) => {
                 match String::from_utf8_lossy(bytes).parse::<f64>() {
-                    Ok(n) => n,
+                    Ok(n)
+
+ => n,
                     Err(_) => return Ok(RespFrame::error("ERR min or max is not a float")),
                 }
             }
@@ -981,13 +1515,13 @@ impl Server {
         };
         
         // Get count
-        let count = self.storage.zcount(0, key, min_score, max_score)?;
+        let count = self.storage.zcount(db, key, min_score, max_score)?;
         
         Ok(RespFrame::Integer(count as i64))
     }
     
     /// Handle ZINCRBY command
-    fn handle_zincrby(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_zincrby(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         // ZINCRBY key increment member
         if parts.len() != 4 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'zincrby' command"));
@@ -1017,22 +1551,25 @@ impl Server {
         };
         
         // Increment score
-        let new_score = self.storage.zincrby(0, key, member, increment)?;
+        let new_score = self.storage.zincrby(db, key, member, increment)?;
         
         // Return new score as bulk string (Redis protocol format)
         Ok(RespFrame::from_string(new_score.to_string()))
     }
     
     /// Handle PING command
+    /// This implementation has been enhanced for better compatibility with
+    /// redis-benchmark and other Redis clients.
     fn handle_ping(&self, parts: &[RespFrame]) -> Result<RespFrame> {
-        if parts.len() == 1 {
-            Ok(RespFrame::SimpleString(Arc::new(b"PONG".to_vec())))
-        } else if parts.len() == 2 {
-            // PING with argument returns the argument
-            Ok(parts[1].clone())
-        } else {
-            Ok(RespFrame::error("ERR wrong number of arguments for 'ping' command"))
+        // If PING has an argument, return that argument
+        if parts.len() > 1 {
+            return Ok(parts[1].clone());
         }
+        
+        // Otherwise return PONG
+        // Note: We use SimpleString instead of BulkString for better compatibility
+        // with redis-benchmark and other clients that may expect this format
+        Ok(RespFrame::SimpleString(Arc::new(b"PONG".to_vec())))
     }
     
     /// Handle ECHO command
@@ -1044,8 +1581,8 @@ impl Server {
         }
     }
     
-    /// Handle SET command - now with actual storage
-    fn handle_set(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    /// Handle SET command
+    fn handle_set(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() < 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'set' command"));
         }
@@ -1119,14 +1656,14 @@ impl Server {
         
         // Check NX condition
         if nx {
-            if self.storage.exists(0, &key)? {
+            if self.storage.exists(db, &key)? {
                 return Ok(RespFrame::null_bulk());
             }
         }
         
         // Check XX condition
         if xx {
-            if !self.storage.exists(0, &key)? {
+            if !self.storage.exists(db, &key)? {
                 return Ok(RespFrame::null_bulk());
             }
         }
@@ -1134,10 +1671,10 @@ impl Server {
         // Set the value
         match expiration {
             Some(expires_in) => {
-                self.storage.set_string_ex(0, key, value, expires_in)?;
+                self.storage.set_string_ex(db, key, value, expires_in)?;
             }
             None => {
-                self.storage.set_string(0, key, value)?;
+                self.storage.set_string(db, key, value)?;
             }
         }
         
@@ -1147,8 +1684,8 @@ impl Server {
         Ok(RespFrame::ok())
     }
     
-    /// Handle GET command - now with actual storage
-    fn handle_get(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    /// Handle GET command
+    fn handle_get(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'get' command"));
         }
@@ -1160,14 +1697,22 @@ impl Server {
         };
         
         // Get the value
-        match self.storage.get_string(0, key)? {
-            Some(value) => Ok(RespFrame::from_bytes(value)),
-            None => Ok(RespFrame::null_bulk()),
+        match self.storage.get_string(db, key)? {
+            Some(value) => {
+                // Record a cache hit
+                self.stats.keyspace_hits.fetch_add(1, Ordering::Relaxed);
+                Ok(RespFrame::from_bytes(value))
+            }
+            None => {
+                // Record a cache miss
+                self.stats.keyspace_misses.fetch_add(1, Ordering::Relaxed);
+                Ok(RespFrame::null_bulk())
+            }
         }
     }
     
     /// Handle INCR command
-    fn handle_incr(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_incr(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'incr' command"));
         }
@@ -1177,14 +1722,14 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid key format")),
         };
         
-        match self.storage.incr(0, key) {
+        match self.storage.incr(db, key) {
             Ok(new_value) => Ok(RespFrame::Integer(new_value)),
             Err(e) => Ok(RespFrame::error(e.to_string())),
         }
     }
     
     /// Handle DECR command
-    fn handle_decr(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_decr(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'decr' command"));
         }
@@ -1194,14 +1739,14 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid key format")),
         };
         
-        match self.storage.incr_by(0, key, -1) {
+        match self.storage.incr_by(db, key, -1) {
             Ok(new_value) => Ok(RespFrame::Integer(new_value)),
             Err(e) => Ok(RespFrame::error(e.to_string())),
         }
     }
     
     /// Handle INCRBY command
-    fn handle_incrby(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_incrby(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'incrby' command"));
         }
@@ -1221,14 +1766,14 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid increment format")),
         };
         
-        match self.storage.incr_by(0, key, increment) {
+        match self.storage.incr_by(db, key, increment) {
             Ok(new_value) => Ok(RespFrame::Integer(new_value)),
             Err(e) => Ok(RespFrame::error(e.to_string())),
         }
     }
     
     /// Handle DEL command
-    fn handle_del(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_del(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() < 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'del' command"));
         }
@@ -1241,7 +1786,7 @@ impl Server {
                 _ => continue, // Skip invalid keys
             };
             
-            if self.storage.delete(0, key)? {
+            if self.storage.delete(db, key)? {
                 deleted += 1;
                 // Record change for auto-save
                 self.record_change();
@@ -1252,7 +1797,7 @@ impl Server {
     }
     
     /// Handle EXISTS command
-    fn handle_exists(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_exists(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() < 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'exists' command"));
         }
@@ -1265,8 +1810,13 @@ impl Server {
                 _ => continue, // Skip invalid keys
             };
             
-            if self.storage.exists(0, key)? {
+            if self.storage.exists(db, key)? {
                 count += 1;
+                // Record a cache hit
+                self.stats.keyspace_hits.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Record a cache miss
+                self.stats.keyspace_misses.fetch_add(1, Ordering::Relaxed);
             }
         }
         
@@ -1274,7 +1824,7 @@ impl Server {
     }
     
     /// Handle EXPIRE command
-    fn handle_expire(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_expire(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 3 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'expire' command"));
         }
@@ -1294,12 +1844,12 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid seconds format")),
         };
         
-        let result = self.storage.expire(0, key, Duration::from_secs(seconds))?;
+        let result = self.storage.expire(db, key, Duration::from_secs(seconds))?;
         Ok(RespFrame::Integer(if result { 1 } else { 0 }))
     }
     
     /// Handle TTL command
-    fn handle_ttl(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+    fn handle_ttl(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'ttl' command"));
         }
@@ -1309,7 +1859,7 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid key format")),
         };
         
-        match self.storage.ttl(0, key)? {
+        match self.storage.ttl(db, key)? {
             Some(duration) => {
                 if duration.as_secs() == 0 && duration.subsec_millis() == 0 {
                     Ok(RespFrame::Integer(-2)) // Key expired
@@ -1318,7 +1868,7 @@ impl Server {
                 }
             }
             None => {
-                if self.storage.exists(0, key)? {
+                if self.storage.exists(db, key)? {
                     Ok(RespFrame::Integer(-1)) // Key exists but no expiration
                 } else {
                     Ok(RespFrame::Integer(-2)) // Key doesn't exist
@@ -1331,25 +1881,25 @@ impl Server {
     fn cleanup_connections(&mut self) -> Result<()> {
         let mut to_remove = Vec::new();
         
-        {
-            let connections = self.connections.lock().unwrap();
-            for (&id, conn) in connections.iter() {
-                if conn.is_closing() {
-                    to_remove.push(id);
-                }
+        // Check all connections for closing state
+        for id in self.connections.all_connection_ids() {
+            let should_remove = self.connections.with_connection(id, |conn| {
+                conn.is_closing()
+            }).unwrap_or(false);
+            
+            if should_remove {
+                to_remove.push(id);
             }
         }
         
-        if !to_remove.is_empty() {
-            let mut connections = self.connections.lock().unwrap();
-            for id in to_remove {
-                if let Some(conn) = connections.remove(&id) {
-                    println!("Client {} disconnected from {}", id, conn.addr);
-                    
-                    // Clean up any pub/sub subscriptions
-                    if let Err(e) = self.pubsub.unsubscribe_all(id) {
-                        eprintln!("Error cleaning up subscriptions for connection {}: {}", id, e);
-                    }
+        // Remove closed connections
+        for id in to_remove {
+            if let Some(conn) = self.connections.remove(id) {
+                println!("Client {} disconnected from {}", id, conn.addr);
+                
+                // Clean up any pub/sub subscriptions
+                if let Err(e) = self.pubsub.unsubscribe_all(id) {
+                    eprintln!("Error cleaning up subscriptions for connection {}: {}", id, e);
                 }
             }
         }
