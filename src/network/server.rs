@@ -770,8 +770,13 @@ impl Server {
             "SAVE" => self.handle_save(parts),
             "BGSAVE" => self.handle_bgsave(parts),
             "LASTSAVE" => self.handle_lastsave(parts),
+            // Scan commands
+            "SCAN" => crate::storage::commands::scan::handle_scan(&self.storage, db, parts),
+            "HSCAN" => crate::storage::commands::scan::handle_hscan(&self.storage, db, parts),
+            "SSCAN" => crate::storage::commands::scan::handle_sscan(&self.storage, db, parts),
+            "ZSCAN" => crate::storage::commands::scan::handle_zscan(&self.storage, db, parts),
             // AOF commands
-            "BGREWRITEAOF" => aof::handle_bgrewriteaof(self.aof_engine.as_ref()),
+            "BGREWRITEAOF" => crate::storage::commands::aof::handle_bgrewriteaof(self.aof_engine.as_ref()),
             // Monitoring commands
             "INFO" => crate::storage::commands::monitor::handle_info(
                 &self.storage,

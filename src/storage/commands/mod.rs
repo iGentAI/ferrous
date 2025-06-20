@@ -10,6 +10,7 @@ pub mod transactions;
 pub mod aof;
 pub mod monitor;
 pub mod config;
+pub mod scan;
 
 // Re-export all handlers for easy access
 pub use lists::*;
@@ -20,3 +21,4 @@ pub use transactions::*;
 pub use aof::*;
 pub use monitor::*;
 pub use config::*;
+pub use scan::*;
