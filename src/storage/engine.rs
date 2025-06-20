@@ -590,27 +590,29 @@ impl StorageEngine {
         let database = self.get_database(db)?;
         let mut db_guard = database.write().unwrap();
         
-        let list = match db_guard.data.get_mut(&key) {
+        // Check if key exists and get its type
+        if let Some(stored_value) = db_guard.data.get(&key) {
+            // Check type before mutation
+            match &stored_value.value {
+                Value::List(_) => {}
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        }
+        
+        // Now perform the actual operation
+        let list_len = match db_guard.data.get_mut(&key) {
             Some(stored_value) => {
-                match &stored_value.value {
-                    Value::List(ref list) => {
-                        // Clone the existing list
-                        let mut new_list = list.clone();
-                        
-                        // Push to cloned list
-                        for element in elements.into_iter().rev() {
-                            new_list.push_front(element);
-                        }
-                        
-                        let len = new_list.len();
-                        
-                        // Replace the list value
-                        stored_value.value = Value::List(new_list);
-                        stored_value.touch();
-                        db_guard.mark_modified(&key);
-                        len
+                if let Value::List(list) = &mut stored_value.value {
+                    // Directly modify the list
+                    for element in elements.into_iter().rev() {
+                        list.push_front(element);
                     }
-                    _ => return Err(StorageError::WrongType.into()),
+                    let len = list.len();
+                    stored_value.touch();
+                    db_guard.mark_modified(&key);
+                    len
+                } else {
+                    unreachable!("Type already checked");
                 }
             }
             None => {
@@ -628,7 +630,7 @@ impl StorageEngine {
             }
         };
         
-        Ok(list)
+        Ok(list_len)
     }
     
     /// Push elements to the tail of a list
@@ -636,27 +638,29 @@ impl StorageEngine {
         let database = self.get_database(db)?;
         let mut db_guard = database.write().unwrap();
         
-        let list = match db_guard.data.get_mut(&key) {
+        // Check if key exists and get its type
+        if let Some(stored_value) = db_guard.data.get(&key) {
+            // Check type before mutation
+            match &stored_value.value {
+                Value::List(_) => {}
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        }
+        
+        // Now perform the actual operation
+        let list_len = match db_guard.data.get_mut(&key) {
             Some(stored_value) => {
-                match &stored_value.value {
-                    Value::List(ref list) => {
-                        // Clone the existing list
-                        let mut new_list = list.clone();
-                        
-                        // Push to cloned list
-                        for element in elements {
-                            new_list.push_back(element);
-                        }
-                        
-                        let len = new_list.len();
-                        
-                        // Replace the list value
-                        stored_value.value = Value::List(new_list);
-                        stored_value.touch();
-                        db_guard.mark_modified(&key);
-                        len
+                if let Value::List(list) = &mut stored_value.value {
+                    // Directly modify the list
+                    for element in elements {
+                        list.push_back(element);
                     }
-                    _ => return Err(StorageError::WrongType.into()),
+                    let len = list.len();
+                    stored_value.touch();
+                    db_guard.mark_modified(&key);
+                    len
+                } else {
+                    unreachable!("Type already checked");
                 }
             }
             None => {
@@ -674,7 +678,7 @@ impl StorageEngine {
             }
         };
         
-        Ok(list)
+        Ok(list_len)
     }
     
     /// Pop element from head of list
@@ -1799,6 +1803,345 @@ impl StorageEngine {
         // For now, always return false (no tracking implemented)
         // In a full implementation, we'd track modification versions
         Ok(false)
+    }
+
+    /// Scan the database keys using cursor-based iteration.
+    /// 
+    /// This function implements the Redis SCAN command that allows incremental
+    /// iteration over a collection of elements.
+    ///
+    /// Parameters:
+    /// * `db`: Database index to scan
+    /// * `cursor`: Cursor position to start from (0 to start a new scan)
+    /// * `pattern`: Optional pattern for key filtering
+    /// * `type_filter`: Optional type filter (string, list, set, hash, zset)
+    /// * `count`: Number of elements to scan (default 10)
+    /// 
+    /// Returns: (next_cursor, Vec<matching_keys>)
+    pub fn scan(&self, db: DatabaseIndex, cursor: u64, pattern: Option<&[u8]>, type_filter: Option<&str>, count: usize) -> Result<(u64, Vec<Vec<u8>>)> {
+        let database = self.get_database(db)?;
+        let db_guard = database.read().unwrap();
+        
+        // Default count if not specified
+        let scan_count = if count == 0 { 10 } else { count };
+        let max_scan_count = std::cmp::min(scan_count, 1000); // Cap at 1000 for safety
+        
+        // Create a snapshot of keys for stable iteration
+        let keys_count = db_guard.data.len();
+        
+        // If no keys, return cursor 0
+        if keys_count == 0 {
+            return Ok((0, Vec::new()));
+        }
+        
+        // Temporary approach: collect all keys into a vector
+        // In a more optimized implementation, we'd use a more sophisticated cursor mechanism
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(keys_count);
+        for (key, stored_value) in &db_guard.data {
+            // Skip expired keys
+            if stored_value.is_expired() {
+                continue;
+            }
+            
+            // Apply type filter if specified
+            if let Some(type_name) = type_filter {
+                let value_type = match &stored_value.value {
+                    Value::String(_) => "string",
+                    Value::List(_) => "list",
+                    Value::Set(_) => "set",
+                    Value::Hash(_) => "hash",
+                    Value::SortedSet(_) => "zset",
+                };
+                
+                if value_type != type_name {
+                    continue;
+                }
+            }
+            
+            keys.push(key.clone());
+        }
+        
+        // Sort keys for consistent iteration
+        keys.sort();
+        
+        // Calculate start position from cursor
+        let start_pos = if cursor == 0 { 0 } else { cursor as usize };
+        if start_pos >= keys.len() && !keys.is_empty() {
+            // Cursor is beyond the end, restart from beginning
+            return Ok((0, Vec::new()));
+        }
+        
+        let mut matching_keys = Vec::new();
+        let mut keys_examined = 0;
+        let mut current_pos = start_pos;
+        
+        // Pattern string for matching
+        let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
+        
+        // Scan keys starting from cursor position
+        while keys_examined < max_scan_count * 10 && matching_keys.len() < max_scan_count {
+            if current_pos >= keys.len() {
+                // Reached end of keys
+                break;
+            }
+            
+            let key = &keys[current_pos];
+            let mut include_key = true;
+            
+            // Apply pattern filter if specified
+            if let Some(ref pat) = pattern_str {
+                let key_str = String::from_utf8_lossy(key);
+                if !pattern_matches(pat, &key_str) {
+                    include_key = false;
+                }
+            }
+            
+            if include_key {
+                matching_keys.push(key.clone());
+            }
+            
+            current_pos += 1;
+            keys_examined += 1;
+        }
+        
+        // Calculate next cursor
+        let next_cursor = if current_pos >= keys.len() {
+            0 // Completed full scan
+        } else {
+            current_pos as u64
+        };
+        
+        Ok((next_cursor, matching_keys))
+    }
+
+    /// Scanning hash elements incrementally.
+    pub fn hscan(&self, db: DatabaseIndex, key: &[u8], cursor: u64, pattern: Option<&[u8]>, count: usize, no_values: bool) -> Result<(u64, Vec<Vec<u8>>)> {
+        // Get the hash
+        match self.get(db, key)? {
+            GetResult::Found(Value::Hash(hash)) => {
+                let scan_count = if count == 0 { 10 } else { count };
+                let max_scan_count = std::cmp::min(scan_count, 1000);
+                
+                // For small hashes, return everything at once
+                if hash.len() <= max_scan_count && cursor == 0 && pattern.is_none() {
+                    let mut result = Vec::new();
+                    for (field, value) in hash.iter() {
+                        result.push(field.clone());
+                        if !no_values {
+                            result.push(value.clone());
+                        }
+                    }
+                    return Ok((0, result));
+                }
+                
+                // Sort fields for consistent iteration
+                let mut fields: Vec<Vec<u8>> = hash.keys().cloned().collect();
+                fields.sort();
+                
+                let start_pos = if cursor == 0 { 0 } else { cursor as usize };
+                if start_pos >= fields.len() && !fields.is_empty() {
+                    return Ok((0, Vec::new()));
+                }
+                
+                let mut result = Vec::new();
+                let mut fields_examined = 0;
+                let mut current_pos = start_pos;
+                let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
+                
+                // Scan fields
+                while fields_examined < max_scan_count * 10 && (result.len() / if no_values { 1 } else { 2 }) < max_scan_count {
+                    if current_pos >= fields.len() {
+                        break;
+                    }
+                    
+                    let field = &fields[current_pos];
+                    let mut include_field = true;
+                    
+                    // Apply pattern filter
+                    if let Some(ref pat) = pattern_str {
+                        let field_str = String::from_utf8_lossy(field);
+                        if !pattern_matches(pat, &field_str) {
+                            include_field = false;
+                        }
+                    }
+                    
+                    if include_field {
+                        result.push(field.clone());
+                        if !no_values {
+                            let value = hash.get(field).unwrap();
+                            result.push(value.clone());
+                        }
+                    }
+                    
+                    current_pos += 1;
+                    fields_examined += 1;
+                }
+                
+                // Calculate next cursor
+                let next_cursor = if current_pos >= fields.len() {
+                    0 // Completed scan
+                } else {
+                    current_pos as u64
+                };
+                
+                Ok((next_cursor, result))
+            },
+            GetResult::Found(_) => {
+                Err(FerrousError::Storage(crate::error::StorageError::WrongType))
+            },
+            _ => {
+                // Key doesn't exist, return empty scan
+                Ok((0, Vec::new()))
+            }
+        }
+    }
+    
+    /// Scanning set members incrementally.
+    pub fn sscan(&self, db: DatabaseIndex, key: &[u8], cursor: u64, pattern: Option<&[u8]>, count: usize) -> Result<(u64, Vec<Vec<u8>>)> {
+        // Get the set
+        match self.get(db, key)? {
+            GetResult::Found(Value::Set(set)) => {
+                let scan_count = if count == 0 { 10 } else { count };
+                let max_scan_count = std::cmp::min(scan_count, 1000);
+                
+                // For small sets, return everything at once
+                if set.len() <= max_scan_count && cursor == 0 && pattern.is_none() {
+                    return Ok((0, set.iter().cloned().collect()));
+                }
+                
+                // Create a sorted vector of members
+                let mut members: Vec<Vec<u8>> = set.iter().cloned().collect();
+                members.sort();
+                
+                let start_pos = if cursor == 0 { 0 } else { cursor as usize };
+                if start_pos >= members.len() && !members.is_empty() {
+                    return Ok((0, Vec::new()));
+                }
+                
+                let mut result = Vec::new();
+                let mut members_examined = 0;
+                let mut current_pos = start_pos;
+                let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
+                
+                // Scan members
+                while members_examined < max_scan_count * 10 && result.len() < max_scan_count {
+                    if current_pos >= members.len() {
+                        break;
+                    }
+                    
+                    let member = &members[current_pos];
+                    let mut include_member = true;
+                    
+                    // Apply pattern filter
+                    if let Some(ref pat) = pattern_str {
+                        let member_str = String::from_utf8_lossy(member);
+                        if !pattern_matches(pat, &member_str) {
+                            include_member = false;
+                        }
+                    }
+                    
+                    if include_member {
+                        result.push(member.clone());
+                    }
+                    
+                    current_pos += 1;
+                    members_examined += 1;
+                }
+                
+                // Calculate next cursor
+                let next_cursor = if current_pos >= members.len() {
+                    0 // Completed scan
+                } else {
+                    current_pos as u64
+                };
+                
+                Ok((next_cursor, result))
+            },
+            GetResult::Found(_) => {
+                Err(FerrousError::Storage(crate::error::StorageError::WrongType))
+            },
+            _ => {
+                // Key doesn't exist, return empty scan
+                Ok((0, Vec::new()))
+            }
+        }
+    }
+    
+    /// Scanning sorted set elements incrementally.
+    pub fn zscan(&self, db: DatabaseIndex, key: &[u8], cursor: u64, pattern: Option<&[u8]>, count: usize) -> Result<(u64, Vec<(Vec<u8>, f64)>)> {
+        // Get the sorted set
+        match self.get(db, key)? {
+            GetResult::Found(Value::SortedSet(zset)) => {
+                let scan_count = if count == 0 { 10 } else { count };
+                let max_scan_count = std::cmp::min(scan_count, 1000);
+                
+                // Create a vector of (member, score) pairs
+                let mut items: Vec<(Vec<u8>, f64)> = Vec::new();
+                let range = zset.range_by_rank(0, zset.len() - 1);
+                for (member, score) in range.items {
+                    items.push((member, score));
+                }
+                
+                // Sort by member for consistent iteration
+                items.sort_by(|a, b| a.0.cmp(&b.0));
+                
+                // For small sorted sets, return everything at once
+                if items.len() <= max_scan_count && cursor == 0 && pattern.is_none() {
+                    return Ok((0, items));
+                }
+                
+                let start_pos = if cursor == 0 { 0 } else { cursor as usize };
+                if start_pos >= items.len() && !items.is_empty() {
+                    return Ok((0, Vec::new()));
+                }
+                
+                let mut result = Vec::new();
+                let mut items_examined = 0;
+                let mut current_pos = start_pos;
+                let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
+                
+                // Scan items
+                while items_examined < max_scan_count * 10 && result.len() < max_scan_count {
+                    if current_pos >= items.len() {
+                        break;
+                    }
+                    
+                    let (member, score) = &items[current_pos];
+                    let mut include_item = true;
+                    
+                    // Apply pattern filter
+                    if let Some(ref pat) = pattern_str {
+                        let member_str = String::from_utf8_lossy(member);
+                        if !pattern_matches(pat, &member_str) {
+                            include_item = false;
+                        }
+                    }
+                    
+                    if include_item {
+                        result.push((member.clone(), *score));
+                    }
+                    
+                    current_pos += 1;
+                    items_examined += 1;
+                }
+                
+                // Calculate next cursor
+                let next_cursor = if current_pos >= items.len() {
+                    0 // Completed scan
+                } else {
+                    current_pos as u64
+                };
+                
+                Ok((next_cursor, result))
+            },
+            GetResult::Found(_) => {
+                Err(FerrousError::Storage(crate::error::StorageError::WrongType))
+            },
+            _ => {
+                // Key doesn't exist, return empty scan
+                Ok((0, Vec::new()))
+            }
+        }
     }
     
     /// Background thread for cleaning up expired keys
