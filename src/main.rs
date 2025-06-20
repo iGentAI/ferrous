@@ -9,6 +9,7 @@ mod network;
 mod storage;
 mod pubsub;
 mod replication;
+mod monitor;
 
 use std::process;
 use error::Result;

@@ -52,11 +52,20 @@ pub struct Connection {
     /// Last activity timestamp
     pub last_activity: Instant,
     
+    /// Creation time
+    pub created_at: Instant,
+    
     /// Selected database (default 0)
     pub db_index: usize,
     
     /// Transaction state
     pub transaction_state: TransactionState,
+    
+    /// Whether this connection is subscribed to MONITOR
+    pub is_monitoring: bool,
+    
+    /// Client name (set via CLIENT SETNAME)
+    pub name: Option<String>,
 }
 
 impl Connection {
@@ -68,6 +77,8 @@ impl Connection {
         // Set TCP nodelay for low latency
         stream.set_nodelay(true)?;
         
+        let now = Instant::now();
+        
         Ok(Connection {
             id,
             stream,
@@ -76,9 +87,12 @@ impl Connection {
             parser: RespParser::new(),
             write_buffer: Vec::with_capacity(16384), // Larger initial capacity for better pipelining
             write_offset: 0,
-            last_activity: Instant::now(),
+            last_activity: now,
+            created_at: now,
             db_index: 0,
             transaction_state: TransactionState::default(),
+            is_monitoring: false,
+            name: None,
         })
     }
     

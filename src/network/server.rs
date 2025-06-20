@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 use std::thread;
 use std::path::PathBuf;
 use crate::error::{FerrousError, Result};
@@ -11,6 +11,8 @@ use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, GetResult, RdbEngine, StorageMonitor, RdbConfig};
 use crate::storage::commands::{transactions, aof};
 use crate::storage::{aof::AofEngine, AofConfig};
+use crate::storage::commands::slowlog::Slowlog;
+use crate::monitor::MonitorSubscribers;
 use crate::pubsub::{PubSubManager, format_message, format_pmessage, 
                     format_subscribe_response, format_psubscribe_response,
                     format_unsubscribe_response, format_punsubscribe_response};
@@ -99,6 +101,25 @@ impl ShardedConnections {
     }
 }
 
+impl crate::storage::commands::client::ConnectionProvider for ShardedConnections {
+    fn with_connection<F, R>(&self, id: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Connection) -> R,
+    {
+        self.with_connection(id, f)
+    }
+    
+    fn all_connection_ids(&self) -> Vec<u64> {
+        self.all_connection_ids()
+    }
+    
+    fn close_connection(&self, id: u64) -> bool {
+        self.with_connection(id, |conn| {
+            conn.state = super::ConnectionState::Closing;
+        }).is_some()
+    }
+}
+
 /// Server statistics for monitoring
 pub struct ServerStats {
     /// Total number of connections received
@@ -160,6 +181,12 @@ pub struct Server {
     start_time: SystemTime,
     /// Replication manager
     replication: Arc<ReplicationManager>,
+    /// Slowlog system
+    slowlog: Arc<Slowlog>,
+    /// Monitor subscribers
+    monitor_subscribers: Arc<MonitorSubscribers>,
+    /// Clients paused until this time
+    clients_paused_until: Arc<Mutex<SystemTime>>,
 }
 
 impl Server {
@@ -211,7 +238,7 @@ impl Server {
         };
         
         // Create storage monitor
-        let mut monitor = StorageMonitor::new();
+        let mut storage_monitor = StorageMonitor::new();
         
         // Create pub/sub manager
         let pubsub = PubSubManager::new();
@@ -222,6 +249,15 @@ impl Server {
         // Create replication manager
         let replication = ReplicationManager::new(config.replication.clone());
         
+        // Create slowlog
+        let slowlog = Arc::new(Slowlog::new());
+        
+        // Create monitor subscribers
+        let monitor_subscribers = Arc::new(MonitorSubscribers::new());
+        
+        // Initialize client pause to UNIX_EPOCH (not paused)
+        let clients_paused_until = Arc::new(Mutex::new(UNIX_EPOCH));
+        
         // Load existing RDB if available
         if let Err(e) = rdb_engine.load(&storage) {
             eprintln!("Failed to load RDB file: {}", e);
@@ -229,7 +265,7 @@ impl Server {
         
         // Start background monitoring if auto-save is enabled
         if config.rdb.auto_save {
-            monitor.start(Arc::clone(&storage), Arc::clone(&rdb_engine), config.rdb.clone());
+            storage_monitor.start(Arc::clone(&storage), Arc::clone(&rdb_engine), config.rdb.clone());
         }
         
         // Check if replication is configured
@@ -254,13 +290,16 @@ impl Server {
             config: config.network,
             storage,
             rdb_engine: Some(rdb_engine),
-            storage_monitor: Some(monitor),
+            storage_monitor: Some(storage_monitor),
             pubsub,
             aof_engine,
             pending_writes: Arc::new(Mutex::new(Vec::new())),
             stats,
             start_time: SystemTime::now(),
             replication,
+            slowlog,
+            monitor_subscribers,
+            clients_paused_until,
         })
     }
     
@@ -605,8 +644,8 @@ impl Server {
     
     /// Process a RESP frame and generate a response
     fn process_frame(&mut self, frame: RespFrame, conn_id: u64) -> Result<RespFrame> {
-        
-        match &frame {
+        // We've removed the start_time here since it was causing duplicate timing
+        let result = match &frame {
             RespFrame::Array(Some(parts)) if !parts.is_empty() => {
                 // Extract command name
                 let cmd_frame = &parts[0];
@@ -636,6 +675,25 @@ impl Server {
                         "QUIT" => return Ok(RespFrame::ok()),
                         _ => return Ok(RespFrame::error("NOAUTH Authentication required")),
                     }
+                }
+                
+                // Special handling for MONITOR command - must be implemented at this level
+                // since it affects the connection state directly
+                if command.as_str() == "MONITOR" {
+                    // Only handle MONITOR if parts count is correct
+                    if parts.len() != 1 {
+                        return Ok(RespFrame::error("ERR wrong number of arguments for 'monitor' command"));
+                    }
+                    
+                    // Subscribe this connection to monitoring
+                    self.monitor_subscribers.subscribe(conn_id)?;
+                    
+                    // Mark connection as monitoring in its state
+                    self.connections.with_connection(conn_id, |conn| {
+                        conn.is_monitoring = true;
+                    });
+                    
+                    return Ok(RespFrame::ok());
                 }
                 
                 // Handle transaction control commands and connection-specific commands
@@ -690,10 +748,30 @@ impl Server {
                 }
                 
                 // Process normal command
-                self.process_normal_command(parts, db_index)
+                let result = match command.as_str() {
+                    // Check if clients are currently paused
+                    // Special commands like AUTH, CLIENT commands are exempt from pausing
+                    _ if !matches!(command.as_str(), "AUTH" | "CLIENT" | "QUIT") => {
+                        // Check if clients are paused
+                        let now = SystemTime::now();
+                        let paused_until = self.clients_paused_until.lock().unwrap();
+                        if now < *paused_until {
+                            return Ok(RespFrame::error("ERR CLIENT PAUSE active, please retry later"));
+                        }
+                        
+                        // Not paused, continue processing
+                        drop(paused_until);
+                        self.process_normal_command(parts, db_index, conn_id)
+                    },
+                    _ => self.process_normal_command(parts, db_index, conn_id),
+                };
+                
+                result
             }
             _ => Ok(RespFrame::error("ERR invalid request format")),
-        }
+        };
+        
+        result
     }
     
     /// Handle EXEC command - execute queued transaction commands
@@ -740,23 +818,36 @@ impl Server {
     
     /// Helper method to process a Vec<RespFrame> in a transaction
     fn process_command_parts(&mut self, parts: &Vec<RespFrame>, db: usize) -> Result<RespFrame> {
-        self.process_normal_command(parts, db)
+        // For transaction processing, use a dummy connection ID of 0 for SLOWLOG
+        // since we don't have the original connection context here
+        self.process_normal_command(parts, db, 0)
     }
 
     /// Process a normal (non-transaction) command
-    fn process_normal_command(&mut self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
-        // Extract command name
+    fn process_normal_command(&mut self, parts: &[RespFrame], db: usize, conn_id: u64) -> Result<RespFrame> {
+        // Record the command timestamp for MONITOR
+        let command_timestamp = SystemTime::now();
+        
+        // Extract command name for debugging
         let cmd_frame = &parts[0];
-        let command = match cmd_frame {
+        let command_name = match cmd_frame {
             RespFrame::BulkString(Some(bytes)) => {
                 String::from_utf8_lossy(bytes).to_uppercase()
             }
             _ => return Ok(RespFrame::error("ERR invalid command format")),
         };
         
+        // Start timing for SLOWLOG - moved here for accurate timing of just the command execution
+        let start_time = std::time::Instant::now();
+        
+        // Debug output to show we're processing a command
+        crate::storage::commands::debug::log_slowlog(
+            &format!("Processing command: {}", command_name)
+        );
+        
         // Log to AOF for write commands
         if let Some(aof) = &self.aof_engine {
-            if self.is_write_command(&command) {
+            if self.is_write_command(&command_name) {
                 if let Err(e) = aof.append_command(parts) {
                     eprintln!("Failed to append to AOF: {}", e);
                 }
@@ -764,7 +855,7 @@ impl Server {
         }
         
         // Route to command handler
-        let result = match command.as_str() {
+        let result = match command_name.as_str() {
             "PING" => self.handle_ping(parts),
             "ECHO" => self.handle_echo(parts),
             "SET" => self.handle_set(parts, db),
@@ -776,8 +867,81 @@ impl Server {
             "EXISTS" => self.handle_exists(parts, db),
             "EXPIRE" => self.handle_expire(parts, db),
             "TTL" => self.handle_ttl(parts, db),
-            // Handle CONFIG command - key for benchmarking compatibility
-            "CONFIG" => crate::storage::commands::config::handle_config(parts),
+            // Special test commands
+            "SLEEP" => {
+                // Special command that intentionally sleeps to test SLOWLOG
+                if parts.len() != 2 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'sleep' command"));
+                }
+                
+                let milliseconds = match &parts[1] {
+                    RespFrame::BulkString(Some(bytes)) => {
+                        match String::from_utf8_lossy(bytes).parse::<u64>() {
+                            Ok(ms) => ms,
+                            Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                        }
+                    }
+                    _ => return Ok(RespFrame::error("ERR invalid milliseconds format")),
+                };
+                
+                // Sleep for the specified time to create a deliberately slow command
+                std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+                
+                Ok(RespFrame::ok())
+            },
+            // Add config command handling for slowlog settings
+            "CONFIG" => {
+                if parts.len() < 2 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'config' command"));
+                }
+                
+                let subcommand = match &parts[1] {
+                    RespFrame::BulkString(Some(bytes)) => {
+                        String::from_utf8_lossy(bytes).to_uppercase()
+                    },
+                    _ => return Ok(RespFrame::error("ERR invalid subcommand format")),
+                };
+                
+                if subcommand.as_str() == "SET" && parts.len() >= 4 {
+                    // Handle CONFIG SET for slowlog settings
+                    let param_name = match &parts[2] {
+                        RespFrame::BulkString(Some(bytes)) => {
+                            String::from_utf8_lossy(bytes).to_string().to_lowercase()
+                        },
+                        _ => return Ok(RespFrame::error("ERR invalid parameter name format")),
+                    };
+                    
+                    let param_value = match &parts[3] {
+                        RespFrame::BulkString(Some(bytes)) => {
+                            String::from_utf8_lossy(bytes).to_string()
+                        },
+                        _ => return Ok(RespFrame::error("ERR invalid parameter value format")),
+                    };
+                    
+                    match param_name.as_str() {
+                        "slowlog-log-slower-than" => {
+                            if let Ok(value) = param_value.parse::<i64>() {
+                                self.slowlog.set_threshold_micros(value);
+                                return Ok(RespFrame::ok());
+                            } else {
+                                return Ok(RespFrame::error("ERR value is not an integer or out of range"));
+                            }
+                        },
+                        "slowlog-max-len" => {
+                            if let Ok(value) = param_value.parse::<u64>() {
+                                self.slowlog.set_max_len(value);
+                                return Ok(RespFrame::ok());
+                            } else {
+                                return Ok(RespFrame::error("ERR value is not an integer or out of range"));
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+                
+                // Default CONFIG handling for other cases
+                crate::storage::commands::config::handle_config(parts)
+            },
             // Additional string commands
             "MGET" => crate::storage::commands::strings::handle_mget(&self.storage, db, parts),
             "MSET" => crate::storage::commands::strings::handle_mset(&self.storage, db, parts),
@@ -859,6 +1023,21 @@ impl Server {
                 &self.replication,
                 parts
             ),
+            "SLOWLOG" => crate::storage::commands::slowlog::handle_slowlog(&self.slowlog, parts),
+            // Memory commands
+            "MEMORY" => crate::storage::commands::memory::handle_memory(parts, &self.storage, db),
+            // Client commands
+            "CLIENT" => {
+                // Get a mutable reference to clients_paused_until for CLIENT PAUSE
+                let mut paused_until = self.clients_paused_until.lock().unwrap();
+                // Use &* to get a reference to the ShardedConnections inside the Arc
+                crate::storage::commands::client::handle_client(
+                    parts,
+                    &*self.connections,
+                    conn_id,
+                    Some(&mut *paused_until)
+                )
+            },
             // Auth command  
             "AUTH" => self.handle_auth(parts, 0), // Special handling for AUTH in process_frame
             // Replication commands
@@ -867,15 +1046,15 @@ impl Server {
             "SYNC" => crate::replication::handle_sync(&self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
             "PSYNC" => crate::replication::handle_psync(parts, &self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
             "QUIT" => Ok(RespFrame::ok()),
-            _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command))),
+            _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command_name))),
         };
         
         // If this was a successful write command, propagate to replicas
-        if self.is_write_command(&command) {
+        if self.is_write_command(&command_name) {
             if let Ok(resp) = &result {
                 if !resp.is_error() {
                     // Log successful propagation
-                    println!("Propagating command {} to replicas", command);
+                    println!("Propagating command {} to replicas", command_name);
                     
                     if let Ok(replica_ids) = self.replication.propagate_command(&RespFrame::Array(Some(parts.to_vec()))) {
                         if !replica_ids.is_empty() {
@@ -894,6 +1073,45 @@ impl Server {
                             }
                         }
                     }
+                }
+            }
+        }
+        
+        // Measure command execution time for SLOWLOG at the very end
+        let duration = start_time.elapsed();
+        let duration_micros = duration.as_micros() as u64;
+        let threshold_micros = self.slowlog.get_threshold_micros();
+        
+        // Debug information to see what's happening
+        crate::storage::commands::debug::log_command_timing(&command_name, duration_micros, threshold_micros);
+        
+        // Get client address for slowlog
+        let client_addr = self.connections.with_connection(conn_id, |conn| {
+            conn.addr.to_string()
+        }).unwrap_or_else(|| "127.0.0.1:unknown".to_string());
+        
+        // Only add to slowlog if actually slow
+        if threshold_micros >= 0 && duration_micros >= threshold_micros as u64 {
+            crate::storage::commands::debug::log_slowlog(
+                &format!("Adding slow command: {} ({}μs) from {}", 
+                         command_name, duration_micros, client_addr)
+            );
+            
+            self.slowlog.add_if_slow(duration, parts, &client_addr, None);
+        } else {
+            crate::storage::commands::debug::log_slowlog(
+                &format!("Command not slow enough: {} ({}μs, threshold {}μs)", 
+                         command_name, duration_micros, threshold_micros)
+            );
+        }
+        
+        // Broadcast to monitors if anyone is monitoring
+        if !self.monitor_subscribers.get_subscribers().is_empty() {
+            // Skip broadcasting sensitive commands like AUTH
+            if let RespFrame::BulkString(Some(cmd_bytes)) = &parts[0] {
+                let cmd = String::from_utf8_lossy(cmd_bytes).to_uppercase();
+                if cmd != "AUTH" {  // Don't broadcast AUTH commands for security
+                    self.broadcast_to_monitors(parts, conn_id, db, command_timestamp)?;
                 }
             }
         }
@@ -2038,6 +2256,40 @@ impl Server {
             _ => unreachable!(),
         }
     }
+    
+    /// Broadcast a command to all monitor subscribers
+    fn broadcast_to_monitors(&self, parts: &[RespFrame], conn_id: u64, db: usize, timestamp: SystemTime) -> Result<()> {
+        let subscribers = self.monitor_subscribers.get_subscribers();
+        
+        if subscribers.is_empty() {
+            return Ok(());
+        }
+        
+        // Get client address for the command
+        let client_addr = self.connections.with_connection(conn_id, |conn| {
+            conn.addr.to_string()
+        }).unwrap_or_else(|| "127.0.0.1:unknown".to_string());
+        
+        // Format the monitor output
+        let monitor_output = MonitorSubscribers::format_monitor_output(
+            timestamp,
+            db,
+            &client_addr,
+            parts
+        );
+        
+        // Send to all monitor subscribers
+        for subscriber_id in subscribers {
+            // Don't send to the connection that issued the command
+            if subscriber_id != conn_id {
+                let _ = self.connections.with_connection(subscriber_id, |conn| {
+                    conn.send_frame(&monitor_output)
+                });
+            }
+        }
+        
+        Ok(())
+    }
 
     /// Clean up closed connections
     fn cleanup_connections(&mut self) -> Result<()> {
@@ -2062,6 +2314,11 @@ impl Server {
                 // Clean up any pub/sub subscriptions
                 if let Err(e) = self.pubsub.unsubscribe_all(id) {
                     eprintln!("Error cleaning up subscriptions for connection {}: {}", id, e);
+                }
+                
+                // Clean up monitor subscription
+                if let Err(e) = self.monitor_subscribers.unsubscribe(id) {
+                    eprintln!("Error cleaning up monitor subscription for connection {}: {}", id, e);
                 }
             }
         }

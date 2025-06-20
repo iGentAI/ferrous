@@ -11,6 +11,11 @@ pub mod aof;
 pub mod monitor;
 pub mod config;
 pub mod scan;
+pub mod slowlog;
+pub mod debug;
+pub mod monitor_cmd;
+pub mod client;
+pub mod memory;
 
 // Re-export all handlers for easy access
 pub use lists::*;
@@ -22,3 +27,8 @@ pub use aof::*;
 pub use monitor::*;
 pub use config::*;
 pub use scan::*;
+pub use slowlog::*;
+pub use debug::*;
+pub use monitor_cmd::*;
+pub use client::*;
+pub use memory::*;
