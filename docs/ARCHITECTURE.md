@@ -35,8 +35,119 @@ This document provides a detailed technical architecture of Ferrous, describing 
 │  │ Replication │  │  Pub/Sub    │  │   Background        │   │
 │  │   Manager   │  │  Engine     │  │    Tasks            │   │
 │  └─────────────┘  └─────────────┘  └─────────────────────┘   │
+├─────────────────────────────────────────────────────────────────┤
+│                    Monitoring Layer (New)                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐   │
+│  │  SLOWLOG    │  │  MONITOR    │  │   Memory Tracking   │   │
+│  │   System    │  │  Broadcast  │  │   & CLIENT Cmds     │   │
+│  └─────────────┘  └─────────────┘  └─────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+## Monitoring Layer (New)
+
+### SLOWLOG System
+
+The SLOWLOG system tracks command execution times and provides insights into slow operations:
+
+```rust
+pub struct Slowlog {
+    /// Entries stored in order (newest first)
+    entries: Arc<Mutex<VecDeque<SlowlogEntry>>>,
+    
+    /// Maximum number of entries to keep
+    max_len: AtomicU64,
+    
+    /// Threshold in microseconds
+    threshold_micros: AtomicI64,
+    
+    /// ID generator for entries
+    next_id: AtomicU64,
+}
+```
+
+Key components:
+- Circular buffer of slow command entries
+- Configurable threshold (microseconds)
+- Configurable maximum length
+- Thread-safe implementation with atomic counters
+
+### MONITOR Implementation
+
+The MONITOR subsystem supports real-time command broadcasting to monitoring clients:
+
+```rust
+pub struct MonitorSubscribers {
+    /// Set of connection IDs that are monitoring
+    subscribers: Arc<Mutex<HashSet<u64>>>,
+}
+```
+
+Key components:
+- Connection ID tracking for subscribers
+- Thread-safe broadcasting to all monitors
+- Properly formatted output with timestamps and connection details
+- Security filtering (AUTH commands not broadcast)
+
+### Client Management
+
+The client management system provides comprehensive client connection control:
+
+```rust
+pub trait ConnectionProvider {
+    /// Execute a function on a specific connection
+    fn with_connection<F, R>(&self, id: u64, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Connection) -> R;
+    
+    /// Get all connection IDs
+    fn all_connection_ids(&self) -> Vec<u64>;
+    
+    /// Close a connection by ID
+    fn close_connection(&self, id: u64) -> bool;
+}
+```
+
+Key components:
+- Client connection listing
+- Connection termination
+- Client pause functionality
+- Connection naming
+- Sharded connection management for concurrency
+
+### Memory Tracking
+
+The memory tracking system provides detailed insights into memory usage:
+
+```rust
+pub struct MemoryStats {
+    /// Total memory usage
+    pub total_used: AtomicUsize,
+    
+    /// Peak memory usage
+    pub peak_used: AtomicUsize,
+    
+    /// Memory used by keys (key names)
+    pub keys_size: AtomicUsize,
+    
+    /// Memory categorized by data structure type
+    pub strings_size: AtomicUsize,
+    pub lists_size: AtomicUsize,
+    pub sets_size: AtomicUsize,
+    pub hashes_size: AtomicUsize,
+    pub zsets_size: AtomicUsize,
+    
+    /// Per-database memory usage
+    pub db_memory: Arc<RwLock<HashMap<usize, usize>>>,
+}
+```
+
+Key components:
+- Per-key memory usage calculation
+- Memory usage categorization by data structure
+- System-wide memory statistics
+- Memory usage analysis and recommendations
+- Enhanced INFO command with memory details
 
 ## Core Components
 

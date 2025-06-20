@@ -9,6 +9,7 @@ pub mod storage;
 pub mod pubsub;
 pub mod replication;
 pub mod config;
+pub mod monitor;
 
 // Re-export commonly used types
 pub use error::{FerrousError, Result};
@@ -18,3 +19,4 @@ pub use storage::{StorageEngine, Value, ValueType};
 pub use pubsub::PubSubManager;
 pub use replication::{ReplicationManager, ReplicationConfig};
 pub use config::Config;
+pub use monitor::MonitorSubscribers;
