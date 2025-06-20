@@ -7,6 +7,8 @@ pub mod protocol;
 pub mod network;
 pub mod storage;
 pub mod pubsub;
+pub mod replication;
+pub mod config;
 
 // Re-export commonly used types
 pub use error::{FerrousError, Result};
@@ -14,3 +16,5 @@ pub use protocol::{RespFrame, RespParser};
 pub use network::{Server, Connection, NetworkConfig};
 pub use storage::{StorageEngine, Value, ValueType};
 pub use pubsub::PubSubManager;
+pub use replication::{ReplicationManager, ReplicationConfig};
+pub use config::Config;

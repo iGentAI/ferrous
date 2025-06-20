@@ -61,6 +61,12 @@ pub enum CommandError {
     
     /// Invalid state for operation
     InvalidState(String),
+    
+    /// Invalid argument for command
+    InvalidArgument,
+    
+    /// Generic command error with message
+    Generic(String),
 }
 
 /// Storage-related errors
@@ -121,6 +127,12 @@ impl fmt::Display for CommandError {
             CommandError::IndexOutOfRange => write!(f, "ERR index out of range"),
             CommandError::NoSuchKey => write!(f, "ERR no such key"),
             CommandError::InvalidState(msg) => {
+                write!(f, "ERR {}", msg)
+            }
+            CommandError::InvalidArgument => {
+                write!(f, "ERR invalid argument")
+            }
+            CommandError::Generic(msg) => {
                 write!(f, "ERR {}", msg)
             }
         }

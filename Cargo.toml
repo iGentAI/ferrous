@@ -11,9 +11,11 @@ categories = ["database", "caching"]
 
 [dependencies]
 rand = "0.8.5"
+thiserror = "1.0"
 
 [dev-dependencies]
 # Only for testing and benchmarking
+tempfile = "3.5.0"
 
 [profile.release]
 lto = true

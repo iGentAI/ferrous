@@ -3,7 +3,7 @@ A Redis-compatible in-memory database server written in pure Rust with zero exte
 
 ## Project Status
 
-Ferrous is currently at Phase 3 implementation, with several Phase 4 features completed:
+Ferrous is currently at Phase 4 implementation, with several key features completed:
 
 ### Completed (Phases 1-3):
 - ✅ TCP Server with connection handling
@@ -20,9 +20,10 @@ Ferrous is currently at Phase 3 implementation, with several Phase 4 features co
 - ✅ Concurrent client handling (50+ connections)
 - ✅ Configuration commands (CONFIG GET)
 - ✅ Enhanced RESP protocol parsing
+- ✅ Master-slave replication
+- ✅ SCAN command family for safe iteration
 
 ### Coming Soon (Remaining Phase 4-6):
-- Master-slave replication
 - Production monitoring (INFO, SLOWLOG)
 - Advanced features (Lua scripting, HyperLogLog)
 - Cluster support
@@ -53,6 +54,7 @@ Average latency: ~0.29ms (Ferrous) vs ~0.32ms (Valkey)
 - **Outperforms Redis/Valkey** on ALL operations by 2-17%
 - **Multi-threaded architecture** provides consistently lower latency
 - **Production build improvements** show 10-60% gains over debug builds
+- **Master-slave replication** supports high-availability deployments
 
 These performance numbers demonstrate the effectiveness of Ferrous's multi-threaded Rust architecture, with all operations exceeding Redis performance.
 
@@ -88,4 +90,25 @@ python3 pipeline_test.py
 
 # Run performance benchmarks
 ./test_benchmark.sh
+
+# Test replication functionality
+./test_replication.sh
+```
+
+## Running Multiple Instances for Replication
+
+To run a master-slave setup, two configuration files are provided:
+
+```bash
+# Start the master
+./target/release/ferrous master.conf
+
+# Start the replica
+./target/release/ferrous replica.conf
+```
+
+Alternatively, you can use the REPLICAOF command to dynamically configure replication:
+
+```bash
+redis-cli -h 127.0.0.1 -p 6380 -a mysecretpassword REPLICAOF 127.0.0.1 6379
 ```

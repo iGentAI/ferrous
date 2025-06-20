@@ -73,6 +73,16 @@ impl RespFrame {
         RespFrame::SimpleString(Arc::new(b"OK".to_vec()))
     }
     
+    /// Create a simple string response
+    pub fn simple_string(s: impl Into<Vec<u8>>) -> Self {
+        RespFrame::SimpleString(Arc::new(s.into()))
+    }
+    
+    /// Check if this frame is an error
+    pub fn is_error(&self) -> bool {
+        matches!(self, RespFrame::Error(_))
+    }
+    
     /// Create an error response
     pub fn error(msg: impl Into<Vec<u8>>) -> Self {
         RespFrame::Error(Arc::new(msg.into()))
@@ -97,6 +107,16 @@ impl RespFrame {
     pub fn from_string(s: impl Into<String>) -> Self {
         let s = s.into();
         RespFrame::BulkString(Some(Arc::new(s.into_bytes())))
+    }
+    
+    /// Create a bulk string from bytes
+    pub fn bulk_string(bytes: impl AsRef<[u8]>) -> Self {
+        RespFrame::BulkString(Some(Arc::new(bytes.as_ref().to_vec())))
+    }
+    
+    /// Create an array of frames
+    pub fn array(frames: Vec<RespFrame>) -> Self {
+        RespFrame::Array(Some(frames))
     }
     
     /// Check if this frame represents a null/nil value

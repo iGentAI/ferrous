@@ -43,6 +43,9 @@ pub struct AofConfig {
     /// AOF filename
     pub filename: String,
     
+    /// Working directory
+    pub dir: String,
+    
     /// Rewrite trigger percentage
     pub auto_rewrite_percentage: u64,
     
@@ -67,6 +70,7 @@ impl Default for AofConfig {
             enabled: false,
             fsync_policy: FsyncPolicy::EverySecond,
             filename: "appendonly.aof".to_string(),
+            dir: "./".to_string(),
             auto_rewrite_percentage: 100,
             auto_rewrite_min_size: 64 * 1024 * 1024, // 64MB
         }
@@ -76,7 +80,8 @@ impl Default for AofConfig {
 impl AofEngine {
     /// Create a new AOF engine
     pub fn new(config: AofConfig) -> Self {
-        let file_path = PathBuf::from(&config.filename);
+        let mut file_path = PathBuf::from(&config.dir);
+        file_path.push(&config.filename);
         
         Self {
             file_path,

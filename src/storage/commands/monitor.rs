@@ -2,6 +2,7 @@
 //! 
 //! Provides Redis-compatible monitoring commands including INFO, MONITOR, and SLOWLOG.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::process;
@@ -10,14 +11,16 @@ use crate::error::Result;
 use crate::protocol::RespFrame;
 use crate::storage::StorageEngine;
 use crate::network::server::ServerStats;
+use crate::replication::ReplicationManager;
 
 /// Handle INFO command
 pub fn handle_info(
-    storage: &StorageEngine,
-    stats: &ServerStats,
+    storage: &Arc<StorageEngine>, 
+    stats: &Arc<ServerStats>,
     start_time: SystemTime,
-    total_connections: usize,
+    connected_clients: usize,
     max_clients: usize,
+    replication: &Arc<ReplicationManager>,
     parts: &[RespFrame]
 ) -> Result<RespFrame> {
     // Parse section filter if provided
@@ -42,7 +45,7 @@ pub fn handle_info(
     
     // Clients section
     if show_all || section.as_deref() == Some("clients") {
-        append_clients_info(&mut info_output, total_connections, max_clients, stats);
+        append_clients_info(&mut info_output, connected_clients, max_clients, stats);
     }
     
     // Memory section
@@ -57,7 +60,7 @@ pub fn handle_info(
     
     // Replication section
     if show_all || section.as_deref() == Some("replication") {
-        append_replication_info(&mut info_output);
+        append_replication_info(&mut info_output, replication);
     }
     
     // CPU section
@@ -88,15 +91,15 @@ fn append_server_info(output: &mut String, start_time: SystemTime) {
     writeln!(output, "").unwrap();
 }
 
-fn append_clients_info(output: &mut String, total_connections: usize, max_clients: usize, stats: &ServerStats) {
+fn append_clients_info(output: &mut String, connected_clients: usize, max_clients: usize, stats: &Arc<ServerStats>) {
     writeln!(output, "# Clients").unwrap();
-    writeln!(output, "connected_clients:{}", total_connections).unwrap();
+    writeln!(output, "connected_clients:{}", connected_clients).unwrap();
     writeln!(output, "blocked_clients:{}", stats.blocked_clients.load(Ordering::Relaxed)).unwrap();
     writeln!(output, "maxclients:{}", max_clients).unwrap();
     writeln!(output, "").unwrap();
 }
 
-fn append_memory_info(output: &mut String, storage: &StorageEngine, stats: &ServerStats) {
+fn append_memory_info(output: &mut String, storage: &Arc<StorageEngine>, stats: &Arc<ServerStats>) {
     writeln!(output, "# Memory").unwrap();
     
     // Get memory stats from storage engine
@@ -119,7 +122,7 @@ fn append_memory_info(output: &mut String, storage: &StorageEngine, stats: &Serv
     writeln!(output, "").unwrap();
 }
 
-fn append_stats_info(output: &mut String, stats: &ServerStats, start_time: SystemTime) {
+fn append_stats_info(output: &mut String, stats: &Arc<ServerStats>, start_time: SystemTime) {
     writeln!(output, "# Stats").unwrap();
     
     writeln!(
@@ -179,10 +182,12 @@ fn append_stats_info(output: &mut String, stats: &ServerStats, start_time: Syste
     writeln!(output, "").unwrap();
 }
 
-fn append_replication_info(output: &mut String) {
+fn append_replication_info(output: &mut String, replication: &Arc<ReplicationManager>) {
     writeln!(output, "# Replication").unwrap();
-    writeln!(output, "role:master").unwrap();
-    writeln!(output, "connected_slaves:0").unwrap();
+    let repl_info = replication.get_info();
+    for (key, value) in repl_info {
+        writeln!(output, "{}:{}", key, value).unwrap();
+    }
     writeln!(output, "").unwrap();
 }
 
@@ -199,7 +204,7 @@ fn append_cpu_info(output: &mut String) {
     writeln!(output, "").unwrap();
 }
 
-fn append_keyspace_info(output: &mut String, storage: &StorageEngine) {
+fn append_keyspace_info(output: &mut String, storage: &Arc<StorageEngine>) {
     writeln!(output, "# Keyspace").unwrap();
     
     // Get statistics for each database
