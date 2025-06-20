@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::thread;
+use std::path::PathBuf;
 use crate::error::{FerrousError, Result};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, GetResult, RdbEngine, StorageMonitor, RdbConfig};
@@ -13,7 +14,9 @@ use crate::storage::{aof::AofEngine, AofConfig};
 use crate::pubsub::{PubSubManager, format_message, format_pmessage, 
                     format_subscribe_response, format_psubscribe_response,
                     format_unsubscribe_response, format_punsubscribe_response};
+use crate::replication::{ReplicationManager, ReplicationConfig};
 use super::{Listener, Connection, ConnectionState, NetworkConfig};
+use crate::Config as FerrousConfig;
 
 /// Connection ID generator
 static CONN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -155,6 +158,8 @@ pub struct Server {
     stats: Arc<ServerStats>,
     /// Server start time
     start_time: SystemTime,
+    /// Replication manager
+    replication: Arc<ReplicationManager>,
 }
 
 impl Server {
@@ -165,18 +170,39 @@ impl Server {
     
     /// Create a new server with custom config
     pub fn with_config(config: NetworkConfig) -> Result<Self> {
-        let listener = Listener::bind(config.clone())?;
+        Self::with_configs(config, ReplicationConfig::default())
+    }
+    
+    /// Create a new server with network and replication configs
+    pub fn with_configs(network_config: NetworkConfig, repl_config: ReplicationConfig) -> Result<Self> {
+        // Create a full Config with defaults for RDB and AOF
+        let config = FerrousConfig::default();
+        
+        // Override with the passed configs
+        let mut server_config = config.clone();
+        server_config.network = network_config;
+        server_config.replication = repl_config;
+        
+        Self::from_config(server_config)
+    }
+    
+    /// Create a new server from a complete configuration
+    pub fn from_config(config: FerrousConfig) -> Result<Self> {
+        let listener = Listener::bind(config.network.clone())?;
         let connections = Arc::new(ShardedConnections::new());
         let storage = StorageEngine::new();
         
-        // Create RDB engine with default config
-        let rdb_config = RdbConfig::default();
-        let rdb_engine = Arc::new(RdbEngine::new(rdb_config.clone()));
+        // Resolve RDB file path
+        let mut rdb_path = PathBuf::from(&config.rdb.dir);
+        rdb_path.push(&config.rdb.filename);
+        println!("RDB path: {}", rdb_path.display());
         
-        // Create AOF engine with default config
-        let aof_config = AofConfig::default();
-        let aof_engine = if aof_config.enabled {
-            let engine = Arc::new(AofEngine::new(aof_config));
+        // Create RDB engine with provided config
+        let rdb_engine = Arc::new(RdbEngine::new(config.rdb.clone()));
+        
+        // Create AOF engine with provided config
+        let aof_engine = if config.aof.enabled {
+            let engine = Arc::new(AofEngine::new(config.aof.clone()));
             engine.init()?;
             engine.load(&storage)?;
             Some(engine)
@@ -193,20 +219,39 @@ impl Server {
         // Create server stats
         let stats = Arc::new(ServerStats::new());
         
+        // Create replication manager
+        let replication = ReplicationManager::new(config.replication.clone());
+        
         // Load existing RDB if available
         if let Err(e) = rdb_engine.load(&storage) {
             eprintln!("Failed to load RDB file: {}", e);
         }
         
         // Start background monitoring if auto-save is enabled
-        if rdb_config.auto_save {
-            monitor.start(Arc::clone(&storage), Arc::clone(&rdb_engine), rdb_config);
+        if config.rdb.auto_save {
+            monitor.start(Arc::clone(&storage), Arc::clone(&rdb_engine), config.rdb.clone());
+        }
+        
+        // Check if replication is configured
+        if let (Some(host), Some(port)) = (config.replication.master_host.as_ref(), config.replication.master_port) {
+            println!("Configured as replica of {}:{}", host, port);
+            
+            // Convert to socket address
+            let addr_str = format!("{}:{}", host, port);
+            if let Ok(addr) = addr_str.parse() {
+                // Set as replica and start replication
+                if let Err(e) = replication.set_master(Some(addr), Arc::clone(&storage)) {
+                    eprintln!("Failed to configure as replica: {}", e);
+                }
+            } else {
+                eprintln!("Invalid master address: {}", addr_str);
+            }
         }
         
         Ok(Server {
             listener,
             connections,
-            config,
+            config: config.network,
             storage,
             rdb_engine: Some(rdb_engine),
             storage_monitor: Some(monitor),
@@ -215,6 +260,7 @@ impl Server {
             pending_writes: Arc::new(Mutex::new(Vec::new())),
             stats,
             start_time: SystemTime::now(),
+            replication,
         })
     }
     
@@ -443,18 +489,31 @@ impl Server {
             // Process each frame and increment command counter
             self.stats.total_commands_processed.fetch_add(1, Ordering::Relaxed);
             
-            // We need to check if this is a QUIT command
+            // Check for special commands that need connection access
+            let mut sync_response = None;
             if let RespFrame::Array(Some(parts)) = &frame {
                 if !parts.is_empty() {
                     if let RespFrame::BulkString(Some(bytes)) = &parts[0] {
-                        if String::from_utf8_lossy(bytes).to_uppercase() == "QUIT" {
+                        let command = String::from_utf8_lossy(bytes).to_uppercase();
+                        
+                        // Handle QUIT command
+                        if command == "QUIT" {
                             should_close = true;
+                        }
+                        
+                        // Handle SYNC/PSYNC commands that need connection access
+                        if command == "SYNC" || command == "PSYNC" {
+                            sync_response = Some(self.handle_sync_command(&command, parts, id)?);
                         }
                     }
                 }
             }
             
-            let response = self.process_frame(frame, id)?;
+            let response = if let Some(sync_resp) = sync_response {
+                sync_resp
+            } else {
+                self.process_frame(frame, id)?
+            };
             responses.push(response);
         }
         
@@ -558,6 +617,9 @@ impl Server {
                     _ => return Ok(RespFrame::error("ERR invalid command format")),
                 };
                 
+                // Check if this is a replication command that needs special handling
+                let _is_sync_command = matches!(command.as_str(), "SYNC" | "PSYNC");
+                
                 // Get connection state
                 let conn_state = self.connections.with_connection(conn_id, |conn| {
                     (conn.db_index, conn.transaction_state.in_transaction, conn.state)
@@ -607,6 +669,16 @@ impl Server {
                     "PSUBSCRIBE" => return self.handle_psubscribe(parts, conn_id),
                     "PUNSUBSCRIBE" => return self.handle_punsubscribe(parts, conn_id),
                     "AUTH" => return self.handle_auth(parts, conn_id), // Handle AUTH after authentication too
+                    _ => {}
+                }
+                
+                // Handle commands that need connection context
+                match command.as_str() {
+                    "REPLCONF" => {
+                        return self.connections.with_connection(conn_id, |conn| {
+                            crate::replication::commands::handle_replconf(parts, conn, &self.replication)
+                        }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
+                    }
                     _ => {}
                 }
                 
@@ -692,7 +764,7 @@ impl Server {
         }
         
         // Route to command handler
-        match command.as_str() {
+        let result = match command.as_str() {
             "PING" => self.handle_ping(parts),
             "ECHO" => self.handle_echo(parts),
             "SET" => self.handle_set(parts, db),
@@ -784,13 +856,49 @@ impl Server {
                 self.start_time,
                 self.connections.total_connections(),
                 self.config.max_clients,
+                &self.replication,
                 parts
             ),
             // Auth command  
             "AUTH" => self.handle_auth(parts, 0), // Special handling for AUTH in process_frame
+            // Replication commands
+            "REPLICAOF" => crate::replication::handle_replicaof(parts, &self.replication, &self.storage),
+            "SLAVEOF" => crate::replication::handle_slaveof(parts, &self.replication, &self.storage),
+            "SYNC" => crate::replication::handle_sync(&self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
+            "PSYNC" => crate::replication::handle_psync(parts, &self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
             "QUIT" => Ok(RespFrame::ok()),
             _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command))),
+        };
+        
+        // If this was a successful write command, propagate to replicas
+        if self.is_write_command(&command) {
+            if let Ok(resp) = &result {
+                if !resp.is_error() {
+                    // Log successful propagation
+                    println!("Propagating command {} to replicas", command);
+                    
+                    if let Ok(replica_ids) = self.replication.propagate_command(&RespFrame::Array(Some(parts.to_vec()))) {
+                        if !replica_ids.is_empty() {
+                            println!("Propagating to {} replicas", replica_ids.len());
+                        }
+                        
+                        // Send command to all replicas
+                        for replica_id in replica_ids {
+                            let propagated = self.connections.with_connection(replica_id, |conn| -> Result<()> {
+                                conn.send_frame(&RespFrame::Array(Some(parts.to_vec())))?;
+                                Ok(())
+                            });
+                            
+                            if let Some(Err(e)) = propagated {
+                                eprintln!("Error propagating to replica {}: {}", replica_id, e);
+                            }
+                        }
+                    }
+                }
+            }
         }
+        
+        result
     }
     
     /// Handle AUTH command
@@ -1882,6 +1990,55 @@ impl Server {
         }
     }
     
+    /// Handle SYNC/PSYNC commands that need connection access
+    fn handle_sync_command(&mut self, command: &str, parts: &[RespFrame], conn_id: u64) -> Result<RespFrame> {
+        match command {
+            "SYNC" => {
+                let response = crate::replication::handle_sync(&self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap())?;
+                
+                // Get connection address and add replica
+                let conn_addr = self.connections.with_connection(conn_id, |conn| conn.addr)
+                    .ok_or_else(|| FerrousError::Connection("Connection not found".into()))?;
+                
+                let replica_info = crate::replication::ReplicaInfo::new(conn_id, conn_addr);
+                self.replication.add_replica(replica_info)?;
+                
+                // Send RDB file to replica
+                self.connections.with_connection(conn_id, |conn| -> Result<()> {
+                    crate::replication::sync::SyncProtocol::send_rdb_to_replica(conn, &self.storage, &self.rdb_engine.as_ref().unwrap())?;
+                    Ok(())
+                }).ok_or_else(|| FerrousError::Connection("Connection not found".into()))??;
+                
+                Ok(response)
+            }
+            "PSYNC" => {
+                let response = crate::replication::handle_psync(parts, &self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap())?;
+                
+                // Check if we need to send RDB (fullresync)
+                if let RespFrame::SimpleString(ref data) = response {
+                    let response_str = String::from_utf8_lossy(data);
+                    if response_str.starts_with("FULLRESYNC") {
+                        // Get connection address and add replica
+                        let conn_addr = self.connections.with_connection(conn_id, |conn| conn.addr)
+                            .ok_or_else(|| FerrousError::Connection("Connection not found".into()))?;
+                        
+                        let replica_info = crate::replication::ReplicaInfo::new(conn_id, conn_addr);
+                        self.replication.add_replica(replica_info)?;
+                        
+                        // Send RDB file to replica
+                        self.connections.with_connection(conn_id, |conn| -> Result<()> {
+                            crate::replication::sync::SyncProtocol::send_rdb_to_replica(conn, &self.storage, &self.rdb_engine.as_ref().unwrap())?;
+                            Ok(())
+                        }).ok_or_else(|| FerrousError::Connection("Connection not found".into()))??;
+                    }
+                }
+                
+                Ok(response)
+            }
+            _ => unreachable!(),
+        }
+    }
+
     /// Clean up closed connections
     fn cleanup_connections(&mut self) -> Result<()> {
         let mut to_remove = Vec::new();

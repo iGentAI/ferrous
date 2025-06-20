@@ -79,6 +79,9 @@ pub struct RdbConfig {
     
     /// RDB filename
     pub filename: String,
+    
+    /// Working directory
+    pub dir: String,
 }
 
 impl Default for RdbConfig {
@@ -92,6 +95,7 @@ impl Default for RdbConfig {
             ],
             compress_strings: false,
             filename: "dump.rdb".to_string(),
+            dir: "./".to_string(),
         }
     }
 }
@@ -99,7 +103,8 @@ impl Default for RdbConfig {
 impl RdbEngine {
     /// Create a new RDB engine
     pub fn new(config: RdbConfig) -> Self {
-        let file_path = PathBuf::from(&config.filename);
+        let mut file_path = PathBuf::from(&config.dir);
+        file_path.push(&config.filename);
         
         Self {
             file_path,
@@ -202,6 +207,133 @@ impl RdbEngine {
     pub fn last_save_time(&self) -> Option<SystemTime> {
         let last_save = self.last_save_time.read().unwrap();
         *last_save
+    }
+    
+    /// Generate RDB bytes for replication
+    pub fn generate_rdb_bytes(&self, storage: &Arc<StorageEngine>) -> Result<Vec<u8>> {
+        let mut buffer = Vec::new();
+        
+        // Write magic and version
+        buffer.extend_from_slice(RDB_MAGIC);
+        buffer.extend_from_slice(format!("{:04}", RDB_VERSION).as_bytes());
+        
+        // Write metadata
+        self.write_aux_field(&mut buffer, "redis-ver", env!("CARGO_PKG_VERSION"))?;
+        self.write_aux_field(&mut buffer, "redis-bits", "64")?;
+        self.write_aux_field(&mut buffer, "ctime", &SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string())?;
+        self.write_aux_field(&mut buffer, "used-mem", &storage.memory_usage().to_string())?;
+        
+        // Write databases
+        for db in 0..storage.database_count() {
+            let keys = storage.get_all_keys(db)?;
+            if keys.is_empty() {
+                continue;
+            }
+            
+            // Select DB opcode
+            buffer.push(RdbOpcode::SelectDb as u8);
+            self.write_length(&mut buffer, db)?;
+            
+            // Resize DB opcode
+            buffer.push(RdbOpcode::ResizeDb as u8);
+            self.write_length(&mut buffer, keys.len())?;
+            self.write_length(&mut buffer, 0)?; // No separate expires hash
+            
+            // Write all key-value pairs
+            for key in keys {
+                if let GetResult::Found(value) = storage.get(db, &key)? {
+                    // Check for expiration
+                    let expire_time = storage.ttl(db, &key)?
+                        .map(|ttl| SystemTime::now() + ttl);
+                    
+                    // Write expiration if present
+                    if let Some(expire) = expire_time {
+                        buffer.push(RdbOpcode::ExpireTimeMs as u8);
+                        let timestamp = expire.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                        buffer.extend_from_slice(&timestamp.to_le_bytes());
+                    }
+                    
+                    // Write value type
+                    match value {
+                        Value::String(_) => buffer.push(RdbOpcode::String as u8),
+                        Value::List(_) => buffer.push(RdbOpcode::List as u8),
+                        Value::Set(_) => buffer.push(RdbOpcode::Set as u8),
+                        Value::Hash(_) => buffer.push(RdbOpcode::Hash as u8),
+                        Value::SortedSet(_) => buffer.push(RdbOpcode::ZSet as u8),
+                    }
+                    
+                    // Write key
+                    self.write_length(&mut buffer, key.len())?;
+                    buffer.extend_from_slice(&key);
+                    
+                    // Write value
+                    match value {
+                        Value::String(bytes) => {
+                            self.write_length(&mut buffer, bytes.len())?;
+                            buffer.extend_from_slice(bytes.as_ref());
+                        }
+                        _ => {
+                            // Simplified handling - just write a placeholder for now
+                            // For production code, you'd want to properly encode each type
+                            buffer.push(0); // Empty value for now
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Write EOF
+        buffer.push(RdbOpcode::Eof as u8);
+        
+        // Write checksum (simplified)
+        let checksum: u64 = 0; // Real implementation would calculate CRC64
+        buffer.extend_from_slice(&checksum.to_le_bytes());
+        
+        println!("RDB: Generated {} bytes for replication", buffer.len());
+        
+        Ok(buffer)
+    }
+    
+    /// Write auxiliary field to buffer
+    fn write_aux_field(&self, buffer: &mut Vec<u8>, key: &str, value: &str) -> Result<()> {
+        buffer.push(RdbOpcode::Aux as u8);
+        
+        // Write key
+        self.write_length(buffer, key.len())?;
+        buffer.extend_from_slice(key.as_bytes());
+        
+        // Write value
+        self.write_length(buffer, value.len())?;
+        buffer.extend_from_slice(value.as_bytes());
+        
+        Ok(())
+    }
+    
+    /// Write length to buffer
+    fn write_length(&self, buffer: &mut Vec<u8>, len: usize) -> Result<()> {
+        match len {
+            0..=63 => {
+                // 6-bit length
+                buffer.push(len as u8);
+            }
+            64..=16383 => {
+                // 14-bit length
+                let high = ((len >> 8) & 0x3F) as u8 | 0x40;
+                let low = (len & 0xFF) as u8;
+                buffer.push(high);
+                buffer.push(low);
+            }
+            _ => {
+                // 32-bit length
+                buffer.push(0x80);
+                buffer.extend_from_slice(&(len as u32).to_be_bytes());
+            }
+        }
+        Ok(())
     }
     
     /// Write snapshot to file

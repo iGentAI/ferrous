@@ -349,35 +349,125 @@ impl AofEngine {
 }
 ```
 
-### 7. Replication
+## System Services
 
-#### Master-Slave Protocol
-
+### 4. Replication Manager
 ```rust
 pub struct ReplicationManager {
-    role: Role,
-    backlog: ReplicationBacklog,
-    slaves: Vec<SlaveInfo>,
+    /// Current role (master or replica)
+    role: Arc<RwLock<ReplicationRole>>,
+    
+    /// Replication configuration
+    config: ReplicationConfig,
+    
+    /// Connected replicas (for master)
+    replicas: Arc<Mutex<HashMap<u64, Arc<ReplicaInfo>>>>,
+    
+    /// Replication backlog (for master)
+    backlog: Arc<ReplicationBacklog>,
+    
+    /// Current replication state
+    state: Arc<Mutex<ReplicationState>>,
+    
+    /// Flag to pause replication
+    paused: AtomicBool,
+    
+    /// Master connection ID (for replica)
+    master_conn_id: Arc<Mutex<Option<u64>>>,
+    
+    /// Handle to stop background replication
+    replication_stop_flag: Arc<Mutex<Option<Arc<AtomicBool>>>>,
 }
 
-pub enum Role {
+pub enum ReplicationRole {
     Master {
-        repl_offset: AtomicU64,
         repl_id: String,
+        repl_offset: Arc<AtomicU64>,
+        // ... additional fields
     },
-    Slave {
+    Replica {
         master_addr: SocketAddr,
-        master_link_status: LinkStatus,
+        master_link_status: MasterLinkStatus,
+        master_repl_id: String,
         repl_offset: u64,
     },
 }
 
-pub struct ReplicationBacklog {
-    buffer: CircularBuffer,
-    size: usize,
-    offset: u64,
+pub enum MasterLinkStatus {
+    Connecting,
+    Synchronizing,
+    Up,
+    Down,
 }
 ```
+
+\\ ... existing code ...
+
+### Replication Architecture
+
+```
+┌─────────────────────────┐      ┌─────────────────────────┐
+│     Ferrous Master      │      │     Ferrous Replica     │
+│                         │      │                         │
+│  ┌─────────────────┐    │      │  ┌─────────────────┐    │
+│  │ ReplicationMgr  │    │      │  │ ReplicationMgr  │    │
+│  │ (Master Role)   │◄───┼──────┼──┤ (Replica Role)  │    │
+│  └─────────────────┘    │      │  └─────────┬───────┘    │
+│          ▲              │      │            │            │
+│          │              │      │            ▼            │
+│  ┌───────┴─────────┐    │      │  ┌─────────────────┐    │
+│  │ Command Router  │    │      │  │ReplicationClient│    │
+│  └───────┬─────────┘    │      │  └─────────┬───────┘    │
+│          │              │      │            │            │
+│          ▼              │      │            ▼            │
+│  ┌─────────────────┐    │      │  ┌─────────────────┐    │
+│  │Storage Engine   │    │      │  │Storage Engine   │    │
+│  └─────────────────┘    │      │  └─────────────────┘    │
+└─────────────────────────┘      └─────────────────────────┘
+        REPLICATION PROTOCOL
+        1. AUTH (Authentication)
+        2. PING/PONG (Connection check)
+        3. REPLCONF (Options negotiation)
+        4. PSYNC (Synchronization)
+        5. RDB Transfer (Initial data sync)
+        6. Command Propagation (Ongoing sync)
+```
+
+#### Replication Process Flow
+
+1. **Initialization**:
+   - Replica connects to master using `ReplicationClient`
+   - Authentication with master using configured password
+   - PING/PONG exchange to verify connection
+
+2. **Handshake and Capabilities**:
+   - REPLCONF exchange to negotiate capabilities and parameters
+   - Replica provides listening port and supported features
+   - Master acknowledges capabilities
+
+3. **Synchronization**:
+   - PSYNC command sent from replica to master
+   - Master determines synchronization mode:
+     - FULLRESYNC for new replicas
+     - CONTINUE for incremental updates (future enhancement)
+   - Master sends replication ID and offset 
+
+4. **RDB Transfer**:
+   - Master generates RDB snapshot of current dataset
+   - RDB data sent to replica as bulk string
+   - Replica reads RDB data and populates its storage engine
+
+5. **Command Propagation**:
+   - Master propagates all write commands to connected replicas
+   - Commands are sent in RESP format
+   - Replica applies commands locally to maintain consistency
+
+6. **Continuous Replication**:
+   - Replica sends periodic ACKs to master
+   - Replica updates status based on connection health
+   - Replica maintains current offset for tracking
+
+### 7. Legacy Replication Reference
 
 ### 8. Transaction Support
 

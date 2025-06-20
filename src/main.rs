@@ -2,15 +2,18 @@
 //! 
 //! This is the main entry point for the Ferrous server.
 
+mod config;
 mod error;
 mod protocol;
 mod network;
 mod storage;
 mod pubsub;
+mod replication;
 
 use std::process;
 use error::Result;
-use network::{Server, NetworkConfig};
+use network::Server;
+use config::{Config};
 
 fn main() {
     if let Err(e) = run() {
@@ -23,15 +26,35 @@ fn run() -> Result<()> {
     println!("Starting Ferrous - Redis-compatible server in Rust");
     println!("Version: {}", env!("CARGO_PKG_VERSION"));
     
-    // Create server with config that includes password
-    let mut config = NetworkConfig::default();
+    // Parse command-line arguments
+    let cli_args = config::parse_cli_args();
     
-    // For testing authentication, enable password protection
-    config.password = Some("mysecretpassword".to_string());
+    // Load configuration
+    let mut config = if let Some(ref config_path) = cli_args.config {
+        println!("Loading configuration from: {}", config_path.display());
+        match config::Config::from_file(config_path) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("Error loading configuration: {}", e);
+                process::exit(1);
+            }
+        }
+    } else {
+        config::Config::default()
+    };
     
-    println!("Authentication enabled with password: 'mysecretpassword'");
+    // Apply command-line overrides
+    config.apply_cli_args(cli_args);
     
-    let mut server = Server::with_config(config)?;
+    // Check for password
+    if let Some(ref password) = config.network.password {
+        println!("Authentication enabled with password: '{}'", password);
+    }
+    
+    println!("Ferrous listening on {}:{}", config.network.bind_addr, config.network.port);
+    
+    // Create and run server
+    let mut server = Server::from_config(config)?;
     
     // Run the server
     server.run()

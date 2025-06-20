@@ -71,6 +71,94 @@ Ferrous is a Redis-compatible in-memory database server written in pure Rust wit
 - **Gossip Protocol**: Node discovery and health checks
 - **Resharding**: Online slot migration
 
+## Replication Implementation
+
+### Replication Design Goals
+
+1. **Fault Tolerance**: Support high-availability deployments
+2. **Consistency**: Ensure data consistency between master and replicas
+3. **Transparent Operation**: Allow dynamic role changes and configuration
+4. **Performance**: Minimize impact on master performance
+5. **Authentication**: Support secure replication with password authentication
+
+### Replication Protocol
+
+The replication protocol follows Redis's approach:
+
+1. **Connection Phase**:
+   - Establish TCP connection to master
+   - Authenticate using AUTH command
+   - Send initial handshake commands
+
+2. **Synchronization Phase**:
+   - Send PSYNC command for initial or partial sync
+   - Receive bulk RDB data for full synchronization
+   - Process RDB data to populate storage engine
+
+3. **Command Propagation Phase**:
+   - Process commands sent from master in real-time
+   - Update slave's offset and status
+
+4. **Health Monitoring**:
+   - Send periodic REPLCONF ACK commands
+   - Monitor master link status
+   - Handle connection failures with exponential backoff
+
+### Configuration
+
+Replication configuration is supported through both configuration files and dynamic commands:
+
+- **Configuration Files**: Settings in master.conf and replica.conf
+  ```
+  # Master settings example
+  bind 127.0.0.1
+  port 6379
+  requirepass mysecretpassword
+  
+  # Replica settings example
+  bind 127.0.0.1
+  port 6380
+  requirepass mysecretpassword
+  replicaof 127.0.0.1 6379
+  ```
+
+- **Dynamic Configuration**: Using the REPLICAOF command
+  ```
+  REPLICAOF <host> <port>  # Set as replica
+  REPLICAOF NO ONE         # Promote to master
+  ```
+
+### Implementation Details
+
+The replication system consists of several components:
+
+1. **ReplicationManager**: Manages replication state and role transitions
+2. **ReplicationClient**: Handles connection to master, synchronization, and command processing
+3. **SyncProtocol**: Implements the PSYNC protocol for data synchronization
+4. **ReplicationBacklog**: Stores recent commands for incremental synchronization
+
+The replication client runs in a separate thread to avoid blocking the main server loop, and implements proper error handling with exponential backoff for connection failures.
+
+### Test Coverage
+
+Replication is extensively tested with:
+
+1. Unit tests for individual components
+2. Integration tests for the complete replication flow
+3. A dedicated test script (test_replication.sh) that validates:
+   - Basic replication functionality
+   - Role transitions
+   - Error handling and recovery
+
+### Future Enhancements
+
+Planned enhancements for the replication system include:
+
+1. **Partial Synchronization**: More efficient handling of reconnections
+2. **PSYNC2 Protocol**: Support for the latest Redis replication protocol
+3. **Diskless Replication**: Direct streaming of RDB data without disk I/O
+4. **Replica Read-only Enforcement**: Ensure replicas cannot be written to
+
 ## Concurrency Model
 
 Unlike Redis's single-threaded model, Ferrous uses a multi-threaded architecture:
