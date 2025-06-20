@@ -1,5 +1,5 @@
 # ferrous
-A Redis-compatible in-memory database server written in pure Rust with zero external dependencies
+A Redis-compatible in-memory database server written in pure Rust with minimal pure Rust dependencies
 
 ## Project Status
 
@@ -57,6 +57,14 @@ Average latency: ~0.29ms (Ferrous) vs ~0.32ms (Valkey)
 - **Master-slave replication** supports high-availability deployments
 
 These performance numbers demonstrate the effectiveness of Ferrous's multi-threaded Rust architecture, with all operations exceeding Redis performance.
+
+## Dependencies
+
+Ferrous uses only two minimal pure Rust dependencies:
+- `rand` - For skip list level generation and random eviction in Redis SET commands
+- `thiserror` - For ergonomic error handling
+
+Both dependencies are 100% pure Rust with no C/C++ bindings, maintaining the safety and portability benefits of Rust.
 
 ## Building and Running
 

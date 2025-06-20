@@ -100,11 +100,11 @@ class FerrousTest:
             b"-ERR unknown command 'UNKNOWN'\r\n"
         )
         
-        # Test 7: Wrong number of args for PING
+        # Test 7: PING with too many args - Redis returns first arg, not an error
         self.test(
-            "PING with too many args",
-            b"*3\r\n$4\r\nPING\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
-            b"-ERR wrong number of arguments for 'ping' command\r\n"
+            'PING with too many args',
+            b'*3\r\n$4\r\nPING\r\n$3\r\nfoo\r\n$3\r\nbar\r\n',
+            b'$3\r\nfoo\r\n'  # Redis returns the first argument, not an error
         )
         
         # Test 8: Wrong number of args for ECHO
