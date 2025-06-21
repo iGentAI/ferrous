@@ -283,11 +283,13 @@ Commands essential for production use:
 ### Priority 5.1: Scripting
 ```
 Redis Lua support:
-- [ ] EVAL/EVALSHA commands
-- [ ] Lua interpreter integration
-- [ ] Redis Lua API
-- [ ] Script caching
-- [ ] SCRIPT commands
+- [🟡] EVAL/EVALSHA commands - Basic implementation complete
+- [🟡] Lua interpreter integration - Pattern-based execution working, full VM execution in progress
+- [🟡] Redis Lua API - Core functionality (call, pcall) implemented
+- [✅] Script caching - Working
+- [✅] SCRIPT commands - Basic implementation complete
+- [ ] Standard library subset - Not yet implemented
+- [ ] Special Redis libraries (cjson, cmsgpack, bit) - Not yet implemented
 ```
 
 ### Priority 5.2: Streams

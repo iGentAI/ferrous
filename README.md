@@ -25,7 +25,7 @@ Ferrous is currently at Phase 4 implementation, with several key features comple
 
 ### Coming Soon (Remaining Phase 4-6):
 - Production monitoring (INFO, SLOWLOG)
-- Advanced features (Lua scripting, HyperLogLog)
+- Advanced features (Lua scripting - partially implemented, HyperLogLog)
 - Cluster support
 
 ## Performance

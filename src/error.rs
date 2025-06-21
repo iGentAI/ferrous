@@ -28,6 +28,9 @@ pub enum FerrousError {
     /// Client connection errors
     Connection(String),
     
+    /// Script execution errors
+    Script(ScriptError),
+    
     /// Internal server errors
     Internal(String),
 }
@@ -88,6 +91,25 @@ pub enum StorageError {
     WouldBlock,
 }
 
+/// Script execution errors
+#[derive(Debug, Clone)]
+pub enum ScriptError {
+    /// Script not found in cache
+    NotFound,
+    
+    /// Script execution error
+    ExecutionError(String),
+    
+    /// Script compilation error
+    CompilationError(String),
+    
+    /// Script timeout
+    Timeout,
+    
+    /// Script killed
+    Killed,
+}
+
 /// Type alias for Results throughout Ferrous
 pub type Result<T> = std::result::Result<T, FerrousError>;
 
@@ -100,6 +122,7 @@ impl fmt::Display for FerrousError {
             FerrousError::Io(msg) => write!(f, "I/O error: {}", msg),
             FerrousError::Config(msg) => write!(f, "Configuration error: {}", msg),
             FerrousError::Connection(msg) => write!(f, "Connection error: {}", msg),
+            FerrousError::Script(err) => write!(f, "{}", err),
             FerrousError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }
     }
@@ -151,10 +174,22 @@ impl fmt::Display for StorageError {
     }
 }
 
-impl StdError for FerrousError {}
+impl fmt::Display for ScriptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScriptError::NotFound => write!(f, "NOSCRIPT No matching script. Please use EVAL."),
+            ScriptError::ExecutionError(msg) => write!(f, "ERR {}", msg),
+            ScriptError::CompilationError(msg) => write!(f, "ERR Error compiling script: {}", msg),
+            ScriptError::Timeout => write!(f, "ERR Script execution time limit exceeded"),
+            ScriptError::Killed => write!(f, "ERR Script killed by user"),
+        }
+    }
+}
 
+impl StdError for FerrousError {}
 impl StdError for CommandError {}
 impl StdError for StorageError {}
+impl StdError for ScriptError {}
 
 // Conversion implementations
 impl From<io::Error> for FerrousError {
@@ -175,6 +210,12 @@ impl From<StorageError> for FerrousError {
     }
 }
 
+impl From<ScriptError> for FerrousError {
+    fn from(err: ScriptError) -> Self {
+        FerrousError::Script(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +227,8 @@ mod tests {
         
         let err = CommandError::WrongType;
         assert_eq!(err.to_string(), "WRONGTYPE Operation against a key holding the wrong kind of value");
+        
+        let err = ScriptError::NotFound;
+        assert_eq!(err.to_string(), "NOSCRIPT No matching script. Please use EVAL.");
     }
 }
