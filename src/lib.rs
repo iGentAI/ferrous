@@ -10,6 +10,7 @@ pub mod pubsub;
 pub mod replication;
 pub mod config;
 pub mod monitor;
+pub mod lua;
 
 // Re-export commonly used types
 pub use error::{FerrousError, Result};

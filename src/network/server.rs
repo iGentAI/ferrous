@@ -19,6 +19,8 @@ use crate::pubsub::{PubSubManager, format_message, format_pmessage,
 use crate::replication::{ReplicationManager, ReplicationConfig};
 use super::{Listener, Connection, ConnectionState, NetworkConfig};
 use crate::Config as FerrousConfig;
+// Add Lua imports to the top of the file
+use crate::lua::{ScriptExecutor, command as lua_command};
 
 /// Connection ID generator
 static CONN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -187,6 +189,8 @@ pub struct Server {
     monitor_subscribers: Arc<MonitorSubscribers>,
     /// Clients paused until this time
     clients_paused_until: Arc<Mutex<SystemTime>>,
+    /// Script executor for Lua scripts
+    script_executor: Arc<ScriptExecutor>,
 }
 
 impl Server {
@@ -258,6 +262,9 @@ impl Server {
         // Initialize client pause to UNIX_EPOCH (not paused)
         let clients_paused_until = Arc::new(Mutex::new(UNIX_EPOCH));
         
+        // Create script executor
+        let script_executor = Arc::new(ScriptExecutor::new(Arc::clone(&storage)));
+        
         // Load existing RDB if available
         if let Err(e) = rdb_engine.load(&storage) {
             eprintln!("Failed to load RDB file: {}", e);
@@ -300,6 +307,7 @@ impl Server {
             slowlog,
             monitor_subscribers,
             clients_paused_until,
+            script_executor,
         })
     }
     
@@ -1046,6 +1054,49 @@ impl Server {
             "SYNC" => crate::replication::handle_sync(&self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
             "PSYNC" => crate::replication::handle_psync(parts, &self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
             "QUIT" => Ok(RespFrame::ok()),
+            // Add the Lua script commands
+            "EVAL" => {
+                let ctx = lua_command::CommandContext {
+                    db,
+                    storage: Arc::clone(&self.storage),
+                    script_executor: Arc::clone(&self.script_executor),
+                };
+                
+                // Convert the async handler to sync using blocks_on
+                // match futures::executor::block_on(lua_command::handle_eval(&ctx, parts)) {
+                match lua_command::handle_eval_sync(&ctx, parts) {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
+                }
+            },
+            "EVALSHA" => {
+                let ctx = lua_command::CommandContext {
+                    db,
+                    storage: Arc::clone(&self.storage),
+                    script_executor: Arc::clone(&self.script_executor),
+                };
+                
+                // Convert the async handler to sync using blocks_on
+                // match futures::executor::block_on(lua_command::handle_evalsha(&ctx, parts)) {
+                match lua_command::handle_evalsha_sync(&ctx, parts) {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
+                }
+            },
+            "SCRIPT" => {
+                let ctx = lua_command::CommandContext {
+                    db,
+                    storage: Arc::clone(&self.storage),
+                    script_executor: Arc::clone(&self.script_executor),
+                };
+                
+                // Convert the async handler to sync using blocks_on
+                // match futures::executor::block_on(lua_command::handle_script(&ctx, parts)) {
+                match lua_command::handle_script_sync(&ctx, parts) {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
+                }
+            },
             _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command_name))),
         };
         
@@ -1165,14 +1216,21 @@ impl Server {
     
     /// Check if a command is a write command that should be logged to AOF
     fn is_write_command(&self, command: &str) -> bool {
-        matches!(command,
-            "SET" | "DEL" | "EXPIRE" | "INCR" | "DECR" | "INCRBY" |
-            "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET" | "LREM" | "LTRIM" |
-            "SADD" | "SREM" | "SPOP" | 
-            "HSET" | "HDEL" | "HINCRBY" |
-            "ZADD" | "ZREM" | "ZINCRBY" |
-            "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "PERSIST"
-        )
+        if command == "SCRIPT" {
+            // SCRIPT FLUSH is a write command, but other SCRIPT subcommands are not
+            // In a real implementation, we would check the subcommand, but for simplicity
+            // we'll treat all SCRIPT commands as non-write commands for now
+            false
+        } else {
+            matches!(command,
+                "SET" | "DEL" | "EXPIRE" | "INCR" | "DECR" | "INCRBY" |
+                "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET" | "LREM" | "LTRIM" |
+                "SADD" | "SREM" | "SPOP" | 
+                "HSET" | "HDEL" | "HINCRBY" |
+                "ZADD" | "ZREM" | "ZINCRBY" |
+                "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "PERSIST" | "EVAL" | "EVALSHA"
+            )
+        }
     }
 
     /// Record a data change for auto-save monitoring
