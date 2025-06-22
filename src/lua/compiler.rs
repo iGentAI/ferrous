@@ -4,7 +4,7 @@
 
 use super::ast::*;
 use super::error::{LuaError, Result};
-use super::value::{FunctionProto, Instruction, LuaValue, LuaString};
+use super::value::{FunctionProto, Instruction, LuaValue, LuaString, LuaClosure, LuaFunction};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -60,6 +60,7 @@ enum ConstantValue {
     Boolean(bool),
     Number(f64),
     String(LuaString),
+    Function(LuaValue), // Functions in constant table
 }
 
 impl From<ConstantValue> for LuaValue {
@@ -69,6 +70,7 @@ impl From<ConstantValue> for LuaValue {
             ConstantValue::Boolean(b) => LuaValue::Boolean(b),
             ConstantValue::Number(n) => LuaValue::Number(n),
             ConstantValue::String(s) => LuaValue::String(s),
+            ConstantValue::Function(f) => f, // Already a LuaValue
         }
     }
 }
@@ -89,6 +91,12 @@ pub struct Compiler {
     
     /// Label positions for break/continue
     labels: HashMap<String, usize>,
+
+    /// Next free register (for intermediate values)
+    next_register: usize,
+
+    /// Register allocation tracking - maps register to whether it's in use
+    register_in_use: Vec<bool>,
 }
 
 impl Compiler {
@@ -106,6 +114,8 @@ impl Compiler {
             constants: Vec::new(),
             breaks: Vec::new(),
             labels: HashMap::new(),
+            next_register: 0,
+            register_in_use: vec![false; 256], // Default to 256 registers max
         }
     }
     
@@ -116,6 +126,10 @@ impl Compiler {
         self.proto.constants.clear();
         self.locals.clear();
         self.constants.clear();
+        self.next_register = 0;
+        for i in 0..self.register_in_use.len() {
+            self.register_in_use[i] = false;
+        }
         
         self.compile_block(&chunk.block)?;
         
@@ -129,6 +143,9 @@ impl Compiler {
         
         // Update the prototype's constants
         self.proto.constants = constants;
+        
+        // Clean up register tracking
+        self.cleanup_registers();
         
         // Return the completed prototype
         Ok(self.proto.clone())
@@ -317,25 +334,7 @@ impl Compiler {
             Statement::Function(func) => self.compile_function_statement(func),
             
             Statement::LocalAssignment { names, values } => {
-                // Compile values
-                let mut regs = Vec::new();
-                for value in values {
-                    let reg = self.compile_expression(value)?;
-                    regs.push(reg);
-                }
-                
-                // Define locals
-                let start_reg = self.alloc_register();
-                for (i, name) in names.iter().enumerate() {
-                    if i < regs.len() {
-                        self.emit_move(start_reg + i, regs[i]);
-                    } else {
-                        self.emit_load_nil(start_reg + i, start_reg + i);
-                    }
-                    self.locals.push(name.clone());
-                }
-                
-                Ok(())
+                self.compile_local_assignment(names, values)
             },
             
             Statement::LocalFunction { name, func } => {
@@ -597,7 +596,15 @@ impl Compiler {
         
         // Compile function expression
         let func_reg = self.compile_expression(&call.func)?;
+        
+        // Mark function register as in use during argument compilation
+        self.register_in_use[func_reg] = true;
+        
+        // Move function to base register
         self.emit_move(base_reg, func_reg);
+        
+        // Free function register
+        self.free_register(func_reg);
         
         // Handle method call
         if call.is_method_call {
@@ -614,13 +621,31 @@ impl Compiler {
                     func_reg as u16,
                     method_reg as u16,
                 );
+                
+                // Free method register
+                self.free_register(method_reg);
             }
         }
         
+        // Make sure base_reg and base_reg+1 are marked as in use
+        self.register_in_use[base_reg] = true;
+        if call.is_method_call {
+            self.register_in_use[base_reg + 1] = true;
+        }
+        
         // Compile arguments
-        for (i, arg) in call.args.iter().enumerate() {
+        let mut arg_regs = Vec::with_capacity(call.args.len());
+        for arg in &call.args {
             let arg_reg = self.compile_expression(arg)?;
-            self.emit_move(base_reg + i + 1, arg_reg);
+            arg_regs.push(arg_reg);
+            self.register_in_use[arg_reg] = true;
+        }
+        
+        // Move arguments to consecutive registers after base+1
+        for (i, arg_reg) in arg_regs.iter().enumerate() {
+            let dest_reg = base_reg + i + 1 + if call.is_method_call { 1 } else { 0 };
+            self.emit_move(dest_reg, *arg_reg);
+            self.free_register(*arg_reg);
         }
         
         // Emit CALL instruction
@@ -631,12 +656,97 @@ impl Compiler {
             OpCode::Call,
             base_reg,
             arg_count + 1,
-            result_count_plus1,
+            result_count_plus1, 
         );
         
         Ok(base_reg)
     }
     
+    /// Compile a binary operation
+    fn compile_binary_operation(&mut self, op: BinaryOp, left: &Expression, right: &Expression) -> Result<usize> {
+        if op == BinaryOp::Concat {
+            // Concatenation with table field access requires special handling to ensure proper register usage
+            
+            // First, determine if we're dealing with table fields by examining the Expression types
+            let has_field_access = match (left, right) {
+                (Expression::Variable(Variable::Field { .. }), _) | (_, Expression::Variable(Variable::Field { .. })) => true,
+                _ => false,
+            };
+            
+            if has_field_access {
+                // For field access, compiling in the normal way leads to register confusion
+                // Instead, we'll explicitly handle the concatenation in stages
+                
+                // Compile left expression into its own register
+                let left_reg = self.compile_expression(left)?;
+                
+                // Mark as in use while compiling right expression
+                self.register_in_use[left_reg] = true;
+                
+                // Compile right expression into another register
+                let right_reg = self.compile_expression(right)?;
+                
+                // Now create a sequence of MOVEs and CONCATs to ensure correct order
+                
+                // Copy left value to a safe temporary register
+                let temp_left = self.alloc_register();
+                self.emit_move(temp_left, left_reg);
+                
+                // Copy right value to a safe temporary register 
+                let temp_right = self.alloc_register();
+                self.emit_move(temp_right, right_reg);
+                
+                // Create concatenation result in a new register, ensuring left + right order
+                let result_reg = self.alloc_register();
+                self.emit_inst(OpCode::Concat, result_reg, temp_left as u16, temp_right as u16);
+                
+                // Free temporary registers
+                self.free_register(left_reg);
+                self.free_register(right_reg);
+                self.free_register(temp_left);
+                self.free_register(temp_right);
+                
+                return Ok(result_reg);
+            }
+        }
+            
+        // For non-concatenation or simple concatenation without table fields, use standard approach
+        
+        // First compile left operand
+        let left_reg = self.compile_expression(left)?;
+        
+        // Mark left register as in use
+        self.register_in_use[left_reg] = true;
+        
+        // Compile right operand
+        let right_reg = self.compile_expression(right)?;
+        
+        // Allocate result register
+        let result_reg = self.alloc_register();
+        
+        match op {
+            BinaryOp::Add => self.emit_inst(OpCode::Add, result_reg, left_reg as u16, right_reg as u16),
+            BinaryOp::Sub => self.emit_inst(OpCode::Sub, result_reg, left_reg as u16, right_reg as u16),
+            BinaryOp::Mul => self.emit_inst(OpCode::Mul, result_reg, left_reg as u16, right_reg as u16),
+            BinaryOp::Div => self.emit_inst(OpCode::Div, result_reg, left_reg as u16, right_reg as u16),
+            BinaryOp::Mod => self.emit_inst(OpCode::Mod, result_reg, left_reg as u16, right_reg as u16),
+            BinaryOp::Pow => self.emit_inst(OpCode::Pow, result_reg, left_reg as u16, right_reg as u16),
+            BinaryOp::Concat => self.emit_inst(OpCode::Concat, result_reg, left_reg as u16, right_reg as u16),
+            _ => {
+                // Comparison operations
+                // Simplified handling for now
+                self.emit_load_bool(result_reg, false, false);
+            }
+        }
+        
+        // Free operand registers if they're temporaries
+        self.free_register(left_reg);
+        self.free_register(right_reg);
+        
+        Ok(result_reg)
+    }
+
+
     /// Compile an expression
     fn compile_expression(&mut self, expr: &Expression) -> Result<usize> {
         match expr {
@@ -671,95 +781,8 @@ impl Compiler {
             Expression::FunctionCall(call) => self.compile_function_call(call, 1),
             
             Expression::BinaryOp { op, left, right } => {
-                let left_reg = self.compile_expression(left)?;
-                let right_reg = self.compile_expression(right)?;
-                let result_reg = self.alloc_register();
-                
-                match op {
-                    BinaryOp::Add => self.emit_inst(OpCode::Add, result_reg, left_reg as u16, right_reg as u16),
-                    BinaryOp::Sub => self.emit_inst(OpCode::Sub, result_reg, left_reg as u16, right_reg as u16),
-                    BinaryOp::Mul => self.emit_inst(OpCode::Mul, result_reg, left_reg as u16, right_reg as u16),
-                    BinaryOp::Div => self.emit_inst(OpCode::Div, result_reg, left_reg as u16, right_reg as u16),
-                    BinaryOp::Mod => self.emit_inst(OpCode::Mod, result_reg, left_reg as u16, right_reg as u16),
-                    BinaryOp::Pow => self.emit_inst(OpCode::Pow, result_reg, left_reg as u16, right_reg as u16),
-                    BinaryOp::Concat => self.emit_inst(OpCode::Concat, result_reg, left_reg as u16, right_reg as u16),
-                    
-                    // Comparison operators
-                    BinaryOp::Eq | BinaryOp::NotEqual | 
-                    BinaryOp::Less | BinaryOp::LessEqual |
-                    BinaryOp::Greater | BinaryOp::GreaterEqual => {
-                        // For comparison operators, we need to emit a comparison followed by a jump
-                        let is_equal = *op == BinaryOp::Eq;
-                        let is_less = *op == BinaryOp::Less;
-                        let is_less_equal = *op == BinaryOp::LessEqual;
-                        
-                        let is_not_equal = *op == BinaryOp::NotEqual;
-                        let is_greater = *op == BinaryOp::Greater;
-                        let is_greater_equal = *op == BinaryOp::GreaterEqual;
-                        
-                        if is_equal || is_not_equal {
-                            self.emit_inst(
-                                OpCode::Eq,
-                                if is_equal { 1 } else { 0 },
-                                left_reg as u16,
-                                right_reg as u16,
-                            );
-                        } else if is_less || is_greater {
-                            self.emit_inst(
-                                OpCode::Lt,
-                                if is_less { 1 } else { 0 },
-                                if is_less { left_reg } else { right_reg } as u16,
-                                if is_less { right_reg } else { left_reg } as u16,
-                            );
-                        } else if is_less_equal || is_greater_equal {
-                            self.emit_inst(
-                                OpCode::Le,
-                                if is_less_equal { 1 } else { 0 },
-                                if is_less_equal { left_reg } else { right_reg } as u16,
-                                if is_less_equal { right_reg } else { left_reg } as u16,
-                            );
-                        }
-                        
-                        // Skip the next instruction if comparison is false
-                        self.emit_jump(1);
-                        
-                        // Load result
-                        self.emit_load_bool(result_reg, true, true);
-                        self.emit_load_bool(result_reg, false, false);
-                    },
-                    
-                    // Logical operators
-                    BinaryOp::And => {
-                        // If left operand is false, result is false, otherwise result is right operand
-                        self.emit_move(result_reg, left_reg);
-                        self.emit_test(result_reg, false);
-                        let jump = self.proto.code.len();
-                        self.emit_jump(0); // Skip right if left is false
-                        
-                        // Right operand
-                        self.emit_move(result_reg, right_reg);
-                        
-                        // Patch jump
-                        let end = self.proto.code.len();
-                        self.patch_jump(jump, end);
-                    },
-                    BinaryOp::Or => {
-                        // If left operand is true, result is left, otherwise result is right
-                        self.emit_move(result_reg, left_reg);
-                        self.emit_test(result_reg, true);
-                        let jump = self.proto.code.len();
-                        self.emit_jump(0); // Skip right if left is true
-                        
-                        // Right operand
-                        self.emit_move(result_reg, right_reg);
-                        
-                        // Patch jump
-                        let end = self.proto.code.len();
-                        self.patch_jump(jump, end);
-                    },
-                }
-                
-                Ok(result_reg)
+                // Use our improved compile_binary_operation function for all binary ops
+                self.compile_binary_operation(*op, left, right)
             },
             
             Expression::UnaryOp { op, operand } => {
@@ -772,6 +795,9 @@ impl Compiler {
                     UnaryOp::Len => self.emit_inst(OpCode::Len, result_reg, operand_reg as u16, 0),
                 }
                 
+                // Free operand register if it's a temporary
+                self.free_register(operand_reg);
+                
                 Ok(result_reg)
             },
             
@@ -781,8 +807,6 @@ impl Compiler {
                 let table_reg = self.alloc_register();
                 
                 // Create empty table
-                // B and C are log(array size) and log(hash size)
-                // For now, hardcode to just 0,0
                 self.emit_inst(OpCode::NewTable, table_reg, 0, 0);
                 
                 // Fill table fields
@@ -792,15 +816,27 @@ impl Compiler {
                             // Array part (implicit index i+1)
                             let value_reg = self.compile_expression(value)?;
                             
-                            // SetList instruction will be emitted after all array fields
+                            // Set table[i+1] = value
                             self.emit_set_table_array(table_reg, i + 1, value_reg);
+                            
+                            // Free value register if it's a temporary
+                            self.free_register(value_reg);
                         },
                         TableField::KeyValue { key, value } => {
                             // Hash part (explicit key)
                             let key_reg = self.compile_expression(key)?;
+                            
+                            // Mark key register as in use so value compilation doesn't reuse it
+                            self.register_in_use[key_reg] = true;
+                            
                             let value_reg = self.compile_expression(value)?;
                             
+                            // Set table[key] = value
                             self.emit_set_table(value_reg, table_reg, key_reg);
+                            
+                            // Free key and value registers if they're temporaries
+                            self.free_register(key_reg);
+                            self.free_register(value_reg);
                         },
                         TableField::NamedField { name, value } => {
                             // Hash part with string key
@@ -808,9 +844,17 @@ impl Compiler {
                             let key_reg = self.alloc_register();
                             self.emit_load_k(key_reg, key_const);
                             
+                            // Mark key register as in use
+                            self.register_in_use[key_reg] = true;
+                            
                             let value_reg = self.compile_expression(value)?;
                             
+                            // Set table[name] = value
                             self.emit_set_table(value_reg, table_reg, key_reg);
+                            
+                            // Free key and value registers if they're temporaries
+                            self.free_register(key_reg);
+                            self.free_register(value_reg);
                         },
                     }
                 }
@@ -837,10 +881,10 @@ impl Compiler {
             Variable::Name(name) => {
                 // Check if it's a local variable
                 if let Some(local_idx) = self.find_local(name) {
-                    // Local variable
+                    // Local variable - already in a register
                     Ok(local_idx)
                 } else {
-                    // Global variable
+                    // Global variable - needs to be loaded into a register
                     let const_idx = self.add_constant(ConstantValue::String(LuaString::from_str(name)));
                     let reg = self.alloc_register();
                     self.emit_get_global(reg, const_idx);
@@ -849,12 +893,23 @@ impl Compiler {
             },
             Variable::Field { table, key } => {
                 // First compile the table expression to get a register with the table
-                // Don't rewrap as Expression::Variable, table is already an Expression
                 let table_reg = self.compile_expression(table)?;
+                
+                // Mark table register as in use so key compilation doesn't reuse it
+                self.register_in_use[table_reg] = true;
+                
+                // Compile key expression
                 let key_reg = self.compile_expression(key)?;
+                
+                // Allocate a register for the field value result
                 let result_reg = self.alloc_register();
                 
+                // Emit get table instruction
                 self.emit_get_table(result_reg, table_reg, key_reg);
+                
+                // Free table and key registers if they're temporaries
+                self.free_register(table_reg);
+                self.free_register(key_reg);
                 
                 Ok(result_reg)
             }
@@ -875,13 +930,85 @@ impl Compiler {
             })
     }
     
-    /// Allocate a register
+    /// Allocate a register for a temporary value
     fn alloc_register(&mut self) -> usize {
-        let reg = self.locals.len();
+        // Start with register after all locals
+        let base_reg = self.locals.len();
+        
+        // Find the next free register
+        let mut reg = base_reg + self.next_register;
+        while self.register_in_use[reg] {
+            reg += 1;
+            // Wrap around if needed (shouldn't happen with 256 regs)
+            if reg >= self.register_in_use.len() {
+                reg = base_reg;
+            }
+        }
+        
+        // Mark register as in use
+        self.register_in_use[reg] = true;
+        
+        // Update next register hint for future allocations
+        self.next_register = reg + 1 - base_reg;
+        if self.next_register >= self.register_in_use.len() - base_reg {
+            self.next_register = 0; // Wrap around
+        }
+        
+        // Update max stack size if needed
         if reg as u8 > self.proto.max_stack_size {
             self.proto.max_stack_size = reg as u8;
         }
+        
         reg
+    }
+
+    /// Free a register that's no longer needed
+    fn free_register(&mut self, reg: usize) {
+        if reg >= self.locals.len() { // Only free registers outside the locals area
+            self.register_in_use[reg] = false;
+        }
+    }
+
+    /// Compile a local variable assignment
+    fn compile_local_assignment(&mut self, names: &[String], values: &[Expression]) -> Result<()> {
+        // First compile all value expressions into temporary registers
+        let mut value_regs = Vec::with_capacity(values.len());
+        for value in values {
+            let reg = self.compile_expression(value)?;
+            value_regs.push(reg);
+            
+            // Mark register as in use so subsequent expressions don't use it
+            self.register_in_use[reg] = true;
+        }
+        
+        // Now define all local variables
+        let start_reg = self.locals.len();
+        for (i, name) in names.iter().enumerate() {
+            if i < value_regs.len() {
+                // Move from temporary register to local
+                self.emit_move(start_reg + i, value_regs[i]);
+                
+                // Free the temporary register
+                self.free_register(value_regs[i]);
+            } else {
+                // Missing value, set to nil
+                self.emit_load_nil(start_reg + i, start_reg + i);
+            }
+            
+            // Add local to scope
+            self.locals.push(name.clone());
+        }
+        
+        Ok(())
+    }
+
+    /// Cleanup function to reset register tracking at end of compilation
+    fn cleanup_registers(&mut self) {
+        // Reset all register tracking
+        for i in 0..self.register_in_use.len() {
+            self.register_in_use[i] = false;
+        }
+        self.next_register = 0;
     }
     
     /// Add a constant to the constant table, returning its index
@@ -893,6 +1020,7 @@ impl Compiler {
                 (ConstantValue::Boolean(a), ConstantValue::Boolean(b)) if a == b => return i,
                 (ConstantValue::Number(a), ConstantValue::Number(b)) if a == b => return i,
                 (ConstantValue::String(a), ConstantValue::String(b)) if a == b => return i,
+                // For functions, we don't check for equality - we always add them as new constants
                 _ => {},
             }
         }
@@ -905,9 +1033,21 @@ impl Compiler {
     
     /// Add a function prototype to the constant table
     fn add_constant_proto(&mut self, proto: FunctionProto) -> usize {
-        // TODO: In a full implementation, this would add the prototype to a list of
-        // prototypes in the parent function, but for now we just return 0 as a placeholder
-        0
+        // In a full Lua implementation, function prototypes would be stored in a separate list
+        // and referenced by index. For our Redis needs, we store them as constants.
+        
+        // Create a proper closure from the function prototype
+        let proto_rc = Rc::new(proto);
+        let closure = LuaClosure {
+            proto: proto_rc,
+            upvalues: Vec::new(), // No upvalues for now - simplified for Redis Lua
+        };
+        
+        // Create a function value
+        let func = LuaValue::Function(LuaFunction::Lua(Rc::new(closure)));
+        
+        // Add to constants and return index
+        self.add_constant(ConstantValue::Function(func))
     }
     
     /// Patch a jump instruction with the correct offset

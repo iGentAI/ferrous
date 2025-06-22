@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use std::rc::Rc;
 use std::cell::RefCell;
 
@@ -17,16 +19,31 @@ use crate::error::{FerrousError, ScriptError};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, DatabaseIndex};
 
-/// Redis Lua script executor
+/// Script executor for managing Lua scripts
 pub struct ScriptExecutor {
     /// Script cache (SHA1 -> compiled script)
-    script_cache: Arc<Mutex<HashMap<String, CompiledScript>>>,
+    cache: Arc<Mutex<HashMap<String, CompiledScript>>>,
     
     /// Storage engine reference
     storage: Arc<StorageEngine>,
     
     /// VM pool for reuse
     vm_pool: Arc<Mutex<Vec<LuaVm>>>,
+    
+    /// Currently running script, if any
+    running: Arc<Mutex<Option<ScriptExecution>>>,
+}
+
+/// Information about a running script
+struct ScriptExecution {
+    /// Script SHA1
+    sha1: String,
+    
+    /// Time the script started
+    start_time: Instant,
+    
+    /// Flag to indicate script should be killed
+    should_kill: Arc<AtomicBool>,
 }
 
 /// A compiled script
@@ -61,18 +78,64 @@ impl ScriptExecutor {
     /// Create a new script executor
     pub fn new(storage: Arc<StorageEngine>) -> Self {
         ScriptExecutor {
-            script_cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(HashMap::new())),
             storage,
             vm_pool: Arc::new(Mutex::new(Vec::new())),
+            running: Arc::new(Mutex::new(None)),
         }
+    }
+    
+    /// Load a script and return its SHA1 hash
+    pub fn load_script(&self, script: &str) -> std::result::Result<String, FerrousError> {
+        let sha = compute_sha1(script);
+        
+        // Check if the script is already in the cache
+        {
+            let cache = self.cache.lock().unwrap();
+            if cache.contains_key(&sha) {
+                return Ok(sha);
+            }
+        }
+        
+        // Compile the script
+        let compiled = match self.compile_script(script, sha.clone()) {
+            Ok(compiled) => compiled,
+            Err(e) => return Err(FerrousError::Script(ScriptError::CompilationError(e.to_string()))),
+        };
+        
+        // Cache the compiled script
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(sha.clone(), compiled);
+        }
+        
+        Ok(sha)
+    }
+    
+    /// Check if a script exists in the cache
+    pub fn script_exists(&self, sha: &str) -> bool {
+        let cache = self.cache.lock().unwrap();
+        cache.contains_key(sha)
+    }
+    
+    /// Flush all scripts from the cache
+    pub fn flush_scripts(&self) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.clear();
+    }
+    
+    /// Get a script from the cache
+    pub fn get_cached(&self, sha: &str) -> Option<CompiledScript> {
+        let cache = self.cache.lock().unwrap();
+        cache.get(sha).cloned()
     }
     
     /// Execute a script
     pub fn eval(&self, script: &str, keys: Vec<Vec<u8>>, argv: Vec<Vec<u8>>, db: DatabaseIndex) -> std::result::Result<RespFrame, FerrousError> {
         // Compile the script if not already in cache
         let compiled = {
-            let sha1 = self.compute_sha1(script);
-            let mut cache = self.script_cache.lock().unwrap();
+            let sha1 = compute_sha1(script);
+            let mut cache = self.cache.lock().unwrap();
             
             if let Some(compiled) = cache.get(&sha1) {
                 compiled.clone()
@@ -83,22 +146,50 @@ impl ScriptExecutor {
             }
         };
         
-        // Execute the compiled script
-        self.execute_compiled(compiled, keys, argv, db)
+        // Mark script as running
+        let should_kill = Arc::new(AtomicBool::new(false));
+        {
+            let mut running = self.running.lock().unwrap();
+            *running = Some(ScriptExecution {
+                sha1: compiled.sha1.clone(),
+                start_time: Instant::now(),
+                should_kill: should_kill.clone(),
+            });
+        }
+        
+        // Execute the script
+        let result = self.execute_compiled_with_kill_flag(compiled, keys, argv, db, should_kill);
+        
+        // Mark script as no longer running
+        {
+            let mut running = self.running.lock().unwrap();
+            *running = None;
+        }
+        
+        result
     }
     
-    /// Execute a script by SHA1 hash
-    pub fn evalsha(&self, sha1: &str, keys: Vec<Vec<u8>>, argv: Vec<Vec<u8>>, db: DatabaseIndex) -> std::result::Result<RespFrame, FerrousError> {
-        // Look up the script in the cache
-        let compiled = {
-            let cache = self.script_cache.lock().unwrap();
-            cache.get(sha1).cloned()
+    /// Execute a script that's already in the cache
+    pub fn evalsha(&self, sha: &str, keys: Vec<Vec<u8>>, argv: Vec<Vec<u8>>, db: DatabaseIndex) -> std::result::Result<RespFrame, FerrousError> {
+        // Get the script from the cache
+        let script = match self.get_cached(sha) {
+            Some(s) => s,
+            None => return Err(FerrousError::Script(ScriptError::NotFound)),
         };
         
-        // Execute the script if found
-        match compiled {
-            Some(script) => self.execute_compiled(script, keys, argv, db),
-            None => Err(ScriptError::NotFound.into()),
+        // Execute the script
+        self.execute_compiled(script, keys, argv, db)
+    }
+    
+    /// Kill the currently running script (if any)
+    pub fn kill_running_script(&self) -> bool {
+        let mut running = self.running.lock().unwrap();
+        
+        if let Some(execution) = running.as_ref() {
+            execution.should_kill.store(true, Ordering::SeqCst);
+            true
+        } else {
+            false
         }
     }
     
@@ -135,34 +226,62 @@ impl ScriptExecutor {
     
     /// Execute a compiled script
     fn execute_compiled(&self, script: CompiledScript, keys: Vec<Vec<u8>>, argv: Vec<Vec<u8>>, db: DatabaseIndex) -> std::result::Result<RespFrame, FerrousError> {
+        let should_kill = Arc::new(AtomicBool::new(false));
+        self.execute_compiled_with_kill_flag(script, keys, argv, db, should_kill)
+    }
+    
+    /// Execute a compiled script with a kill flag
+    fn execute_compiled_with_kill_flag(&self, script: CompiledScript, keys: Vec<Vec<u8>>, argv: Vec<Vec<u8>>, db: DatabaseIndex, 
+                                        should_kill: Arc<AtomicBool>) -> std::result::Result<RespFrame, FerrousError> {
         // Get or create a VM
         let mut vm = self.get_vm();
         
         // Set up the environment
         self.setup_vm_environment(&mut vm, keys.clone(), argv.clone(), db)?;
         
+        // Log that we're going to execute the script
+        println!("[LUA EXEC] Executing script: {}", script.source);
+        
+        // Set a custom check_limits function that also checks the kill flag
+        let should_kill_clone = should_kill.clone();
+        let check_limits_with_kill = move |vm: &mut LuaVm| -> Result<()> {
+            // First do regular limit checks
+            vm.check_limits()?;
+            
+            // Then check if script should be killed
+            if should_kill_clone.load(Ordering::SeqCst) {
+                return Err(LuaError::Runtime("Script execution aborted".to_string()));
+            }
+            
+            Ok(())
+        };
+        
         // We'll use the simplified path for now - the run method will try the full VM first with fallback
         // to pattern matching for reliability
-        let result = vm.run_simple(&script.source);
-        
-        // Process result
-        match result {
+        let result = match vm.run_with_kill_check(&script.source, &check_limits_with_kill) {
             Ok(lua_result) => {
                 // Convert result to Redis response
-                let resp = self.lua_to_resp(lua_result)?;
-                
-                // Return VM to pool
-                self.return_vm(vm);
-                
-                Ok(resp)
+                println!("[LUA EXEC] Script executed successfully, result: {:?}", lua_result);
+                self.lua_to_resp(lua_result)
             },
             Err(e) => {
-                // Return VM to pool even on error
-                self.return_vm(vm);
-                
-                Err(ScriptError::ExecutionError(format!("Script execution error: {}", e)).into())
-            },
-        }
+                if should_kill.load(Ordering::SeqCst) {
+                    // The script was killed
+                    println!("[LUA EXEC] Script execution was aborted");
+                    Ok(RespFrame::error("ERR Script execution aborted"))
+                } else {
+                    // Log the error and return as a Redis error
+                    println!("[LUA EXEC] Script execution error: {}", e);
+                    Ok(RespFrame::error(format!("ERR Lua execution error: {}", e)))
+                }
+            }
+        };
+        
+        // Return VM to pool
+        self.return_vm(vm);
+        
+        // Return the result or error
+        result
     }
     
     /// Set up the VM environment for script execution
@@ -187,7 +306,14 @@ impl ScriptExecutor {
         }
         vm.set_global("ARGV", LuaValue::Table(Rc::new(RefCell::new(argv_table))));
         
-        // Create the redis API
+        // Make sure Redis API is initialized in the VM
+        // This will set up redis.call and other Redis functions
+        match vm.ensure_redis_environment() {
+            Ok(_) => {},
+            Err(e) => return Err(FerrousError::Script(ScriptError::ExecutionError(e.to_string())))
+        }
+        
+        // Create the Redis API
         let redis_api = Box::new(FerrousRedisApi {
             storage: self.storage.clone(),
             db,
@@ -196,9 +322,6 @@ impl ScriptExecutor {
         });
         
         vm.set_redis_api(redis_api);
-        
-        // Register standard libraries
-        self.register_standard_libs(vm)?;
         
         Ok(())
     }
@@ -277,19 +400,6 @@ impl ScriptExecutor {
                 pool.push(vm);
             }
         }
-    }
-    
-    /// Compute SHA1 hash of a script
-    fn compute_sha1(&self, script: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
-        // Since Rust's standard library doesn't include cryptographic hashes,
-        // we'll use a simple hash for now. In a production implementation,
-        // you'd use a proper SHA1 implementation from a crate like sha1 or ring.
-        let mut hasher = DefaultHasher::new();
-        script.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
     }
     
     /// Convert a Lua value to a Redis response
@@ -384,7 +494,10 @@ impl RedisApi for FerrousRedisApi {
         let cmd_name = match &args[0] {
             LuaValue::String(s) => {
                 match s.to_str() {
-                    Ok(name) => name.to_uppercase(),
+                    Ok(name) => {
+                        println!("[LUA DEBUG] Command: {}", name.to_uppercase());
+                        name.to_uppercase()
+                    },
                     Err(_) => return Err(LuaError::Runtime("invalid command name".to_string())),
                 }
             },
@@ -421,8 +534,16 @@ impl RedisApi for FerrousRedisApi {
             }
         }
         
+        println!("[LUA DEBUG] Processing command: {}", cmd_name);
+        
         // Execute the command by directly using the storage engine
         let result = match cmd_name.as_str() {
+            // Special case for PING - just return PONG
+            "PING" => {
+                println!("[LUA DEBUG] Executing PING command");
+                Ok(LuaValue::String(LuaString::from_str("PONG")))
+            },
+            
             // String operations
             "GET" => {
                 if resp_args.len() != 2 {
@@ -434,10 +555,21 @@ impl RedisApi for FerrousRedisApi {
                     _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
                 };
                 
+                println!("[LUA DEBUG] Executing GET for key: {:?}", key);
+                
                 match self.storage.get_string(self.db, key) {
-                    Ok(Some(bytes)) => Ok(LuaValue::String(LuaString::from_bytes(bytes))),
-                    Ok(None) => Ok(LuaValue::Nil),
-                    Err(e) => Err(LuaError::Runtime(format!("Error executing GET: {}", e))),
+                    Ok(Some(bytes)) => {
+                        println!("[LUA DEBUG] GET found value, length: {}", bytes.len());
+                        Ok(LuaValue::String(LuaString::from_bytes(bytes)))
+                    },
+                    Ok(None) => {
+                        println!("[LUA DEBUG] GET key not found");
+                        Ok(LuaValue::Nil)
+                    },
+                    Err(e) => {
+                        println!("[LUA ERROR] GET error: {}", e);
+                        Err(LuaError::Runtime(format!("Error executing GET: {}", e)))
+                    },
                 }
             },
             
@@ -457,7 +589,58 @@ impl RedisApi for FerrousRedisApi {
                     _ => return Err(LuaError::Runtime("Invalid value format".to_string())),
                 };
                 
-                match self.storage.set_string(self.db, key, value) {
+                println!("[LUA DEBUG] Executing SET for key: {:?}", key);
+                
+                // Check for expiration options
+                let mut expiry = None;
+                let mut i = 3;
+                while i < resp_args.len() {
+                    match &resp_args[i] {
+                        RespFrame::BulkString(Some(bytes)) => {
+                            let opt = String::from_utf8_lossy(bytes).to_uppercase();
+                            match opt.as_str() {
+                                "EX" => {
+                                    if i + 1 < resp_args.len() {
+                                        if let RespFrame::BulkString(Some(sec_bytes)) = &resp_args[i + 1] {
+                                            if let Ok(sec_str) = String::from_utf8(sec_bytes.to_vec()) {
+                                                if let Ok(seconds) = sec_str.parse::<u64>() {
+                                                    expiry = Some(Duration::from_secs(seconds));
+                                                    i += 2;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                "PX" => {
+                                    if i + 1 < resp_args.len() {
+                                        if let RespFrame::BulkString(Some(ms_bytes)) = &resp_args[i + 1] {
+                                            if let Ok(ms_str) = String::from_utf8(ms_bytes.to_vec()) {
+                                                if let Ok(millis) = ms_str.parse::<u64>() {
+                                                    expiry = Some(Duration::from_millis(millis));
+                                                    i += 2;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                _ => {}
+                            }
+                        },
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                
+                // Set with or without expiration
+                let result = if let Some(expires) = expiry {
+                    self.storage.set_string_ex(self.db, key, value, expires)
+                } else {
+                    self.storage.set_string(self.db, key, value)
+                };
+                
+                match result {
                     Ok(_) => Ok(LuaValue::String(LuaString::from_str("OK"))),
                     Err(e) => Err(LuaError::Runtime(format!("Error executing SET: {}", e))),
                 }
@@ -548,6 +731,64 @@ impl RedisApi for FerrousRedisApi {
                 }
             },
             
+            "HSET" => {
+                if resp_args.len() < 4 || resp_args.len() % 2 != 0 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let mut field_count = 0;
+                
+                // Process field-value pairs
+                let mut field_values = Vec::new();
+                for i in (2..resp_args.len()).step_by(2) {
+                    let field = match &resp_args[i] {
+                        RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                        _ => return Err(LuaError::Runtime("Invalid field format".to_string())),
+                    };
+                    
+                    let value = match &resp_args[i+1] {
+                        RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                        RespFrame::Integer(n) => n.to_string().into_bytes(),
+                        _ => return Err(LuaError::Runtime("Invalid value format".to_string())),
+                    };
+                    
+                    field_values.push((field, value));
+                }
+                
+                // Call the storage engine's hset with field_values
+                match self.storage.hset(self.db, key, field_values) {
+                    Ok(count) => Ok(LuaValue::Number(count as f64)),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing HSET: {}", e)))
+                }
+            },
+            
+            "HGET" => {
+                if resp_args.len() != 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let field = match &resp_args[2] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid field format".to_string())),
+                };
+                
+                match self.storage.hget(self.db, key, field) {
+                    Ok(Some(value)) => Ok(LuaValue::String(LuaString::from_bytes(value))),
+                    Ok(None) => Ok(LuaValue::Nil),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing HGET: {}", e))),
+                }
+            },
+            
             "KEYS" => {
                 if resp_args.len() != 2 {
                     return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
@@ -574,10 +815,18 @@ impl RedisApi for FerrousRedisApi {
                 }
             },
             
-            // Add more command implementations as needed...
+            // Add any other commands you want to support...
             
-            _ => Err(LuaError::Runtime(format!("Command '{}' not implemented in script mode", cmd_name))),
+            _ => {
+                println!("[LUA ERROR] Command not implemented in script mode: {}", cmd_name);
+                Err(LuaError::Runtime(format!("Command '{}' not supported in script mode", cmd_name)))
+            },
         };
+        
+        match &result {
+            Ok(val) => println!("[LUA DEBUG] Command {} returned: {:?}", cmd_name, val),
+            Err(e) => println!("[LUA ERROR] Command {} error: {}", cmd_name, e),
+        }
         
         result
     }
@@ -609,15 +858,43 @@ impl RedisApi for FerrousRedisApi {
 
 /// redis.call implementation
 fn redis_call_impl(vm: &mut LuaVm, args: &[LuaValue]) -> Result<LuaValue> {
-    // Call redis.call through the VM helper methods
+    // Add debug logging to help diagnose issues
+    if let Some(cmd) = args.get(0) {
+        if let LuaValue::String(ref s) = cmd {
+            if let Ok(cmd_str) = s.to_str() {
+                println!("[DEBUG LUA] redis.call: {}", cmd_str);
+            }
+        }
+    }
+    
+    // Call redis.call through the VM helper methods, with error handling
     vm.set_redis_api_if_missing()?;
-    vm.call_redis_api(args, false)
+    
+    match vm.call_redis_api(args, false) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            // Log the error but avoid panicking the server
+            println!("[ERROR LUA] redis.call error: {}", e);
+            Err(e)
+        }
+    }
 }
 
 /// redis.pcall implementation
 fn redis_pcall_impl(vm: &mut LuaVm, args: &[LuaValue]) -> Result<LuaValue> {
+    // Add debug logging to help diagnose issues
+    if let Some(cmd) = args.get(0) {
+        if let LuaValue::String(ref s) = cmd {
+            if let Ok(cmd_str) = s.to_str() {
+                println!("[DEBUG LUA] redis.pcall: {}", cmd_str);
+            }
+        }
+    }
+    
     // Call redis.pcall through the VM helper methods
     vm.set_redis_api_if_missing()?;
+    
+    // pcall catches errors and returns them as values rather than throwing
     vm.call_redis_api(args, true)
 }
 
@@ -664,4 +941,36 @@ impl LuaTable {
         }
         Rc::new(RefCell::new(table))
     }
+}
+
+/// Compute the SHA1 hash of a script
+fn compute_sha1(script: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    // In a production implementation, we would use a proper SHA1 library
+    // For this version focused on Redis compatibility, we'll implement a simple SHA1-like hash
+    
+    // Create two hashers for increased collision resistance
+    let mut hasher1 = DefaultHasher::new();
+    let mut hasher2 = DefaultHasher::new();
+    
+    // Hash the script with both hashers
+    script.hash(&mut hasher1);
+    (script.len() as u64).hash(&mut hasher2);
+    for (i, c) in script.chars().enumerate() {
+        if i % 2 == 0 {
+            c.hash(&mut hasher1);
+        } else {
+            c.hash(&mut hasher2);
+        }
+    }
+    
+    // Combine the hashes
+    let hash1 = hasher1.finish();
+    let hash2 = hasher2.finish();
+    let combined = hash1 ^ (hash2 << 1) ^ (hash2 >> 1);
+    
+    // Format the hash to look like a SHA1 (40 hex digits)
+    format!("{:016x}{:016x}{:08x}", hash1, hash2, combined & 0xFFFFFFFF)
 }

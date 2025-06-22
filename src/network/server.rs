@@ -1062,12 +1062,22 @@ impl Server {
                     script_executor: Arc::clone(&self.script_executor),
                 };
                 
-                // Convert the async handler to sync using blocks_on
-                // match futures::executor::block_on(lua_command::handle_eval(&ctx, parts)) {
-                match lua_command::handle_eval_sync(&ctx, parts) {
-                    Ok(resp) => Ok(resp),
-                    Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
-                }
+                println!("[SERVER DEBUG] Processing EVAL command");
+                
+                // Try to execute the script, but catch any errors that might occur
+                let result = match lua_command::handle_eval_sync(&ctx, parts) {
+                    Ok(resp) => {
+                        println!("[SERVER DEBUG] EVAL executed successfully");
+                        Ok(resp)
+                    },
+                    Err(e) => {
+                        // Log the error but return it as a Redis error response instead of propagating
+                        eprintln!("[SERVER ERROR] Lua EVAL error: {}", e);
+                        Ok(RespFrame::error(format!("ERR Lua execution error: {}", e)))
+                    }
+                };
+                
+                return result;
             },
             "EVALSHA" => {
                 let ctx = lua_command::CommandContext {
@@ -1076,12 +1086,22 @@ impl Server {
                     script_executor: Arc::clone(&self.script_executor),
                 };
                 
-                // Convert the async handler to sync using blocks_on
-                // match futures::executor::block_on(lua_command::handle_evalsha(&ctx, parts)) {
-                match lua_command::handle_evalsha_sync(&ctx, parts) {
-                    Ok(resp) => Ok(resp),
-                    Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
-                }
+                println!("[SERVER DEBUG] Processing EVALSHA command");
+                
+                // Try to execute the script, but catch any errors that might occur
+                let result = match lua_command::handle_evalsha_sync(&ctx, parts) {
+                    Ok(resp) => {
+                        println!("[SERVER DEBUG] EVALSHA executed successfully");
+                        Ok(resp)
+                    },
+                    Err(e) => {
+                        // Log the error but return it as a Redis error response instead of propagating
+                        eprintln!("[SERVER ERROR] Lua EVALSHA error: {}", e);
+                        Ok(RespFrame::error(format!("ERR Lua execution error: {}", e)))
+                    }
+                };
+                
+                return result;
             },
             "SCRIPT" => {
                 let ctx = lua_command::CommandContext {
@@ -1090,12 +1110,22 @@ impl Server {
                     script_executor: Arc::clone(&self.script_executor),
                 };
                 
-                // Convert the async handler to sync using blocks_on
-                // match futures::executor::block_on(lua_command::handle_script(&ctx, parts)) {
-                match lua_command::handle_script_sync(&ctx, parts) {
-                    Ok(resp) => Ok(resp),
-                    Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
-                }
+                println!("[SERVER DEBUG] Processing SCRIPT command");
+                
+                // Try to execute the script command, but catch any errors that might occur
+                let result = match lua_command::handle_script_sync(&ctx, parts) {
+                    Ok(resp) => {
+                        println!("[SERVER DEBUG] SCRIPT executed successfully");
+                        Ok(resp)
+                    },
+                    Err(e) => {
+                        // Log the error but return it as a Redis error response instead of propagating
+                        eprintln!("[SERVER ERROR] Lua SCRIPT error: {}", e);
+                        Ok(RespFrame::error(format!("ERR Lua script error: {}", e)))
+                    }
+                };
+                
+                return result;
             },
             _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command_name))),
         };
