@@ -51,8 +51,21 @@ pub async fn handle_eval(ctx: &CommandContext, args: &[RespFrame]) -> Result<Res
         argv.push(extract_bytes(&args[i])?);
     }
     
+    println!("[SERVER DEBUG] EVAL: Running script with {} keys, {} args", keys.len(), argv.len());
+    
     // Execute script
-    ctx.script_executor.eval(&script, keys, argv, ctx.db)
+    match ctx.script_executor.eval(&script, keys, argv, ctx.db) {
+        Ok(resp) => {
+            println!("[SERVER DEBUG] EVAL executed successfully");
+            Ok(resp)
+        },
+        Err(e) => {
+            // Convert Lua errors to proper Redis errors with appropriate format
+            let error_msg = format!("ERR Error running script: {}", e);
+            println!("[SERVER ERROR] EVAL error: {}", error_msg);
+            Ok(RespFrame::error(error_msg))
+        }
+    }
 }
 
 /// Handle EVALSHA command
@@ -87,12 +100,21 @@ pub async fn handle_evalsha(ctx: &CommandContext, args: &[RespFrame]) -> Result<
         argv.push(extract_bytes(&args[i])?);
     }
     
-    // Execute script
-    ctx.script_executor.evalsha(&sha1, keys, argv, ctx.db)
+    // Execute script from cache
+    match ctx.script_executor.evalsha(&sha1, keys, argv, ctx.db) {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            if let FerrousError::Script(ScriptError::NotFound) = &e {
+                Ok(RespFrame::error("NOSCRIPT No matching script. Please use EVAL."))
+            } else {
+                Ok(RespFrame::error(format!("ERR Error running script: {}", e)))
+            }
+        }
+    }
 }
 
-/// Handle SCRIPT commands
-///
+/// Handle SCRIPT command
+/// 
 /// SCRIPT LOAD script
 /// SCRIPT EXISTS sha1 [sha1 ...]
 /// SCRIPT FLUSH
@@ -116,15 +138,9 @@ pub async fn handle_script(ctx: &CommandContext, args: &[RespFrame]) -> Result<R
             // Extract script
             let script = extract_string(&args[2])?;
             
-            // Load script (using empty keys and argv to just compile and cache)
-            match ctx.script_executor.eval(&script, vec![], vec![], ctx.db) {
-                Ok(_) => {
-                    // Get SHA1 of script
-                    let sha1 = compute_sha1(&script);
-                    
-                    // Return SHA1
-                    Ok(RespFrame::BulkString(Some(Arc::new(sha1.into_bytes()))))
-                },
+            // Load script
+            match ctx.script_executor.load_script(&script) {
+                Ok(sha) => Ok(RespFrame::BulkString(Some(Arc::new(sha.into_bytes())))),
                 Err(e) => Err(e),
             }
         },
@@ -135,32 +151,31 @@ pub async fn handle_script(ctx: &CommandContext, args: &[RespFrame]) -> Result<R
                 return Err(CommandError::WrongNumberOfArgs("script exists".to_string()).into());
             }
             
-            // Not implemented in this simplified version
-            // In a real implementation, we would check the script cache
-            
-            // Return 0 for simplicity
-            let mut responses = Vec::new();
-            for _ in 2..args.len() {
-                responses.push(RespFrame::Integer(0));
+            // Check if scripts exist
+            let mut response = Vec::with_capacity(args.len() - 2);
+            for i in 2..args.len() {
+                let sha = extract_string(&args[i])?;
+                let exists = ctx.script_executor.script_exists(&sha);
+                response.push(RespFrame::Integer(if exists { 1 } else { 0 }));
             }
             
-            Ok(RespFrame::Array(Some(responses)))
+            Ok(RespFrame::Array(Some(response)))
         },
         
         "FLUSH" => {
-            // Not implemented in this simplified version
-            // In a real implementation, we would clear the script cache
+            // Flush script cache
+            ctx.script_executor.flush_scripts();
             
-            // Return OK
             Ok(RespFrame::SimpleString(Arc::new(b"OK".to_vec())))
         },
         
         "KILL" => {
-            // Not implemented in this simplified version
-            // In a real implementation, we would kill the currently running script
-            
-            // Return error (no running script)
-            Err(ScriptError::ExecutionError("No scripts in execution".to_string()).into())
+            // Kill running script
+            if ctx.script_executor.kill_running_script() {
+                Ok(RespFrame::SimpleString(Arc::new(b"OK".to_vec())))
+            } else {
+                Err(ScriptError::ExecutionError("No scripts in execution".to_string()).into())
+            }
         },
         
         _ => Err(CommandError::InvalidArgument.into()),
@@ -197,8 +212,21 @@ pub fn handle_eval_sync(ctx: &CommandContext, args: &[RespFrame]) -> Result<Resp
         argv.push(extract_bytes(&args[i])?);
     }
     
+    println!("[SERVER DEBUG] EVAL: Running script with {} keys, {} args", keys.len(), argv.len());
+    
     // Execute script
-    ctx.script_executor.eval(&script, keys, argv, ctx.db)
+    match ctx.script_executor.eval(&script, keys, argv, ctx.db) {
+        Ok(resp) => {
+            println!("[SERVER DEBUG] EVAL executed successfully");
+            Ok(resp)
+        },
+        Err(e) => {
+            // Convert Lua errors to proper Redis errors with appropriate format
+            let error_msg = format!("ERR Error running script: {}", e);
+            println!("[SERVER ERROR] EVAL error: {}", error_msg);
+            Ok(RespFrame::error(error_msg))
+        }
+    }
 }
 
 /// Synchronous version of handle_evalsha
@@ -231,8 +259,17 @@ pub fn handle_evalsha_sync(ctx: &CommandContext, args: &[RespFrame]) -> Result<R
         argv.push(extract_bytes(&args[i])?);
     }
     
-    // Execute script
-    ctx.script_executor.evalsha(&sha1, keys, argv, ctx.db)
+    // Execute script from cache
+    match ctx.script_executor.evalsha(&sha1, keys, argv, ctx.db) {
+        Ok(resp) => Ok(resp),
+        Err(e) => {
+            if let FerrousError::Script(ScriptError::NotFound) = &e {
+                Ok(RespFrame::error("NOSCRIPT No matching script. Please use EVAL."))
+            } else {
+                Ok(RespFrame::error(format!("ERR Error running script: {}", e)))
+            }
+        }
+    }
 }
 
 /// Synchronous version of handle_script
@@ -255,15 +292,9 @@ pub fn handle_script_sync(ctx: &CommandContext, args: &[RespFrame]) -> Result<Re
             // Extract script
             let script = extract_string(&args[2])?;
             
-            // Load script (using empty keys and argv to just compile and cache)
-            match ctx.script_executor.eval(&script, vec![], vec![], ctx.db) {
-                Ok(_) => {
-                    // Get SHA1 of script
-                    let sha1 = compute_sha1(&script);
-                    
-                    // Return SHA1
-                    Ok(RespFrame::BulkString(Some(Arc::new(sha1.into_bytes()))))
-                },
+            // Load script
+            match ctx.script_executor.load_script(&script) {
+                Ok(sha) => Ok(RespFrame::BulkString(Some(Arc::new(sha.into_bytes())))),
                 Err(e) => Err(e),
             }
         },
@@ -274,41 +305,33 @@ pub fn handle_script_sync(ctx: &CommandContext, args: &[RespFrame]) -> Result<Re
                 return Err(CommandError::WrongNumberOfArgs("script exists".to_string()).into());
             }
             
-            // Not implemented in this simplified version
-            // In a real implementation, we would check the script cache
-            
-            // Return 0 for simplicity
-            let mut responses = Vec::new();
-            for _ in 2..args.len() {
-                responses.push(RespFrame::Integer(0));
+            // Check if scripts exist
+            let mut response = Vec::with_capacity(args.len() - 2);
+            for i in 2..args.len() {
+                let sha = extract_string(&args[i])?;
+                let exists = ctx.script_executor.script_exists(&sha);
+                response.push(RespFrame::Integer(if exists { 1 } else { 0 }));
             }
             
-            Ok(RespFrame::Array(Some(responses)))
+            Ok(RespFrame::Array(Some(response)))
         },
         
         "FLUSH" => {
-            // Not implemented in this simplified version
-            // In a real implementation, we would clear the script cache
+            // Flush script cache
+            ctx.script_executor.flush_scripts();
             
-            // Return OK
             Ok(RespFrame::SimpleString(Arc::new(b"OK".to_vec())))
         },
         
         "KILL" => {
-            // Not implemented in this simplified version
-            // In a real implementation, we would kill the currently running script
-            
-            // Return error (no running script)
-            Err(ScriptError::ExecutionError("No scripts in execution".to_string()).into())
+            // Kill running script
+            if ctx.script_executor.kill_running_script() {
+                Ok(RespFrame::SimpleString(Arc::new(b"OK".to_vec())))
+            } else {
+                Err(ScriptError::ExecutionError("No scripts in execution".to_string()).into())
+            }
         },
         
         _ => Err(CommandError::InvalidArgument.into()),
     }
-}
-
-/// Compute SHA1 hash (simplified implementation)
-fn compute_sha1(script: &str) -> String {
-    // In a real implementation, this would compute an actual SHA1 hash
-    // For simplicity, we return a placeholder
-    "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string()
 }

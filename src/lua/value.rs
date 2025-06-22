@@ -167,6 +167,40 @@ impl LuaTable {
             }
         }
     }
+
+    /// Remove a value by key
+    pub fn remove(&mut self, key: &LuaValue) -> Option<LuaValue> {
+        match key {
+            LuaValue::Number(n) if n.fract() == 0.0 && *n >= 1.0 => {
+                let index = (*n as usize) - 1;
+                
+                if index < self.array.len() {
+                    // For array part, we replace with nil but keep the slot
+                    // to maintain the integrity of the array structure
+                    let old_value = std::mem::replace(&mut self.array[index], LuaValue::Nil);
+                    
+                    // If it was the last element, we can pop it
+                    if index == self.array.len() - 1 {
+                        // Pop any trailing nils
+                        while !self.array.is_empty() && 
+                              matches!(self.array[self.array.len() - 1], LuaValue::Nil) {
+                            self.array.pop();
+                        }
+                    }
+                    
+                    if old_value.is_nil() {
+                        None
+                    } else {
+                        Some(old_value)
+                    }
+                } else {
+                    // For hash part
+                    self.hash.remove(key)
+                }
+            },
+            _ => self.hash.remove(key),
+        }
+    }
     
     /// Get the length of the table (Lua's # operator)
     pub fn len(&self) -> usize {

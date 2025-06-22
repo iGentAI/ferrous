@@ -10,6 +10,7 @@ mod storage;
 mod pubsub;
 mod replication;
 mod monitor;
+mod lua;
 
 use std::process;
 use error::Result;

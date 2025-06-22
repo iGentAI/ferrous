@@ -234,6 +234,50 @@ The memory tracking implementation has minimal performance impact when tested wi
 
 The impact varies by operation type, with write operations showing slight regressions (1-8%) and read operations showing improvements. This is a reasonable trade-off for the added memory visibility.
 
+## Lua Testing Results
+
+### Lua VM Implementation Status
+
+The Lua VM implementation has been significantly improved, providing better register allocation especially for table field access and concatenation operations. Comprehensive testing shows:
+
+| Test Category | Status | Notes |
+|---------------|--------|-------|
+| Basic Arithmetic | ✅ PASS | Correctly calculates expressions like `1 + 2 * 3` |
+| String Operations | ✅ PASS | Correctly concatenates strings like `"hello" .. " " .. "world"` |
+| Local Variables | ✅ PASS | Properly handles local variable declarations and access |
+| Function Calls | ✅ PASS | Basic function definitions and calls work correctly |
+| Table Operations | ✅ PASS | Table creation, field access, and field concatenation work correctly |
+| Table Field Concatenation | ✅ PASS | Fixed to properly handle `t.foo .. " " .. t.baz` → `"bar 42"` |
+| KEYS Access | ✅ PASS | Correctly handles access to the special KEYS table |
+| Redis Call Function | 🟡 PARTIAL | Works in isolation but has protocol issues |
+| Closures | 🟡 PARTIAL | Basic closures work but complex upvalues need improvement |
+| Standard Libraries | 🟡 PARTIAL | Basic functions work; others have simplified implementations |
+| Redis Libraries | 🟡 PARTIAL | Partial implementation of cjson, cmsgpack, bit libraries |
+
+### Register Allocation Improvements
+
+A major focus of the recent work has been fixing the compiler's register allocation strategy, particularly for table field access in concatenation expressions. The improved implementation:
+
+1. **Problem:** Previously, table field concatenation like `t.foo .. " " .. t.baz` was incorrectly producing `"bar baz42"` instead of the expected `"bar 42"` because the field name "baz" was being included in the concatenation.
+
+2. **Solution:** The register allocation in the compiler has been enhanced to:
+   - Properly handle field names and values in separate registers
+   - Use temporary registers to store intermediate values safely
+   - Ensure correct concatenation ordering
+   - Free registers appropriately when no longer needed
+
+3. **Results:** All table field concatenation tests now pass correctly, producing the expected output of `"bar 42"` instead of the previous incorrect `"bar baz42"`.
+
+### Redis Integration Status
+
+The direct integration with Redis commands through the Lua VM shows mixed results:
+
+- Direct Redis commands (e.g., PING) work correctly
+- EVAL with simple literal return values is processed but has connection handling issues
+- redis.call() functionality works in isolated tests but has protocol issues in direct testing
+
+These findings suggest that while the core VM functionality is now working correctly, there are still issues with how the EVAL command response is packaged and returned to clients that need addressing in future work.
+
 ## Strengths
 
 1. **All Core Data Structures**: Complete implementation of strings, lists, sets, hashes, and sorted sets

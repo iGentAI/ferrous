@@ -22,10 +22,11 @@ Ferrous is currently at Phase 4 implementation, with several key features comple
 - ✅ Enhanced RESP protocol parsing
 - ✅ Master-slave replication
 - ✅ SCAN command family for safe iteration
+- ✅ Improved Lua VM with proper register allocation
 
 ### Coming Soon (Remaining Phase 4-6):
 - Production monitoring (INFO, SLOWLOG)
-- Advanced features (Lua scripting - partially implemented, HyperLogLog)
+- Advanced features (Lua scripting - register allocation fixed, full Redis API integration in progress, HyperLogLog)
 - Cluster support
 
 ## Performance

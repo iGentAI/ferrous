@@ -80,6 +80,37 @@ trait CommandValidator {
 2. **Integration Tests**: Multi-command scenarios  
 3. **Regression Tests**: Known Redis bugs/edge cases
 4. **Stress Tests**: High load scenarios
+5. **Lua Tests**: Script functionality and edge cases
+
+### Lua VM Tests
+
+The Lua VM implementation has been validated with specialized test programs:
+
+#### Lua VM Test Suite
+```
+- Test basic arithmetic operations (PASS)
+- Test string operations (PASS)
+- Test local variables and functions (PASS)
+- Test table operations including field access and concatenation (PASS)
+- Test KEYS table access (PASS)
+- Test Redis API functions (PARTIAL)
+- Test closures and upvalues (PARTIAL)
+- Test standard library functions (PARTIAL)
+- Test Redis-specific libraries (PARTIAL)
+```
+
+#### Register Allocation Testing
+The VM's register allocation has been extensively tested, focusing on table field concatenation that previously produced incorrect output ("bar baz42" instead of "bar 42"). The improved implementation:
+
+- Correctly handles table field access in concatenation
+- Properly manages registers during bytecode generation
+- Uses explicit temporary registers to store intermediate results
+- Ensures correct left-to-right ordering of operands
+
+#### Remaining Issues
+- The direct Redis protocol integration for EVAL commands still has issues with connection handling
+- Some advanced Lua features (closures, complex function calls) need additional work
+- Redis-specific libraries (cjson, cmsgpack) have simplified implementations
 
 ### Data Structure Validation
 
