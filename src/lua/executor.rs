@@ -433,6 +433,20 @@ impl ScriptExecutor {
                     }
                     Ok(RespFrame::Array(Some(frames)))
                 } else {
+                    // Check if this is an error table (has 'err' field)
+                    let err_key = LuaValue::String(LuaString::from_str("err"));
+                    if let Some(LuaValue::String(err_msg)) = t.get(&err_key) {
+                        // This is an error response from redis.pcall
+                        return Ok(RespFrame::Error(Arc::new(err_msg.as_bytes().to_vec())));
+                    }
+                    
+                    // Check if this is a status reply table (has 'ok' field)
+                    let ok_key = LuaValue::String(LuaString::from_str("ok"));
+                    if let Some(LuaValue::String(ok_msg)) = t.get(&ok_key) {
+                        // This is a status response
+                        return Ok(RespFrame::SimpleString(Arc::new(ok_msg.as_bytes().to_vec())));
+                    }
+                    
                     // Non-array tables not supported in Redis Lua
                     Err(ScriptError::ExecutionError("cannot convert a non-array table to Redis response".to_string()).into())
                 }
@@ -789,6 +803,279 @@ impl RedisApi for FerrousRedisApi {
                 }
             },
             
+            // List operations
+            "LPUSH" => {
+                if resp_args.len() < 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let mut values = Vec::new();
+                for i in 2..resp_args.len() {
+                    match &resp_args[i] {
+                        RespFrame::BulkString(Some(bytes)) => values.push(bytes.as_ref().to_vec()),
+                        RespFrame::Integer(n) => values.push(n.to_string().into_bytes()),
+                        _ => return Err(LuaError::Runtime("Invalid value format".to_string())),
+                    }
+                }
+                
+                match self.storage.lpush(self.db, key, values) {
+                    Ok(new_len) => Ok(LuaValue::Number(new_len as f64)),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing LPUSH: {}", e))),
+                }
+            },
+            
+            "RPUSH" => {
+                if resp_args.len() < 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let mut values = Vec::new();
+                for i in 2..resp_args.len() {
+                    match &resp_args[i] {
+                        RespFrame::BulkString(Some(bytes)) => values.push(bytes.as_ref().to_vec()),
+                        RespFrame::Integer(n) => values.push(n.to_string().into_bytes()),
+                        _ => return Err(LuaError::Runtime("Invalid value format".to_string())),
+                    }
+                }
+                
+                match self.storage.rpush(self.db, key, values) {
+                    Ok(new_len) => Ok(LuaValue::Number(new_len as f64)),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing RPUSH: {}", e))),
+                }
+            },
+            
+            "LPOP" => {
+                if resp_args.len() != 2 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                match self.storage.lpop(self.db, key) {
+                    Ok(Some(value)) => Ok(LuaValue::String(LuaString::from_bytes(value))),
+                    Ok(None) => Ok(LuaValue::Nil),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing LPOP: {}", e))),
+                }
+            },
+            
+            "RPOP" => {
+                if resp_args.len() != 2 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                match self.storage.rpop(self.db, key) {
+                    Ok(Some(value)) => Ok(LuaValue::String(LuaString::from_bytes(value))),
+                    Ok(None) => Ok(LuaValue::Nil),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing RPOP: {}", e))),
+                }
+            },
+            
+            "LLEN" => {
+                if resp_args.len() != 2 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                match self.storage.llen(self.db, key) {
+                    Ok(len) => Ok(LuaValue::Number(len as f64)),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing LLEN: {}", e))),
+                }
+            },
+            
+            // Set operations
+            "SADD" => {
+                if resp_args.len() < 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let mut members = Vec::new();
+                for i in 2..resp_args.len() {
+                    match &resp_args[i] {
+                        RespFrame::BulkString(Some(bytes)) => members.push(bytes.as_ref().to_vec()),
+                        RespFrame::Integer(n) => members.push(n.to_string().into_bytes()),
+                        _ => return Err(LuaError::Runtime("Invalid member format".to_string())),
+                    }
+                }
+                
+                match self.storage.sadd(self.db, key, members) {
+                    Ok(added) => {
+                        // Explicitly cast usize to f64
+                        let result: f64 = added as f64;
+                        Ok(LuaValue::Number(result)) 
+                    },
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing SADD: {}", e))),
+                }
+            },
+            
+            "SREM" => {
+                if resp_args.len() < 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                // Convert all elements to bytes vectors
+                let mut member_values = Vec::new();
+                for i in 2..resp_args.len() {
+                    match &resp_args[i] {
+                        RespFrame::BulkString(Some(bytes)) => member_values.push(bytes.as_ref().to_vec()),
+                        RespFrame::Integer(n) => member_values.push(n.to_string().into_bytes()),
+                        _ => return Err(LuaError::Runtime("Invalid member format".to_string())),
+                    }
+                }
+                
+                match self.storage.srem(self.db, key, &member_values) {
+                    Ok(removed) => Ok(LuaValue::Number(removed as f64)),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing SREM: {}", e))),
+                }
+            },
+            
+            "SISMEMBER" => {
+                if resp_args.len() != 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let member = match &resp_args[2] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid member format".to_string())),
+                };
+                
+                match self.storage.sismember(self.db, key, member) {
+                    Ok(is_member) => Ok(LuaValue::Number(if is_member { 1.0 } else { 0.0 })),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing SISMEMBER: {}", e))),
+                }
+            },
+            
+            "SCARD" => {
+                if resp_args.len() != 2 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                match self.storage.scard(self.db, key) {
+                    Ok(count) => Ok(LuaValue::Number(count as f64)),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing SCARD: {}", e))),
+                }
+            },
+            
+            // Sorted set operations  
+            "ZADD" => {
+                if resp_args.len() < 4 || (resp_args.len() - 2) % 2 != 0 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let mut added_count = 0;
+                
+                // Process score/member pairs one at a time
+                for i in (2..resp_args.len()).step_by(2) {
+                    let score = match &resp_args[i] {
+                        RespFrame::Integer(n) => *n as f64,
+                        RespFrame::BulkString(Some(bytes)) => {
+                            match String::from_utf8_lossy(bytes).parse::<f64>() {
+                                Ok(f) => f,
+                                Err(_) => return Err(LuaError::Runtime("Invalid score format".to_string())),
+                            }
+                        },
+                        _ => return Err(LuaError::Runtime("Invalid score format".to_string())),
+                    };
+                    
+                    let member = match &resp_args[i+1] {
+                        RespFrame::BulkString(Some(bytes)) => bytes.as_ref().to_vec(),
+                        _ => return Err(LuaError::Runtime("Invalid member format".to_string())),
+                    };
+                    
+                    // Call ZADD with a single member/score
+                    match self.storage.zadd(self.db, key.clone(), member, score) {
+                        Ok(added) => added_count += added as usize,
+                        Err(e) => return Err(LuaError::Runtime(format!("Error executing ZADD: {}", e))),
+                    }
+                }
+                
+                Ok(LuaValue::Number(added_count as f64))
+            },
+            
+            "ZSCORE" => {
+                if resp_args.len() != 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let member = match &resp_args[2] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid member format".to_string())),
+                };
+                
+                match self.storage.zscore(self.db, key, member) {
+                    Ok(Some(score)) => Ok(LuaValue::Number(score)),
+                    Ok(None) => Ok(LuaValue::Nil),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing ZSCORE: {}", e))),
+                }
+            },
+            
+            "ZCARD" => {
+                if resp_args.len() != 2 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                match self.storage.scard(self.db, key) {
+                    Ok(count) => Ok(LuaValue::Number(count as f64)),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing ZCARD: {}", e))),
+                }
+            },
+            
             "KEYS" => {
                 if resp_args.len() != 2 {
                     return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
@@ -812,6 +1099,75 @@ impl RedisApi for FerrousRedisApi {
                         Ok(LuaValue::Table(Rc::new(RefCell::new(table))))
                     },
                     Err(e) => Err(LuaError::Runtime(format!("Error executing KEYS: {}", e))),
+                }
+            },
+            
+            "TYPE" => {
+                if resp_args.len() != 2 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                match self.storage.key_type(self.db, key) {
+                    Ok(type_name) => {
+                        Ok(LuaValue::String(LuaString::from_str(&type_name)))
+                    },
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing TYPE: {}", e))),
+                }
+            },
+            
+            "EXPIRE" => {
+                if resp_args.len() != 3 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                let seconds = match &resp_args[2] {
+                    RespFrame::Integer(n) => *n as u64,
+                    RespFrame::BulkString(Some(bytes)) => {
+                        match String::from_utf8_lossy(bytes).parse::<u64>() {
+                            Ok(n) => n,
+                            Err(_) => return Err(LuaError::Runtime("Invalid seconds format".to_string())),
+                        }
+                    },
+                    _ => return Err(LuaError::Runtime("Invalid seconds format".to_string())),
+                };
+                
+                match self.storage.expire(self.db, key, Duration::from_secs(seconds)) {
+                    Ok(set) => Ok(LuaValue::Number(if set { 1.0 } else { 0.0 })),
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing EXPIRE: {}", e))),
+                }
+            },
+            
+            "TTL" => {
+                if resp_args.len() != 2 {
+                    return Err(LuaError::Runtime(format!("Wrong number of arguments for '{}'", cmd_name)));
+                }
+                
+                let key = match &resp_args[1] {
+                    RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+                    _ => return Err(LuaError::Runtime("Invalid key format".to_string())),
+                };
+                
+                match self.storage.ttl(self.db, key) {
+                    Ok(Some(ttl)) => Ok(LuaValue::Number(ttl.as_secs() as f64)),
+                    Ok(None) => {
+                        // Check if key exists without expiry
+                        if self.storage.exists(self.db, key).unwrap_or(false) {
+                            Ok(LuaValue::Number(-1.0))
+                        } else {
+                            Ok(LuaValue::Number(-2.0))
+                        }
+                    },
+                    Err(e) => Err(LuaError::Runtime(format!("Error executing TTL: {}", e))),
                 }
             },
             
