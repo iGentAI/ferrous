@@ -61,9 +61,19 @@ pub async fn handle_eval(ctx: &CommandContext, args: &[RespFrame]) -> Result<Res
         },
         Err(e) => {
             // Convert Lua errors to proper Redis errors with appropriate format
-            let error_msg = format!("ERR Error running script: {}", e);
-            println!("[SERVER ERROR] EVAL error: {}", error_msg);
-            Ok(RespFrame::error(error_msg))
+            match e {
+                FerrousError::Script(ScriptError::CompilationError(msg)) => {
+                    Ok(RespFrame::error(format!("ERR Error compiling script (new function): {}", msg)))
+                },
+                FerrousError::Script(ScriptError::ExecutionError(msg)) => {
+                    Ok(RespFrame::error(format!("ERR Error running script (call to f_...): {}", msg)))
+                },
+                _ => {
+                    let error_msg = format!("ERR {}", e);
+                    println!("[SERVER ERROR] EVAL error: {}", error_msg);
+                    Ok(RespFrame::error(error_msg))
+                }
+            }
         }
     }
 }
@@ -222,9 +232,19 @@ pub fn handle_eval_sync(ctx: &CommandContext, args: &[RespFrame]) -> Result<Resp
         },
         Err(e) => {
             // Convert Lua errors to proper Redis errors with appropriate format
-            let error_msg = format!("ERR Error running script: {}", e);
-            println!("[SERVER ERROR] EVAL error: {}", error_msg);
-            Ok(RespFrame::error(error_msg))
+            match e {
+                FerrousError::Script(ScriptError::CompilationError(msg)) => {
+                    Ok(RespFrame::error(format!("ERR Error compiling script (new function): {}", msg)))
+                },
+                FerrousError::Script(ScriptError::ExecutionError(msg)) => {
+                    Ok(RespFrame::error(format!("ERR Error running script (call to f_...): {}", msg)))
+                },
+                _ => {
+                    let error_msg = format!("ERR {}", e);
+                    println!("[SERVER ERROR] EVAL error: {}", error_msg);
+                    Ok(RespFrame::error(error_msg))
+                }
+            }
         }
     }
 }

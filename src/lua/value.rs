@@ -214,6 +214,16 @@ impl LuaTable {
             matches!(k, LuaValue::Number(n) if n.fract() == 0.0 && *n > 0.0)
         })
     }
+    
+    /// Get the metatable of this table (accessor for the private field)
+    pub fn get_metatable(&self) -> Option<Rc<RefCell<LuaTable>>> {
+        self.metatable.clone()
+    }
+    
+    /// Set the metatable of this table (accessor for the private field)
+    pub fn set_metatable(&mut self, metatable: Option<Rc<RefCell<LuaTable>>>) {
+        self.metatable = metatable;
+    }
 }
 
 impl Default for LuaTable {
@@ -259,6 +269,22 @@ pub struct FunctionProto {
     
     /// Maximum stack size needed
     pub max_stack_size: u8,
+    
+    /// Number of upvalues used by this function
+    pub upvalue_count: u8,
+}
+
+impl Default for FunctionProto {
+    fn default() -> Self {
+        FunctionProto {
+            code: Vec::new(),
+            constants: Vec::new(),
+            num_params: 0,
+            is_vararg: false,
+            max_stack_size: 0,
+            upvalue_count: 0,
+        }
+    }
 }
 
 /// Bytecode instruction (32-bit format compatible with Lua 5.1)
@@ -267,9 +293,73 @@ pub struct Instruction(pub u32);
 
 /// Upvalue reference (for closures)
 #[derive(Debug, Clone)]
-pub struct UpvalueRef {
-    // Simplified for initial implementation
-    pub index: usize,
+pub enum UpvalueRef {
+    /// An open upvalue refers to a variable still on the stack
+    Open {
+        /// Index of the variable on the stack
+        index: usize,
+    },
+    
+    /// A closed upvalue contains the value itself after the original variable goes out of scope
+    Closed {
+        /// The captured value
+        value: Rc<RefCell<LuaValue>>,
+    },
+}
+
+impl UpvalueRef {
+    /// Create a new open upvalue
+    pub fn new_open(index: usize) -> Self {
+        UpvalueRef::Open { index }
+    }
+    
+    /// Create a new closed upvalue
+    pub fn new_closed(value: LuaValue) -> Self {
+        UpvalueRef::Closed {
+            value: Rc::new(RefCell::new(value)),
+        }
+    }
+    
+    /// Close an upvalue by storing the value directly
+    pub fn close(&mut self, value: LuaValue) {
+        *self = UpvalueRef::Closed {
+            value: Rc::new(RefCell::new(value)),
+        };
+    }
+    
+    /// Get the current value of the upvalue
+    pub fn get_value(&self, stack: &[LuaValue]) -> LuaValue {
+        match self {
+            UpvalueRef::Open { index } => {
+                if *index < stack.len() {
+                    stack[*index].clone()
+                } else {
+                    LuaValue::Nil
+                }
+            },
+            UpvalueRef::Closed { value } => {
+                value.borrow().clone()
+            }
+        }
+    }
+    
+    /// Set the current value of the upvalue
+    pub fn set_value(&self, stack: &mut [LuaValue], value: LuaValue) -> Result<(), super::error::LuaError> {
+        match self {
+            UpvalueRef::Open { index } => {
+                if *index < stack.len() {
+                    stack[*index] = value;
+                    Ok(())
+                } else {
+                    Err(super::error::LuaError::Runtime("upvalue index out of bounds".to_string()))
+                }
+            },
+            UpvalueRef::Closed { value: upvalue_value } => {
+                *upvalue_value.borrow_mut() = value;
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Rust function callable from Lua

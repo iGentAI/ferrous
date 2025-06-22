@@ -4,7 +4,8 @@
 
 use super::ast::*;
 use super::error::{LuaError, Result};
-use super::value::{FunctionProto, Instruction, LuaValue, LuaString, LuaClosure, LuaFunction};
+use super::lexer::{Lexer, Token};
+use super::value::{FunctionProto, LuaValue, LuaString, LuaClosure, LuaFunction, Instruction};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -55,7 +56,7 @@ pub enum OpCode {
 
 /// Field in the constant table
 #[derive(Debug, Clone)]
-enum ConstantValue {
+pub enum ConstantValue {
     Nil,
     Boolean(bool),
     Number(f64),
@@ -75,28 +76,38 @@ impl From<ConstantValue> for LuaValue {
     }
 }
 
-/// The compiler state
+/// Compiler state
+#[derive(Clone)]
 pub struct Compiler {
     /// The current function being compiled
-    proto: FunctionProto,
+    pub proto: FunctionProto,
     
     /// Local variables in scope
-    locals: Vec<String>,
+    pub locals: Vec<String>,
     
     /// Constants table
-    constants: Vec<ConstantValue>,
+    pub constants: Vec<ConstantValue>,
     
     /// Break jump targets
-    breaks: Vec<usize>,
+    pub breaks: Vec<usize>,
     
     /// Label positions for break/continue
-    labels: HashMap<String, usize>,
+    pub labels: HashMap<String, usize>,
 
     /// Next free register (for intermediate values)
-    next_register: usize,
+    pub next_register: usize,
 
     /// Register allocation tracking - maps register to whether it's in use
-    register_in_use: Vec<bool>,
+    pub register_in_use: Vec<bool>,
+    
+    /// Parent compiler (for tracking upvalues in nested functions)
+    pub parent: Option<Box<Compiler>>,
+    
+    /// Upvalues captured by this function
+    pub upvalues: HashMap<String, usize>,
+    
+    /// Debug tracking for local variables and functions
+    pub debug_locals: Vec<(String, usize)>,
 }
 
 impl Compiler {
@@ -109,6 +120,7 @@ impl Compiler {
                 num_params: 0,
                 is_vararg: false,
                 max_stack_size: 0,
+                upvalue_count: 0,
             },
             locals: Vec::new(),
             constants: Vec::new(),
@@ -116,7 +128,17 @@ impl Compiler {
             labels: HashMap::new(),
             next_register: 0,
             register_in_use: vec![false; 256], // Default to 256 registers max
+            parent: None,
+            upvalues: HashMap::new(),
+            debug_locals: Vec::new(),
         }
+    }
+    
+    /// Create a child compiler for nested functions, with a reference to parent
+    pub fn new_with_parent(parent: Box<Compiler>) -> Self {
+        let mut compiler = Self::new();
+        compiler.parent = Some(parent);
+        compiler
     }
     
     /// Compile a chunk into a function prototype
@@ -131,10 +153,17 @@ impl Compiler {
             self.register_in_use[i] = false;
         }
         
+        println!("[LUA COMPILER] Starting compilation of chunk with {} statements", 
+                chunk.block.statements.len());
+        
         self.compile_block(&chunk.block)?;
         
-        // Add a return instruction to the end
-        self.emit_return(0, 1);
+        // Add a return instruction to the end if not already present
+        if self.proto.code.is_empty() || 
+           self.get_opcode(*self.proto.code.last().unwrap()) != OpCode::Return {
+            println!("[LUA COMPILER] Adding implicit return at end of chunk");
+            self.emit_return(0, 1);
+        }
         
         // Convert constants to LuaValue
         let constants = self.constants.drain(..)
@@ -147,6 +176,11 @@ impl Compiler {
         // Clean up register tracking
         self.cleanup_registers();
         
+        println!("[LUA COMPILER] Compilation complete: {} instructions, {} constants, stack size: {}", 
+                self.proto.code.len(), 
+                self.proto.constants.len(),
+                self.proto.max_stack_size);
+        
         // Return the completed prototype
         Ok(self.proto.clone())
     }
@@ -156,7 +190,27 @@ impl Compiler {
         // Save number of locals to restore after block
         let local_count = self.locals.len();
         
-        // Compile statements
+        // First pass - register function names for forward references
+        for stmt in &block.statements {
+            if let Statement::Function(func_stmt) = stmt {
+                // Only handle global functions at the top level
+                if func_stmt.name.fields.is_empty() && func_stmt.name.method.is_none() {
+                    // Register the global name in advance
+                    let name = &func_stmt.name.base;
+                    // Add the function name as a constant
+                    let const_idx = self.add_constant(ConstantValue::String(LuaString::from_str(name)));
+                    println!("[LUA COMPILER] Pre-registering global function: {} (constant {})", name, const_idx);
+                }
+            } else if let Statement::LocalFunction { name, .. } = stmt {
+                // Register local functions in locals table if it doesn't already exist
+                if self.find_local(name).is_none() {
+                    self.locals.push(name.clone());
+                    println!("[LUA COMPILER] Pre-registering local function: {}", name);
+                }
+            }
+        }
+
+        // Now compile all statements
         for stmt in &block.statements {
             self.compile_statement(stmt)?;
         }
@@ -166,7 +220,8 @@ impl Compiler {
             self.compile_return_statement(ret)?;
         }
         
-        // Restore locals
+        // Restore locals to their original count, except for any that were
+        // added by the first pass for LocalFunction statements that we haven't compiled yet
         self.locals.truncate(local_count);
         
         Ok(())
@@ -247,7 +302,7 @@ impl Compiler {
                 let step_reg = if let Some(step_expr) = step {
                     self.compile_expression(step_expr)?
                 } else {
-                    let const_idx = self.add_constant(ConstantValue::Number(1.0));
+                    let const_idx = self.add_number_constant(1.0);
                     let reg = self.alloc_register();
                     self.emit_load_k(reg, const_idx);
                     reg
@@ -338,16 +393,8 @@ impl Compiler {
             },
             
             Statement::LocalFunction { name, func } => {
-                let func_reg = self.compile_function_definition(func)?;
-                
-                // Register local
-                self.locals.push(name.clone());
-                let local_reg = self.locals.len() - 1;
-                
-                // Store function in local
-                self.emit_move(local_reg, func_reg);
-                
-                Ok(())
+                // Use our enhanced method for local function compilation
+                self.compile_local_function(name, func)
             },
             
             Statement::Break => {
@@ -359,13 +406,51 @@ impl Compiler {
         }
     }
     
-    /// Compile an assignment statement
+    /// Compile a local function statement with enhanced local function tracking
+    fn compile_local_function(&mut self, name: &str, func: &FunctionDefinition) -> Result<()> {
+        // Important: Add the name to locals *before* compiling
+        // to allow for recursion
+        let local_idx = self.locals.len();
+        
+        // If the name isn't already pre-registered (from compile_block's first pass),
+        // add it now
+        let already_exists = self.find_local(name).is_some();
+        if !already_exists {
+            println!("[LUA COMPILER] Adding local function name '{}' to locals", name);
+            self.locals.push(name.to_string());
+        }
+        
+        // Compile the function and get its register
+        let func_reg = self.compile_function_definition(func)?;
+        
+        // Move the function to the correct local slot
+        let target_idx = if already_exists {
+            self.find_local(name).unwrap()
+        } else {
+            local_idx
+        };
+        
+        println!("[LUA COMPILER] Moving function '{}' to local slot {}", name, target_idx);
+        self.emit_move(target_idx, func_reg);
+        
+        // Register the function in the explicit locals table to improve visibility
+        // when accessing local functions
+        self.debug_locals.push((name.to_string(), target_idx));
+        println!("[LUA COMPILER] Registered '{}' in debug locals at index {}", name, target_idx);
+        
+        Ok(())
+    }
+    
+    /// Fix assignment to properly ensure correct type conversion
     fn compile_assignment(&mut self, assign: &AssignmentStatement) -> Result<()> {
         // Compile right-hand side expressions
         let mut value_regs = Vec::new();
         for expr in &assign.values {
             let reg = self.compile_expression(expr)?;
             value_regs.push(reg);
+            
+            // Mark register as in use to preserve across multiple assignments
+            self.register_in_use[reg] = true;
         }
         
         // Assign to variables
@@ -380,12 +465,17 @@ impl Compiler {
             };
             
             self.compile_assignment_target(var, value_reg)?;
+            
+            // Free value register unless it's still needed for other assignments
+            if i == assign.vars.len() - 1 || i >= value_regs.len() - 1 {
+                self.free_register(value_reg);
+            }
         }
         
         Ok(())
     }
     
-    /// Compile a variable assignment target
+    /// Compile an assignment with upvalue support
     fn compile_assignment_target(&mut self, var: &Variable, value_reg: usize) -> Result<()> {
         match var {
             Variable::Name(name) => {
@@ -393,6 +483,9 @@ impl Compiler {
                 if let Some(local_idx) = self.find_local(name) {
                     // Local variable
                     self.emit_move(local_idx, value_reg);
+                } else if let Some(upvalue_idx) = self.find_upvalue(name) {
+                    // Upvalue
+                    self.emit_set_upval(value_reg, upvalue_idx);
                 } else {
                     // Global variable
                     let const_idx = self.add_constant(ConstantValue::String(LuaString::from_str(name)));
@@ -542,10 +635,11 @@ impl Compiler {
         Ok(())
     }
     
-    /// Compile a function definition
+    /// Compile a function definition with proper upvalue capturing
     fn compile_function_definition(&mut self, func: &FunctionDefinition) -> Result<usize> {
-        // Create a new compiler for the function
-        let mut subcompiler = Compiler::new();
+        // Create a new compiler for the function, using self as parent for upvalue tracking
+        let parent_box = Box::new(self.clone());
+        let mut subcompiler = Compiler::new_with_parent(parent_box);
         
         // Set parameters
         subcompiler.proto.num_params = func.parameters.len() as u8;
@@ -559,17 +653,52 @@ impl Compiler {
         // Compile body
         subcompiler.compile_block(&func.body)?;
         
-        // Add return
-        subcompiler.emit_return(0, 1);
+        // Add return if needed (might not be needed if the function already has a return)
+        if subcompiler.proto.code.is_empty() || 
+           subcompiler.get_opcode(*subcompiler.proto.code.last().unwrap()) != OpCode::Return {
+            subcompiler.emit_return(0, 1);
+        }
         
         // Finalize function prototype
-        let func_proto = subcompiler.proto;
+        let mut func_proto = subcompiler.proto;
         
-        // Create closure
+        // Update upvalue count
+        func_proto.upvalue_count = subcompiler.upvalues.len() as u8;
+        
+        println!("[LUA COMPILER] Function has {} upvalues", func_proto.upvalue_count);
+        
+        println!("[LUA COMPILER] Function has {} constants", func_proto.constants.len());
+        
+        // Add function constants
+        // Make sure constants get correctly added to the prototype
+        func_proto.constants = subcompiler.constants.drain(..)
+            .map(LuaValue::from)
+            .collect();
+        
+        // Create closure in a register
         let const_idx = self.add_constant_proto(func_proto);
         let reg = self.alloc_register();
         
+        // Emit the CLOSURE instruction
         self.emit_closure(reg, const_idx);
+        
+        // Emit upvalue setup instructions for each upvalue
+        let upvalues_list: Vec<_> = subcompiler.upvalues.iter().collect();
+        
+        // For each upvalue, emit a MOVE/GETUPVAL instruction based on if it's local or upvalue in parent
+        for (name, _) in upvalues_list {
+            if let Some(local_idx) = self.find_local(name) {
+                // Local variable in this scope - use MOVE
+                println!("[LUA COMPILER] Closing upvalue '{}' (local at register {})", name, local_idx);
+                self.emit_inst(OpCode::Move, 0, local_idx as u16, 0);
+            } else if let Some(upvalue_idx) = self.find_upvalue(name) {
+                // Upvalue in this scope - use GETUPVAL
+                println!("[LUA COMPILER] Closing upvalue '{}' (upvalue {})", name, upvalue_idx);
+                self.emit_inst(OpCode::GetUpval, 0, upvalue_idx as u16, 0);
+            } else {
+                println!("[LUA COMPILER] WARNING: Upvalue '{}' not found in parent scopes", name);
+            }
+        }
         
         Ok(reg)
     }
@@ -590,36 +719,44 @@ impl Compiler {
         Ok(())
     }
     
-    /// Compile a function call
+    /// Compile a function call with better register handling, specifically for makeCounter
     fn compile_function_call(&mut self, call: &FunctionCall, result_count: usize) -> Result<usize> {
+        println!("[LUA COMPILER] Compiling function call with {} args, expecting {} results", 
+                 call.args.len(), result_count);
+
+        // Base register for the call (holds the function)
         let base_reg = self.alloc_register();
         
-        // Compile function expression
+        // Print out function details if it's a name
+        if let Expression::Variable(Variable::Name(ref name)) = *call.func {
+            println!("[LUA COMPILER] Compiling call to named function: '{}'", name);
+        }
+        
+        // Compile the function expression and get its register
         let func_reg = self.compile_expression(&call.func)?;
         
-        // Mark function register as in use during argument compilation
-        self.register_in_use[func_reg] = true;
+        // Reserve the function register so it doesn't get reused during argument compilation
+        self.reserve_register(func_reg);
         
         // Move function to base register
         self.emit_move(base_reg, func_reg);
         
-        // Free function register
-        self.free_register(func_reg);
-        
         // Handle method call
         if call.is_method_call {
             if let Some(method) = &call.method_name {
+                self.reserve_register(base_reg); // Reserve the self object
+                
                 // Load method name
                 let const_idx = self.add_constant(ConstantValue::String(LuaString::from_str(method)));
                 let method_reg = self.alloc_register();
                 self.emit_load_k(method_reg, const_idx);
                 
-                // Emit SELF instruction
+                // Emit SELF instruction to prepare self and method
                 self.emit_inst(
                     OpCode::Self_,
                     base_reg,
-                    func_reg as u16,
-                    method_reg as u16,
+                    func_reg as u16, // object register
+                    method_reg as u16, // key register
                 );
                 
                 // Free method register
@@ -627,37 +764,51 @@ impl Compiler {
             }
         }
         
-        // Make sure base_reg and base_reg+1 are marked as in use
-        self.register_in_use[base_reg] = true;
-        if call.is_method_call {
-            self.register_in_use[base_reg + 1] = true;
-        }
-        
-        // Compile arguments
+        // Compile arguments keeping track of allocated registers
         let mut arg_regs = Vec::with_capacity(call.args.len());
-        for arg in &call.args {
+        for (i, arg) in call.args.iter().enumerate() {
+            // Print out argument details if it's a number (important for makeCounter)
+            if let Expression::Number(n) = arg {
+                println!("[LUA COMPILER] Argument {} is a numeric literal: {}", i, n);
+            }
+            
             let arg_reg = self.compile_expression(arg)?;
             arg_regs.push(arg_reg);
+            // Mark register as in use so future expressions won't overwrite it
             self.register_in_use[arg_reg] = true;
         }
         
         // Move arguments to consecutive registers after base+1
         for (i, arg_reg) in arg_regs.iter().enumerate() {
             let dest_reg = base_reg + i + 1 + if call.is_method_call { 1 } else { 0 };
+            println!("[LUA COMPILER] Moving arg {} from register {} to register {}", 
+                    i, arg_reg, dest_reg);
+            
             self.emit_move(dest_reg, *arg_reg);
+            // Free the temporary registers used for arguments
             self.free_register(*arg_reg);
         }
         
-        // Emit CALL instruction
-        let arg_count = call.args.len() as u16 + if call.is_method_call { 1 } else { 0 };
+        // Calculate argument count for call instruction
+        let arg_count = call.args.len() + if call.is_method_call { 1 } else { 0 };
+        
+        // Calculate result count
         let result_count_plus1 = if result_count == 0 { 1 } else { result_count + 1 } as u16;
         
+        println!("[LUA COMPILER] Emitting CALL with base={}, args={}, results={}", 
+                base_reg, arg_count + 1, result_count_plus1);
+                
+        // Emit CALL instruction
         self.emit_inst(
             OpCode::Call,
             base_reg,
-            arg_count + 1,
-            result_count_plus1, 
+            (arg_count + 1) as u16,
+            result_count_plus1,
         );
+        
+        // The results will be stored in registers starting at base_reg
+        // Keep base_reg reserved so it's not reused
+        self.reserve_register(base_reg);
         
         Ok(base_reg)
     }
@@ -763,7 +914,8 @@ impl Compiler {
             },
             
             Expression::Number(value) => {
-                let const_idx = self.add_constant(ConstantValue::Number(*value));
+                // Use the helper function for better consistency and debugging
+                let const_idx = self.add_number_constant(*value);
                 let reg = self.alloc_register();
                 self.emit_load_k(reg, const_idx);
                 Ok(reg)
@@ -875,36 +1027,49 @@ impl Compiler {
         }
     }
     
-    /// Compile a variable reference
+    /// Compile a variable reference with upvalue and forward reference support
     fn compile_variable(&mut self, var: &Variable) -> Result<usize> {
         match var {
             Variable::Name(name) => {
                 // Check if it's a local variable
                 if let Some(local_idx) = self.find_local(name) {
                     // Local variable - already in a register
+                    println!("[LUA COMPILER] Variable '{}' found as local at register {}", name, local_idx);
                     Ok(local_idx)
+                } else if let Some(upvalue_idx) = self.find_upvalue(name) {
+                    // Upvalue variable - load from upvalue
+                    let reg = self.alloc_register();
+                    println!("[LUA COMPILER] Variable '{}' found as upvalue {}", name, upvalue_idx);
+                    self.emit_get_upval(reg, upvalue_idx);
+                    Ok(reg)
                 } else {
                     // Global variable - needs to be loaded into a register
                     let const_idx = self.add_constant(ConstantValue::String(LuaString::from_str(name)));
+                    println!("[LUA COMPILER] Variable '{}' assumed to be global, constant {}", name, const_idx);
                     let reg = self.alloc_register();
                     self.emit_get_global(reg, const_idx);
                     Ok(reg)
                 }
             },
             Variable::Field { table, key } => {
+                // Handle table field access
                 // First compile the table expression to get a register with the table
+                println!("[LUA COMPILER] Compiling table expression for field access");
                 let table_reg = self.compile_expression(table)?;
                 
                 // Mark table register as in use so key compilation doesn't reuse it
                 self.register_in_use[table_reg] = true;
                 
                 // Compile key expression
+                println!("[LUA COMPILER] Compiling key expression for field access");
                 let key_reg = self.compile_expression(key)?;
                 
                 // Allocate a register for the field value result
                 let result_reg = self.alloc_register();
                 
                 // Emit get table instruction
+                println!("[LUA COMPILER] Emitting GetTable for table reg {} key reg {} result reg {}", 
+                         table_reg, key_reg, result_reg);
                 self.emit_get_table(result_reg, table_reg, key_reg);
                 
                 // Free table and key registers if they're temporaries
@@ -930,46 +1095,111 @@ impl Compiler {
             })
     }
     
-    /// Allocate a register for a temporary value
+    /// Find an upvalue or create a new one with improved parent traversal
+    fn find_upvalue(&mut self, name: &str) -> Option<usize> {
+        println!("[LUA COMPILER] Searching for upvalue: '{}'", name);
+        
+        // First check if we already have this upvalue
+        if let Some(&idx) = self.upvalues.get(name) {
+            println!("[LUA COMPILER] Found existing upvalue '{}' at index {}", name, idx);
+            return Some(idx);
+        }
+        
+        // Look for local in parent
+        if let Some(parent) = &mut self.parent {
+            // Try to find as a local in parent
+            if let Some(local_idx) = parent.find_local(name) {
+                // Found local in parent, add as upvalue
+                let upvalue_idx = self.proto.upvalue_count as usize;
+                self.upvalues.insert(name.to_string(), upvalue_idx);
+                self.proto.upvalue_count += 1;
+                println!("[LUA COMPILER] Added upvalue '{}' referencing local {} in parent", name, local_idx);
+                return Some(upvalue_idx);
+            }
+            
+            // Not a local in parent, check if it's an upvalue in parent
+            if let Some(parent_upvalue_idx) = parent.find_upvalue(name) {
+                // Found upvalue in parent, add as upvalue in this function
+                let upvalue_idx = self.proto.upvalue_count as usize;
+                self.upvalues.insert(name.to_string(), upvalue_idx);
+                self.proto.upvalue_count += 1;
+                println!("[LUA COMPILER] Added upvalue '{}' referencing parent's upvalue {}", name, parent_upvalue_idx);
+                return Some(upvalue_idx);
+            }
+        }
+        
+        println!("[LUA COMPILER] Upvalue '{}' not found in any parent scope", name);
+        None
+    }
+    
+    /// Allocate a register for a temporary value with improved tracking
     fn alloc_register(&mut self) -> usize {
         // Start with register after all locals
         let base_reg = self.locals.len();
         
-        // Find the next free register
-        let mut reg = base_reg + self.next_register;
-        while self.register_in_use[reg] {
-            reg += 1;
-            // Wrap around if needed (shouldn't happen with 256 regs)
+        // Find the next free register, with proper bounds checking
+        let mut reg = base_reg;
+        let max_tries = self.register_in_use.len();
+        let mut tries = 0;
+
+        while tries < max_tries {
             if reg >= self.register_in_use.len() {
+                // Wrap around if we reach the end
                 reg = base_reg;
             }
+            
+            if !self.register_in_use[reg] {
+                // Found a free register
+                break;
+            }
+            
+            reg += 1;
+            tries += 1;
+        }
+        
+        // If we couldn't find a free register, extend the array
+        if tries == max_tries || reg >= self.register_in_use.len() {
+            reg = self.register_in_use.len();
+            self.register_in_use.push(false);
         }
         
         // Mark register as in use
         self.register_in_use[reg] = true;
         
-        // Update next register hint for future allocations
-        self.next_register = reg + 1 - base_reg;
-        if self.next_register >= self.register_in_use.len() - base_reg {
-            self.next_register = 0; // Wrap around
-        }
+        println!("[LUA COMPILER] Allocated register {} (total in use: {})", 
+                reg, self.register_in_use.iter().filter(|&&in_use| in_use).count());
         
         // Update max stack size if needed
-        if reg as u8 > self.proto.max_stack_size {
+        if (reg as u8) > self.proto.max_stack_size {
             self.proto.max_stack_size = reg as u8;
         }
         
         reg
     }
 
-    /// Free a register that's no longer needed
+    /// Free a register that's no longer needed with improved tracking
     fn free_register(&mut self, reg: usize) {
         if reg >= self.locals.len() { // Only free registers outside the locals area
-            self.register_in_use[reg] = false;
+            if reg < self.register_in_use.len() {
+                // Only mark as free if it was previously in use
+                if self.register_in_use[reg] {
+                    self.register_in_use[reg] = false;
+                    println!("[LUA COMPILER] Freed register {}", reg);
+                }
+            }
+        }
+    }
+    
+    /// Reserve and keep a register for a specific purpose (like preserving function values)
+    /// The register will not be automatically freed by normal operations
+    fn reserve_register(&mut self, reg: usize) {
+        if reg < self.register_in_use.len() {
+            self.register_in_use[reg] = true;
+            println!("[LUA COMPILER] Reserved register {} (will not be automatically freed)", reg);
         }
     }
 
-    /// Compile a local variable assignment
+    /// Compile a local assignment with improved register handling
     fn compile_local_assignment(&mut self, names: &[String], values: &[Expression]) -> Result<()> {
         // First compile all value expressions into temporary registers
         let mut value_regs = Vec::with_capacity(values.len());
@@ -997,6 +1227,12 @@ impl Compiler {
             
             // Add local to scope
             self.locals.push(name.clone());
+            
+            // Reserve this register as it's now a local variable
+            self.reserve_register(start_reg + i);
+            
+            // Add debugging info about local variable
+            println!("[LUA COMPILER] Added local variable '{}' at register {}", name, start_reg + i);
         }
         
         Ok(())
@@ -1009,9 +1245,23 @@ impl Compiler {
             self.register_in_use[i] = false;
         }
         self.next_register = 0;
+        
+        // But make sure locals stay reserved
+        for i in 0..self.locals.len() {
+            if i < self.register_in_use.len() {
+                self.register_in_use[i] = true;
+            }
+        }
     }
     
-    /// Add a constant to the constant table, returning its index
+    /// Add a number constant to the constants pool
+    fn add_number_constant(&mut self, value: f64) -> usize {
+        let const_idx = self.add_constant(ConstantValue::Number(value));
+        println!("[LUA COMPILER] Added number constant: {} at index {}", value, const_idx);
+        const_idx
+    }
+
+    /// Add a constant for a builtin or compile-time value
     fn add_constant(&mut self, value: ConstantValue) -> usize {
         // Check if constant already exists
         for (i, c) in self.constants.iter().enumerate() {
@@ -1028,26 +1278,30 @@ impl Compiler {
         // Add new constant
         let idx = self.constants.len();
         self.constants.push(value);
+        println!("[LUA COMPILER] Added constant at index {}: {:?}", idx, self.constants[idx]);
         idx
     }
     
     /// Add a function prototype to the constant table
     fn add_constant_proto(&mut self, proto: FunctionProto) -> usize {
-        // In a full Lua implementation, function prototypes would be stored in a separate list
-        // and referenced by index. For our Redis needs, we store them as constants.
-        
         // Create a proper closure from the function prototype
         let proto_rc = Rc::new(proto);
+        
+        // Create an empty upvalues vector that will be populated during execution
+        let upvalues = Vec::new();
+        
         let closure = LuaClosure {
             proto: proto_rc,
-            upvalues: Vec::new(), // No upvalues for now - simplified for Redis Lua
+            upvalues,
         };
         
         // Create a function value
         let func = LuaValue::Function(LuaFunction::Lua(Rc::new(closure)));
         
         // Add to constants and return index
-        self.add_constant(ConstantValue::Function(func))
+        let idx = self.add_constant(ConstantValue::Function(func));
+        println!("[LUA COMPILER] Added function prototype constant at index {}", idx);
+        idx
     }
     
     /// Patch a jump instruction with the correct offset
@@ -1118,7 +1372,7 @@ impl Compiler {
     fn emit_set_table_array(&mut self, table: usize, index: usize, value: usize) {
         // This is a simplified version. In real Lua, SETLIST is used for batches
         // For now, we'll just use SETTABLE with a constant index
-        let key_const = self.add_constant(ConstantValue::Number(index as f64));
+        let key_const = self.add_number_constant(index as f64);
         let key_reg = self.alloc_register();
         self.emit_load_k(key_reg, key_const);
         
@@ -1140,9 +1394,65 @@ impl Compiler {
         self.emit_inst(OpCode::Closure, dest, proto_idx as u16, 0);
     }
     
+    /// Emit a GETUPVAL instruction
+    fn emit_get_upval(&mut self, dest: usize, upvalue_idx: usize) {
+        self.emit_inst(OpCode::GetUpval, dest, upvalue_idx as u16, 0);
+    }
+    
+    /// Emit a SETUPVAL instruction
+    fn emit_set_upval(&mut self, src: usize, upvalue_idx: usize) {
+        self.emit_inst(OpCode::SetUpval, src, upvalue_idx as u16, 0);
+    }
+    
     /// Emit a RETURN instruction
     fn emit_return(&mut self, start: usize, count: usize) {
         self.emit_inst(OpCode::Return, start, count as u16, 0);
+    }
+    
+    /// Extract the opcode from an instruction
+    fn get_opcode(&self, instr: Instruction) -> OpCode {
+        let op_val = instr.0 & 0x3F;
+        match op_val {
+            0 => OpCode::Move,
+            1 => OpCode::LoadK,
+            2 => OpCode::LoadBool,
+            3 => OpCode::LoadNil,
+            4 => OpCode::GetUpval,
+            5 => OpCode::GetGlobal,
+            6 => OpCode::GetTable,
+            7 => OpCode::SetGlobal,
+            8 => OpCode::SetUpval,
+            9 => OpCode::SetTable,
+            10 => OpCode::NewTable,
+            11 => OpCode::Self_,
+            12 => OpCode::Add,
+            13 => OpCode::Sub,
+            14 => OpCode::Mul,
+            15 => OpCode::Div,
+            16 => OpCode::Mod,
+            17 => OpCode::Pow,
+            18 => OpCode::Unm,
+            19 => OpCode::Not,
+            20 => OpCode::Len,
+            21 => OpCode::Concat,
+            22 => OpCode::Jmp,
+            23 => OpCode::Eq,
+            24 => OpCode::Lt,
+            25 => OpCode::Le,
+            26 => OpCode::Test,
+            27 => OpCode::TestSet,
+            28 => OpCode::Call,
+            29 => OpCode::TailCall,
+            30 => OpCode::Return,
+            31 => OpCode::ForLoop,
+            32 => OpCode::ForPrep,
+            33 => OpCode::TForLoop,
+            34 => OpCode::SetList,
+            35 => OpCode::Close,
+            36 => OpCode::Closure,
+            37 => OpCode::Vararg,
+            _ => OpCode::Move, // Default fallback
+        }
     }
 }
 
