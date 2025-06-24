@@ -11,6 +11,9 @@ use crate::lua_new::ast::{
     FunctionCall, TableConstructor, TableField
 };
 use crate::lua_new::parser::Parser;
+use crate::lua_new::executor::{CompiledScript, ScriptError};
+use crate::lua_new::vm::LuaVM;
+use crate::lua_new::VMConfig;
 use std::collections::HashMap;
 
 /// Register allocator for the compiler
@@ -168,6 +171,9 @@ pub struct Compiler {
     
     /// Heap for string interning
     heap: *mut crate::lua_new::heap::LuaHeap,
+    
+    /// VM configuration
+    config: VMConfig,
 }
 
 impl Compiler {
@@ -180,6 +186,7 @@ impl Compiler {
             code: Vec::new(),
             upvalues: Vec::new(),
             heap: std::ptr::null_mut(),
+            config: VMConfig::default(),
         }
     }
     
@@ -267,13 +274,51 @@ impl Compiler {
         self.compile_chunk(&ast)
     }
     
+    /// Compile a script
+    pub fn compile_script(&self, source: &str, sha1: String) -> std::result::Result<CompiledScript, ScriptError> {
+        // Create a VM for compilation
+        let mut vm = LuaVM::new(self.config.clone());
+        
+        // Parse the script
+        let mut parser = match crate::lua_new::parser::Parser::new(source, &mut vm.heap) {
+            Ok(p) => p,
+            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
+        };
+        
+        // Parse the AST
+        let ast = match parser.parse() {
+            Ok(ast) => ast,
+            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
+        };
+        
+        // Create compiler and set heap reference
+        let mut compiler = crate::lua_new::compiler::Compiler::new();
+        compiler.set_heap(&mut vm.heap as *mut _);
+        
+        // Compile the AST to a function prototype
+        let proto = match compiler.compile_chunk(&ast) {
+            Ok(p) => p,
+            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
+        };
+        
+        // Create a closure from the prototype
+        let closure = vm.heap.alloc_closure(proto, Vec::new());
+        
+        Ok(CompiledScript {
+            source: source.to_string(),
+            sha1,
+            closure,
+        })
+    }
+
     /// Compile a chunk of code
-    fn compile_chunk(&mut self, chunk: &Chunk) -> Result<FunctionProto> {
+    pub fn compile_chunk(&mut self, chunk: &Chunk) -> Result<FunctionProto> {
         // Reset compiler state
         self.reg_alloc = RegisterAllocator::new();
         self.constants.clear();
         self.code.clear();
         self.upvalues.clear();
+        self.scope = Scope::new();
         
         // Compile statements
         for stmt in &chunk.statements {

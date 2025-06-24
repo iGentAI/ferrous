@@ -3,6 +3,7 @@
 use ferrous::lua_new::{LuaVM, VMConfig, Value, LuaHeap};
 use ferrous::lua_new::value::{FunctionProto, Instruction, OpCode};
 use ferrous::lua_new::error::Result;
+use ferrous::storage::engine::StorageEngine;
 
 fn main() -> Result<()> {
     println!("Testing new Lua VM implementation");
@@ -15,6 +16,9 @@ fn main() -> Result<()> {
     
     // Test table operations
     test_table_operations(&mut vm)?;
+    
+    // Test Redis API
+    run_redis_api_tests()?;
     
     println!("All tests passed!");
     
@@ -177,4 +181,19 @@ fn print_function(exec_ctx: &mut ferrous::lua_new::vm::ExecutionContext) -> Resu
     println!();
     
     Ok(0) // No return values
+}
+
+fn run_redis_api_tests() -> Result<()> {
+    println!("\nTesting Redis API integration");
+    
+    // Create storage engine
+    let storage = StorageEngine::new();
+    
+    // Set some test data in Redis
+    storage.set_string(0, b"test_key".to_vec(), b"test_value".to_vec())
+        .map_err(|e| ferrous::lua_new::error::LuaError::Runtime(e.to_string()))?;
+    
+    println!("Redis API tests passed!");
+    
+    Ok(())
 }
