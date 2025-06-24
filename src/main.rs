@@ -10,7 +10,8 @@ mod storage;
 mod pubsub;
 mod replication;
 mod monitor;
-mod lua;
+// Replace the old lua module with the new implementation
+mod lua_new;
 
 use std::process;
 use error::Result;

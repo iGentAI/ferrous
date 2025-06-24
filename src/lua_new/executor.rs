@@ -5,6 +5,7 @@ use crate::lua_new::value::{Value, ClosureHandle, StringHandle};
 use crate::lua_new::vm::{LuaVM, ExecutionContext};
 use crate::lua_new::error::{LuaError, Result};
 use crate::lua_new::{VMConfig, LuaLimits};
+use crate::lua_new::redis_api::RedisApiContext;
 use crate::storage::engine::StorageEngine;
 use crate::protocol::resp::RespFrame;
 use crate::error::FerrousError;
@@ -128,6 +129,9 @@ impl ScriptExecutor {
         args: Vec<Vec<u8>>,
         db: usize,
     ) -> std::result::Result<RespFrame, FerrousError> {
+        println!("[LUA_NEW] Executing EVAL source={} keys={} args={}", 
+                source, keys.len(), args.len());
+        
         // Compute SHA1
         let sha1 = compute_sha1(source);
         
@@ -168,6 +172,9 @@ impl ScriptExecutor {
         args: Vec<Vec<u8>>,
         db: usize,
     ) -> std::result::Result<RespFrame, FerrousError> {
+        println!("[LUA_NEW] Executing EVALSHA sha1={} keys={} args={}", 
+                sha1, keys.len(), args.len());
+                
         // Look up in cache
         let script = match self.get_cached(sha1) {
             Some(script) => {
@@ -264,15 +271,28 @@ impl ScriptExecutor {
     ) -> std::result::Result<RespFrame, FerrousError> {
         let start_time = Instant::now();
         
+        println!("[LUA_NEW] Starting script execution");
+        
         // Get or create a VM
-        let mut vm = self.get_vm()?;
+        let mut vm = match self.get_vm() {
+            Ok(vm) => vm,
+            Err(e) => return Err(e),
+        };
         
         // Set up killable execution
         let kill_flag = Arc::new(AtomicBool::new(false));
         vm.set_kill_flag(Arc::clone(&kill_flag));
         
         // Set up environment
-        self.setup_environment(&mut vm, &keys, &args, db)?;
+        match self.setup_environment(&mut vm, &keys, &args, db) {
+            Ok(()) => {},
+            Err(e) => {
+                self.return_vm(vm);
+                return Err(e);
+            }
+        }
+        
+        println!("[LUA_NEW] Environment setup complete, executing script");
         
         // Track execution
         {
@@ -285,13 +305,18 @@ impl ScriptExecutor {
         }
         
         // Execute script
-        let result = match vm.execute_with_limits(script.closure, &[], kill_flag) {
+        let result = match vm.execute_with_limits(script.closure, &[], Arc::clone(&kill_flag)) {
             Ok(value) => {
+                println!("[LUA_NEW] Script executed successfully, converting result to RESP");
                 // Convert to Redis response
-                self.value_to_resp(value, &vm.heap)
+                match RedisApiContext::lua_to_resp(&mut vm, value) {
+                    Ok(resp) => Ok(resp),
+                    Err(e) => Ok(RespFrame::Error(Arc::new(format!("ERR {}", e).into_bytes()))),
+                }
             }
             Err(e) => {
                 // Map error to Redis format
+                println!("[LUA_NEW] Script execution error: {}", e);
                 if matches!(e, LuaError::ScriptKilled) {
                     Ok(RespFrame::Error(Arc::new(
                         b"ERR Script killed by user with SCRIPT KILL".to_vec()
@@ -320,6 +345,7 @@ impl ScriptExecutor {
         // Return VM to pool
         self.return_vm(vm);
         
+        println!("[LUA_NEW] Script execution complete");
         result
     }
     
@@ -348,18 +374,22 @@ impl ScriptExecutor {
         }
     }
     
-    /// Set up the Lua environment with KEYS and ARGV
+    /// Setup the Lua environment
     fn setup_environment(
         &self,
         vm: &mut LuaVM,
         keys: &[Vec<u8>],
         args: &[Vec<u8>],
-        _db: usize,
+        db: usize,
     ) -> std::result::Result<(), FerrousError> {
+        println!("[LUA_NEW] Setting up environment with {} keys and {} args", 
+                keys.len(), args.len());
+        
         // Create KEYS table
         let keys_table = vm.heap.alloc_table();
         for (i, key) in keys.iter().enumerate() {
-            let idx = Value::Number((i + 1) as f64); // 1-indexed
+            // Lua tables are 1-indexed
+            let idx = Value::Number((i + 1) as f64);
             let val = Value::String(vm.heap.alloc_string(key));
             vm.heap.get_table_mut(keys_table)
                 .map_err(|e| FerrousError::Internal(e.to_string()))?
@@ -369,7 +399,8 @@ impl ScriptExecutor {
         // Create ARGV table
         let argv_table = vm.heap.alloc_table();
         for (i, arg) in args.iter().enumerate() {
-            let idx = Value::Number((i + 1) as f64); // 1-indexed
+            // Lua tables are 1-indexed
+            let idx = Value::Number((i + 1) as f64);
             let val = Value::String(vm.heap.alloc_string(arg));
             vm.heap.get_table_mut(argv_table)
                 .map_err(|e| FerrousError::Internal(e.to_string()))?
@@ -381,97 +412,31 @@ impl ScriptExecutor {
         let keys_name = vm.heap.create_string("KEYS");
         let argv_name = vm.heap.create_string("ARGV");
         
+        // Set KEYS global
         vm.heap.get_table_mut(globals)
             .map_err(|e| FerrousError::Internal(e.to_string()))?
             .set(Value::String(keys_name), Value::Table(keys_table));
-            
+        
+        // Set ARGV global
         vm.heap.get_table_mut(globals)
             .map_err(|e| FerrousError::Internal(e.to_string()))?
             .set(Value::String(argv_name), Value::Table(argv_table));
         
         // Register Redis API
-        self.register_redis_api(vm)?;
-        
-        Ok(())
-    }
-    
-    /// Register Redis API functions
-    fn register_redis_api(&self, vm: &mut LuaVM) -> std::result::Result<(), FerrousError> {
-        // Create redis table
-        let redis_table = vm.heap.alloc_table();
-        
-        // Register functions - for now, these are stubs
-        // In full implementation, these would call into Redis
-        
-        // Set redis table in globals
-        let globals = vm.globals();
-        let redis_name = vm.heap.create_string("redis");
-        
-        vm.heap.get_table_mut(globals)
-            .map_err(|e| FerrousError::Internal(e.to_string()))?
-            .set(Value::String(redis_name), Value::Table(redis_table));
-        
-        Ok(())
-    }
-    
-    /// Convert a Lua value to a Redis response
-    fn value_to_resp(&self, value: Value, heap: &LuaHeap) -> std::result::Result<RespFrame, FerrousError> {
-        match value {
-            Value::Nil => Ok(RespFrame::Null),
-            
-            Value::Boolean(b) => {
-                Ok(RespFrame::Integer(if b { 1 } else { 0 }))
-            }
-            
-            Value::Number(n) => {
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-                    Ok(RespFrame::Integer(n as i64))
-                } else {
-                    Ok(RespFrame::BulkString(Some(Arc::new(n.to_string().into_bytes()))))
-                }
-            }
-            
-            Value::String(s) => {
-                let bytes = heap.get_string(s)
-                    .map_err(|e| FerrousError::Internal(e.to_string()))?
-                    .to_vec();
-                Ok(RespFrame::BulkString(Some(Arc::new(bytes))))
-            }
-            
-            Value::Table(t) => {
-                // First, collect all the table entries to avoid borrow issues
-                let mut table_values = Vec::new();
-                {
-                    let table = heap.get_table(t)
-                        .map_err(|e| FerrousError::Internal(e.to_string()))?;
-                    let len = table.len();
-                    
-                    for i in 1..=len {
-                        let key = Value::Number(i as f64);
-                        if let Some(val) = table.get(&key) {
-                            table_values.push(*val);
-                        }
-                    }
-                }
-                
-                // Now, convert each value to a RESP frame without borrowing issues
-                let mut elements = Vec::new();
-                for val in table_values {
-                    let resp_val = self.value_to_resp(val, heap)?;
-                    elements.push(resp_val);
-                }
-                
-                Ok(RespFrame::Array(Some(elements)))
-            }
-            
-            _ => {
-                // Function, thread, etc. - convert to string representation
-                Ok(RespFrame::BulkString(Some(Arc::new(
-                    format!("<{}>", value.type_name()).into_bytes()
-                ))))
-            }
+        let redis_ctx = RedisApiContext::new(Arc::clone(&self.storage), db);
+        if let Err(e) = RedisApiContext::register_with_context(vm, redis_ctx) {
+            return Err(FerrousError::Internal(e.to_string()));
         }
+        
+        // Apply sandbox
+        let sandbox = crate::lua_new::sandbox::LuaSandbox::redis_compatible();
+        if let Err(e) = sandbox.apply(vm) {
+            return Err(FerrousError::Internal(e.to_string()));
+        }
+        
+        Ok(())
     }
+
 }
 
 /// Compute SHA1 hash of a script

@@ -951,26 +951,65 @@ impl LuaVM {
         Err(LuaError::InvalidUpvalue(index))
     }
     
-    /// Get a value from a table
+    /// Table get operation
     pub fn table_get(&mut self, table: TableHandle, key: Value) -> Result<Value> {
-        let table_obj = self.heap.get_table(table)?;
-        
-        // Direct lookup
-        if let Some(value) = table_obj.get(&key) {
-            return Ok(*value);
+        // First check direct lookup without metamethods
+        if let Some(value) = {
+            let table_obj = self.heap.get_table(table)?;
+            table_obj.get(&key).copied()
+        } {
+            return Ok(value);
         }
         
-        // Check metatable __index
-        if let Some(metatable) = table_obj.metatable {
-            if let Some(index_value) = self.get_metamethod(metatable, "__index")? {
+        // Now check for metatable
+        let metatable = {
+            let table_obj = self.heap.get_table(table)?;
+            table_obj.metatable
+        };
+        
+        if let Some(mt) = metatable {
+            // Get the __index metamethod
+            if let Some(index_value) = self.get_metamethod(mt, "__index")? {
                 match index_value {
-                    Value::Closure(_) | Value::CFunction(_) => {
-                        // Call metamethod - simplified for now
-                        return Ok(Value::Nil);
-                    }
                     Value::Table(t) => {
-                        // Recursive lookup
+                        // Recursive lookup in the metatable's __index table
                         return self.table_get(t, key);
+                    }
+                    Value::Closure(func) => {
+                        // Call metamethod function with (table, key)
+                        return self.execute_function(func, &[Value::Table(table), key]);
+                    }
+                    Value::CFunction(func) => {
+                        // Need to handle C function specially to avoid borrow checker issues
+                        // Create a separate scope to organize borrows
+                        let (thread_handle, stack_len) = {
+                            let thread = self.heap.get_thread_mut(self.current_thread)?;
+                            // Push table and key onto stack
+                            thread.stack.push(Value::Table(table));
+                            thread.stack.push(key);
+                            (self.current_thread, thread.stack.len())
+                        };
+                        
+                        // Create execution context without borrowing self directly
+                        let mut ctx = ExecutionContext {
+                            vm: self,
+                            base: stack_len - 2,
+                            arg_count: 2,
+                        };
+                        
+                        // Call the function
+                        let ret_count = func(&mut ctx)?;
+                        
+                        // Get return value
+                        if ret_count > 0 {
+                            let thread = self.heap.get_thread(thread_handle)?;
+                            if thread.stack.len() >= ret_count as usize {
+                                return Ok(thread.stack[thread.stack.len() - ret_count as usize]);
+                            }
+                        }
+                        
+                        // No return value or error
+                        return Ok(Value::Nil);
                     }
                     _ => {}
                 }
@@ -987,11 +1026,15 @@ impl LuaVM {
         Ok(())
     }
     
-    /// Get a metamethod from a table
+    /// Get metamethod from a table
     fn get_metamethod(&mut self, table: TableHandle, method: &str) -> Result<Option<Value>> {
-        let key = self.heap.create_string(method);
+        let method_key = self.heap.create_string(method);
+        
+        // Get the table first
         let table_obj = self.heap.get_table(table)?;
-        Ok(table_obj.get(&Value::String(key)).copied())
+        
+        // Check if table has the metamethod
+        Ok(table_obj.get(&Value::String(method_key)).copied())
     }
     
     /// Execute arithmetic operation
