@@ -13,6 +13,7 @@ categories = ["database", "caching"]
 rand = "0.8.5"
 thiserror = "1.0"
 futures = "0.3" # For async/await support
+sha1 = "0.10.5" # For Lua script SHA1 computation
 
 [dev-dependencies]
 # Only for testing and benchmarking

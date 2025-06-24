@@ -19,8 +19,9 @@ use crate::pubsub::{PubSubManager, format_message, format_pmessage,
 use crate::replication::{ReplicationManager, ReplicationConfig};
 use super::{Listener, Connection, ConnectionState, NetworkConfig};
 use crate::Config as FerrousConfig;
-// Add Lua imports to the top of the file
-use crate::lua::{ScriptExecutor, command as lua_command};
+// Replace lua imports with new lua_new imports
+use crate::lua_new::ScriptExecutor;
+use crate::storage::commands::lua as lua_command;
 
 /// Connection ID generator
 static CONN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1056,16 +1057,8 @@ impl Server {
             "QUIT" => Ok(RespFrame::ok()),
             // Add the Lua script commands
             "EVAL" => {
-                let ctx = lua_command::CommandContext {
-                    db,
-                    storage: Arc::clone(&self.storage),
-                    script_executor: Arc::clone(&self.script_executor),
-                };
-                
                 println!("[SERVER DEBUG] Processing EVAL command");
-                
-                // Try to execute the script, but catch any errors that might occur
-                let result = match lua_command::handle_eval_sync(&ctx, parts) {
+                match lua_command::handle_eval(&self.storage, &self.script_executor, db, parts) {
                     Ok(resp) => {
                         println!("[SERVER DEBUG] EVAL executed successfully");
                         Ok(resp)
@@ -1075,21 +1068,11 @@ impl Server {
                         eprintln!("[SERVER ERROR] Lua EVAL error: {}", e);
                         Ok(RespFrame::error(format!("ERR Lua execution error: {}", e)))
                     }
-                };
-                
-                return result;
+                }
             },
             "EVALSHA" => {
-                let ctx = lua_command::CommandContext {
-                    db,
-                    storage: Arc::clone(&self.storage),
-                    script_executor: Arc::clone(&self.script_executor),
-                };
-                
                 println!("[SERVER DEBUG] Processing EVALSHA command");
-                
-                // Try to execute the script, but catch any errors that might occur
-                let result = match lua_command::handle_evalsha_sync(&ctx, parts) {
+                match lua_command::handle_evalsha(&self.storage, &self.script_executor, db, parts) {
                     Ok(resp) => {
                         println!("[SERVER DEBUG] EVALSHA executed successfully");
                         Ok(resp)
@@ -1099,21 +1082,11 @@ impl Server {
                         eprintln!("[SERVER ERROR] Lua EVALSHA error: {}", e);
                         Ok(RespFrame::error(format!("ERR Lua execution error: {}", e)))
                     }
-                };
-                
-                return result;
+                }
             },
             "SCRIPT" => {
-                let ctx = lua_command::CommandContext {
-                    db,
-                    storage: Arc::clone(&self.storage),
-                    script_executor: Arc::clone(&self.script_executor),
-                };
-                
                 println!("[SERVER DEBUG] Processing SCRIPT command");
-                
-                // Try to execute the script command, but catch any errors that might occur
-                let result = match lua_command::handle_script_sync(&ctx, parts) {
+                match lua_command::handle_script(&self.storage, &self.script_executor, db, parts) {
                     Ok(resp) => {
                         println!("[SERVER DEBUG] SCRIPT executed successfully");
                         Ok(resp)
@@ -1123,9 +1096,7 @@ impl Server {
                         eprintln!("[SERVER ERROR] Lua SCRIPT error: {}", e);
                         Ok(RespFrame::error(format!("ERR Lua script error: {}", e)))
                     }
-                };
-                
-                return result;
+                }
             },
             _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command_name))),
         };
