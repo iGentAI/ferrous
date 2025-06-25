@@ -63,12 +63,49 @@ impl RegisterAllocator {
         reg
     }
     
+    /// Allocate multiple consecutive registers
+    fn allocate_consecutive(&mut self, count: u16) -> u16 {
+        // Find a range of 'count' consecutive free registers
+        let mut start_reg = 0;
+        'outer: while start_reg + count <= u16::MAX {
+            // Check if we need to resize allocation table
+            if (start_reg + count) as usize > self.allocated.len() {
+                self.allocated.resize((start_reg + count) as usize, false);
+            }
+            
+            // Check if all registers in range are free
+            for i in 0..count {
+                if self.allocated[(start_reg + i) as usize] {
+                    // Found an allocated register, move past it
+                    start_reg += i + 1;
+                    continue 'outer;
+                }
+            }
+            
+            // If we got here, all registers in range are free
+            for i in 0..count {
+                self.allocated[(start_reg + i) as usize] = true;
+            }
+            
+            // Update next register and max register
+            self.next_reg = start_reg + count;
+            if start_reg + count - 1 > self.max_reg {
+                self.max_reg = start_reg + count - 1;
+            }
+            
+            return start_reg;
+        }
+        
+        // Failed to find consecutive registers, shouldn't happen with reasonable counts
+        panic!("Failed to allocate {} consecutive registers", count);
+    }
+    
     /// Free a register
     fn free(&mut self, reg: u16) {
         if reg < self.allocated.len() as u16 {
             self.allocated[reg as usize] = false;
             
-            // Update next_reg to prefer recently freed registers
+            // Update next_reg to use the newly freed register if it's earlier
             if reg < self.next_reg {
                 self.next_reg = reg;
             }
@@ -944,27 +981,69 @@ impl Compiler {
     fn compile_expression(&mut self, expr: &Node<Expression>) -> Result<u16> {
         match &expr.node {
             Expression::BinaryOp { op, left, right } => {
-                // Special handling for concatenation to ensure proper temporary registers
+                // Special handling for concatenation to ensure the VM semantics are followed
                 if *op == BinaryOperator::Concat {
-                    // For concatenation, we need to ensure any table field access
-                    // is properly evaluated to registers first - and ensure those registers
-                    // are temporary and don't get reused prematurely
+                    // The CONCAT instruction in Lua 5.1 works on a range of registers, not just two operands
+                    // For a .. b, we need consecutive registers and CONCAT will use operands in range
                     
-                    // Step 1: Fully evaluate left operand to a register
+                    // Step 1: Compile left expression first
                     let left_reg = self.compile_expression(left)?;
                     
-                    // Step 2: Fully evaluate right operand to a separate register
-                    let right_reg = self.compile_expression(right)?;
+                    // Step 2: Allocate consecutive register for right operand
+                    // We need a base register and we need to ensure the next register is available
+                    let base_reg = self.reg_alloc.allocate();
+                    let next_reg = self.reg_alloc.allocate();
                     
-                    // Step 3: Allocate separate register for result to avoid potential issues
+                    // Ensure we actually got consecutive registers
+                    if next_reg != base_reg + 1 {
+                        // This is unlikely with our allocator but guard against it
+                        self.reg_alloc.free(next_reg);
+                        self.reg_alloc.free(base_reg);
+                        
+                        // Try again with a more forceful approach
+                        let forced_base = self.reg_alloc.allocate_consecutive(2);
+                        
+                        // Copy left value to first register
+                        self.emit(OpCode::Move, forced_base, left_reg, 0);
+                        
+                        // Now compile right expression and move to second register
+                        let right_reg = self.compile_expression(right)?;
+                        self.emit(OpCode::Move, forced_base + 1, right_reg, 0);
+                        
+                        // Result register for the concatenation
+                        let result_reg = self.reg_alloc.allocate();
+                        
+                        // Emit CONCAT with the BASE and END of range (not left & right)
+                        self.emit(OpCode::Concat, result_reg, forced_base, forced_base + 1);
+                        
+                        // Free all temporary registers
+                        self.reg_alloc.free(forced_base);
+                        self.reg_alloc.free(forced_base + 1);
+                        self.reg_alloc.free(right_reg);
+                        
+                        // Important: We don't free left_reg here as it may be a local variable
+                        
+                        return Ok(result_reg);
+                    }
+                    
+                    // Copy left operand to base register
+                    self.emit(OpCode::Move, base_reg, left_reg, 0);
+                    
+                    // Step 3: Compile right expression and put in next register
+                    let right_reg = self.compile_expression(right)?;
+                    self.emit(OpCode::Move, next_reg, right_reg, 0);
+                    
+                    // Step 4: Allocate destination register for result
                     let result_reg = self.reg_alloc.allocate();
                     
-                    // Step 4: Use CONCAT opcode with the evaluated expressions
-                    self.emit(OpCode::Concat, result_reg, left_reg, right_reg);
+                    // Step 5: Emit CONCAT with the BASE and END of range
+                    self.emit(OpCode::Concat, result_reg, base_reg, next_reg);
                     
-                    // Step 5: Free the operand registers after we're done with them
-                    self.reg_alloc.free(left_reg);
-                    self.reg_alloc.free(right_reg);
+                    // Step 6: Free our temporary registers (not input regs which might be locals)
+                    self.reg_alloc.free(base_reg);
+                    self.reg_alloc.free(next_reg);
+                    
+                    // Don't directly free left_reg and right_reg - they might be local variables!
                     
                     return Ok(result_reg);
                 }
@@ -1069,13 +1148,9 @@ impl Compiler {
                     },
                 }
                 
-                // Free operand registers
-                self.reg_alloc.free(left_reg);
-                self.reg_alloc.free(right_reg);
-                
-                return Ok(result_reg);
+                Ok(result_reg)
             },
-            
+
             // For other expression types, delegate to the base compiler
             _ => match &expr.node {
                 Expression::Variable(var) => {
@@ -1083,7 +1158,11 @@ impl Compiler {
                         Variable::Name(name) => {
                             // Check if it's a local variable
                             if let Some(reg) = self.scope.lookup(name) {
-                                return Ok(reg);
+                                // For local variables, we need to be careful about register handling
+                                // Always copy to a new register to avoid any potential conflicts
+                                let temp_reg = self.reg_alloc.allocate();
+                                self.emit(OpCode::Move, temp_reg, reg, 0);
+                                return Ok(temp_reg);
                             }
                             
                             // Global variable - use GETGLOBAL instruction
@@ -1105,9 +1184,8 @@ impl Compiler {
                             let dest_reg = self.reg_alloc.allocate();
                             self.emit(OpCode::GetTable, dest_reg, table_reg, key_reg);
                             
-                            // Free registers
-                            self.reg_alloc.free(table_reg);
-                            self.reg_alloc.free(key_reg);
+                            // IMPORTANT: We do NOT free these registers here
+                            // In complex expressions, freeing prematurely causes issues
                             
                             Ok(dest_reg)
                         },
@@ -1121,6 +1199,7 @@ impl Compiler {
                             
                             // Ensure constant index is within limits (0-255 for RK)
                             let dest_reg = self.reg_alloc.allocate();
+                            
                             if const_idx > 0xFF {
                                 // If index is too large, load constant into a register first
                                 let key_reg = self.reg_alloc.allocate();
@@ -1129,15 +1208,14 @@ impl Compiler {
                                 // Then use the register
                                 self.emit(OpCode::GetTable, dest_reg, table_reg, key_reg);
                                 
-                                // Free the key register
+                                // Free the key register - this is safe as it's a pure temporary
                                 self.reg_alloc.free(key_reg);
                             } else {
                                 // GetTable with constant key (RK format)
                                 self.emit(OpCode::GetTable, dest_reg, table_reg, 0x100 | const_idx);
                             }
                             
-                            // Free register
-                            self.reg_alloc.free(table_reg);
+                            // IMPORTANT: We do NOT free table_reg here to avoid reuse conflicts
                             
                             Ok(dest_reg)
                         }

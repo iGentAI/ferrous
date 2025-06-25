@@ -50,6 +50,8 @@ impl<'a> ExecutionContext<'a> {
     
     /// Push a return value
     pub fn push_result(&mut self, value: Value) -> Result<()> {
+        // Add directly to the thread stack - the Call opcode handler will
+        // find the values based on the stack size before and after the call
         let thread = self.vm.heap.get_thread_mut(self.vm.current_thread)?;
         thread.stack.push(value);
         Ok(())
@@ -590,13 +592,16 @@ impl LuaVM {
             
             OpCode::Concat => {
                 // R(A) := R(B).. ... ..R(C)
-                // Improved implementation with better error handling
+                // Important: This concatenates a RANGE of values from B to C inclusive
+                // B and C can be either registers or constants (RK format)
                 
                 // First collect all values and convert them to strings to avoid double borrowing
                 let mut values_to_concat = Vec::new();
                 
+                // For each value in the range from B to C inclusive
                 for i in b..=c {
-                    let value = self.get_register(frame.base_register, i)?;
+                    // Use get_rk to handle both registers and constants
+                    let value = self.get_rk(&frame, i)?;
                     
                     // Convert each value to a string representation
                     let str_value = match value {
@@ -606,18 +611,25 @@ impl LuaVM {
                                 .map_err(|_| LuaError::InvalidEncoding)?
                                 .to_string()
                         }
-                        Value::Number(n) => n.to_string(),
-                        Value::Nil => "nil".to_string(),
-                        Value::Boolean(b) => if b { "true".to_string() } else { "false".to_string() },
+                        Value::Number(n) => {
+                            // Format number appropriately - Lua automatically converts numbers to strings
+                            n.to_string()
+                        },
+                        Value::Nil => {
+                            return Err(LuaError::TypeError("attempt to concatenate a nil value".to_string()));
+                        },
+                        Value::Boolean(_) => {
+                            return Err(LuaError::TypeError("attempt to concatenate a boolean value".to_string()));
+                        },
                         Value::Table(_) => {
                             return Err(LuaError::TypeError("attempt to concatenate a table value".to_string()));
-                        }
+                        },
                         Value::Closure(_) | Value::CFunction(_) => {
                             return Err(LuaError::TypeError("attempt to concatenate a function value".to_string()));
-                        }
+                        },
                         Value::Thread(_) => {
                             return Err(LuaError::TypeError("attempt to concatenate a thread value".to_string()));
-                        }
+                        },
                     };
                     
                     values_to_concat.push(str_value);
@@ -753,26 +765,36 @@ impl LuaVM {
                         return Ok(ExecutionStatus::Continue);
                     }
                     Value::CFunction(cfunc) => {
-                        // Call C function directly
+                        // Record stack size before call to know where results will be pushed
+                        let stack_size_before = {
+                            let thread = self.heap.get_thread(self.current_thread)?;
+                            thread.stack.len()
+                        };
+                        
+                        // Create execution context
                         let mut ctx = ExecutionContext {
                             vm: self,
                             base: frame.base_register as usize + a + 1,
                             arg_count: args.len(),
                         };
                         
+                        // Call function and get return count
                         let ret_count = cfunc(&mut ctx)?;
                         
-                        // Move returns to correct positions
+                        // The return values have been pushed to the end of the stack
+                        // We need to move them to their expected locations
                         let thread = self.heap.get_thread_mut(self.current_thread)?;
                         let base = frame.base_register as usize;
                         
+                        // Copy values from where they were pushed to where they're expected
                         for i in 0..ret_count as usize {
-                            if base + a + i < thread.stack.len() {
-                                thread.stack[base + a + i] = thread.stack[base + a + 1 + arg_count + i];
+                            // Make sure we don't go out of bounds
+                            if stack_size_before + i < thread.stack.len() && base + a + i < thread.stack.len() {
+                                thread.stack[base + a + i] = thread.stack[stack_size_before + i];
                             }
                         }
                         
-                        // Clear extra values
+                        // Truncate the stack to remove extra copies of the return values
                         thread.stack.truncate(base + a + ret_count as usize);
                         
                         // Continue execution
@@ -982,32 +1004,46 @@ impl LuaVM {
     /// Get RK value (register or constant)
     fn get_rk(&self, frame: &CallFrame, index: usize) -> Result<Value> {
         if index & 0x100 != 0 {
-            // Constant - but we should check if the index is valid
+            // This is an RK format (constant with high bit set)
+            // Extract the constant index (remove the high bit)
             let const_idx = index & 0xFF;
             
-            // Get the constant directly - don't go past the end of the constants table
+            // Get the closure to access its constants table
             let closure_obj = self.heap.get_closure(frame.closure)?;
             
+            // Safely check if the constant index is valid
             if const_idx >= closure_obj.proto.constants.len() {
                 return Err(LuaError::InvalidOperation(
-                    format!("register {} out of bounds", index)
+                    format!("constant index {} out of bounds (max {})", 
+                            const_idx, closure_obj.proto.constants.len() - 1)
                 ));
             }
             
+            // Return a copy of the constant
             Ok(closure_obj.proto.constants[const_idx].clone())
         } else {
-            // Register
+            // Regular register
             self.get_register(frame.base_register, index)
         }
     }
     
-    /// Get a constant value
+    /// Get a constant value with proper bounds checking
     fn get_constant(&self, closure: ClosureHandle, index: usize) -> Result<Value> {
         let closure_obj = self.heap.get_closure(closure)?;
         
-        closure_obj.proto.constants.get(index)
-            .copied()
-            .ok_or(LuaError::InvalidConstant(index))
+        if index >= closure_obj.proto.constants.len() {
+            return Err(LuaError::InvalidOperation(
+                format!("constant index {} out of bounds (max {})", 
+                        index, 
+                        if closure_obj.proto.constants.is_empty() {
+                            0
+                        } else {
+                            closure_obj.proto.constants.len() - 1
+                        })
+            ));
+        }
+        
+        Ok(closure_obj.proto.constants[index].clone())
     }
     
     /// Get a function prototype for a CLOSURE instruction
@@ -1098,100 +1134,76 @@ impl LuaVM {
     
     /// Table get operation
     pub fn table_get(&mut self, table: TableHandle, key: Value) -> Result<Value> {
-        // First check direct lookup without metamethods
+        // Direct table lookup - most common case
         if let Some(value) = {
             let table_obj = self.heap.get_table(table)?;
-            table_obj.get(&key).copied()
+            table_obj.get(&key).copied()  // Copy value to avoid borrowing issues
         } {
             return Ok(value);
         }
         
-        // Now check for metatable
-        let metatable = {
+        // Metatable lookup - use the __index metamethod if available
+        let metatable_opt = {
             let table_obj = self.heap.get_table(table)?;
-            table_obj.metatable
+            table_obj.metatable  // Get metatable handle (if any)
         };
         
-        if let Some(mt) = metatable {
-            // Get the __index metamethod
-            if let Some(index_value) = self.get_metamethod(mt, "__index")? {
+        if let Some(metatable) = metatable_opt {
+            let metamethod_key = self.heap.create_string("__index");
+            
+            // Look up __index in metatable
+            let index_opt = {
+                let metatable_obj = self.heap.get_table(metatable)?;
+                metatable_obj.get(&Value::String(metamethod_key)).copied()
+            };
+            
+            // Process based on metamethod type
+            if let Some(index_value) = index_opt {
                 match index_value {
-                    Value::Table(t) => {
-                        // Recursive lookup in the metatable's __index table
-                        return self.table_get(t, key);
-                    }
+                    Value::Table(index_table) => {
+                        // Recursive lookup in the __index table
+                        self.table_get(index_table, key)
+                    },
                     Value::Closure(func) => {
-                        // CRITICAL FIX: Instead of recursively calling execute_function,
-                        // we need to use a separate thread to execute the metamethod.
-                        
-                        // Arguments for the metamethod
-                        let args = vec![Value::Table(table), key];
-                        
-                        // Create a temporary thread
-                        let temp_thread = self.heap.alloc_thread();
-                        
-                        // Save original thread
-                        let original_thread = self.current_thread;
-                        
-                        // Switch to the temporary thread
-                        self.current_thread = temp_thread;
-                        
-                        // Push the call frame on the TEMPORARY thread
-                        self.push_call_frame(func, &args)?;
-                        
-                        // Execute the metamethod on the temporary thread
-                        let result = match self.execute_function(func, &args) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                // Restore original thread before propagating error
-                                self.current_thread = original_thread;
-                                return Err(e);
-                            }
-                        };
-                        
-                        // Restore the original thread
-                        self.current_thread = original_thread;
-                        
-                        return Ok(result);
-                    }
+                        // Call the __index function with (table, key)
+                        let args = vec![Value::Table(table), key]; 
+                        self.execute_function(func, &args)
+                    },
                     Value::CFunction(func) => {
-                        // Need to handle C function specially to avoid borrow checker issues
-                        // Create a separate scope to organize borrows
-                        let (thread_handle, stack_len) = {
-                            let thread = self.heap.get_thread_mut(self.current_thread)?;
-                            // Push table and key onto stack
-                            thread.stack.push(Value::Table(table));
-                            thread.stack.push(key);
-                            (self.current_thread, thread.stack.len())
-                        };
+                        // Call C function for __index
+                        // First prepare the stack
+                        let thread = self.heap.get_thread_mut(self.current_thread)?;
+                        thread.stack.push(Value::Table(table));
+                        thread.stack.push(key);
                         
-                        // Create execution context without borrowing self directly
+                        // Create execution context
+                        let stack_size = thread.stack.len();
                         let mut ctx = ExecutionContext {
                             vm: self,
-                            base: stack_len - 2,
+                            base: stack_size - 2,
                             arg_count: 2,
                         };
                         
                         // Call the function
                         let ret_count = func(&mut ctx)?;
                         
-                        // Get return value
+                        // Return the result (or nil if no results)
                         if ret_count > 0 {
-                            let thread = self.heap.get_thread(thread_handle)?;
-                            if thread.stack.len() >= ret_count as usize {
-                                return Ok(thread.stack[thread.stack.len() - ret_count as usize]);
-                            }
+                            let thread = self.heap.get_thread(self.current_thread)?;
+                            // Return the top value from stack
+                            Ok(thread.stack[thread.stack.len() - 1])
+                        } else {
+                            Ok(Value::Nil)
                         }
-                        
-                        // No return value or error
-                        return Ok(Value::Nil);
-                    }
-                    _ => {}
+                    },
+                    _ => Ok(Value::Nil),  // __index is not a table or function
                 }
+            } else {
+                Ok(Value::Nil)  // No __index metamethod
             }
+        } else {
+            Ok(Value::Nil)  // No metatable
         }
-        
-        Ok(Value::Nil)
     }
     
     /// Set a value in a table
@@ -1297,3 +1309,4 @@ impl LuaVM {
         self.kill_flag = None;
     }
 }
+
