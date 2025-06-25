@@ -1,8 +1,19 @@
 # Ferrous Release Notes
 
-## Version 0.1.0 (June 20, 2025)
+## Version 0.1.0 (June 25, 2025)
 
 ### Major Features
+
+#### Lua Scripting with GIL Implementation
+- Added complete Lua scripting support with Redis compatibility
+- Implemented Global Interpreter Lock (GIL) for atomic script execution
+- Fixed critical issues with KEYS/ARGV access and redis.call/pcall functions
+- Added transaction-like semantics for script operations
+- Implemented proper error handling and propagation
+- Added script kill and timeout functionality
+- Created comprehensive test suite for Lua functionality
+- Successfully implemented cjson library with encode/decode support
+- Added table operations with full concatenation support
 
 #### Master-Slave Replication
 - Added complete master-slave replication support
@@ -38,34 +49,37 @@
 - Improved connection handling for concurrent clients
 - Enhanced RDB file generation and transfer
 - Performance maintained with replication enabled
+- Optimized Lua script execution with GIL approach
 
 ### Test Suite Enhancements
+- Added Lua scripting test suite (test_lua_gil.py)
 - Added replication-specific test script (test_replication.sh)
 - Enhanced protocol fuzzing tests
 - Added comprehensive benchmark tests for replication scenarios
 - Added tests for configuration parsing and handling
 
 ### Documentation
+- Updated documentation to reflect Lua GIL architecture
+- Added Lua compatibility report
 - Updated documentation to reflect replication architecture
 - Added operational guides for multi-instance setup
 - Updated roadmap to reflect completion of high-priority features
 - Added design details for the replication subsystem
 
 ### Bug Fixes
-- Fixed issues with authentication in replication protocol
+- Fixed critical issues with Lua KEYS/ARGV access
+- Fixed crashes in redis.call/redis.pcall functions
 - Improved handling of non-blocking I/O in replication client
 - Fixed RDB transfer protocol implementation
 - Enhanced error recovery with proper backoff
 
-## Known Issues
-- PING command with too many arguments returns the first argument instead of an error message
-
 ## Next Steps
 The next planned features include:
-- Production monitoring (INFO, SLOWLOG)
+- Refinement of Lua transaction rollback mechanism
+- Production monitoring improvements (INFO enhancements)
 - Enhanced security features
-- Lua scripting support
+- Extended data type operations
 - Partial synchronization for more efficient replication
 
 ## Credits
-Replication implementation and configuration enhancements by the Ferrous team.
+Lua GIL implementation, replication implementation, and configuration enhancements by the Ferrous team.

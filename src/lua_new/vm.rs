@@ -157,10 +157,14 @@ impl LuaVM {
         Ok(())
     }
     
-    /// Check resource limits
+    /// Check resource limits and kill flag
     pub fn check_limits(&mut self) -> Result<()> {
-        // Check kill flag
-        self.check_kill()?;
+        // Check kill flag first
+        if let Some(flag) = &self.kill_flag {
+            if flag.load(Ordering::Relaxed) {
+                return Err(LuaError::ScriptKilled);
+            }
+        }
         
         // Increment and check instruction count
         self.instruction_count += 1;
@@ -199,6 +203,20 @@ impl LuaVM {
         
         // Main execution loop - keep executing until we return to the initial depth
         loop {
+            // Check kill flag first - this allows script termination
+            if let Some(flag) = &self.kill_flag {
+                if flag.load(Ordering::Relaxed) {
+                    println!("[LUA_VM] Script killed by kill flag");
+                    return Err(LuaError::ScriptKilled);
+                }
+            }
+            
+            // Check resource limits
+            if let Err(e) = self.check_limits() {
+                println!("[LUA_VM] Resource limit exceeded: {}", e);
+                return Err(e);
+            }
+            
             // Check if we've returned to the initial level or below
             let current_depth = {
                 let thread = self.heap.get_thread(self.current_thread)?;
@@ -457,27 +475,44 @@ impl LuaVM {
             OpCode::GetTable => {
                 // R(A) := R(B)[R(C)]
                 let table_val = self.get_register(frame.base_register, b)?;
-                let key = if c >= 0x100 {
-                    // This is an RK format (constant with high bit set)
-                    // Extract the constant index (remove the high bit)
-                    let const_idx = c & 0xFF;
-                    
-                    // Get the constant from closure constants
-                    let closure_obj = self.heap.get_closure(frame.closure)?;
-                    if const_idx >= closure_obj.proto.constants.len() {
-                        return Err(LuaError::InvalidOperation(format!("constant index {} out of bounds", const_idx)));
-                    }
-                    
-                    closure_obj.proto.constants[const_idx].clone()
-                } else {
-                    // Regular register
-                    self.get_register(frame.base_register, c)?
-                };
+                
+                // Extra validation for table type
+                if !matches!(table_val, Value::Table(_)) {
+                    return Err(LuaError::TypeError(format!(
+                        "attempt to index a {} value (not a table)", 
+                        table_val.type_name()
+                    )));
+                }
+                
+                let key = self.get_rk(&frame, c)?;
+                
+                // Additional validation for nil key
+                if matches!(key, Value::Nil) {
+                    return Err(LuaError::TypeError("table index is nil".to_string()));
+                }
                 
                 if let Value::Table(table) = table_val {
-                    let value = self.table_get(table, key)?;
-                    self.set_register(frame.base_register, a, value)?;
+                    // Extra validation for table handle
+                    if !self.heap.is_valid_table(table) {
+                        println!("[VM_ERROR] Invalid table handle: {:?}", table);
+                        return Err(LuaError::InvalidHandle);
+                    }
+                    
+                    // Extra debug information
+                    println!("[VM_DEBUG] GetTable: A={}, B={}, C={}, table={:?}, key={:?}", 
+                             a, b, c, table, key);
+                    
+                    match self.table_get(table, key) {
+                        Ok(value) => {
+                            self.set_register(frame.base_register, a, value)?;
+                        }
+                        Err(e) => {
+                            println!("[VM_ERROR] Table get failed: {}", e);
+                            return Err(e);
+                        }
+                    }
                 } else {
+                    // Should never happen due to the type check above
                     return Err(LuaError::TypeError("attempt to index a non-table".to_string()));
                 }
             }
@@ -499,28 +534,44 @@ impl LuaVM {
             OpCode::SetTable => {
                 // R(A)[R(B)] := R(C)
                 let table_val = self.get_register(frame.base_register, a)?;
-                let key = if b >= 0x100 {
-                    // This is an RK format (constant with high bit set)
-                    // Extract the constant index (remove the high bit)
-                    let const_idx = b & 0xFF;
-                    
-                    // Get the constant from closure constants
-                    let closure_obj = self.heap.get_closure(frame.closure)?;
-                    if const_idx >= closure_obj.proto.constants.len() {
-                        return Err(LuaError::InvalidOperation(format!("constant index {} out of bounds", const_idx)));
-                    }
-                    
-                    closure_obj.proto.constants[const_idx].clone()
-                } else {
-                    // Regular register
-                    self.get_register(frame.base_register, b)?
-                };
                 
-                let value = self.get_register(frame.base_register, c)?;
+                // Extra validation for table type
+                if !matches!(table_val, Value::Table(_)) {
+                    return Err(LuaError::TypeError(format!(
+                        "attempt to index a {} value (not a table)", 
+                        table_val.type_name()
+                    )));
+                }
+                
+                let key = self.get_rk(&frame, b)?;
+                
+                // Additional validation for nil key
+                if matches!(key, Value::Nil) {
+                    return Err(LuaError::TypeError("table index is nil".to_string()));
+                }
+                
+                let value = self.get_rk(&frame, c)?;
                 
                 if let Value::Table(table) = table_val {
-                    self.table_set(table, key, value)?;
+                    // Extra validation for table handle
+                    if !self.heap.is_valid_table(table) {
+                        println!("[VM_ERROR] Invalid table handle: {:?}", table);
+                        return Err(LuaError::InvalidHandle);
+                    }
+                    
+                    // Extra debug information
+                    println!("[VM_DEBUG] SetTable: A={}, B={}, C={}, table={:?}, key={:?}, value={:?}", 
+                             a, b, c, table, key, value);
+                    
+                    match self.table_set(table, key, value) {
+                        Ok(()) => {},
+                        Err(e) => {
+                            println!("[VM_ERROR] Table set failed: {}", e);
+                            return Err(e);
+                        }
+                    }
                 } else {
+                    // Should never happen due to the type check above
                     return Err(LuaError::TypeError("attempt to index a non-table".to_string()));
                 }
             }
@@ -1001,28 +1052,39 @@ impl LuaVM {
         Ok(())
     }
     
-    /// Get RK value (register or constant)
+    /// Get register or constant (RK format) with enhanced error handling
     fn get_rk(&self, frame: &CallFrame, index: usize) -> Result<Value> {
+        println!("[VM_DEBUG] get_rk called with index: {}", index);
+        
         if index & 0x100 != 0 {
             // This is an RK format (constant with high bit set)
             // Extract the constant index (remove the high bit)
             let const_idx = index & 0xFF;
             
             // Get the closure to access its constants table
-            let closure_obj = self.heap.get_closure(frame.closure)?;
+            let closure_obj = match self.heap.get_closure(frame.closure) {
+                Ok(c) => c,
+                Err(e) => {
+                    println!("[VM_ERROR] Failed to get closure for RK format: {}", e);
+                    return Err(e);
+                }
+            };
             
             // Safely check if the constant index is valid
             if const_idx >= closure_obj.proto.constants.len() {
-                return Err(LuaError::InvalidOperation(
-                    format!("constant index {} out of bounds (max {})", 
-                            const_idx, closure_obj.proto.constants.len() - 1)
-                ));
+                println!("[VM_ERROR] Constant index {} out of bounds (max {})", 
+                        const_idx, 
+                        if closure_obj.proto.constants.is_empty() { 0 } 
+                        else { closure_obj.proto.constants.len() - 1 });
+                return Err(LuaError::InvalidConstant(const_idx));
             }
             
+            println!("[VM_DEBUG] RK format: using constant at index {}", const_idx);
             // Return a copy of the constant
             Ok(closure_obj.proto.constants[const_idx].clone())
         } else {
             // Regular register
+            println!("[VM_DEBUG] RK format: using register at index {}", index);
             self.get_register(frame.base_register, index)
         }
     }
@@ -1132,28 +1194,60 @@ impl LuaVM {
         Err(LuaError::InvalidUpvalue(index))
     }
     
-    /// Table get operation
+    /// Table get operation with enhanced handle validation
     pub fn table_get(&mut self, table: TableHandle, key: Value) -> Result<Value> {
+        // Add explicit handle validation first
+        if !self.heap.is_valid_table(table) {
+            println!("[LUA_ERROR] Invalid table handle in table_get: {:?}", table);
+            return Err(LuaError::InvalidHandle);
+        }
+        
         // Direct table lookup - most common case
-        if let Some(value) = {
+        let table_lookup_result = {
             let table_obj = self.heap.get_table(table)?;
             table_obj.get(&key).copied()  // Copy value to avoid borrowing issues
-        } {
+        };
+        
+        if let Some(value) = table_lookup_result {
             return Ok(value);
+        }
+        
+        // Check if key access would be valid
+        if matches!(key, Value::Nil) {
+            println!("[LUA_ERROR] Invalid nil key in table_get");
+            return Err(LuaError::TypeError("table index is nil".to_string()));
         }
         
         // Metatable lookup - use the __index metamethod if available
         let metatable_opt = {
-            let table_obj = self.heap.get_table(table)?;
+            let table_obj = match self.heap.get_table(table) {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("[LUA_ERROR] Failed to get table for metatable lookup: {}", e);
+                    return Err(e);
+                }
+            };
             table_obj.metatable  // Get metatable handle (if any)
         };
         
         if let Some(metatable) = metatable_opt {
+            // Validate metatable handle
+            if !self.heap.is_valid_table(metatable) {
+                println!("[LUA_ERROR] Invalid metatable handle: {:?}", metatable);
+                return Err(LuaError::InvalidHandle);
+            }
+            
             let metamethod_key = self.heap.create_string("__index");
             
             // Look up __index in metatable
             let index_opt = {
-                let metatable_obj = self.heap.get_table(metatable)?;
+                let metatable_obj = match self.heap.get_table(metatable) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        println!("[LUA_ERROR] Failed to get metatable: {}", e);
+                        return Err(e);
+                    }
+                };
                 metatable_obj.get(&Value::String(metamethod_key)).copied()
             };
             
@@ -1162,15 +1256,18 @@ impl LuaVM {
                 match index_value {
                     Value::Table(index_table) => {
                         // Recursive lookup in the __index table
+                        println!("[LUA_DEBUG] using table __index: {:?}", index_table);
                         self.table_get(index_table, key)
                     },
                     Value::Closure(func) => {
                         // Call the __index function with (table, key)
+                        println!("[LUA_DEBUG] calling closure __index: {:?}", func);
                         let args = vec![Value::Table(table), key]; 
                         self.execute_function(func, &args)
                     },
                     Value::CFunction(func) => {
                         // Call C function for __index
+                        println!("[LUA_DEBUG] calling C function __index");
                         // First prepare the stack
                         let thread = self.heap.get_thread_mut(self.current_thread)?;
                         thread.stack.push(Value::Table(table));
@@ -1196,12 +1293,17 @@ impl LuaVM {
                             Ok(Value::Nil)
                         }
                     },
-                    _ => Ok(Value::Nil),  // __index is not a table or function
+                    _ => {
+                        println!("[LUA_DEBUG] __index is not a table or function: {:?}", index_value);
+                        Ok(Value::Nil)  // __index is not a table or function
+                    }
                 }
             } else {
+                println!("[LUA_DEBUG] No __index metamethod found");
                 Ok(Value::Nil)  // No __index metamethod
             }
         } else {
+            println!("[LUA_DEBUG] No metatable found");
             Ok(Value::Nil)  // No metatable
         }
     }
@@ -1307,6 +1409,30 @@ impl LuaVM {
         
         // Clear kill flag
         self.kill_flag = None;
+    }
+    
+    /// Reset the VM to a clean state
+    pub fn full_reset(&mut self) {
+        println!("[LUA_VM] Performing full VM reset");
+        
+        // Reset kill flag
+        self.kill_flag = None;
+        
+        // Reset instruction count
+        self.instruction_count = 0;
+        
+        // Create a completely fresh heap
+        // This is the key to resolving handle validity issues
+        self.heap = LuaHeap::new();
+        
+        // Create a new main thread
+        self.current_thread = self.heap.alloc_thread();
+        
+        // Create fresh global environment and registry
+        self.globals = self.heap.alloc_table();
+        self.registry = self.heap.alloc_table();
+        
+        println!("[LUA_VM] Full reset complete, created fresh heap and thread");
     }
 }
 

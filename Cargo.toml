@@ -10,10 +10,13 @@ keywords = ["redis", "database", "cache", "nosql"]
 categories = ["database", "caching"]
 
 [dependencies]
+lazy_static = "1.4"
 rand = "0.8.5"
 thiserror = "1.0"
 futures = "0.3" # For async/await support
 sha1 = "0.10.5" # For Lua script SHA1 computation
+uuid = { version = "1.3.0", features = ["v4"] } # For transaction IDs
+tokio = { version = "1.0", features = ["rt", "time"] } # For async operations and timeouts
 
 [dev-dependencies]
 # Only for testing and benchmarking

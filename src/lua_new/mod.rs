@@ -6,6 +6,9 @@
 //! - Redis API compatibility (redis.call, redis.pcall, etc.)
 //! - Memory and CPU usage limits
 //! - Generational arena for efficient memory management
+//! - Global Interpreter Lock (GIL) for atomic script execution
+
+use std::time::Duration;
 
 pub mod arena;
 pub mod error;
@@ -22,6 +25,7 @@ pub mod ast;
 pub mod lexer;
 pub mod cjson;
 pub mod sha1;
+pub mod gil;
 
 #[cfg(test)]
 mod test_cjson;
@@ -34,6 +38,7 @@ pub use heap::LuaHeap;
 pub use sandbox::LuaSandbox;
 pub use parser::Parser;
 pub use compiler::Compiler;
+pub use gil::LuaGIL;
 
 /// Resource limits for Lua scripts
 #[derive(Debug, Clone)]
@@ -77,6 +82,9 @@ pub struct VMConfig {
     
     /// Resource limits
     pub limits: LuaLimits,
+    
+    /// Script execution timeout
+    pub script_timeout: Duration,
 }
 
 impl Default for VMConfig {
@@ -85,6 +93,7 @@ impl Default for VMConfig {
             deterministic: true,  // Redis requires determinism
             debug: false,
             limits: LuaLimits::default(),
+            script_timeout: Duration::from_millis(500), // 500ms timeout for testing
         }
     }
 }

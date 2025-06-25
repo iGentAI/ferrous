@@ -66,10 +66,16 @@ pub enum LuaError {
     
     /// Compilation error
     CompileError(String),
+    
+    /// Script execution timeout
+    Timeout,
+    
+    /// No context available
+    NoContext,
 }
 
-impl fmt::Display for LuaError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for LuaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LuaError::Runtime(msg) => write!(f, "runtime error: {}", msg),
             LuaError::TypeError(msg) => write!(f, "type error: {}", msg),
@@ -91,6 +97,8 @@ impl fmt::Display for LuaError {
             LuaError::ResourceLimit(msg) => write!(f, "resource limit: {}", msg),
             LuaError::ScriptKilled => write!(f, "script killed"),
             LuaError::CompileError(msg) => write!(f, "compile error: {}", msg),
+            LuaError::Timeout => write!(f, "script execution timeout"),
+            LuaError::NoContext => write!(f, "no script context available"),
         }
     }
 }

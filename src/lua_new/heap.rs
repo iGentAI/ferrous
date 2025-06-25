@@ -848,6 +848,53 @@ impl LuaHeap {
         
         white_count + black_count
     }
+    
+    /// Check if a table handle is valid
+    pub fn is_valid_table(&self, handle: TableHandle) -> bool {
+        self.tables.contains(handle.0)
+    }
+    
+    /// Check if a string handle is valid
+    pub fn is_valid_string(&self, handle: StringHandle) -> bool {
+        self.strings.contains(handle.0)
+    }
+    
+    /// Check if a closure handle is valid
+    pub fn is_valid_closure(&self, handle: ClosureHandle) -> bool {
+        self.closures.contains(handle.0)
+    }
+    
+    /// Check if a thread handle is valid
+    pub fn is_valid_thread(&self, handle: ThreadHandle) -> bool {
+        self.threads.contains(handle.0)
+    }
+    
+    /// Get a string with validation
+    pub fn get_string_safe(&self, handle: StringHandle) -> Option<&[u8]> {
+        if self.is_valid_string(handle) {
+            self.strings.get(handle.0).map(|obj| obj.bytes.as_ref())
+        } else {
+            None
+        }
+    }
+    
+    /// Get a table with validation
+    pub fn get_table_safe(&self, handle: TableHandle) -> Option<&TableObject> {
+        if self.is_valid_table(handle) {
+            self.tables.get(handle.0)
+        } else {
+            None
+        }
+    }
+    
+    /// Get a closure with validation
+    pub fn get_closure_safe(&self, handle: ClosureHandle) -> Option<&ClosureObject> {
+        if self.is_valid_closure(handle) {
+            self.closures.get(handle.0)
+        } else {
+            None
+        }
+    }
 }
 
 impl Default for LuaHeap {
