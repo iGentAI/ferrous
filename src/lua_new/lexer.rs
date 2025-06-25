@@ -304,7 +304,7 @@ impl<'a> Lexer<'a> {
     /// Skip a long comment
     fn skip_long_comment(&mut self) -> Result<()> {
         // Skip until ]]
-        let mut bracket_count = 0;
+        let bracket_count = 0;
         while let Some(ch) = self.next_char() {
             if ch == ']' {
                 if self.peek_char() == Some(']') {

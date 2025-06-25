@@ -22,7 +22,13 @@ Ferrous is currently at Phase 4 implementation, with several key features comple
 - ✅ Enhanced RESP protocol parsing
 - ✅ Master-slave replication
 - ✅ SCAN command family for safe iteration
-- ✅ Improved Lua VM with proper register allocation
+- ✅ Improved Lua VM with proper memory management
+- ✅ cjson.encode support
+
+### Known Limitations:
+- ⚠️ Table field concatenation issues with complex operations in Lua scripts
+- ⚠️ Command renaming/disabling not implemented yet
+- ⚠️ Protected mode not implemented
 
 ### Coming Soon (Remaining Phase 4-6):
 - Production monitoring (INFO, SLOWLOG)

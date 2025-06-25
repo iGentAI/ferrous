@@ -13,7 +13,6 @@ use crate::lua_new::value::{Value, StringHandle, TableHandle, CFunction};
 use crate::lua_new::error::{LuaError, Result};
 use crate::storage::engine::StorageEngine;
 use crate::protocol::resp::RespFrame;
-use sha1::{Sha1, Digest};
 use std::sync::Arc;
 
 /// Redis API context
@@ -727,14 +726,13 @@ fn redis_sha1hex_impl(exec_ctx: &mut ExecutionContext) -> Result<i32> {
         _ => return Err(LuaError::TypeError("redis.sha1hex requires a string".to_string())),
     };
     
-    // Compute SHA1
-    let mut hasher = Sha1::new();
-    hasher.update(&input);
-    let hash = hasher.finalize();
+    // Compute SHA1 using our module
+    let input_str = std::str::from_utf8(&input)
+        .map_err(|_| LuaError::InvalidEncoding)?;
+    let hash = crate::lua_new::sha1::compute_sha1(input_str);
     
-    // Convert to hex string
-    let hex_string = format!("{:x}", hash);
-    let handle = exec_ctx.vm.heap.create_string(&hex_string);
+    // Create string handle
+    let handle = exec_ctx.vm.heap.create_string(&hash);
     
     // Return the hash
     exec_ctx.push_result(Value::String(handle))?;

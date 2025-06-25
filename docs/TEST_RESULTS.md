@@ -1,16 +1,16 @@
 # Ferrous Test Results Report
 
-**Date**: June 20, 2025
+**Date**: June 25, 2025
 **Version**: 0.1.0 (Phase 4 Implementation)
 
 ## Executive Summary
 
-The Ferrous Redis-compatible server has been successfully implemented through Phase 4, with significant features now complete. All core functionality tests passed, demonstrating 100% protocol compatibility for implemented commands. The server remained stable under stress testing, including high-throughput pipeline operations and concurrent client scenarios. Performance tests show excellent results compared to Redis, with some operations exceeding Redis performance in pipelined mode. Recently implemented features including master-slave replication, SLOWLOG, MONITOR, CLIENT commands, and memory tracking are fully functional and pass all tests.
+The Ferrous Redis-compatible server has been successfully implemented through Phase 4, with significant features now complete. All core functionality tests passed, demonstrating 100% protocol compatibility for implemented commands. The server remained stable under stress testing, including high-throughput pipeline operations and concurrent client scenarios. Performance tests show excellent results compared to Redis, with some operations exceeding Redis performance in pipelined mode. Recently implemented features including master-slave replication, SLOWLOG, MONITOR, CLIENT commands, and memory tracking are fully functional and pass all tests. The Lua scripting implementation has been significantly improved, with a working cjson.encode function, though some limitations remain with complex table field operations.
 
 ## Test Environment
 
 - **Server**: Ferrous v0.1.0 running on localhost:6379
-- **Build**: Release build with Rust compiler warnings (127 warnings, no errors)
+- **Build**: Release build with Rust compiler warnings (213 warnings, no errors)
 - **Platform**: Fedora Linux 41
 - **Test Tools**: redis-cli, custom Python test suites, redis-benchmark
 
@@ -104,14 +104,24 @@ The Ferrous Redis-compatible server has been successfully implemented through Ph
 | CLIENT ID | ✅ PASSED | Returns connection ID |
 | CLIENT PAUSE | ✅ PASSED | Temporarily blocks command processing |
 
-### ✅ Memory Tracking Tests
+### 🟡 Lua Testing Results
 
-| Test Case | Result | Description |
-|-----------|--------|-------------|
-| Memory Usage Calculation | ✅ PASSED | Accurate memory usage reporting |
-| Memory Statistics | ✅ PASSED | MEMORY STATS reports detailed metrics |
-| Memory Doctor | ✅ PASSED | Identifies memory hotspots |
-| Different Data Types | ✅ PASSED | Accurate reporting for all data structures |
+| Test Category | Status | Notes |
+|---------------|--------|-------|
+| Basic Arithmetic | ✅ PASS | Correctly calculates expressions like `1 + 2 * 3` |
+| String Operations | ✅ PASS | Correctly concatenates strings like `"hello" .. " " .. "world"` |
+| Local Variables | ✅ PASS | Properly handles local variable declarations and access |
+| Function Calls | ✅ PASS | Basic function definitions and calls work correctly |
+| Table Operations | ✅ PASS | Table creation and basic field access work correctly |
+| Simple Table Concatenation | ✅ PASS | Operations like `t.foo .. ' test'` work correctly |
+| Complex Table Concatenation | ❌ FAIL | Operations like `t.a .. ' ' .. t.b` fail with "attempt to index a non-table" error |
+| Direct Number Concatenation | ❌ FAIL | Operations like `'Number: ' .. t.num` fail with "attempt to concatenate a table value" |
+| KEYS Access | ✅ PASS | Correctly handles access to the special KEYS table |
+| Redis Call Function | ✅ PASS | Basic `redis.call()` functionality works |
+| cjson.encode | ✅ PASS | Properly encodes Lua tables to JSON objects |
+| cjson.decode | 🟡 PARTIAL | Basic structure exists but full implementation is pending |
+| Closures | 🟡 PARTIAL | Basic closures work but complex upvalues need improvement |
+| Standard Libraries | 🟡 PARTIAL | Basic functions work; others have simplified implementations |
 
 ### ✅ Protocol Fuzzing Tests (test_protocol_fuzz.py)
 
@@ -238,7 +248,7 @@ The impact varies by operation type, with write operations showing slight regres
 
 ### Lua VM Implementation Status
 
-The Lua VM implementation has been significantly improved, providing better register allocation especially for table field access and concatenation operations. Comprehensive testing shows:
+The Lua VM implementation has been significantly improved, providing better register allocation, memory management, and JSON encoding support. Current status:
 
 | Test Category | Status | Notes |
 |---------------|--------|-------|
@@ -246,37 +256,34 @@ The Lua VM implementation has been significantly improved, providing better regi
 | String Operations | ✅ PASS | Correctly concatenates strings like `"hello" .. " " .. "world"` |
 | Local Variables | ✅ PASS | Properly handles local variable declarations and access |
 | Function Calls | ✅ PASS | Basic function definitions and calls work correctly |
-| Table Operations | ✅ PASS | Table creation, field access, and field concatenation work correctly |
-| Table Field Concatenation | ✅ PASS | Fixed to properly handle `t.foo .. " " .. t.baz` → `"bar 42"` |
+| Table Operations | ✅ PASS | Table creation and field access work correctly |
+| Simple String Concatenation | ✅ PASS | `t.str .. ' world'` correctly returns concatenated string |
+| Complex Table Concatenation | ❌ FAIL | Multiple table field operations like `t.foo .. ' ' .. t.baz` fail |
 | KEYS Access | ✅ PASS | Correctly handles access to the special KEYS table |
-| Redis Call Function | 🟡 PARTIAL | Works in isolation but has protocol issues |
-| Closures | 🟡 PARTIAL | Basic closures work but complex upvalues need improvement |
-| Standard Libraries | 🟡 PARTIAL | Basic functions work; others have simplified implementations |
-| Redis Libraries | 🟡 PARTIAL | Partial implementation of cjson, cmsgpack, bit libraries |
+| Redis Call Integration | ✅ PASS | Basic `redis.call()` functionality works correctly |
+| JSON Encoding | ✅ PASS | `cjson.encode(t)` correctly produces JSON representation |
+| Garbage Collection | ✅ PASS | Memory is properly reclaimed after script execution |
+
+### JSON Library Support
+
+The cjson library has been implemented with the following features:
+
+1. **cjson.encode**: Now properly handles all Lua data types:
+   - Primitive values (numbers, strings, booleans, nil)
+   - Tables (both array-like and object-like)
+   - Nested structures with proper type conversion
+   - Cycle detection to prevent infinite recursion
+   - Proper JSON string escaping
+
+2. **cjson.decode**: Basic implementation in place, but not fully functional.
 
 ### Register Allocation Improvements
 
-A major focus of the recent work has been fixing the compiler's register allocation strategy, particularly for table field access in concatenation expressions. The improved implementation:
+A major focus of the recent work has been fixing the compiler's register allocation strategy, particularly for table field access in concatenation expressions:
 
-1. **Problem:** Previously, table field concatenation like `t.foo .. " " .. t.baz` was incorrectly producing `"bar baz42"` instead of the expected `"bar 42"` because the field name "baz" was being included in the concatenation.
-
-2. **Solution:** The register allocation in the compiler has been enhanced to:
-   - Properly handle field names and values in separate registers
-   - Use temporary registers to store intermediate values safely
-   - Ensure correct concatenation ordering
-   - Free registers appropriately when no longer needed
-
-3. **Results:** All table field concatenation tests now pass correctly, producing the expected output of `"bar 42"` instead of the previous incorrect `"bar baz42"`.
-
-### Redis Integration Status
-
-The direct integration with Redis commands through the Lua VM shows mixed results:
-
-- Direct Redis commands (e.g., PING) work correctly
-- EVAL with simple literal return values is processed but has connection handling issues
-- redis.call() functionality works in isolated tests but has protocol issues in direct testing
-
-These findings suggest that while the core VM functionality is now working correctly, there are still issues with how the EVAL command response is packaged and returned to clients that need addressing in future work.
+1. Improved handling of table field access during compilation
+2. Enhanced concatenation operation in the VM to better collect and process values
+3. Fixed issues with stack management during nested function calls
 
 ## Strengths
 
@@ -293,17 +300,18 @@ These findings suggest that while the core VM functionality is now working corre
 11. **Replication**: Working master-slave replication with proper authentication and data synchronization
 12. **Monitoring Suite**: Complete implementation of SLOWLOG, MONITOR, and CLIENT commands
 13. **Memory Tracking**: Comprehensive memory usage tracking and analysis
+14. **Lua Integration**: Functional Lua VM with cjson.encode support and stable execution
 
 ## Known Limitations and Next Steps
 
-1. **Security Features**: Command renaming/disabling and protected mode remain to be implemented
-2. **Fine-grained Memory Control**: Current memory tracking is precise but could benefit from custom allocator integration
-3. **Key Migration Commands**: Not yet implemented, important for cluster support
+1. **Table Field Concatenation**: Issues with complex table field concatenation operations in Lua scripts
+2. **JSON Decoding**: cjson.decode implementation needs completion
+3. **Security Features**: Command renaming/disabling and protected mode remain to be implemented
+4. **Fine-grained Memory Control**: Current memory tracking is precise but could benefit from custom allocator integration
+5. **Key Migration Commands**: Not yet implemented, important for cluster support
 
 ## Conclusion
 
-Ferrous has reached an important milestone with the completion of the core production readiness features - SLOWLOG, MONITOR, CLIENT commands, and memory tracking. The implementation is stable, scales effectively with concurrent clients, and handles high-throughput pipeline operations efficiently. These features have been thoroughly tested and integrate well with the existing codebase without causing regressions.
+Ferrous has reached an important milestone with the completion of core production readiness features and significant improvements to the Lua VM implementation. The server demonstrates excellent performance characteristics very close to Redis benchmark targets. The implementation of cjson.encode is now complete and working correctly, though some limitations remain with table field concatenation operations.
 
-The server demonstrates performance characteristics very close to Redis benchmark targets with minimal losses on write operations and improvements on read operations. The memory tracking implementation is accurate and provides valuable production visibility with acceptable performance trade-offs.
-
-Next steps will focus on implementing the remaining security features and potentially exploring memory optimization strategies such as custom allocators to bring performance even closer to Redis.
+Next steps will focus on completing the cjson.decode functionality, resolving the remaining table field concatenation issues, and implementing the security features needed for production deployment.

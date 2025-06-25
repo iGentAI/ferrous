@@ -20,6 +20,11 @@ pub mod parser;
 pub mod compiler;
 pub mod ast;
 pub mod lexer;
+pub mod cjson;
+pub mod sha1;
+
+#[cfg(test)]
+mod test_cjson;
 
 pub use error::{LuaError, Result};
 pub use value::Value;

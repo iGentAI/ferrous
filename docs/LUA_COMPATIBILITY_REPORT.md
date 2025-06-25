@@ -21,7 +21,7 @@ The Ferrous Lua implementation based on the generational arena architecture prov
 | | Basic data types (number, string, boolean, nil) | ✓ | ✓ | Fully implemented |
 | | Tables (array and hash) | ✓ | ✓ | Fully implemented |
 | | Functions (named and anonymous) | ✓ | ✓ | Fully implemented |
-| | Operators (arithmetic, string, comparison, logical) | ✓ | ✓ | Fully implemented |
+| | Operators (arithmetic, string, comparison, logical) | ✓ | ✓ | Implemented with known issue on multiple table field concatenation |
 | | Control flow (if, loops) | ✓ | ✓ | Fully implemented |
 | | Scope rules and local variables | ✓ | ✓ | Fully implemented |
 | | Lexical closures | ✓ | ✓ | Implemented |
@@ -31,7 +31,7 @@ The Ferrous Lua implementation based on the generational arena architecture prov
 | | table library | ✓ | ✓ | All required functions implemented |
 | | math library (subset) | ✓ | ✓ | Redis-compatible subset implemented |
 | | base functions (select, tonumber, tostring, etc.) | ✓ | ✓ | Implemented |
-| | cjson library | ✓ | ❌ | Not yet implemented - required for full Redis compatibility |
+| | cjson library | ✓ | ✓ | cjson.encode implemented for tables, arrays, and primitive types |
 | | cmsgpack library | ❌ | ❌ | Not implemented (optional in Redis) |
 | | bit library | ❌ | ❌ | Not implemented (optional in Redis) |
 | **Metatables** | | | | |
@@ -81,34 +81,34 @@ The generational arena design specified the following performance targets:
 | GC Pause | <5ms for 50MB heap | ~8ms for 50MB heap | ⚠️ Needs Optimization |
 | Scripts/second | 200,000 ops/sec | ~150,000 ops/sec | ⚠️ Needs Optimization |
 
-## Identified Gaps and Improvement Areas
+## Known Limitations and Issues
 
-While the core implementation is solid and passes the test suite, there are a few areas that need addressing:
+While the core implementation is robust and passes most tests, there are a few areas with known limitations:
 
-1. **Library Support**:
-   - The `cjson` library is not implemented yet but is required for full Redis compatibility
-   - The `cmsgpack` and `bit` libraries are also missing but are optional in Redis
+1. **Table Field Concatenation**: 
+   - Simple concatenation operations like `t.foo .. ' test'` work correctly
+   - More complex operations involving multiple table fields fail with errors
+   - Using intermediate variables (e.g., `local x = t.a; local y = t.b; return x .. ' ' .. y`) also fails
+   - Direct table number field concatenation (e.g., `'prefix' .. t.num`) triggers a type error
 
-2. **Performance Optimization**:
+2. **Library Support**:
+   - The `cjson` library has been implemented with encoding support, but not full decoding
+   - The `cmsgpack` and `bit` libraries are not implemented, though they are optional in Redis
+
+3. **Performance Optimization**:
    - GC pause times could be further reduced
    - Script execution throughput could be improved
-   - Table access speeds are close to target but could be optimized further
-
-3. **Test Coverage**:
-   - While the test suite is comprehensive, increasing edge case coverage would improve reliability
 
 ## Next Steps
 
-1. Implement the `cjson` library to achieve full Redis compatibility
-2. Optimize garbage collection to reduce pause times
-3. Benchmark and profile the implementation to identify and fix performance bottlenecks
-4. Add more automated tests to improve coverage of edge cases
+1. Fix the remaining table field concatenation issues with a more robust VM implementation
+2. Complete the `cjson.decode` implementation
+3. Optimize garbage collection to reduce pause times
+4. Improve script execution throughput
 5. Consider implementing the optional `cmsgpack` and `bit` libraries for full feature parity
 
 ## Conclusion
 
-The current Lua implementation with the generational arena architecture succeeds in providing a Redis-compatible scripting engine with significant improvements in performance and memory efficiency compared to traditional reference-counted designs.
+The current Lua implementation with the generational arena architecture is feature-complete for core Redis requirements, with the exception of the table field concatenation limitations noted above. The implementation provides excellent memory efficiency and type safety through the use of the handle-based design. Performance is very close to the target specifications, with some areas still needing optimization.
 
-The implementation is feature-complete for the core Redis requirements, with the only significant gap being the missing `cjson` library. The performance is very close to the ambitious targets set in the design specification, with a few areas still needing optimization.
-
-Overall, the implementation is robust, well-tested, and ready for production use, with a clear path for the remaining enhancements.
+The implementation is robust enough for production use, with a clear path for addressing the remaining limitations and optimizations in future updates.

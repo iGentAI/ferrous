@@ -23,35 +23,62 @@ pub struct CommandContext {
 
 /// Handle EVAL command - EVAL script numkeys key [key ...] arg [arg ...]
 pub fn handle_eval(ctx: &CommandContext, parts: &[RespFrame]) -> Result<RespFrame> {
+    println!("[LUA_CMD] Processing EVAL command with {} parts", parts.len());
+    
     if parts.len() < 3 {
+        println!("[LUA_CMD] Error: wrong number of arguments, got {}", parts.len());
         return Ok(RespFrame::error("ERR wrong number of arguments for 'eval' command"));
+    }
+    
+    // Debug print parts for troubleshooting
+    for (i, part) in parts.iter().enumerate() {
+        println!("[LUA_CMD] Part {}: {:?}", i, part);
     }
     
     // Extract script
     let script = match &parts[1] {
         RespFrame::BulkString(Some(bytes)) => {
             match String::from_utf8(bytes.as_ref().to_vec()) {
-                Ok(s) => s,
-                Err(_) => return Ok(RespFrame::error("ERR invalid script encoding")),
+                Ok(s) => {
+                    println!("[LUA_CMD] Script: {}", s);
+                    s
+                },
+                Err(e) => {
+                    println!("[LUA_CMD] Error parsing script: {}", e);
+                    return Ok(RespFrame::error("ERR invalid script encoding"));
+                }
             }
         }
-        _ => return Ok(RespFrame::error("ERR invalid script format")),
+        other => {
+            println!("[LUA_CMD] Error: expected BulkString for script, got {:?}", other);
+            return Ok(RespFrame::error("ERR invalid script format"));
+        }
     };
     
     // Extract numkeys
     let numkeys = match &parts[2] {
         RespFrame::BulkString(Some(bytes)) => {
             match String::from_utf8_lossy(bytes).parse::<usize>() {
-                Ok(n) => n,
-                Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                Ok(n) => {
+                    println!("[LUA_CMD] Numkeys: {}", n);
+                    n
+                },
+                Err(e) => {
+                    println!("[LUA_CMD] Error parsing numkeys: {}", e);
+                    return Ok(RespFrame::error("ERR value is not an integer or out of range"));
+                }
             }
         }
-        _ => return Ok(RespFrame::error("ERR invalid numkeys format")),
+        other => {
+            println!("[LUA_CMD] Error: expected BulkString for numkeys, got {:?}", other);
+            return Ok(RespFrame::error("ERR invalid numkeys format"));
+        }
     };
     
     // Check if numkeys is valid
     let max_keys = parts.len() - 3;
     if numkeys > max_keys {
+        println!("[LUA_CMD] Error: numkeys {} > max available keys {}", numkeys, max_keys);
         return Ok(RespFrame::error(format!("ERR Number of keys can't be greater than number of args - 3")));
     }
     
@@ -64,19 +91,31 @@ pub fn handle_eval(ctx: &CommandContext, parts: &[RespFrame]) -> Result<RespFram
             RespFrame::BulkString(Some(bytes)) => {
                 let bytes_vec = bytes.as_ref().to_vec();
                 if i - 3 < numkeys {
+                    println!("[LUA_CMD] Key {}: {:?}", i-3, String::from_utf8_lossy(&bytes_vec));
                     keys.push(bytes_vec);
                 } else {
+                    println!("[LUA_CMD] Arg {}: {:?}", i-3-numkeys, String::from_utf8_lossy(&bytes_vec));
                     args.push(bytes_vec);
                 }
             }
-            _ => return Ok(RespFrame::error("ERR invalid key/arg format")),
+            other => {
+                println!("[LUA_CMD] Error: expected BulkString for key/arg, got {:?}", other);
+                return Ok(RespFrame::error("ERR invalid key/arg format"));
+            }
         }
     }
     
     // Execute script
+    println!("[LUA_CMD] Calling script_executor.eval with script '{}'", script);
     match ctx.script_executor.eval(&script, keys, args, ctx.db) {
-        Ok(resp) => Ok(resp),
-        Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
+        Ok(resp) => {
+            println!("[LUA_CMD] Script executed successfully, response: {:?}", resp);
+            Ok(resp)
+        },
+        Err(e) => {
+            println!("[LUA_CMD] Script execution error: {}", e);
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
     }
 }
 
