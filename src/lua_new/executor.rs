@@ -6,6 +6,9 @@ use crate::lua_new::vm::{LuaVM, ExecutionContext};
 use crate::lua_new::error::{LuaError, Result};
 use crate::lua_new::{VMConfig, LuaLimits};
 use crate::lua_new::redis_api::RedisApiContext;
+use crate::lua_new::parser::Parser;
+use crate::lua_new::compiler::Compiler;
+use crate::lua_new::sandbox::LuaSandbox;
 use crate::storage::engine::StorageEngine;
 use crate::protocol::resp::RespFrame;
 use crate::error::FerrousError;
@@ -265,41 +268,28 @@ impl ScriptExecutor {
         
         println!("[LUA_NEW] Starting script execution");
         
-        // Get or create a VM
+        // Get a VM from the pool
         let mut vm = match self.get_vm() {
-            Ok(vm) => vm,
+            Ok(mut vm) => {
+                // Explicitly mark vm as mutable to fix the borrow error
+                vm.reset();  // Clean state for reuse
+                vm
+            },
             Err(e) => return Err(e),
         };
-        
-        // Properly reset the VM before use - important for clean state
-        vm.reset();
         
         // Set up killable execution
         let kill_flag = Arc::new(AtomicBool::new(false));
         vm.set_kill_flag(Arc::clone(&kill_flag));
         
-        // Set up environment
+        // CRITICAL: Set up environment before scripts execute
         match self.setup_environment(&mut vm, &keys, &args, db) {
             Ok(()) => {},
             Err(e) => {
                 self.return_vm(vm);
                 return Err(e);
             }
-        }
-        
-        println!("[LUA_NEW] Environment setup complete, compiling script");
-        
-        // Compile the script in the VM that will execute it
-        let closure = match self.compile_in_vm(&mut vm, &script.source) {
-            Ok(closure) => closure,
-            Err(e) => {
-                println!("[LUA_NEW] Script compilation error: {}", e);
-                self.return_vm(vm);
-                return Ok(RespFrame::Error(Arc::new(
-                    format!("ERR Compilation failed: {}", e).into_bytes()
-                )));
-            }
-        };
+        }      
         
         // Track execution
         {
@@ -311,35 +301,25 @@ impl ScriptExecutor {
             });
         }
         
-        // Execute script
-        let result = match vm.execute_with_limits(closure, &[], Arc::clone(&kill_flag)) {
+        // Run script
+        let result = match self.compile_and_execute(&mut vm, &script.source) {
             Ok(value) => {
                 println!("[LUA_NEW] Script executed successfully with value: {:?}", value);
                 // Convert to Redis response
                 match RedisApiContext::lua_to_resp(&mut vm, value) {
                     Ok(resp) => {
-                        // Debug log the response being sent back
                         println!("[LUA_NEW] Converted Lua result to RESP frame: {:?}", resp);
-                        
-                        // Serialize the frame to bytes to check the protocol format
-                        let debug_bytes = crate::protocol::serializer::serialize_to_vec(&resp)
-                            .map_err(|e| FerrousError::Internal(format!("Error serializing response: {}", e)))?;
-                        
-                        println!("[LUA_NEW] Serialized response ({} bytes): {:?}", 
-                            debug_bytes.len(),
-                            String::from_utf8_lossy(&debug_bytes));
-                        
                         Ok(resp)
                     },
                     Err(e) => {
-                        println!("[LUA_NEW] Error converting Lua value to RESP: {}", e);
+                        println!("[LUA_ERROR] Error converting Lua value to RESP: {}", e);
                         Ok(RespFrame::Error(Arc::new(format!("ERR {}", e).into_bytes())))
                     }
                 }
             }
             Err(e) => {
                 // Map error to Redis format
-                println!("[LUA_NEW] Script execution error: {}", e);
+                println!("[LUA_ERROR] Script execution error: {}", e);
                 if matches!(e, LuaError::ScriptKilled) {
                     Ok(RespFrame::Error(Arc::new(
                         b"ERR Script killed by user with SCRIPT KILL".to_vec()
@@ -352,7 +332,7 @@ impl ScriptExecutor {
             }
         };
         
-        // Clear current script
+        // Clean up
         {
             let mut current = self.current_script.lock().unwrap();
             *current = None;
@@ -368,46 +348,47 @@ impl ScriptExecutor {
         // Return VM to pool
         self.return_vm(vm);
         
-        println!("[LUA_NEW] Script execution complete");
+        println!("[LUA_NEW] Script execution complete in {:?}", start_time.elapsed());
         result
     }
     
-    /// Compile a script in a specific VM
-    fn compile_in_vm(&self, vm: &mut LuaVM, source: &str) -> std::result::Result<ClosureHandle, ScriptError> {
-        // Parse the script source into an AST
-        let mut parser = match crate::lua_new::parser::Parser::new(source, &mut vm.heap) {
-            Ok(p) => p,
-            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
-        };
+    /// Execute compiled bytecode
+    fn compile_and_execute(&self, vm: &mut LuaVM, source: &str) -> Result<Value> {
+        let start = Instant::now();
         
-        // Parse the AST
-        let ast = match parser.parse() {
-            Ok(ast) => ast,
-            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
-        };
+        // Parse the script source into an AST
+        let mut parser = Parser::new(source, &mut vm.heap)?;
+        let ast = parser.parse()?;
         
         // Create a compiler and set heap reference
-        let mut compiler = crate::lua_new::compiler::Compiler::new();
+        let mut compiler = Compiler::new();
         compiler.set_heap(&mut vm.heap as *mut _);
         
         // Compile the AST to a function prototype
-        let proto = match compiler.compile_chunk(&ast) {
-            Ok(p) => p,
-            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
-        };
+        let proto = compiler.compile_chunk(&ast)?;
         
         // Create a closure from the prototype
         let closure = vm.heap.alloc_closure(proto, Vec::new());
         
-        Ok(closure)
+        // Execute the function
+        println!("[LUA_EXECUTOR] Executing script (took {}µs to compile)",
+                 start.elapsed().as_micros());
+        
+        let result = vm.execute_function(closure, &[]);
+        
+        println!("[LUA_EXECUTOR] Script execution complete (took {}µs total)",
+                 start.elapsed().as_micros());
+        
+        result
     }
     
     /// Get a VM from the pool or create a new one
     fn get_vm(&self) -> std::result::Result<LuaVM, FerrousError> {
         let mut pool = self.vm_pool.lock().unwrap();
         
-        if let Some(mut vm) = pool.pop() {
-            // Reset the VM for reuse - but the full reset will happen in execute_script
+        if let Some(vm) = pool.pop() {
+            // Return the VM without trying to reset it here
+            // The reset will happen in execute_script
             Ok(vm)
         } else {
             // Create new VM
@@ -436,6 +417,13 @@ impl ScriptExecutor {
     ) -> std::result::Result<(), FerrousError> {
         println!("[LUA_NEW] Setting up environment with {} keys and {} args", 
                 keys.len(), args.len());
+        
+        // First, apply sandbox to register ALL standard library functions
+        // This MUST happen before any other initialization
+        if let Err(e) = LuaSandbox::redis_compatible().apply(vm) {
+            println!("[LUA_ERROR] Sandbox application failed: {}", e);
+            return Err(FerrousError::Internal(format!("Failed to set up Lua environment: {}", e)));
+        }
         
         // Create KEYS table
         let keys_table = vm.heap.alloc_table();
@@ -485,11 +473,49 @@ impl ScriptExecutor {
             return Err(FerrousError::Internal(e.to_string()));
         }
         
-        // Apply sandbox
-        let sandbox = crate::lua_new::sandbox::LuaSandbox::redis_compatible();
-        if let Err(e) = sandbox.apply(vm) {
-            return Err(FerrousError::Internal(e.to_string()));
-        }
+        // Last thing: perform a simple test of the type function to validate environment
+        let test_script = "local t = {}; return type(t)";
+        let mut parser = Parser::new(test_script, &mut vm.heap).map_err(|e| {
+            FerrousError::Internal(format!("Failed to verify environment: {}", e))
+        })?;
+        let ast = parser.parse().map_err(|e| {
+            FerrousError::Internal(format!("Failed to verify environment: {}", e))
+        })?;
+        let mut compiler = Compiler::new();
+        compiler.set_heap(&mut vm.heap as *mut _);
+        let proto = compiler.compile_chunk(&ast).map_err(|e| {
+            FerrousError::Internal(format!("Failed to verify environment: {}", e))
+        })?;
+        let closure = vm.heap.alloc_closure(proto, Vec::new());
+        match vm.execute_function(closure, &[]) {
+            Ok(result) => {
+                println!("[LUA_ENV] Type function test result: {:?}", result);
+            },
+            Err(e) => {
+                println!("[LUA_ERROR] Type function verification failed: {}", e);
+                return Err(FerrousError::Internal(format!("Type function verification failed: {}", e)));
+            }
+        };
+        
+        Ok(())
+    }
+    
+    /// Register standard Lua global functions
+    fn register_globals(&self, vm: &mut LuaVM) -> Result<()> {
+        let globals = vm.globals();
+        
+        // Register core functions
+        let type_key = vm.heap.create_string("type");
+        vm.heap.get_table_mut(globals)?.set(
+            Value::String(type_key),
+            Value::CFunction(crate::lua_new::sandbox::lua_type)
+        );
+        
+        let print_key = vm.heap.create_string("print");
+        vm.heap.get_table_mut(globals)?.set(
+            Value::String(print_key),
+            Value::CFunction(crate::lua_new::sandbox::lua_print)
+        );
         
         Ok(())
     }
