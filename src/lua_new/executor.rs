@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-/// A compiled Lua script
+/// A compiled Lua script - modified to NOT store handles
 #[derive(Clone)]
 pub struct CompiledScript {
     /// Original source code
@@ -24,8 +24,8 @@ pub struct CompiledScript {
     /// SHA1 hash of the script
     pub sha1: String,
     
-    /// Compiled closure handle (in a shared heap)
-    pub closure: ClosureHandle,
+    // Remove the closure handle field which was causing cross-VM issues
+    // pub closure: ClosureHandle, 
 }
 
 /// Runtime information for a running script
@@ -243,21 +243,13 @@ impl ScriptExecutor {
     
     /// Compile a script
     fn compile_script(&self, source: &str, sha1: String) -> std::result::Result<CompiledScript, ScriptError> {
-        // For now, we'll create a simple stub
-        // In a full implementation, this would parse and compile Lua code
-        
-        // Create a temporary VM for compilation
-        let mut vm = LuaVM::new(self.config.clone());
-        
-        // Create a dummy closure
-        // In real implementation, this would be the compiled bytecode
-        let proto = crate::lua_new::value::FunctionProto::default();
-        let closure = vm.heap.alloc_closure(proto, Vec::new());
+        // We no longer need to create a temporary VM just for compilation
+        // Just compute the SHA1 and store the source
         
         Ok(CompiledScript {
             source: source.to_string(),
             sha1,
-            closure,
+            // No longer storing the closure
         })
     }
     
@@ -279,6 +271,9 @@ impl ScriptExecutor {
             Err(e) => return Err(e),
         };
         
+        // Properly reset the VM before use - important for clean state
+        vm.reset();
+        
         // Set up killable execution
         let kill_flag = Arc::new(AtomicBool::new(false));
         vm.set_kill_flag(Arc::clone(&kill_flag));
@@ -292,7 +287,19 @@ impl ScriptExecutor {
             }
         }
         
-        println!("[LUA_NEW] Environment setup complete, executing script");
+        println!("[LUA_NEW] Environment setup complete, compiling script");
+        
+        // Compile the script in the VM that will execute it
+        let closure = match self.compile_in_vm(&mut vm, &script.source) {
+            Ok(closure) => closure,
+            Err(e) => {
+                println!("[LUA_NEW] Script compilation error: {}", e);
+                self.return_vm(vm);
+                return Ok(RespFrame::Error(Arc::new(
+                    format!("ERR Compilation failed: {}", e).into_bytes()
+                )));
+            }
+        };
         
         // Track execution
         {
@@ -305,13 +312,29 @@ impl ScriptExecutor {
         }
         
         // Execute script
-        let result = match vm.execute_with_limits(script.closure, &[], Arc::clone(&kill_flag)) {
+        let result = match vm.execute_with_limits(closure, &[], Arc::clone(&kill_flag)) {
             Ok(value) => {
-                println!("[LUA_NEW] Script executed successfully, converting result to RESP");
+                println!("[LUA_NEW] Script executed successfully with value: {:?}", value);
                 // Convert to Redis response
                 match RedisApiContext::lua_to_resp(&mut vm, value) {
-                    Ok(resp) => Ok(resp),
-                    Err(e) => Ok(RespFrame::Error(Arc::new(format!("ERR {}", e).into_bytes()))),
+                    Ok(resp) => {
+                        // Debug log the response being sent back
+                        println!("[LUA_NEW] Converted Lua result to RESP frame: {:?}", resp);
+                        
+                        // Serialize the frame to bytes to check the protocol format
+                        let debug_bytes = crate::protocol::serializer::serialize_to_vec(&resp)
+                            .map_err(|e| FerrousError::Internal(format!("Error serializing response: {}", e)))?;
+                        
+                        println!("[LUA_NEW] Serialized response ({} bytes): {:?}", 
+                            debug_bytes.len(),
+                            String::from_utf8_lossy(&debug_bytes));
+                        
+                        Ok(resp)
+                    },
+                    Err(e) => {
+                        println!("[LUA_NEW] Error converting Lua value to RESP: {}", e);
+                        Ok(RespFrame::Error(Arc::new(format!("ERR {}", e).into_bytes())))
+                    }
                 }
             }
             Err(e) => {
@@ -349,13 +372,42 @@ impl ScriptExecutor {
         result
     }
     
+    /// Compile a script in a specific VM
+    fn compile_in_vm(&self, vm: &mut LuaVM, source: &str) -> std::result::Result<ClosureHandle, ScriptError> {
+        // Parse the script source into an AST
+        let mut parser = match crate::lua_new::parser::Parser::new(source, &mut vm.heap) {
+            Ok(p) => p,
+            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
+        };
+        
+        // Parse the AST
+        let ast = match parser.parse() {
+            Ok(ast) => ast,
+            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
+        };
+        
+        // Create a compiler and set heap reference
+        let mut compiler = crate::lua_new::compiler::Compiler::new();
+        compiler.set_heap(&mut vm.heap as *mut _);
+        
+        // Compile the AST to a function prototype
+        let proto = match compiler.compile_chunk(&ast) {
+            Ok(p) => p,
+            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
+        };
+        
+        // Create a closure from the prototype
+        let closure = vm.heap.alloc_closure(proto, Vec::new());
+        
+        Ok(closure)
+    }
+    
     /// Get a VM from the pool or create a new one
     fn get_vm(&self) -> std::result::Result<LuaVM, FerrousError> {
         let mut pool = self.vm_pool.lock().unwrap();
         
         if let Some(mut vm) = pool.pop() {
-            // Reset the VM for reuse
-            vm.instruction_count = 0;
+            // Reset the VM for reuse - but the full reset will happen in execute_script
             Ok(vm)
         } else {
             // Create new VM
@@ -428,6 +480,11 @@ impl ScriptExecutor {
             return Err(FerrousError::Internal(e.to_string()));
         }
         
+        // Register cjson library
+        if let Err(e) = crate::lua_new::cjson::register(vm) {
+            return Err(FerrousError::Internal(e.to_string()));
+        }
+        
         // Apply sandbox
         let sandbox = crate::lua_new::sandbox::LuaSandbox::redis_compatible();
         if let Err(e) = sandbox.apply(vm) {
@@ -441,18 +498,7 @@ impl ScriptExecutor {
 
 /// Compute SHA1 hash of a script
 fn compute_sha1(script: &str) -> String {
-    use std::fmt::Write;
-    
-    // Simple hash function for now
-    // In real implementation, use proper SHA1
-    let mut hash = 0u64;
-    for byte in script.bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
-    }
-    
-    let mut result = String::new();
-    write!(&mut result, "{:040x}", hash).unwrap();
-    result
+    crate::lua_new::sha1::compute_sha1(script)
 }
 
 /// Extension trait for converting Ferrous errors

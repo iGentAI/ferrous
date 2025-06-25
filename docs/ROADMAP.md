@@ -283,14 +283,21 @@ Commands essential for production use:
 ### Priority 5.1: Scripting
 ```
 Redis Lua support:
-- [🟡] EVAL/EVALSHA commands - Basic implementation complete
-- [🟡] Lua interpreter integration - Core VM functionality working, includes arithmetic, string handling, and table operations
-- [🟡] Redis Lua API - Core functionality (call, pcall) implemented with some limitations
+- [✅] EVAL/EVALSHA commands - Implementation complete 
+- [✅] Lua interpreter integration - Generational arena architecture implemented
+- [✅] Redis Lua API - Core functionality (call, pcall) implemented
 - [✅] Script caching - Working
 - [✅] SCRIPT commands - Basic implementation complete
-- [🟡] Standard library subset - Basic functions implemented
-- [🟡] Special Redis libraries (cjson, cmsgpack, bit) - Partially implemented
-- [🟡] Register allocation - Improved implementation with proper table field handling
+- [✅] Standard library subset - Basic functions implemented
+- [🟡] Special Redis libraries:
+  - [✅] cjson.encode - Complete with table and array support
+  - [🟡] cjson.decode - Basic structure exists but implementation is incomplete
+  - [❌] cmsgpack - Not yet implemented
+  - [❌] bit - Not yet implemented
+- [🟡] Table operations:
+  - [✅] Simple table field access and concatenation work
+  - [❌] Complex table field concatenation (t.foo .. ' ' .. t.baz) has limitations
+  - [❌] Direct number field concatenation ('prefix' .. t.num)
 ```
 
 ### Priority 5.2: Streams

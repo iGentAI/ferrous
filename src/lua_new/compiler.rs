@@ -274,40 +274,15 @@ impl Compiler {
         self.compile_chunk(&ast)
     }
     
-    /// Compile a script
-    pub fn compile_script(&self, source: &str, sha1: String) -> std::result::Result<CompiledScript, ScriptError> {
-        // Create a VM for compilation
-        let mut vm = LuaVM::new(self.config.clone());
-        
-        // Parse the script
-        let mut parser = match crate::lua_new::parser::Parser::new(source, &mut vm.heap) {
-            Ok(p) => p,
-            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
-        };
-        
-        // Parse the AST
-        let ast = match parser.parse() {
-            Ok(ast) => ast,
-            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
-        };
-        
-        // Create compiler and set heap reference
-        let mut compiler = crate::lua_new::compiler::Compiler::new();
-        compiler.set_heap(&mut vm.heap as *mut _);
-        
-        // Compile the AST to a function prototype
-        let proto = match compiler.compile_chunk(&ast) {
-            Ok(p) => p,
-            Err(e) => return Err(ScriptError::CompilationFailed(e.to_string())),
-        };
-        
-        // Create a closure from the prototype
-        let closure = vm.heap.alloc_closure(proto, Vec::new());
+    /// Compile a script into a CompiledScript for the executor
+    pub fn compile_script(source: &str, sha1: String, _heap: &mut crate::lua_new::heap::LuaHeap) -> std::result::Result<CompiledScript, ScriptError> {
+        // We no longer need to parse or compile here since compilation will happen
+        // in the execution VM - just store the source and SHA1
         
         Ok(CompiledScript {
             source: source.to_string(),
             sha1,
-            closure,
+            // the closure field has been removed
         })
     }
 
@@ -968,6 +943,214 @@ impl Compiler {
     /// Compile an expression
     fn compile_expression(&mut self, expr: &Node<Expression>) -> Result<u16> {
         match &expr.node {
+            Expression::BinaryOp { op, left, right } => {
+                // Special handling for concatenation to ensure proper temporary registers
+                if *op == BinaryOperator::Concat {
+                    // For concatenation, we need to ensure any table field access
+                    // is properly evaluated to registers first - and ensure those registers
+                    // are temporary and don't get reused prematurely
+                    
+                    // Step 1: Fully evaluate left operand to a register
+                    let left_reg = self.compile_expression(left)?;
+                    
+                    // Step 2: Fully evaluate right operand to a separate register
+                    let right_reg = self.compile_expression(right)?;
+                    
+                    // Step 3: Allocate separate register for result to avoid potential issues
+                    let result_reg = self.reg_alloc.allocate();
+                    
+                    // Step 4: Use CONCAT opcode with the evaluated expressions
+                    self.emit(OpCode::Concat, result_reg, left_reg, right_reg);
+                    
+                    // Step 5: Free the operand registers after we're done with them
+                    self.reg_alloc.free(left_reg);
+                    self.reg_alloc.free(right_reg);
+                    
+                    return Ok(result_reg);
+                }
+                
+                // For other binary operations, use the standard approach
+                // Compile operands
+                let left_reg = self.compile_expression(left)?;
+                let right_reg = self.compile_expression(right)?;
+                
+                // Allocate register for result
+                let result_reg = self.reg_alloc.allocate();
+                
+                // Emit appropriate instruction based on operator
+                match op {
+                    BinaryOperator::Add => {
+                        self.emit(OpCode::Add, result_reg, left_reg, right_reg);
+                    },
+                    BinaryOperator::Sub => {
+                        self.emit(OpCode::Sub, result_reg, left_reg, right_reg);
+                    },
+                    BinaryOperator::Mul => {
+                        self.emit(OpCode::Mul, result_reg, left_reg, right_reg);
+                    },
+                    BinaryOperator::Div => {
+                        self.emit(OpCode::Div, result_reg, left_reg, right_reg);
+                    },
+                    BinaryOperator::Mod => {
+                        self.emit(OpCode::Mod, result_reg, left_reg, right_reg);
+                    },
+                    BinaryOperator::Pow => {
+                        self.emit(OpCode::Pow, result_reg, left_reg, right_reg);
+                    },
+                    BinaryOperator::Concat => {
+                        // Already handled above, but kept for completeness
+                        self.emit(OpCode::Concat, result_reg, left_reg, right_reg);
+                    },
+                    
+                    // Comparisons 
+                    BinaryOperator::LT => {
+                        self.emit(OpCode::Lt, 1, left_reg, right_reg); // A=1 means "true if L<R"
+                        self.emit(OpCode::LoadBool, result_reg, 1, 1); // Load true, skip next
+                        self.emit(OpCode::LoadBool, result_reg, 0, 0); // Load false
+                    },
+                    BinaryOperator::LE => {
+                        self.emit(OpCode::Le, 1, left_reg, right_reg);
+                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
+                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
+                    },
+                    BinaryOperator::GT => {
+                        self.emit(OpCode::Lt, 1, right_reg, left_reg); // Swap operands for GT
+                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
+                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
+                    },
+                    BinaryOperator::GE => {
+                        self.emit(OpCode::Le, 1, right_reg, left_reg); // Swap operands for GE
+                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
+                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
+                    },
+                    BinaryOperator::EQ => {
+                        self.emit(OpCode::Eq, 1, left_reg, right_reg);
+                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
+                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
+                    },
+                    BinaryOperator::NE => {
+                        self.emit(OpCode::Eq, 0, left_reg, right_reg);
+                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
+                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
+                    },
+                    
+                    // Logical operations with short-circuit evaluation 
+                    BinaryOperator::And => {
+                        // Move left value to result register
+                        self.emit(OpCode::Move, result_reg, left_reg, 0);
+                        
+                        // Test if left is truthy
+                        self.emit(OpCode::Test, result_reg, 0, 0); // If result is falsey, skip
+                        
+                        // Skip right operand if left is false/nil (short-circuit)
+                        let end_jump = self.emit_jump();
+                        
+                        // Evaluate right operand and store in result register
+                        self.emit(OpCode::Move, result_reg, right_reg, 0);
+                        
+                        // Patch jump to here
+                        self.patch_jump(end_jump);
+                    },
+                    BinaryOperator::Or => {
+                        // Move left value to result register
+                        self.emit(OpCode::Move, result_reg, left_reg, 0);
+                        
+                        // Test if left is truthy
+                        self.emit(OpCode::Test, result_reg, 1, 0); // If result is truthy, skip
+                        
+                        // Skip right operand if left is true (short-circuit)
+                        let end_jump = self.emit_jump();
+                        
+                        // Evaluate right operand and store in result register
+                        self.emit(OpCode::Move, result_reg, right_reg, 0);
+                        
+                        // Patch jump to here
+                        self.patch_jump(end_jump);
+                    },
+                }
+                
+                // Free operand registers
+                self.reg_alloc.free(left_reg);
+                self.reg_alloc.free(right_reg);
+                
+                return Ok(result_reg);
+            },
+            
+            // For other expression types, delegate to the base compiler
+            _ => match &expr.node {
+                Expression::Variable(var) => {
+                    match var {
+                        Variable::Name(name) => {
+                            // Check if it's a local variable
+                            if let Some(reg) = self.scope.lookup(name) {
+                                return Ok(reg);
+                            }
+                            
+                            // Global variable - use GETGLOBAL instruction
+                            let const_idx = self.add_constant(Value::String(*name));
+                            let reg = self.reg_alloc.allocate();
+                            self.emit_bx(OpCode::GetGlobal, reg, const_idx);
+                            
+                            Ok(reg)
+                        },
+                        
+                        Variable::TableField { table, key } => {
+                            // Compile table expression directly (without assuming it's a Variable)
+                            let table_reg = self.compile_expression(table)?;
+                            
+                            // Compile key expression
+                            let key_reg = self.compile_expression(key)?;
+                            
+                            // GetTable instruction
+                            let dest_reg = self.reg_alloc.allocate();
+                            self.emit(OpCode::GetTable, dest_reg, table_reg, key_reg);
+                            
+                            // Free registers
+                            self.reg_alloc.free(table_reg);
+                            self.reg_alloc.free(key_reg);
+                            
+                            Ok(dest_reg)
+                        },
+                        
+                        Variable::TableDot { table, key } => {
+                            // Compile table expression directly (without assuming it's a Variable)
+                            let table_reg = self.compile_expression(table)?;
+                            
+                            // Use key as a constant
+                            let const_idx = self.add_constant(Value::String(*key));
+                            
+                            // Ensure constant index is within limits (0-255 for RK)
+                            let dest_reg = self.reg_alloc.allocate();
+                            if const_idx > 0xFF {
+                                // If index is too large, load constant into a register first
+                                let key_reg = self.reg_alloc.allocate();
+                                self.emit_bx(OpCode::LoadK, key_reg, const_idx);
+                                
+                                // Then use the register
+                                self.emit(OpCode::GetTable, dest_reg, table_reg, key_reg);
+                                
+                                // Free the key register
+                                self.reg_alloc.free(key_reg);
+                            } else {
+                                // GetTable with constant key (RK format)
+                                self.emit(OpCode::GetTable, dest_reg, table_reg, 0x100 | const_idx);
+                            }
+                            
+                            // Free register
+                            self.reg_alloc.free(table_reg);
+                            
+                            Ok(dest_reg)
+                        }
+                    }
+                },
+                _ => self.compile_expression_original(expr)
+            }
+        }
+    }
+    
+    /// Original implementation of compile_expression for other expression types
+    fn compile_expression_original(&mut self, expr: &Node<Expression>) -> Result<u16> {
+        match &expr.node {
             Expression::Nil => {
                 let reg = self.reg_alloc.allocate();
                 self.emit(OpCode::LoadNil, reg, 0, 0);
@@ -994,90 +1177,9 @@ impl Compiler {
                 Ok(reg)
             },
             
-            Expression::Variable(var) => {
-                match var {
-                    Variable::Name(name) => {
-                        // Check if it's a local variable
-                        if let Some(reg) = self.scope.lookup(name) {
-                            return Ok(reg);
-                        }
-                        
-                        // Global variable - use GETGLOBAL instruction
-                        let const_idx = self.add_constant(Value::String(*name));
-                        let reg = self.reg_alloc.allocate();
-                        self.emit_bx(OpCode::GetGlobal, reg, const_idx);
-                        
-                        Ok(reg)
-                    },
-                    
-                    Variable::TableField { table, key } => {
-                        // Create an Expression node for the table
-                        let table_var = match &table.node {
-                            Expression::Variable(var) => var.clone(),
-                            _ => return Err(LuaError::TypeError("Expected variable for table access".to_string())),
-                        };
-
-                        let table_expr = Node::new(
-                            Expression::Variable(table_var),
-                            table.loc
-                        );
-                        
-                        let table_reg = self.compile_expression(&table_expr)?;
-                        
-                        // Compile key expression
-                        let key_reg = self.compile_expression(key)?;
-                        
-                        // GetTable instruction
-                        let dest_reg = self.reg_alloc.allocate();
-                        self.emit(OpCode::GetTable, dest_reg, table_reg, key_reg);
-                        
-                        // Free registers
-                        self.reg_alloc.free(table_reg);
-                        self.reg_alloc.free(key_reg);
-                        
-                        Ok(dest_reg)
-                    },
-                    
-                    Variable::TableDot { table, key } => {
-                        // Create an Expression node for the table
-                        let table_var = match &table.node {
-                            Expression::Variable(var) => var.clone(),
-                            _ => return Err(LuaError::TypeError("Expected variable for table dot access".to_string())),
-                        };
-
-                        let table_expr = Node::new(
-                            Expression::Variable(table_var),
-                            table.loc
-                        );
-                        
-                        let table_reg = self.compile_expression(&table_expr)?;
-                        
-                        // Use key as a constant
-                        let const_idx = self.add_constant(Value::String(*key));
-                        
-                        // Ensure constant index is within limits (0-255 for RK)
-                        let dest_reg = self.reg_alloc.allocate();
-                        if const_idx > 0xFF {
-                            // If index is too large, load constant into a register first
-                            let key_reg = self.reg_alloc.allocate();
-                            self.emit_bx(OpCode::LoadK, key_reg, const_idx);
-                            
-                            // Then use the register
-                            self.emit(OpCode::GetTable, dest_reg, table_reg, key_reg);
-                            
-                            // Free the key register
-                            self.reg_alloc.free(key_reg);
-                        } else {
-                            // GetTable with constant key (RK format)
-                            self.emit(OpCode::GetTable, dest_reg, table_reg, 0x100 | const_idx);
-                        }
-                        
-                        // Free register
-                        self.reg_alloc.free(table_reg);
-                        
-                        Ok(dest_reg)
-                    }
-                }
+            Expression::Variable(_) => {
+                // Should never happen - handled in compile_expression
+                panic!("Variable expression should be handled in compile_expression")
             },
             
             Expression::Vararg => {
@@ -1239,110 +1341,9 @@ impl Compiler {
                 Ok(closure_reg)
             },
             
-            Expression::BinaryOp { op, left, right } => {
-                // Compile operands
-                let left_reg = self.compile_expression(left)?;
-                let right_reg = self.compile_expression(right)?;
-                
-                // Allocate register for result
-                let result_reg = self.reg_alloc.allocate();
-                
-                // Emit appropriate instruction based on operator
-                match op {
-                    BinaryOperator::Add => {
-                        self.emit(OpCode::Add, result_reg, left_reg, right_reg);
-                    },
-                    BinaryOperator::Sub => {
-                        self.emit(OpCode::Sub, result_reg, left_reg, right_reg);
-                    },
-                    BinaryOperator::Mul => {
-                        self.emit(OpCode::Mul, result_reg, left_reg, right_reg);
-                    },
-                    BinaryOperator::Div => {
-                        self.emit(OpCode::Div, result_reg, left_reg, right_reg);
-                    },
-                    BinaryOperator::Mod => {
-                        self.emit(OpCode::Mod, result_reg, left_reg, right_reg);
-                    },
-                    BinaryOperator::Pow => {
-                        self.emit(OpCode::Pow, result_reg, left_reg, right_reg);
-                    },
-                    BinaryOperator::Concat => {
-                        self.emit(OpCode::Concat, result_reg, left_reg, right_reg);
-                    },
-                    
-                    // Comparisons
-                    BinaryOperator::LT => {
-                        self.emit(OpCode::Lt, 1, left_reg, right_reg); // A=1 means "true if L<R"
-                        self.emit(OpCode::LoadBool, result_reg, 1, 1); // Load true, skip next
-                        self.emit(OpCode::LoadBool, result_reg, 0, 0); // Load false
-                    },
-                    BinaryOperator::LE => {
-                        self.emit(OpCode::Le, 1, left_reg, right_reg);
-                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
-                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
-                    },
-                    BinaryOperator::GT => {
-                        self.emit(OpCode::Lt, 1, right_reg, left_reg); // Swap operands for GT
-                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
-                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
-                    },
-                    BinaryOperator::GE => {
-                        self.emit(OpCode::Le, 1, right_reg, left_reg); // Swap operands for GE
-                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
-                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
-                    },
-                    BinaryOperator::EQ => {
-                        self.emit(OpCode::Eq, 1, left_reg, right_reg);
-                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
-                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
-                    },
-                    BinaryOperator::NE => {
-                        self.emit(OpCode::Eq, 0, left_reg, right_reg);
-                        self.emit(OpCode::LoadBool, result_reg, 1, 1);
-                        self.emit(OpCode::LoadBool, result_reg, 0, 0);
-                    },
-                    
-                    // Logical operations with short-circuit evaluation
-                    BinaryOperator::And => {
-                        // Move left value to result register
-                        self.emit(OpCode::Move, result_reg, left_reg, 0);
-                        
-                        // Test if left is truthy
-                        self.emit(OpCode::Test, result_reg, 0, 0); // If result is falsey, skip
-                        
-                        // Skip right operand if left is false/nil (short-circuit)
-                        let end_jump = self.emit_jump();
-                        
-                        // Evaluate right operand and store in result register
-                        self.emit(OpCode::Move, result_reg, right_reg, 0);
-                        
-                        // Patch jump to here
-                        self.patch_jump(end_jump);
-                    },
-                    BinaryOperator::Or => {
-                        // Move left value to result register
-                        self.emit(OpCode::Move, result_reg, left_reg, 0);
-                        
-                        // Test if left is truthy
-                        self.emit(OpCode::Test, result_reg, 1, 0); // If result is truthy, skip
-                        
-                        // Skip right operand if left is true (short-circuit)
-                        let end_jump = self.emit_jump();
-                        
-                        // Evaluate right operand and store in result register
-                        self.emit(OpCode::Move, result_reg, right_reg, 0);
-                        
-                        // Patch jump to here
-                        self.patch_jump(end_jump);
-                    },
-                }
-                
-                // Free operand registers
-                self.reg_alloc.free(left_reg);
-                self.reg_alloc.free(right_reg);
-                
-                Ok(result_reg)
+            Expression::BinaryOp { .. } => {
+                // Binary operations are now handled in the main compile_expression method
+                panic!("Binary operations should be handled in compile_expression")
             },
             
             Expression::UnaryOp { op, operand } => {
