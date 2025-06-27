@@ -1,11 +1,8 @@
 use crate::lua_new::error::{LuaError, Result};
-use crate::lua_new::parser::Parser;
-use crate::lua_new::compiler::Compiler;
+use crate::lua_new::compilation::{CompilationScript};
+use crate::lua_new::value::Value;
 use crate::lua_new::vm::LuaVM;
 use crate::lua_new::redis_api::RedisApiContext;
-use crate::lua_new::sandbox::LuaSandbox;
-use crate::lua_new::gil::LuaGIL;
-use crate::lua_new::value::Value;
 use crate::storage::engine::StorageEngine;
 use crate::protocol::resp::RespFrame;
 use crate::error::FerrousError;
@@ -30,7 +27,7 @@ pub struct ScriptExecutor {
     cache: Arc<RwLock<HashMap<String, CompiledScript>>>,
     
     /// Global Interpreter Lock
-    gil: Arc<LuaGIL>,
+    gil: Arc<crate::lua_new::gil::LuaGIL>,
     
     /// Storage engine reference
     storage: Arc<StorageEngine>,
@@ -40,6 +37,9 @@ pub struct ScriptExecutor {
     
     /// Configuration
     config: crate::lua_new::VMConfig,
+    
+    /// Compilation cache (new)
+    compilation_cache: Arc<RwLock<HashMap<String, CompilationScript>>>,
 }
 
 /// Runtime information for a running script
@@ -110,10 +110,11 @@ impl ScriptExecutor {
         
         ScriptExecutor {
             cache: Arc::new(RwLock::new(HashMap::new())),
-            gil: Arc::new(LuaGIL::new(storage.clone())),
+            gil: Arc::new(crate::lua_new::gil::LuaGIL::new(storage.clone())),
             storage,
             stats: Arc::new(Mutex::new(ExecutionStats::default())),
             config,
+            compilation_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -126,36 +127,59 @@ impl ScriptExecutor {
         args: Vec<Vec<u8>>,
         db: usize,
     ) -> std::result::Result<RespFrame, FerrousError> {
-        println!("[LUA_GIL] Executing EVAL source={} keys={} args={}", 
+        println!("[LUA_EXECUTOR] Executing EVAL source={} keys={} args={}", 
                 source, keys.len(), args.len());
         
         // Compute SHA1
-        let sha1 = compute_sha1(source);
+        let sha1 = crate::lua_new::compilation::compute_sha1(source);
         
-        // Try cache first
-        let script = match self.get_cached(&sha1) {
-            Some(script) => {
+        // Try compilation cache first
+        let compilation_result = match self.get_cached_compilation(&sha1) {
+            Some(compiled) => {
+                println!("[LUA_EXECUTOR] Using cached compilation");
                 self.stats.lock().unwrap().cache_hits += 1;
-                script
+                Ok(compiled)
             }
             None => {
+                println!("[LUA_EXECUTOR] Compiling new script");
                 self.stats.lock().unwrap().cache_misses += 1;
                 
-                // Compile new script
-                match self.compile_script(source, sha1.clone()) {
-                    Ok(script) => {
+                // Compile script
+                let mut vm = LuaVM::new(self.config.clone());
+                let mut compiler = crate::lua_new::compiler::Compiler::new();
+                compiler.set_heap(&mut vm.heap as *mut _);
+                
+                match compiler.compile(source) {
+                    Ok(compilation) => {
                         // Add to cache
-                        self.add_to_cache(script.clone());
-                        script
+                        self.add_to_compilation_cache(compilation.clone());
+                        Ok(compilation)
                     }
                     Err(e) => {
-                        return Ok(RespFrame::Error(Arc::new(
-                            format!("ERR {}", e).into_bytes()
-                        )));
+                        let error_msg = format!("Compilation error: {}", e);
+                        println!("[LUA_EXECUTOR] {}", error_msg);
+                        Err(ScriptError::CompilationFailed(error_msg))
                     }
                 }
             }
         };
+        
+        // Handle compilation errors
+        let _compilation = match compilation_result {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(RespFrame::Error(Arc::new(e.to_string().into_bytes())));
+            }
+        };
+        
+        // Always create the source-only script for backward compatibility
+        let script = CompiledScript {
+            source: source.to_string(),
+            sha1: sha1.clone(),
+        };
+        
+        // Add to cache
+        self.add_to_cache(script.clone());
         
         // Execute script using the GIL
         let result = self.gil.execute_script(
@@ -198,7 +222,7 @@ impl ScriptExecutor {
         args: Vec<Vec<u8>>,
         db: usize,
     ) -> std::result::Result<RespFrame, FerrousError> {
-        println!("[LUA_GIL] Executing EVALSHA sha1={} keys={} args={}", 
+        println!("[LUA_EXECUTOR] Executing EVALSHA sha1={} keys={} args={}", 
                 sha1, keys.len(), args.len());
                 
         // Look up in cache
@@ -250,15 +274,33 @@ impl ScriptExecutor {
     
     /// Load a script without executing (SCRIPT LOAD)
     pub fn load(&self, source: &str) -> std::result::Result<String, ScriptError> {
-        let sha1 = compute_sha1(source);
+        let sha1 = crate::lua_new::compilation::compute_sha1(source);
         
         // Check if already loaded
         if self.get_cached(&sha1).is_some() {
             return Ok(sha1);
         }
         
-        // Compile and cache
-        let script = self.compile_script(source, sha1.clone())?;
+        // Compile script
+        let mut vm = LuaVM::new(self.config.clone());
+        let mut compiler = crate::lua_new::compiler::Compiler::new();
+        compiler.set_heap(&mut vm.heap as *mut _);
+        
+        // Compile and add to compilation cache
+        match compiler.compile(source) {
+            Ok(compilation) => {
+                self.add_to_compilation_cache(compilation);
+            }
+            Err(e) => {
+                return Err(ScriptError::CompilationFailed(e.to_string()));
+            }
+        }
+        
+        // Add to source cache
+        let script = CompiledScript {
+            source: source.to_string(),
+            sha1: sha1.clone(),
+        };
         self.add_to_cache(script);
         
         Ok(sha1)
@@ -273,6 +315,7 @@ impl ScriptExecutor {
     /// Flush the script cache (SCRIPT FLUSH)
     pub fn flush(&self) {
         self.cache.write().unwrap().clear();
+        self.compilation_cache.write().unwrap().clear();
     }
     
     /// Kill the currently running script (SCRIPT KILL)
@@ -285,27 +328,21 @@ impl ScriptExecutor {
         self.cache.read().unwrap().get(sha1).cloned()
     }
     
+    /// Get a cached compilation
+    fn get_cached_compilation(&self, sha1: &str) -> Option<CompilationScript> {
+        self.compilation_cache.read().unwrap().get(sha1).cloned()
+    }
+    
     /// Add a script to cache
     fn add_to_cache(&self, script: CompiledScript) {
         self.cache.write().unwrap().insert(script.sha1.clone(), script);
     }
     
-    /// Compile a script
-    fn compile_script(&self, source: &str, sha1: String) -> std::result::Result<CompiledScript, ScriptError> {
-        // We no longer need to create a temporary VM just for compilation
-        // Just compute the SHA1 and store the source
-        
-        Ok(CompiledScript {
-            source: source.to_string(),
-            sha1,
-        })
+    /// Add a compilation to cache
+    fn add_to_compilation_cache(&self, script: CompilationScript) {
+        self.compilation_cache.write().unwrap().insert(script.sha1.clone(), script);
     }
 
-}
-
-/// Compute SHA1 hash of a script
-fn compute_sha1(script: &str) -> String {
-    crate::lua_new::sha1::compute_sha1(script)
 }
 
 /// Extension trait for converting standard errors

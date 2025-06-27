@@ -295,6 +295,9 @@ pub struct FunctionProto {
     
     /// Line number information (if available)
     pub line_info: Option<Vec<u32>>,
+    
+    /// Nested function prototypes
+    pub nested_protos: Vec<FunctionProto>,
 }
 
 impl Default for FunctionProto {
@@ -308,6 +311,7 @@ impl Default for FunctionProto {
             upvalue_count: 0,
             source: None,
             line_info: None,
+            nested_protos: Vec::new(),
         }
     }
 }

@@ -26,6 +26,7 @@ pub mod lexer;
 pub mod cjson;
 pub mod sha1;
 pub mod gil;
+pub mod compilation;
 
 #[cfg(test)]
 mod test_cjson;
@@ -39,6 +40,7 @@ pub use sandbox::LuaSandbox;
 pub use parser::Parser;
 pub use compiler::Compiler;
 pub use gil::LuaGIL;
+pub use compilation::{CompilationScript, CompilationProto, CompilationValue};
 
 /// Resource limits for Lua scripts
 #[derive(Debug, Clone)]

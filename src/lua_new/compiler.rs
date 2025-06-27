@@ -4,7 +4,8 @@
 //! for the Lua VM to execute.
 
 use crate::lua_new::error::{LuaError, Result};
-use crate::lua_new::value::{FunctionProto, Instruction, OpCode, Value, StringHandle};
+use crate::lua_new::compilation::{CompilationValue, CompilationProto, CompilationScript};
+use crate::lua_new::value::{Instruction, OpCode, StringHandle};
 use crate::lua_new::ast::{
     Chunk, Statement, Expression, Variable, Node, BinaryOperator, UnaryOperator,
     FunctionName, FunctionDefinition, Assignment, LocalAssignment, ReturnStatement,
@@ -12,8 +13,6 @@ use crate::lua_new::ast::{
 };
 use crate::lua_new::parser::Parser;
 use crate::lua_new::executor::{CompiledScript, ScriptError};
-use crate::lua_new::vm::LuaVM;
-use crate::lua_new::VMConfig;
 use std::collections::HashMap;
 
 /// Register allocator for the compiler
@@ -128,7 +127,8 @@ impl RegisterAllocator {
 /// Scope information for local variables
 struct Scope {
     /// Local variables (name -> register)
-    locals: HashMap<StringHandle, u16>,
+    /// We use string indices instead of StringHandle since we're compilation-only
+    locals: HashMap<usize, u16>,
     
     /// Parent scope (for lookup)
     parent: Option<Box<Scope>>,
@@ -152,14 +152,14 @@ impl Scope {
     }
     
     /// Define a local variable
-    fn define(&mut self, name: StringHandle, register: u16) {
+    fn define(&mut self, name: usize, register: u16) {
         self.locals.insert(name, register);
     }
     
     /// Look up a local variable
-    fn lookup(&self, name: &StringHandle) -> Option<u16> {
+    fn lookup(&self, name: usize) -> Option<u16> {
         // Check current scope
-        if let Some(reg) = self.locals.get(name) {
+        if let Some(reg) = self.locals.get(&name) {
             return Some(*reg);
         }
         
@@ -198,19 +198,25 @@ pub struct Compiler {
     scope: Scope,
     
     /// Current function's constants
-    constants: Vec<Value>,
+    constants: Vec<CompilationValue>,
     
     /// Current function's bytecode
     code: Vec<Instruction>,
     
     /// Upvalue information for closures
-    upvalues: Vec<(StringHandle, bool)>, // (name, is_local)
+    upvalues: Vec<(usize, bool)>, // (name_index, is_local)
     
-    /// Heap for string interning
+    /// String pool for the entire script
+    string_pool: Vec<String>,
+    
+    /// Map from string content to index in string pool
+    string_map: HashMap<String, usize>,
+    
+    /// Nested function prototypes for the current function
+    nested_protos: Vec<CompilationProto>,
+    
+    /// Heap for temporary string interning
     heap: *mut crate::lua_new::heap::LuaHeap,
-    
-    /// VM configuration
-    config: VMConfig,
 }
 
 impl Compiler {
@@ -222,12 +228,14 @@ impl Compiler {
             constants: Vec::new(),
             code: Vec::new(),
             upvalues: Vec::new(),
+            string_pool: Vec::new(),
+            string_map: HashMap::new(),
+            nested_protos: Vec::new(),
             heap: std::ptr::null_mut(),
-            config: VMConfig::default(),
         }
     }
     
-    /// Set the heap reference for string interning
+    /// Set the heap reference for string interning during parsing
     pub fn set_heap(&mut self, heap: *mut crate::lua_new::heap::LuaHeap) {
         self.heap = heap;
     }
@@ -237,12 +245,50 @@ impl Compiler {
         unsafe { &mut *self.heap }
     }
     
+    /// Intern a string handle into the string pool
+    fn intern_string_handle(&mut self, handle: StringHandle) -> usize {
+        // Get string bytes from heap
+        let bytes = self.heap().get_string(handle).unwrap();
+        let string = std::str::from_utf8(bytes).unwrap().to_string();
+        
+        // Check if already in pool
+        if let Some(&idx) = self.string_map.get(&string) {
+            return idx;
+        }
+        
+        // Add to pool
+        let idx = self.string_pool.len();
+        self.string_pool.push(string.clone());
+        self.string_map.insert(string, idx);
+        idx
+    }
+    
+    /// Add a string directly to the pool
+    fn add_string(&mut self, s: &str) -> usize {
+        // Check if already in pool
+        if let Some(&idx) = self.string_map.get(s) {
+            return idx;
+        }
+        
+        // Add to pool
+        let idx = self.string_pool.len();
+        self.string_pool.push(s.to_string());
+        self.string_map.insert(s.to_string(), idx);
+        idx
+    }
+    
     /// Add a constant
-    fn add_constant(&mut self, value: Value) -> u16 {
+    fn add_constant(&mut self, value: CompilationValue) -> u16 {
         // Check if constant already exists
         for (i, v) in self.constants.iter().enumerate() {
-            if *v == value {
-                return i as u16;
+            match (v, &value) {
+                (CompilationValue::Nil, CompilationValue::Nil) => return i as u16,
+                (CompilationValue::Boolean(a), CompilationValue::Boolean(b)) if a == b => return i as u16,
+                (CompilationValue::Number(a), CompilationValue::Number(b)) if a == b => return i as u16,
+                (CompilationValue::String(a), CompilationValue::String(b)) if a == b => return i as u16,
+                (CompilationValue::FunctionPrototype(a), CompilationValue::FunctionPrototype(b)) if a == b => return i as u16,
+                (CompilationValue::TableConstructor, CompilationValue::TableConstructor) => return i as u16,
+                _ => {}
             }
         }
         
@@ -304,34 +350,37 @@ impl Compiler {
         );
     }
     
-    /// Compile a Lua script
-    pub fn compile(&mut self, source: &str) -> Result<FunctionProto> {
-        let mut parser = Parser::new(source, self.heap())?;
-        let ast = parser.parse()?;
-        self.compile_chunk(&ast)
-    }
-    
-    /// Compile a script into a CompiledScript for the executor
-    pub fn compile_script(source: &str, sha1: String, _heap: &mut crate::lua_new::heap::LuaHeap) -> std::result::Result<CompiledScript, ScriptError> {
-        // We no longer need to parse or compile here since compilation will happen
-        // in the execution VM - just store the source and SHA1
-        
-        Ok(CompiledScript {
-            source: source.to_string(),
-            sha1,
-            // the closure field has been removed
-        })
-    }
-
-    /// Compile a chunk of code
-    pub fn compile_chunk(&mut self, chunk: &Chunk) -> Result<FunctionProto> {
+    /// Compile a Lua script and return a CompilationScript
+    pub fn compile(&mut self, source: &str) -> Result<CompilationScript> {
         // Reset compiler state
         self.reg_alloc = RegisterAllocator::new();
         self.constants.clear();
         self.code.clear();
         self.upvalues.clear();
         self.scope = Scope::new();
+        self.nested_protos.clear();
+        // Note: we don't clear string_pool/string_map as they persist for the whole script
         
+        let mut parser = Parser::new(source, self.heap())?;
+        let ast = parser.parse()?;
+        
+        // Compile the main chunk
+        let main_proto = self.compile_chunk(&ast)?;
+        
+        // Compute SHA1
+        let sha1 = crate::lua_new::compilation::compute_sha1(source);
+        
+        // Create the compilation script
+        Ok(CompilationScript::new(
+            main_proto,
+            self.string_pool.clone(),
+            None, // source_name
+            sha1,
+        ))
+    }
+    
+    /// Compile a chunk of code
+    fn compile_chunk(&mut self, chunk: &Chunk) -> Result<CompilationProto> {
         // Compile statements
         for stmt in &chunk.statements {
             self.compile_statement(stmt)?;
@@ -345,15 +394,15 @@ impl Compiler {
             self.emit(OpCode::Return, 0, 1, 0);
         }
         
-        // Create the function prototype
-        Ok(FunctionProto {
+        // Create and return the function prototype
+        Ok(CompilationProto {
             code: self.code.clone(),
             constants: self.constants.clone(),
-            param_count: 0, // Will be set by caller for function definitions
-            is_vararg: false, // Will be set by caller for vararg functions
+            param_count: 0, // Top-level chunk has no parameters
+            is_vararg: false, // Top-level chunk is not variadic
             max_stack_size: (self.reg_alloc.max_reg() + 1).max(2) as u8,
             upvalue_count: self.upvalues.len() as u8,
-            source: None, // Source file name not tracked in this implementation
+            nested_protos: self.nested_protos.clone(),
             line_info: None, // Line number info not tracked in this implementation
         })
     }
@@ -537,7 +586,7 @@ impl Compiler {
                     self.compile_expression(step_expr)?
                 } else {
                     // Use constant 1
-                    let const_idx = self.add_constant(Value::Number(1.0));
+                    let const_idx = self.add_constant(CompilationValue::Number(1.0));
                     let reg = self.reg_alloc.allocate();
                     self.emit_bx(OpCode::LoadK, reg, const_idx);
                     reg
@@ -547,7 +596,8 @@ impl Compiler {
                 let var_reg = self.reg_alloc.allocate();
                 
                 // Define loop variable in scope
-                self.scope.define(*variable, var_reg);
+                let var_idx = self.intern_string_handle(*variable);
+                self.scope.define(var_idx, var_reg);
                 
                 // ForPrep (subtract step from init)
                 self.emit_sbx(OpCode::ForPrep, init_reg, 1); // Jump to ForLoop
@@ -617,13 +667,15 @@ impl Compiler {
     fn compile_variable_assignment(&mut self, var: &Node<Variable>, value_reg: u16) -> Result<()> {
         match &var.node {
             Variable::Name(name) => {
+                let name_idx = self.intern_string_handle(*name);
+                
                 // Check if it's a local variable
-                if let Some(reg) = self.scope.lookup(name) {
+                if let Some(reg) = self.scope.lookup(name_idx) {
                     // Local variable - use MOVE instruction
                     self.emit(OpCode::Move, reg, value_reg, 0);
                 } else {
                     // Global variable - use SETGLOBAL instruction
-                    let const_idx = self.add_constant(Value::String(*name));
+                    let const_idx = self.add_constant(CompilationValue::String(name_idx));
                     self.emit_bx(OpCode::SetGlobal, value_reg, const_idx);
                 }
             },
@@ -670,7 +722,8 @@ impl Compiler {
                 let table_reg = self.compile_expression(&table_expr)?;
                 
                 // Use key as a constant
-                let const_idx = self.add_constant(Value::String(*key));
+                let key_idx = self.intern_string_handle(*key);
+                let const_idx = self.add_constant(CompilationValue::String(key_idx));
                 
                 // Ensure constant index is within limits (0-255 for RK)
                 if const_idx > 0xFF {
@@ -708,7 +761,8 @@ impl Compiler {
         let mut var_regs = Vec::with_capacity(assignment.names.len());
         for name in &assignment.names {
             let reg = self.reg_alloc.allocate();
-            self.scope.define(*name, reg);
+            let name_idx = self.intern_string_handle(*name);
+            self.scope.define(name_idx, reg);
             var_regs.push(reg);
         }
         
@@ -739,11 +793,13 @@ impl Compiler {
         let old_constants = std::mem::replace(&mut self.constants, Vec::new());
         let old_code = std::mem::replace(&mut self.code, Vec::new());
         let old_upvalues = std::mem::take(&mut self.upvalues);
+        let old_nested_protos = std::mem::replace(&mut self.nested_protos, Vec::new());
         
         // Define parameters as local variables
         for (i, &name) in func_def.parameters.names.iter().enumerate() {
             let reg = i as u16; // Parameters are in first registers
-            self.scope.define(name, reg);
+            let name_idx = self.intern_string_handle(name);
+            self.scope.define(name_idx, reg);
         }
         
         // Compile function body
@@ -760,37 +816,43 @@ impl Compiler {
         }
         
         // Create function prototype
-        let proto = FunctionProto {
+        let proto = CompilationProto {
             code: self.code.clone(),
             constants: self.constants.clone(),
             param_count: func_def.parameters.names.len() as u8,
             is_vararg: func_def.parameters.is_variadic,
             max_stack_size: (self.reg_alloc.max_reg() + 1).max(2) as u8,
             upvalue_count: self.upvalues.len() as u8,
-            source: None, // Source file name not tracked in this implementation
-            line_info: None, // Line number info not tracked in this implementation
+            nested_protos: self.nested_protos.clone(),
+            line_info: None,
         };
         
         // Restore compiler state
-        let _func_proto = proto;
         self.reg_alloc = old_reg_alloc;
         self.scope = old_scope;
         self.constants = old_constants;
         self.code = old_code;
         self.upvalues = old_upvalues;
+        let mut restored_nested_protos = old_nested_protos;
         
-        // Add the function prototype as a constant
-        let proto_idx = self.add_constant(Value::Number(1.0)); // Placeholder - we don't have proper proto constants yet
+        // Add the function prototype to nested protos
+        restored_nested_protos.push(proto);
+        let proto_idx = restored_nested_protos.len() - 1;
+        self.nested_protos = restored_nested_protos;
+        
+        // Add the function prototype index as a constant
+        let const_idx = self.add_constant(CompilationValue::FunctionPrototype(proto_idx));
         
         // Create closure
         let closure_reg = self.reg_alloc.allocate();
-        self.emit_bx(OpCode::Closure, closure_reg, proto_idx);
+        self.emit_bx(OpCode::Closure, closure_reg, const_idx);
         
         // Handle function name and assignment
         if is_local {
             // Local function - get the simple name
             if let FunctionName::Simple(name) = &func_def.name {
-                self.scope.define(*name, closure_reg);
+                let name_idx = self.intern_string_handle(*name);
+                self.scope.define(name_idx, closure_reg);
             } else {
                 return Err(LuaError::SyntaxError {
                     message: "Local function must have a simple name".to_string(),
@@ -803,37 +865,41 @@ impl Compiler {
             match &func_def.name {
                 FunctionName::Simple(name) => {
                     // Simple global function name
-                    let name_idx = self.add_constant(Value::String(*name));
-                    self.emit_bx(OpCode::SetGlobal, closure_reg, name_idx);
+                    let name_idx = self.intern_string_handle(*name);
+                    let name_const_idx = self.add_constant(CompilationValue::String(name_idx));
+                    self.emit_bx(OpCode::SetGlobal, closure_reg, name_const_idx);
                 },
                 FunctionName::TableField { base, fields } => {
                     // Function in table: base.field1.field2 = function
+                    let base_idx = self.intern_string_handle(*base);
+                    
                     // Get the base table - global or local
-                    let base_reg = if let Some(reg) = self.scope.lookup(base) {
+                    let base_reg = if let Some(reg) = self.scope.lookup(base_idx) {
                         // Local variable
                         reg
                     } else {
                         // Global variable
-                        let base_idx = self.add_constant(Value::String(*base));
+                        let base_const_idx = self.add_constant(CompilationValue::String(base_idx));
                         let reg = self.reg_alloc.allocate();
-                        self.emit_bx(OpCode::GetGlobal, reg, base_idx);
+                        self.emit_bx(OpCode::GetGlobal, reg, base_const_idx);
                         reg
                     };
                     
                     // Handle nested fields
                     let mut table_reg = base_reg;
                     for (i, field) in fields.iter().enumerate() {
-                        let field_idx = self.add_constant(Value::String(*field));
+                        let field_idx = self.intern_string_handle(*field);
+                        let field_const_idx = self.add_constant(CompilationValue::String(field_idx));
                         
                         if i < fields.len() - 1 {
                             // Intermediate field access
                             let next_reg = self.reg_alloc.allocate();
                             
                             // Ensure constant index is within limits (0-255 for RK)
-                            if field_idx > 0xFF {
+                            if field_const_idx > 0xFF {
                                 // If index is too large, load constant into a register first
                                 let key_reg = self.reg_alloc.allocate();
-                                self.emit_bx(OpCode::LoadK, key_reg, field_idx);
+                                self.emit_bx(OpCode::LoadK, key_reg, field_const_idx);
                                 
                                 // Then use the register
                                 self.emit(OpCode::GetTable, next_reg, table_reg, key_reg);
@@ -842,11 +908,11 @@ impl Compiler {
                                 self.reg_alloc.free(key_reg);
                             } else {
                                 // GetTable with constant key (RK format)
-                                self.emit(OpCode::GetTable, next_reg, table_reg, 0x100 | field_idx);
+                                self.emit(OpCode::GetTable, next_reg, table_reg, 0x100 | field_const_idx);
                             }
                             
                             // Free previous register if it's not the base variable
-                            if i > 0 || !self.scope.lookup(base).is_some() {
+                            if i > 0 || !self.scope.lookup(base_idx).is_some() {
                                 self.reg_alloc.free(table_reg);
                             }
                             
@@ -855,10 +921,10 @@ impl Compiler {
                             // Final field assignment
                             
                             // Ensure constant index is within limits (0-255 for RK)
-                            if field_idx > 0xFF {
+                            if field_const_idx > 0xFF {
                                 // If index is too large, load constant into a register first
                                 let key_reg = self.reg_alloc.allocate();
-                                self.emit_bx(OpCode::LoadK, key_reg, field_idx);
+                                self.emit_bx(OpCode::LoadK, key_reg, field_const_idx);
                                 
                                 // Then use the register
                                 self.emit(OpCode::SetTable, table_reg, key_reg, closure_reg);
@@ -867,11 +933,11 @@ impl Compiler {
                                 self.reg_alloc.free(key_reg);
                             } else {
                                 // SetTable with constant key (RK format)
-                                self.emit(OpCode::SetTable, table_reg, 0x100 | field_idx, closure_reg);
+                                self.emit(OpCode::SetTable, table_reg, 0x100 | field_const_idx, closure_reg);
                             }
                             
                             // Free table register if it's not a local variable
-                            if i > 0 || !self.scope.lookup(base).is_some() {
+                            if i > 0 || !self.scope.lookup(base_idx).is_some() {
                                 self.reg_alloc.free(table_reg);
                             }
                         }
@@ -1156,8 +1222,10 @@ impl Compiler {
                 Expression::Variable(var) => {
                     match var {
                         Variable::Name(name) => {
+                            let name_idx = self.intern_string_handle(*name);
+                            
                             // Check if it's a local variable
-                            if let Some(reg) = self.scope.lookup(name) {
+                            if let Some(reg) = self.scope.lookup(name_idx) {
                                 // For local variables, we need to be careful about register handling
                                 // Always copy to a new register to avoid any potential conflicts
                                 let temp_reg = self.reg_alloc.allocate();
@@ -1166,7 +1234,7 @@ impl Compiler {
                             }
                             
                             // Global variable - use GETGLOBAL instruction
-                            let const_idx = self.add_constant(Value::String(*name));
+                            let const_idx = self.add_constant(CompilationValue::String(name_idx));
                             let reg = self.reg_alloc.allocate();
                             self.emit_bx(OpCode::GetGlobal, reg, const_idx);
                             
@@ -1195,7 +1263,8 @@ impl Compiler {
                             let table_reg = self.compile_expression(table)?;
                             
                             // Use key as a constant
-                            let const_idx = self.add_constant(Value::String(*key));
+                            let key_idx = self.intern_string_handle(*key);
+                            let const_idx = self.add_constant(CompilationValue::String(key_idx));
                             
                             // Ensure constant index is within limits (0-255 for RK)
                             let dest_reg = self.reg_alloc.allocate();
@@ -1221,234 +1290,244 @@ impl Compiler {
                         }
                     }
                 },
-                _ => self.compile_expression_original(expr)
+                Expression::Nil => {
+                    let reg = self.reg_alloc.allocate();
+                    self.emit(OpCode::LoadNil, reg, 0, 0);
+                    Ok(reg)
+                },
+                
+                Expression::Boolean(b) => {
+                    let reg = self.reg_alloc.allocate();
+                    self.emit(OpCode::LoadBool, reg, if *b { 1 } else { 0 }, 0);
+                    Ok(reg)
+                },
+                
+                Expression::Number(n) => {
+                    let const_idx = self.add_constant(CompilationValue::Number(*n));
+                    let reg = self.reg_alloc.allocate();
+                    self.emit_bx(OpCode::LoadK, reg, const_idx);
+                    Ok(reg)
+                },
+                
+                Expression::String(s) => {
+                    let str_idx = self.intern_string_handle(*s);
+                    let const_idx = self.add_constant(CompilationValue::String(str_idx));
+                    let reg = self.reg_alloc.allocate();
+                    self.emit_bx(OpCode::LoadK, reg, const_idx);
+                    Ok(reg)
+                },
+                
+                Expression::Vararg => {
+                    // Not implemented yet
+                    Err(LuaError::NotImplemented("vararg expression"))
+                },
+                
+                Expression::FunctionCall(call) => {
+                    self.compile_function_call(call, false)
+                },
+                
+                Expression::TableConstructor(table) => {
+                    // Allocate register for the table
+                    let table_reg = self.reg_alloc.allocate();
+                    
+                    // Create table with estimated size
+                    let array_size = table.fields.iter()
+                        .filter(|f| matches!(f, TableField::Array(_)))
+                        .count();
+                    let _hash_size = table.fields.len() - array_size;
+                    
+                    // Compute log2 sizes for B and C fields (or just use reasonable defaults)
+                    let b = 0; // array size log2
+                    let c = 0; // hash size log2
+                    
+                    self.emit(OpCode::NewTable, table_reg, b, c);
+                    
+                    // Fill in the fields
+                    for (i, field) in table.fields.iter().enumerate() {
+                        match field {
+                            TableField::Array(expr) => {
+                                // Compile value expression
+                                let value_reg = self.compile_expression(expr)?;
+                                
+                                // Store in array part (i+1)
+                                let array_idx = i + 1;
+                                
+                                // Create constant for the index
+                                let const_idx = self.add_constant(CompilationValue::Number(array_idx as f64));
+                                
+                                // Ensure constant index is within limits (0-255 for RK)
+                                if const_idx > 0xFF {
+                                    // If index is too large, load constant into a register first
+                                    let key_reg = self.reg_alloc.allocate();
+                                    self.emit_bx(OpCode::LoadK, key_reg, const_idx);
+                                    
+                                    // Then use the register
+                                    self.emit(OpCode::SetTable, table_reg, key_reg, value_reg);
+                                    
+                                    // Free the key register
+                                    self.reg_alloc.free(key_reg);
+                                } else {
+                                    // SetTable with constant key (RK format)
+                                    self.emit(OpCode::SetTable, table_reg, 0x100 | const_idx, value_reg);
+                                }
+                                
+                                // Free value register
+                                self.reg_alloc.free(value_reg);
+                            },
+                            
+                            TableField::Record { key, value } => {
+                                // Compile value expression
+                                let value_reg = self.compile_expression(value)?;
+                                
+                                // Use constant for key
+                                let key_idx = self.intern_string_handle(*key);
+                                let const_idx = self.add_constant(CompilationValue::String(key_idx));
+                                
+                                // Ensure constant index is within limits (0-255 for RK)
+                                if const_idx > 0xFF {
+                                    // If index is too large, load constant into a register first
+                                    let key_reg = self.reg_alloc.allocate();
+                                    self.emit_bx(OpCode::LoadK, key_reg, const_idx);
+                                    
+                                    // Then use the register
+                                    self.emit(OpCode::SetTable, table_reg, key_reg, value_reg);
+                                    
+                                    // Free the key register
+                                    self.reg_alloc.free(key_reg);
+                                } else {
+                                    // SetTable with constant key (RK format)
+                                    self.emit(OpCode::SetTable, table_reg, 0x100 | const_idx, value_reg);
+                                }
+                                
+                                // Free value register
+                                self.reg_alloc.free(value_reg);
+                            },
+                            
+                            TableField::Expression { key, value } => {
+                                // Compile key and value expressions
+                                let key_reg = self.compile_expression(key)?;
+                                let value_reg = self.compile_expression(value)?;
+                                
+                                // Set the table field
+                                self.emit(OpCode::SetTable, table_reg, key_reg, value_reg);
+                                
+                                // Free registers
+                                self.reg_alloc.free(key_reg);
+                                self.reg_alloc.free(value_reg);
+                            },
+                        }
+                    }
+                    
+                    Ok(table_reg)
+                },
+                
+                Expression::AnonymousFunction { parameters, body } => {
+                    // Save current compiler state
+                    let old_reg_alloc = std::mem::replace(&mut self.reg_alloc, RegisterAllocator::new());
+                    let old_scope = std::mem::replace(&mut self.scope, Scope::new());
+                    let old_constants = std::mem::replace(&mut self.constants, Vec::new());
+                    let old_code = std::mem::replace(&mut self.code, Vec::new());
+                    let old_upvalues = std::mem::take(&mut self.upvalues);
+                    let old_nested_protos = std::mem::replace(&mut self.nested_protos, Vec::new());
+                    
+                    // Define parameters as local variables
+                    for (i, &name) in parameters.names.iter().enumerate() {
+                        let reg = i as u16; // Parameters are in first registers
+                        let name_idx = self.intern_string_handle(name);
+                        self.scope.define(name_idx, reg);
+                    }
+                    
+                    // Compile function body
+                    for stmt in &body.statements {
+                        self.compile_statement(stmt)?;
+                    }
+                    
+                    // Add return statement
+                    if let Some(ret) = &body.ret {
+                        self.compile_return_statement(ret)?;
+                    } else {
+                        // Implicit return nil
+                        self.emit(OpCode::Return, 0, 1, 0);
+                    }
+                    
+                    // Create function prototype
+                    let proto = CompilationProto {
+                        code: self.code.clone(),
+                        constants: self.constants.clone(),
+                        param_count: parameters.names.len() as u8,
+                        is_vararg: parameters.is_variadic,
+                        max_stack_size: (self.reg_alloc.max_reg() + 1).max(2) as u8,
+                        upvalue_count: self.upvalues.len() as u8,
+                        nested_protos: self.nested_protos.clone(),
+                        line_info: None,
+                    };
+                    
+                    // Restore compiler state
+                    self.reg_alloc = old_reg_alloc;
+                    self.scope = old_scope;
+                    self.constants = old_constants;
+                    self.code = old_code;
+                    self.upvalues = old_upvalues;
+                    let mut restored_nested_protos = old_nested_protos;
+                    
+                    // Add the function prototype to nested protos
+                    restored_nested_protos.push(proto);
+                    let proto_idx = restored_nested_protos.len() - 1;
+                    self.nested_protos = restored_nested_protos;
+                    
+                    // Add the function prototype index as a constant
+                    let const_idx = self.add_constant(CompilationValue::FunctionPrototype(proto_idx));
+                    
+                    // Create closure
+                    let closure_reg = self.reg_alloc.allocate();
+                    self.emit_bx(OpCode::Closure, closure_reg, const_idx);
+                    
+                    Ok(closure_reg)
+                },
+                
+                Expression::UnaryOp { op, operand } => {
+                    // Compile operand
+                    let operand_reg = self.compile_expression(operand)?;
+                    
+                    // Allocate register for result
+                    let result_reg = self.reg_alloc.allocate();
+                    
+                    // Emit appropriate instruction based on operator
+                    match op {
+                        UnaryOperator::Minus => {
+                            self.emit(OpCode::Unm, result_reg, operand_reg, 0);
+                        },
+                        UnaryOperator::Not => {
+                            self.emit(OpCode::Not, result_reg, operand_reg, 0);
+                        },
+                        UnaryOperator::Len => {
+                            self.emit(OpCode::Len, result_reg, operand_reg, 0);
+                        },
+                    }
+                    
+                    // Free operand register
+                    self.reg_alloc.free(operand_reg);
+                    
+                    Ok(result_reg)
+                },
+                
+                Expression::BinaryOp { .. } => {
+                    // Binary operations are now handled in the main compile_expression method
+                    panic!("Binary operations should be handled in compile_expression")
+                },
             }
         }
     }
     
-    /// Original implementation of compile_expression for other expression types
-    fn compile_expression_original(&mut self, expr: &Node<Expression>) -> Result<u16> {
-        match &expr.node {
-            Expression::Nil => {
-                let reg = self.reg_alloc.allocate();
-                self.emit(OpCode::LoadNil, reg, 0, 0);
-                Ok(reg)
-            },
-            
-            Expression::Boolean(b) => {
-                let reg = self.reg_alloc.allocate();
-                self.emit(OpCode::LoadBool, reg, if *b { 1 } else { 0 }, 0);
-                Ok(reg)
-            },
-            
-            Expression::Number(n) => {
-                let const_idx = self.add_constant(Value::Number(*n));
-                let reg = self.reg_alloc.allocate();
-                self.emit_bx(OpCode::LoadK, reg, const_idx);
-                Ok(reg)
-            },
-            
-            Expression::String(s) => {
-                let const_idx = self.add_constant(Value::String(*s));
-                let reg = self.reg_alloc.allocate();
-                self.emit_bx(OpCode::LoadK, reg, const_idx);
-                Ok(reg)
-            },
-            
-            Expression::Variable(_) => {
-                // Should never happen - handled in compile_expression
-                panic!("Variable expression should be handled in compile_expression")
-            },
-            
-            Expression::Vararg => {
-                // Not implemented yet
-                Err(LuaError::NotImplemented("vararg expression"))
-            },
-            
-            Expression::FunctionCall(call) => {
-                self.compile_function_call(call, false)
-            },
-            
-            Expression::TableConstructor(table) => {
-                // Allocate register for the table
-                let table_reg = self.reg_alloc.allocate();
-                
-                // Create table with estimated size
-                let array_size = table.fields.iter()
-                    .filter(|f| matches!(f, TableField::Array(_)))
-                    .count();
-                let _hash_size = table.fields.len() - array_size;
-                
-                // Compute log2 sizes for B and C fields (or just use reasonable defaults)
-                let b = 0; // array size log2
-                let c = 0; // hash size log2
-                
-                self.emit(OpCode::NewTable, table_reg, b, c);
-                
-                // Fill in the fields
-                for (i, field) in table.fields.iter().enumerate() {
-                    match field {
-                        TableField::Array(expr) => {
-                            // Compile value expression
-                            let value_reg = self.compile_expression(expr)?;
-                            
-                            // Store in array part (i+1)
-                            let array_idx = i + 1;
-                            
-                            // Create constant for the index
-                            let const_idx = self.add_constant(Value::Number(array_idx as f64));
-                            
-                            // Ensure constant index is within limits (0-255 for RK)
-                            if const_idx > 0xFF {
-                                // If index is too large, load constant into a register first
-                                let key_reg = self.reg_alloc.allocate();
-                                self.emit_bx(OpCode::LoadK, key_reg, const_idx);
-                                
-                                // Then use the register
-                                self.emit(OpCode::SetTable, table_reg, key_reg, value_reg);
-                                
-                                // Free the key register
-                                self.reg_alloc.free(key_reg);
-                            } else {
-                                // SetTable with constant key (RK format)
-                                self.emit(OpCode::SetTable, table_reg, 0x100 | const_idx, value_reg);
-                            }
-                            
-                            // Free value register
-                            self.reg_alloc.free(value_reg);
-                        },
-                        
-                        TableField::Record { key, value } => {
-                            // Compile value expression
-                            let value_reg = self.compile_expression(value)?;
-                            
-                            // Use constant for key
-                            let const_idx = self.add_constant(Value::String(*key));
-                            
-                            // Ensure constant index is within limits (0-255 for RK)
-                            if const_idx > 0xFF {
-                                // If index is too large, load constant into a register first
-                                let key_reg = self.reg_alloc.allocate();
-                                self.emit_bx(OpCode::LoadK, key_reg, const_idx);
-                                
-                                // Then use the register
-                                self.emit(OpCode::SetTable, table_reg, key_reg, value_reg);
-                                
-                                // Free the key register
-                                self.reg_alloc.free(key_reg);
-                            } else {
-                                // SetTable with constant key (RK format)
-                                self.emit(OpCode::SetTable, table_reg, 0x100 | const_idx, value_reg);
-                            }
-                            
-                            // Free value register
-                            self.reg_alloc.free(value_reg);
-                        },
-                        
-                        TableField::Expression { key, value } => {
-                            // Compile key and value expressions
-                            let key_reg = self.compile_expression(key)?;
-                            let value_reg = self.compile_expression(value)?;
-                            
-                            // Set the table field
-                            self.emit(OpCode::SetTable, table_reg, key_reg, value_reg);
-                            
-                            // Free registers
-                            self.reg_alloc.free(key_reg);
-                            self.reg_alloc.free(value_reg);
-                        },
-                    }
-                }
-                
-                Ok(table_reg)
-            },
-            
-            Expression::AnonymousFunction { parameters, body } => {
-                // Save current compiler state
-                let old_reg_alloc = std::mem::replace(&mut self.reg_alloc, RegisterAllocator::new());
-                let old_scope = std::mem::replace(&mut self.scope, Scope::new());
-                let old_constants = std::mem::replace(&mut self.constants, Vec::new());
-                let old_code = std::mem::replace(&mut self.code, Vec::new());
-                let old_upvalues = std::mem::take(&mut self.upvalues);
-                
-                // Define parameters as local variables
-                for (i, &name) in parameters.names.iter().enumerate() {
-                    let reg = i as u16; // Parameters are in first registers
-                    self.scope.define(name, reg);
-                }
-                
-                // Compile function body
-                for stmt in &body.statements {
-                    self.compile_statement(stmt)?;
-                }
-                
-                // Add return statement
-                if let Some(ret) = &body.ret {
-                    self.compile_return_statement(ret)?;
-                } else {
-                    // Implicit return nil
-                    self.emit(OpCode::Return, 0, 1, 0);
-                }
-                
-                // Create function prototype
-                let _proto = FunctionProto {
-                    code: self.code.clone(),
-                    constants: self.constants.clone(),
-                    param_count: parameters.names.len() as u8,
-                    is_vararg: parameters.is_variadic,
-                    max_stack_size: (self.reg_alloc.max_reg() + 1).max(2) as u8,
-                    upvalue_count: self.upvalues.len() as u8,
-                    source: None,
-                    line_info: None,
-                };
-                
-                // Restore compiler state
-                self.reg_alloc = old_reg_alloc;
-                self.scope = old_scope;
-                self.constants = old_constants;
-                self.code = old_code;
-                self.upvalues = old_upvalues;
-                
-                // Add the function prototype as a constant
-                let proto_idx = self.add_constant(Value::Number(1.0)); // Placeholder
-                
-                // Create closure
-                let closure_reg = self.reg_alloc.allocate();
-                self.emit_bx(OpCode::Closure, closure_reg, proto_idx);
-                
-                Ok(closure_reg)
-            },
-            
-            Expression::BinaryOp { .. } => {
-                // Binary operations are now handled in the main compile_expression method
-                panic!("Binary operations should be handled in compile_expression")
-            },
-            
-            Expression::UnaryOp { op, operand } => {
-                // Compile operand
-                let operand_reg = self.compile_expression(operand)?;
-                
-                // Allocate register for result
-                let result_reg = self.reg_alloc.allocate();
-                
-                // Emit appropriate instruction based on operator
-                match op {
-                    UnaryOperator::Minus => {
-                        self.emit(OpCode::Unm, result_reg, operand_reg, 0);
-                    },
-                    UnaryOperator::Not => {
-                        self.emit(OpCode::Not, result_reg, operand_reg, 0);
-                    },
-                    UnaryOperator::Len => {
-                        self.emit(OpCode::Len, result_reg, operand_reg, 0);
-                    },
-                }
-                
-                // Free operand register
-                self.reg_alloc.free(operand_reg);
-                
-                Ok(result_reg)
-            },
-        }
+    /// Compile a script into a CompiledScript for the executor
+    pub fn compile_script(source: &str, sha1: String, _heap: &mut crate::lua_new::heap::LuaHeap) -> std::result::Result<CompiledScript, ScriptError> {
+        // We no longer need to parse or compile here since compilation will happen
+        // in the execution VM - just store the source and SHA1
+        
+        Ok(CompiledScript {
+            source: source.to_string(),
+            sha1,
+            // the closure field has been removed
+        })
     }
 }
