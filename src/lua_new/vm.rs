@@ -5,6 +5,7 @@ use crate::lua_new::value::{Value, StringHandle, TableHandle, ClosureHandle, Thr
                              FunctionProto, UpvalueRef, Instruction, OpCode};
 use crate::lua_new::error::{LuaError, Result};
 use crate::lua_new::{VMConfig, LuaLimits};
+use crate::lua_new::compilation::{CompilationScript, CompilationProto, CompilationValue};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -188,6 +189,97 @@ impl LuaVM {
         }
         
         Ok(())
+    }
+    
+    /// Load a compile script and create a closure
+    pub fn load_compilation_script(&mut self, script: &CompilationScript) -> Result<ClosureHandle> {
+        println!("[VM] Loading compiled script with {} strings, {} constants in main proto",
+                 script.string_pool.len(), script.main_proto.constants.len());
+        
+        // First, intern all strings from the string pool
+        let string_handles: Vec<StringHandle> = script.string_pool.iter()
+            .map(|s| self.heap.create_string(s))
+            .collect();
+        
+        // Now load the main prototype
+        let proto = self.load_compilation_proto(&script.main_proto, &string_handles)?;
+        
+        // Create a closure with no upvalues
+        let closure_handle = self.heap.alloc_closure(proto, Vec::new());
+        
+        println!("[VM] Compiled script loaded successfully");
+        Ok(closure_handle)
+    }
+    
+    /// Load a compiled prototype recursively
+    fn load_compilation_proto(&mut self, proto: &CompilationProto, string_handles: &[StringHandle]) -> Result<FunctionProto> {
+        // Convert constants
+        let constants = proto.constants.iter()
+            .map(|c| self.compilation_value_to_value(c, string_handles))
+            .collect::<Result<Vec<Value>>>()?;
+        
+        // Load nested prototypes
+        let mut nested_protos = Vec::new();
+        for nested_proto in &proto.nested_protos {
+            nested_protos.push(self.load_compilation_proto(nested_proto, string_handles)?);
+        }
+        
+        // Create function prototype
+        let function_proto = FunctionProto {
+            code: proto.code.clone(),
+            constants,
+            param_count: proto.param_count,
+            is_vararg: proto.is_vararg,
+            max_stack_size: proto.max_stack_size,
+            upvalue_count: proto.upvalue_count,
+            source: None, // We don't have this info yet
+            line_info: proto.line_info.clone(),
+            nested_protos,
+        };
+        
+        Ok(function_proto)
+    }
+    
+    /// Convert a compilation value to a runtime value
+    fn compilation_value_to_value(&mut self, value: &CompilationValue, string_handles: &[StringHandle]) -> Result<Value> {
+        match value {
+            CompilationValue::Nil => Ok(Value::Nil),
+            CompilationValue::Boolean(b) => Ok(Value::Boolean(*b)),
+            CompilationValue::Number(n) => Ok(Value::Number(*n)),
+            CompilationValue::String(idx) => {
+                if *idx >= string_handles.len() {
+                    return Err(LuaError::InvalidConstant(*idx));
+                }
+                Ok(Value::String(string_handles[*idx]))
+            },
+            CompilationValue::FunctionPrototype(idx) => {
+                // For now, we just return a placeholder number
+                // In the future, we'll need to handle this properly
+                Ok(Value::Number(*idx as f64))
+            },
+            CompilationValue::TableConstructor => {
+                // For now, we just return a placeholder
+                Ok(Value::Nil)
+            },
+        }
+    }
+    
+    /// Execute a script directly from source
+    pub fn execute_script(&mut self, source: &str) -> Result<Value> {
+        println!("[VM] Executing script from source");
+        
+        // Create a compiler
+        let mut compiler = crate::lua_new::compiler::Compiler::new();
+        compiler.set_heap(&mut self.heap as *mut _);
+        
+        // Compile the script
+        let compilation_script = compiler.compile(source)?;
+        
+        // Load the script
+        let closure = self.load_compilation_script(&compilation_script)?;
+        
+        // Execute the script
+        self.execute_function(closure, &[])
     }
     
     /// Execute a function
@@ -642,20 +734,22 @@ impl LuaVM {
             }
             
             OpCode::Concat => {
+                println!("[VM_DEBUG] Executing CONCAT operation: A={}, B={}, C={}", a, b, c);
                 // R(A) := R(B).. ... ..R(C)
                 // Important: This concatenates a RANGE of values from B to C inclusive
-                // B and C can be either registers or constants (RK format)
                 
                 // First collect all values and convert them to strings to avoid double borrowing
                 let mut values_to_concat = Vec::new();
                 
                 // For each value in the range from B to C inclusive
                 for i in b..=c {
-                    // Use get_rk to handle both registers and constants
-                    let value = self.get_rk(&frame, i)?;
+                    // Use get_register directly (not get_rk) for register access to handle table fields properly
+                    let reg_value = self.get_register(frame.base_register, i)?;
+                    
+                    println!("[VM_DEBUG] Concat value at register {}: {:?}", i, reg_value);
                     
                     // Convert each value to a string representation
-                    let str_value = match value {
+                    let str_value = match reg_value {
                         Value::String(s) => {
                             let bytes = self.heap.get_string(s)?;
                             std::str::from_utf8(bytes)
@@ -666,14 +760,32 @@ impl LuaVM {
                             // Format number appropriately - Lua automatically converts numbers to strings
                             n.to_string()
                         },
+                        Value::Table(t) => {
+                            // For table values, try metamethod or error
+                            if let Some(meta_fn) = self.get_table_metamethod(t, "__tostring")? {
+                                // Call metamethod with the table as argument
+                                let result = self.execute_function(meta_fn, &[Value::Table(t)])?;
+                                match result {
+                                    Value::String(s) => {
+                                        let bytes = self.heap.get_string(s)?;
+                                        std::str::from_utf8(bytes)
+                                            .map_err(|_| LuaError::InvalidEncoding)?
+                                            .to_string()
+                                    }
+                                    _ => return Err(LuaError::TypeError(format!(
+                                        "__tostring metamethod did not return a string (got {})",
+                                        result.type_name()
+                                    ))),
+                                }
+                            } else {
+                                return Err(LuaError::TypeError("attempt to concatenate a table value".to_string()));
+                            }
+                        },
                         Value::Nil => {
                             return Err(LuaError::TypeError("attempt to concatenate a nil value".to_string()));
                         },
                         Value::Boolean(_) => {
                             return Err(LuaError::TypeError("attempt to concatenate a boolean value".to_string()));
-                        },
-                        Value::Table(_) => {
-                            return Err(LuaError::TypeError("attempt to concatenate a table value".to_string()));
                         },
                         Value::Closure(_) | Value::CFunction(_) => {
                             return Err(LuaError::TypeError("attempt to concatenate a function value".to_string()));
@@ -691,6 +803,8 @@ impl LuaVM {
                 for value in values_to_concat {
                     result.push_str(&value);
                 }
+                
+                println!("[VM_DEBUG] Concatenation result: {}", result);
                 
                 // Create the final string and store in the result register
                 let str_handle = self.heap.create_string(&result);
@@ -1089,60 +1203,62 @@ impl LuaVM {
         }
     }
     
-    /// Get a constant value with proper bounds checking
+    /// Get a constant value with proper bounds checking and error handling
     fn get_constant(&self, closure: ClosureHandle, index: usize) -> Result<Value> {
         let closure_obj = self.heap.get_closure(closure)?;
         
+        // Improved constant index validation with better error reporting
+        if closure_obj.proto.constants.is_empty() {
+            println!("[VM_ERROR] No constants available in closure (requested index: {})", index);
+            return Err(LuaError::InvalidOperation(format!(
+                "Attempt to access constant at index {} but constants array is empty", index
+            )));
+        }
+
         if index >= closure_obj.proto.constants.len() {
-            return Err(LuaError::InvalidOperation(
-                format!("constant index {} out of bounds (max {})", 
-                        index, 
-                        if closure_obj.proto.constants.is_empty() {
-                            0
-                        } else {
-                            closure_obj.proto.constants.len() - 1
-                        })
-            ));
+            println!("[VM_ERROR] Constant index {} out of bounds (max: {})", 
+                    index, 
+                    closure_obj.proto.constants.len() - 1);
+                    
+            return Err(LuaError::InvalidConstant(index));
         }
         
-        Ok(closure_obj.proto.constants[index].clone())
+        // Make sure we return a owned copy of the constant
+        let constant = closure_obj.proto.constants[index].clone();
+        
+        println!("[VM_DEBUG] Retrieved constant at index {}: {:?}", index, constant);
+        
+        // Success, return the constant
+        Ok(constant)
     }
     
-    /// Get a function prototype for a CLOSURE instruction
+    /// Get a function prototype for CLOSURE instruction with support for nested prototypes
     fn get_proto(&mut self, closure: ClosureHandle, index: usize) -> Result<FunctionProto> {
-        // First get the closure to extract any necessary information
-        let proto_clone = {
-            let closure_obj = self.heap.get_closure(closure)?;
-            closure_obj.proto.clone()
-        };
+        println!("[VM_DEBUG] get_proto called with index: {}", index);
         
-        // Fixed logic: Index 0 should actually be a different proto not the same one
+        // Get the closure to access its prototype
+        let closure_obj = self.heap.get_closure(closure)?;
+        
+        // Check if the requested prototype is the closure's own prototype (index 0)
         if index == 0 {
-            // For now, use a placeholder implementation as a temporary fix
-            // Instead of recursively using the same proto (which causes infinite recursion),
-            // create a new simple proto that just returns a string
-            
-            let mut proto = FunctionProto::default();
-            
-            // Add a string constant "test result"
-            let str_handle = self.heap.create_string("test result");
-            proto.constants.push(Value::String(str_handle));
-            
-            // LOADK R(0) <- K(0)
-            let loadk = (OpCode::LoadK as u32) | ((0u32) << 6) | ((0u32) << 14);
-            proto.code.push(Instruction::new(loadk));
-            
-            // RETURN R(0) 2
-            let ret = (OpCode::Return as u32) | ((0u32) << 6) | ((2u32) << 14);
-            proto.code.push(Instruction::new(ret));
-            
-            // Set stack size
-            proto.max_stack_size = 1;
-            
-            Ok(proto)
-        } else {
-            Err(LuaError::InvalidConstant(index))
+            // Return a clone of the closure's own prototype
+            return Ok(closure_obj.proto.clone());
         }
+        
+        // Otherwise, check if the index is valid for a nested prototype
+        if index > 0 && index <= closure_obj.proto.nested_protos.len() {
+            // Rust indexes are 0-based, but Lua function prototypes use 1-based indexing for nested protos
+            let nested_index = index - 1;
+            println!("[VM_DEBUG] Accessing nested prototype at index {}", nested_index);
+            return Ok(closure_obj.proto.nested_protos[nested_index].clone());
+        }
+        
+        // If we reach here, the index is invalid
+        println!("[VM_ERROR] Invalid prototype index: {} (max: {})", 
+                index, closure_obj.proto.nested_protos.len());
+        
+        // Return a clear error message with diagnostic information
+        Err(LuaError::InvalidConstant(index))
     }
     
     /// Get an upvalue
@@ -1324,6 +1440,41 @@ impl LuaVM {
         
         // Check if table has the metamethod
         Ok(table_obj.get(&Value::String(method_key)).copied())
+    }
+    
+    /// Get metamethod from a table
+    fn get_table_metamethod(&mut self, table: TableHandle, method: &str) -> Result<Option<ClosureHandle>> {
+        println!("[VM_DEBUG] Looking up metamethod '{}' for table {:?}", method, table);
+        
+        // Create method key first, before any table borrows
+        let method_key = self.heap.create_string(method);
+        let method_key_val = Value::String(method_key);
+        
+        // Get table object
+        let table_obj = self.heap.get_table(table)?;
+        
+        // Check if table has metatable
+        if let Some(metatable) = table_obj.metatable {
+            let metatable_obj = self.heap.get_table(metatable)?;
+            
+            // Look up metamethod using the pre-created key
+            if let Some(method_val) = metatable_obj.get(&method_key_val) {
+                println!("[VM_DEBUG] Found metamethod '{}': {:?}", method, method_val);
+                
+                // Convert to closure if possible
+                match *method_val {
+                    Value::Closure(closure) => {
+                        return Ok(Some(closure));
+                    },
+                    _ => {
+                        println!("[VM_DEBUG] Metamethod is not a closure: {:?}", method_val);
+                    }
+                }
+            }
+        }
+        
+        println!("[VM_DEBUG] No metamethod '{}' found for table {:?}", method, table);
+        Ok(None)
     }
     
     /// Execute arithmetic operation

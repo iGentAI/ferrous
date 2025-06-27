@@ -186,7 +186,7 @@ impl LuaGIL {
         }
     }
     
-    /// Execute with context
+    /// Execute with context with improved error handling
     fn execute_with_context(
         &self,
         script: CompiledScript,
@@ -195,17 +195,19 @@ impl LuaGIL {
         exec_info: ExecutionInfo,
         transaction: Transaction,
     ) -> std::result::Result<RespFrame, LuaError> {
+        println!("[LUA_GIL] Executing script in context of transaction {}", exec_info.transaction_id);
         let mut vm_guard = self.vm_instance.lock().unwrap();
         
         // Create a new script context
         let context = ScriptContext {
-            keys,
-            args,
+            keys: keys.clone(),
+            args: args.clone(),
             db: exec_info.db_index,
             transaction_id: exec_info.transaction_id,
             storage_proxy: TransactionalStorageProxy::new(
                 &self.transaction_manager,
                 transaction,
+                &self.storage_engine,
             ),
         };
         
@@ -215,8 +217,20 @@ impl LuaGIL {
         // Set kill flag
         vm_guard.vm.set_kill_flag(exec_info.kill_flag.clone());
         
+        println!("[LUA_GIL] Executing script '{}' with {} keys and {} args", 
+                 script.source, keys.len(), args.len());
+                 
         // Execute script
-        let result = vm_guard.execute_script(&script.source);
+        let result = match vm_guard.execute_script(&script.source) {
+            Ok(resp) => {
+                println!("[LUA_GIL] Script execution successful");
+                Ok(resp)
+            }
+            Err(e) => {
+                println!("[LUA_GIL] Script execution failed: {}", e);
+                Err(e)
+            }
+        };
         
         // Pop context (even if error)
         vm_guard.context_stack.pop();
@@ -300,28 +314,48 @@ impl LuaVMInstance {
             .map_err(|e| LuaError::Runtime(e.to_string()))
     }
     
-    /// Setup transactional environment
+    /// Setup transactional environment with improved API registration
     fn setup_transactional_env(&mut self, context: &ScriptContext) -> Result<()> {
+        println!("[LUA_VM_INSTANCE] Setting up transactional environment");
+        
         // Reset VM to clean state
         self.vm.full_reset();
         
         // Apply sandbox
         crate::lua_new::sandbox::LuaSandbox::redis_compatible().apply(&mut self.vm)?;
+        println!("[LUA_VM_INSTANCE] Sandbox applied");
         
         // Register cjson library
         crate::lua_new::cjson::register(&mut self.vm)?;
+        println!("[LUA_VM_INSTANCE] CJSON library registered");
         
-        // Setup KEYS and ARGV
+        // Setup KEYS and ARGV with the improved implementation
         self.setup_script_arrays(&context.keys, &context.args)?;
         
-        // Register transactional Redis API
+        // Create Redis API context
+        let redis_ctx = crate::lua_new::redis_api::RedisApiContext::new(
+            context.storage_proxy.storage.clone(),
+            context.db,
+        );
+        
+        // Register Redis API with context
+        crate::lua_new::redis_api::RedisApiContext::register_with_context(
+            &mut self.vm,
+            redis_ctx,
+        )?;
+        println!("[LUA_VM_INSTANCE] Redis API registered with context");
+        
+        // Register transactional Redis API on top
         self.register_transactional_api(context)?;
+        println!("[LUA_VM_INSTANCE] Transactional API registered");
         
         Ok(())
     }
     
-    /// Setup KEYS and ARGV arrays
+    /// Setup KEYS and ARGV arrays with improved implementation
     fn setup_script_arrays(&mut self, keys: &[Vec<u8>], args: &[Vec<u8>]) -> Result<()> {
+        println!("[LUA_VM_INSTANCE] Setting up KEYS and ARGV arrays - keys={}, args={}", keys.len(), args.len());
+        
         // Create KEYS table
         let keys_table = self.vm.heap.alloc_table();
         
@@ -332,6 +366,9 @@ impl LuaVMInstance {
         for (i, key) in keys.iter().enumerate() {
             let idx = crate::lua_new::value::Value::Number((i + 1) as f64);
             let val = crate::lua_new::value::Value::String(self.vm.heap.alloc_string(key));
+            
+            // Debug info for keys
+            println!("[LUA_VM_INSTANCE] KEYS[{}] = {:?}", i+1, String::from_utf8_lossy(key));
             
             {
                 let table = self.vm.heap.get_table_mut(keys_table)?;
@@ -344,19 +381,23 @@ impl LuaVMInstance {
             let idx = crate::lua_new::value::Value::Number((i + 1) as f64);
             let val = crate::lua_new::value::Value::String(self.vm.heap.alloc_string(arg));
             
+            // Debug info for args
+            println!("[LUA_VM_INSTANCE] ARGV[{}] = {:?}", i+1, String::from_utf8_lossy(arg));
+            
             {
                 let table = self.vm.heap.get_table_mut(argv_table)?;
                 table.set(idx, val);
             }
         }
         
-        // Set tables in globals
+        // Set tables in globals with explicit debug
         let globals = self.vm.globals();
         let keys_name = self.vm.heap.create_string("KEYS");
         let argv_name = self.vm.heap.create_string("ARGV");
         
         // Set KEYS global
         {
+            println!("[LUA_VM_INSTANCE] Setting KEYS global table - handle: {:?}", keys_table);
             let globals_table = self.vm.heap.get_table_mut(globals)?;
             globals_table.set(
                 crate::lua_new::value::Value::String(keys_name), 
@@ -366,6 +407,7 @@ impl LuaVMInstance {
         
         // Set ARGV global
         {
+            println!("[LUA_VM_INSTANCE] Setting ARGV global table - handle: {:?}", argv_table);
             let globals_table = self.vm.heap.get_table_mut(globals)?;
             globals_table.set(
                 crate::lua_new::value::Value::String(argv_name), 
@@ -373,22 +415,55 @@ impl LuaVMInstance {
             );
         }
         
+        // Verify tables are accessible by immediately retrieving them
+        {
+            let globals_table = self.vm.heap.get_table(globals)?;
+            
+            // Verify KEYS is accessible
+            if let Some(&crate::lua_new::value::Value::Table(found_keys)) = 
+                    globals_table.get(&crate::lua_new::value::Value::String(keys_name.clone())) {
+                println!("[LUA_VM_INSTANCE] Verified KEYS global is accessible: {:?}", found_keys);
+                if let Ok(keys_table_obj) = self.vm.heap.get_table(found_keys) {
+                    println!("[LUA_VM_INSTANCE] KEYS table has {} array entries and {} map entries",
+                            keys_table_obj.array.len(),
+                            keys_table_obj.map.len());
+                }
+            } else {
+                println!("[LUA_VM_INSTANCE] WARNING: KEYS global was not accessible!");
+            }
+        }
+        
         Ok(())
     }
     
-    /// Register transactional Redis API
+    /// Improved transactional Redis API registration
     fn register_transactional_api(&mut self, context: &ScriptContext) -> Result<()> {
+        println!("[LUA_VM_INSTANCE] Registering transactional Redis API");
+        
         // Create redis table
         let redis_table = self.vm.heap.alloc_table();
         
         // Create redis function names
         let call_key = self.vm.heap.create_string("call");
         let pcall_key = self.vm.heap.create_string("pcall");
-        // These are unused but kept for completeness
-        let _log_key = self.vm.heap.create_string("log");
-        let _sha1hex_key = self.vm.heap.create_string("sha1hex");
-        let _error_reply_key = self.vm.heap.create_string("error_reply");
-        let _status_reply_key = self.vm.heap.create_string("status_reply");
+        let log_key = self.vm.heap.create_string("log");
+        let sha1hex_key = self.vm.heap.create_string("sha1hex");
+        let error_reply_key = self.vm.heap.create_string("error_reply");
+        let status_reply_key = self.vm.heap.create_string("status_reply");
+        
+        // Get existing redis table if any
+        let globals = self.vm.globals();
+        let redis_name = self.vm.heap.create_string("redis");
+        let existing_redis = {
+            let globals_table = self.vm.heap.get_table(globals)?;
+            match globals_table.get(&crate::lua_new::value::Value::String(redis_name.clone())) {
+                Some(&crate::lua_new::value::Value::Table(table)) => Some(table),
+                _ => None
+            }
+        };
+        
+        // Use existing or new redis table
+        let redis_table = existing_redis.unwrap_or(redis_table);
         
         // Register functions
         {
@@ -407,7 +482,58 @@ impl LuaVMInstance {
             );
         }
         
-        // Register other Redis functions here
+        // Register log function
+        {
+            let table = self.vm.heap.get_table_mut(redis_table)?;
+            table.set(
+                crate::lua_new::value::Value::String(log_key),
+                crate::lua_new::value::Value::CFunction(crate::lua_new::redis_api::redis_log_impl)
+            );
+        }
+        
+        // Register sha1hex function
+        {
+            let table = self.vm.heap.get_table_mut(redis_table)?;
+            table.set(
+                crate::lua_new::value::Value::String(sha1hex_key),
+                crate::lua_new::value::Value::CFunction(crate::lua_new::redis_api::redis_sha1hex_impl)
+            );
+        }
+        
+        // Register error_reply function
+        {
+            let table = self.vm.heap.get_table_mut(redis_table)?;
+            table.set(
+                crate::lua_new::value::Value::String(error_reply_key),
+                crate::lua_new::value::Value::CFunction(crate::lua_new::redis_api::redis_error_reply_impl)
+            );
+        }
+        
+        // Register status_reply function
+        {
+            let table = self.vm.heap.get_table_mut(redis_table)?;
+            table.set(
+                crate::lua_new::value::Value::String(status_reply_key),
+                crate::lua_new::value::Value::CFunction(crate::lua_new::redis_api::redis_status_reply_impl)
+            );
+        }
+        
+        // Register constants
+        let constants = [
+            ("LOG_DEBUG", 0.0),
+            ("LOG_VERBOSE", 1.0),
+            ("LOG_NOTICE", 2.0),
+            ("LOG_WARNING", 3.0),
+        ];
+        
+        for (name, value) in &constants {
+            let key = self.vm.heap.create_string(name);
+            let table = self.vm.heap.get_table_mut(redis_table)?;
+            table.set(
+                crate::lua_new::value::Value::String(key),
+                crate::lua_new::value::Value::Number(*value)
+            );
+        }
         
         // Store context in VM registry
         let registry = self.vm.registry();
@@ -425,16 +551,16 @@ impl LuaVMInstance {
             );
         }
         
-        // Set redis table in globals
-        let globals = self.vm.globals();
-        let redis_name = self.vm.heap.create_string("redis");
+        println!("[LUA_VM_INSTANCE] Stored script context in registry: {:?}", context_ptr);
         
-        {
+        // Set redis table in globals (if not already set)
+        if existing_redis.is_none() {
             let globals_table = self.vm.heap.get_table_mut(globals)?;
             globals_table.set(
                 crate::lua_new::value::Value::String(redis_name),
                 crate::lua_new::value::Value::Table(redis_table)
             );
+            println!("[LUA_VM_INSTANCE] Set redis table in globals");
         }
         
         Ok(())
@@ -442,17 +568,15 @@ impl LuaVMInstance {
     
     /// Compile and run a script
     fn compile_and_run(&mut self, source: &str) -> Result<crate::lua_new::value::Value> {
-        // Parse
-        let mut parser = crate::lua_new::parser::Parser::new(source, &mut self.vm.heap)?;
-        let ast = parser.parse()?;
-        
-        // Compile
+        // Create a compiler
         let mut compiler = crate::lua_new::compiler::Compiler::new();
         compiler.set_heap(&mut self.vm.heap as *mut _);
-        let proto = compiler.compile_chunk(&ast)?;
         
-        // Create closure
-        let closure = self.vm.heap.alloc_closure(proto, Vec::new());
+        // Compile using the public compile method
+        let compilation = compiler.compile(source)?;
+        
+        // Load the compiled script
+        let closure = self.vm.load_compilation_script(&compilation)?;
         
         // Execute
         self.vm.execute_function(closure, &[])
@@ -704,24 +828,27 @@ pub struct TransactionalStorageProxy {
 }
 
 impl TransactionalStorageProxy {
-    /// Create a new transactional storage proxy
+    /// Create a new transactional storage proxy with explicit storage parameter
     pub fn new(
         transaction_manager: &Arc<TransactionManager>,
         transaction: Transaction,
+        storage: &Arc<StorageEngine>,
     ) -> Self {
         TransactionalStorageProxy {
             transaction_manager: Arc::clone(transaction_manager),
             transaction,
-            storage: Arc::clone(&transaction_manager.storage_engine),
+            storage: Arc::clone(storage),
         }
     }
     
-    /// Execute a command
+    /// Execute a command with enhanced logging and error handling
     pub fn execute_command(
         &self,
         cmd: &str,
         args: Vec<Vec<u8>>,
     ) -> std::result::Result<RespFrame, LuaError> {
+        println!("[REDIS_EXECUTE] Executing command: '{}' with {} args", cmd, args.len());
+        
         match cmd.to_uppercase().as_str() {
             "GET" => self.handle_get(&args),
             "SET" => self.handle_set(&args),
@@ -729,28 +856,39 @@ impl TransactionalStorageProxy {
             "EXISTS" => self.handle_exists(&args),
             "INCR" => self.handle_incr(&args),
             "PING" => self.handle_ping(),
-            // ... other commands
-            _ => Err(LuaError::Runtime(format!("Unsupported command: {}", cmd))),
+            // Add more commands as needed
+            _ => Err(LuaError::Runtime(format!("Unsupported Redis command: {}", cmd))),
         }
     }
     
     /// Handle PING command
     fn handle_ping(&self) -> std::result::Result<RespFrame, LuaError> {
+        println!("[REDIS_EXECUTE] PING command responding with PONG");
         Ok(RespFrame::SimpleString(Arc::new(b"PONG".to_vec())))
     }
     
-    /// Handle GET command
+    /// Enhanced GET command with better debug logging
     fn handle_get(&self, args: &[Vec<u8>]) -> std::result::Result<RespFrame, LuaError> {
         if args.is_empty() {
             return Err(LuaError::Runtime("GET requires a key".to_string()));
         }
         
         let key = &args[0];
+        println!("[REDIS_EXECUTE] GET key: {}", String::from_utf8_lossy(key));
         
         match self.storage.get_string(self.transaction.db, key) {
-            Ok(Some(val)) => Ok(RespFrame::BulkString(Some(Arc::new(val)))),
-            Ok(None) => Ok(RespFrame::Null),
-            Err(e) => Err(LuaError::Runtime(e.to_string())),
+            Ok(Some(val)) => {
+                println!("[REDIS_EXECUTE] GET found value: {}", String::from_utf8_lossy(&val));
+                Ok(RespFrame::BulkString(Some(Arc::new(val))))
+            },
+            Ok(None) => {
+                println!("[REDIS_EXECUTE] GET key not found");
+                Ok(RespFrame::Null)
+            },
+            Err(e) => {
+                println!("[REDIS_EXECUTE] GET error: {}", e);
+                Err(LuaError::Runtime(e.to_string()))
+            }
         }
     }
     
@@ -871,16 +1009,20 @@ impl TransactionalStorageProxy {
 
 /// Redis call function with transaction support
 pub fn redis_call_transaction(ctx: &mut crate::lua_new::vm::ExecutionContext) -> Result<i32> {
+    println!("[REDIS_CALL] Accessing redis.call function");
     redis_call_impl(ctx, false)
 }
 
 /// Redis pcall function with transaction support
 pub fn redis_pcall_transaction(ctx: &mut crate::lua_new::vm::ExecutionContext) -> Result<i32> {
+    println!("[REDIS_CALL] Accessing redis.pcall function");
     redis_call_impl(ctx, true)
 }
 
-/// Redis call implementation
+/// Improved redis.call implementation
 fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: bool) -> Result<i32> {
+    println!("[REDIS_CALL] Starting implementation with is_pcall={}", is_pcall);
+    
     // Get script context from the registry
     let registry = ctx.vm.registry();
     let context_key = ctx.vm.heap.create_string("_SCRIPT_CONTEXT");
@@ -888,9 +1030,13 @@ fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: boo
     let context_ptr = match ctx.vm.heap.get_table(registry)? {
         table => {
             match table.get(&crate::lua_new::value::Value::String(context_key)) {
-                Some(&crate::lua_new::value::Value::Number(n)) => n as usize,
+                Some(&crate::lua_new::value::Value::Number(n)) => {
+                    println!("[REDIS_CALL] Found context pointer: {}", n);
+                    n as usize
+                },
                 _ => {
                     let error = LuaError::Runtime("Script context not found".to_string());
+                    println!("[REDIS_CALL] Error: Script context not found");
                     if is_pcall {
                         return transform_error_to_table(ctx, error);
                     } else {
@@ -908,6 +1054,7 @@ fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: boo
     // Check arguments
     if ctx.get_arg_count() == 0 {
         let error = LuaError::Runtime("redis.call requires at least one argument".to_string());
+        println!("[REDIS_CALL] Error: No arguments provided");
         if is_pcall {
             return transform_error_to_table(ctx, error);
         } else {
@@ -917,9 +1064,14 @@ fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: boo
     
     // Get command
     let cmd = match ctx.get_arg(0)? {
-        crate::lua_new::value::Value::String(s) => ctx.vm.heap.get_string_utf8(s)?.to_string(),
+        crate::lua_new::value::Value::String(s) => {
+            let cmd_str = ctx.vm.heap.get_string_utf8(s)?.to_string();
+            println!("[REDIS_CALL] Command: {}", cmd_str);
+            cmd_str
+        },
         _ => {
             let error = LuaError::TypeError("redis.call first argument must be a command name".to_string());
+            println!("[REDIS_CALL] Error: First argument is not a string");
             if is_pcall {
                 return transform_error_to_table(ctx, error);
             } else {
@@ -934,22 +1086,30 @@ fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: boo
         let arg = ctx.get_arg(i)?;
         match arg {
             crate::lua_new::value::Value::String(s) => {
-                args.push(ctx.vm.heap.get_string(s)?.to_vec());
+                let bytes = ctx.vm.heap.get_string(s)?.to_vec();
+                println!("[REDIS_CALL] Arg {}: String {:?}", i, 
+                         String::from_utf8_lossy(&bytes));
+                args.push(bytes);
             }
             crate::lua_new::value::Value::Number(n) => {
+                println!("[REDIS_CALL] Arg {}: Number {}", i, n);
                 args.push(n.to_string().into_bytes());
             }
             crate::lua_new::value::Value::Boolean(b) => {
+                println!("[REDIS_CALL] Arg {}: Boolean {}", i, b);
                 args.push(b.to_string().into_bytes());
             }
             crate::lua_new::value::Value::Nil => {
+                println!("[REDIS_CALL] Arg {}: Nil", i);
                 args.push(b"".to_vec());
             }
             _ => {
+                let type_name = arg.type_name();
                 let error = LuaError::TypeError(format!(
                     "Unsupported argument type: {}",
-                    arg.type_name()
+                    type_name
                 ));
+                println!("[REDIS_CALL] Error: Unsupported type {}", type_name);
                 if is_pcall {
                     return transform_error_to_table(ctx, error);
                 } else {
@@ -960,9 +1120,11 @@ fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: boo
     }
     
     // Execute command via storage proxy
+    println!("[REDIS_CALL] Executing command '{}' with {} args", cmd, args.len());
     let result = match context.storage_proxy.execute_command(&cmd, args) {
         Ok(resp) => {
             // Convert to Lua value
+            println!("[REDIS_CALL] Command executed successfully: {:?}", resp);
             let value = crate::lua_new::redis_api::RedisApiContext::resp_to_lua(
                 &mut ctx.vm,
                 resp
@@ -971,6 +1133,7 @@ fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: boo
             Ok(1) // One return value
         }
         Err(e) => {
+            println!("[REDIS_CALL] Command execution error: {}", e);
             if is_pcall {
                 transform_error_to_table(ctx, e)
             } else {
@@ -982,11 +1145,13 @@ fn redis_call_impl(ctx: &mut crate::lua_new::vm::ExecutionContext, is_pcall: boo
     result
 }
 
-/// Transform error to table
+/// Improved transform_error_to_table function
 fn transform_error_to_table(
     ctx: &mut crate::lua_new::vm::ExecutionContext,
     error: LuaError,
 ) -> Result<i32> {
+    println!("[REDIS_ERROR] Creating error table: {}", error);
+    
     // Create error table
     let table = ctx.vm.heap.alloc_table();
     let err_key = ctx.vm.heap.create_string("err");
@@ -1002,5 +1167,6 @@ fn transform_error_to_table(
     
     // Return the error table
     ctx.push_result(crate::lua_new::value::Value::Table(table))?;
+    println!("[REDIS_ERROR] Error table created and returned");
     Ok(1) // One return value
 }
