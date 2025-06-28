@@ -7,7 +7,6 @@
 use crate::lua_new::vm::{LuaVM, ExecutionContext};
 use crate::lua_new::value::{Value, CFunction, TableHandle};
 use crate::lua_new::error::{LuaError, Result};
-use std::collections::HashSet;
 
 /// Lua sandbox configuration
 pub struct LuaSandbox {
@@ -27,37 +26,36 @@ impl LuaSandbox {
     pub fn apply(&self, vm: &mut LuaVM) -> Result<()> {
         println!("[LUA_SANDBOX] Applying sandbox restrictions");
         
-        // Get globals table
-        let globals = vm.globals();
-        
         // Remove unsafe libraries
-        self.remove_libraries(vm, globals)?;
+        self.remove_libraries(vm)?;
         
         // Register safe stdlib functions
-        self.register_safe_stdlib(vm, globals)?;
+        self.register_safe_stdlib(vm)?;
         
         Ok(())
     }
     
     /// Remove unsafe libraries
-    fn remove_libraries(&self, vm: &mut LuaVM, globals: TableHandle) -> Result<()> {
+    fn remove_libraries(&self, vm: &mut LuaVM) -> Result<()> {
         let unsafe_libs = ["io", "os", "debug", "package", "coroutine", "dofile", "loadfile"];
+        let globals = vm.globals();
         
         for lib in &unsafe_libs {
             let key = vm.heap.create_string(lib);
-            vm.heap.get_table_mut(globals)?.set(Value::String(key), Value::Nil);
+            vm.table_set(globals, Value::String(key), Value::Nil)?;
         }
         
         // Ensure math.random and math.randomseed are removed if deterministic mode is enabled
         if self.deterministic {
             let math_key = vm.heap.create_string("math");
             
-            // Use the heap directly instead of the private vm.table_get method
+            // Get the math table using two-phase approach
             let math_table_opt = {
-                let global_table = vm.heap.get_table(globals)?;
-                match global_table.get(&Value::String(math_key)) {
-                    Some(&Value::Table(table)) => Some(table),
-                    _ => None,
+                let math_value = vm.table_get(globals, Value::String(math_key))?;
+                if let Value::Table(table) = math_value {
+                    Some(table)
+                } else {
+                    None
                 }
             };
             
@@ -65,8 +63,8 @@ impl LuaSandbox {
                 let random_key = vm.heap.create_string("random");
                 let randomseed_key = vm.heap.create_string("randomseed");
                 
-                vm.heap.get_table_mut(math_table)?.set(Value::String(random_key), Value::Nil);
-                vm.heap.get_table_mut(math_table)?.set(Value::String(randomseed_key), Value::Nil);
+                vm.table_set(math_table, Value::String(random_key), Value::Nil)?;
+                vm.table_set(math_table, Value::String(randomseed_key), Value::Nil)?;
             }
         }
         
@@ -74,27 +72,24 @@ impl LuaSandbox {
     }
     
     /// Register safe standard library functions
-    fn register_safe_stdlib(&self, vm: &mut LuaVM, globals: TableHandle) -> Result<()> {
+    fn register_safe_stdlib(&self, vm: &mut LuaVM) -> Result<()> {
         // Register critical global functions - These MUST be available for basic Lua functionality
         println!("[LUA_SANDBOX] Registering core Lua standard functions");
         
-        // Register global functions
-        let key_type = vm.heap.create_string("type");
-        let func_type = Value::CFunction(lua_type);
+        // Register essential global functions
+        self.register_global_function(vm, "type", lua_type)?;
+        self.register_global_function(vm, "tostring", tostring_func)?;
+        self.register_global_function(vm, "tonumber", tonumber_func)?;
+        self.register_global_function(vm, "print", lua_print)?;
+        self.register_global_function(vm, "assert", assert_func)?;
         
-        // First set the method to the globals table directly
-        vm.heap.get_table_mut(globals)?
-            .set(Value::String(key_type), func_type);
-            
-        // Register other essential functions directly to globals
-        self.register_global_function(vm, globals, "tostring", tostring_func)?;
-        self.register_global_function(vm, globals, "tonumber", tonumber_func)?;
-        self.register_global_function(vm, globals, "print", lua_print)?;
-        self.register_global_function(vm, globals, "assert", assert_func)?;
-        self.register_global_function(vm, globals, "pairs", lua_pairs)?;
-        self.register_global_function(vm, globals, "ipairs", lua_ipairs)?;
-        self.register_global_function(vm, globals, "next", lua_next)?;
-        self.register_global_function(vm, globals, "pcall", lua_pcall)?;
+        // Register iterator functions - critical for for-loops
+        self.register_global_function(vm, "pairs", lua_pairs)?;
+        self.register_global_function(vm, "ipairs", lua_ipairs)?;
+        self.register_global_function(vm, "next", lua_next)?;
+        
+        // Other core functions
+        self.register_global_function(vm, "pcall", lua_pcall)?;
         
         // Register table library
         let table_lib = vm.heap.alloc_table();
@@ -106,8 +101,7 @@ impl LuaSandbox {
         self.register_table_function(vm, table_lib, "remove", table_remove)?;
         
         // Set table library in globals
-        vm.heap.get_table_mut(globals)?
-            .set(Value::String(table_key), Value::Table(table_lib));
+        vm.table_set(vm.globals(), Value::String(table_key), Value::Table(table_lib))?;
         
         // Register string library
         let string_lib = vm.heap.alloc_table();
@@ -120,8 +114,7 @@ impl LuaSandbox {
         self.register_table_function(vm, string_lib, "char", string_char)?;
         
         // Set string library in globals
-        vm.heap.get_table_mut(globals)?
-            .set(Value::String(string_key), Value::Table(string_lib));
+        vm.table_set(vm.globals(), Value::String(string_key), Value::Table(string_lib))?;
         
         // Register math library
         let math_lib = vm.heap.alloc_table();
@@ -133,49 +126,33 @@ impl LuaSandbox {
         self.register_table_function(vm, math_lib, "ceil", math_ceil)?;
         
         // Set math library in globals
-        vm.heap.get_table_mut(globals)?
-            .set(Value::String(math_key), Value::Table(math_lib));
+        vm.table_set(vm.globals(), Value::String(math_key), Value::Table(math_lib))?;
         
         println!("[LUA_SANDBOX] Core Lua standard functions registered successfully");
         
         // Verify type function registration by running a simple test
         let type_key = vm.heap.create_string("type");
-        match vm.heap.get_table(globals)?.get(&Value::String(type_key)) {
-            Some(&Value::CFunction(_)) => {
-                println!("[LUA_SANDBOX] Type function verification successful");
-            },
-            _ => {
-                println!("[LUA_SANDBOX] WARNING: Type function not found in globals!");
-            }
+        let type_value = vm.table_get(vm.globals(), Value::String(type_key))?;
+        
+        if matches!(type_value, Value::CFunction(_)) {
+            println!("[LUA_SANDBOX] Type function verification successful");
+        } else {
+            println!("[LUA_SANDBOX] WARNING: Type function not found in globals!");
         }
         
         Ok(())
     }
     
     /// Register a global function
-    fn register_global_function(&self, vm: &mut LuaVM, globals: TableHandle, name: &str, func: CFunction) -> Result<()> {
+    fn register_global_function(&self, vm: &mut LuaVM, name: &str, func: CFunction) -> Result<()> {
         let key = vm.heap.create_string(name);
-        vm.heap.get_table_mut(globals)?
-            .set(Value::String(key), Value::CFunction(func));
-        Ok(())
+        vm.table_set(vm.globals(), Value::String(key), Value::CFunction(func))
     }
     
     /// Register a library function
     fn register_table_function(&self, vm: &mut LuaVM, table: TableHandle, name: &str, func: CFunction) -> Result<()> {
         let key = vm.heap.create_string(name);
-        vm.heap.get_table_mut(table)?
-            .set(Value::String(key), Value::CFunction(func));
-        Ok(())
-    }
-    
-    /// Register a function in a table (deprecated - use register_table_function instead)
-    fn register_function_in_table(&self, vm: &mut LuaVM, table: TableHandle, name: &str, func: CFunction) -> Result<()> {
-        self.register_table_function(vm, table, name, func)
-    }
-    
-    /// Register a function in globals (deprecated - use register_global_function instead)
-    fn register_function(&self, vm: &mut LuaVM, table: TableHandle, name: &str, func: CFunction) -> Result<()> {
-        self.register_global_function(vm, table, name, func)
+        vm.table_set(table, Value::String(key), Value::CFunction(func))
     }
 }
 
@@ -257,82 +234,241 @@ pub fn lua_pairs(ctx: &mut ExecutionContext) -> Result<i32> {
         return Err(LuaError::Runtime("pairs requires a table argument".to_string()));
     }
     
-    // Just return the next function, the table, and nil as initial state
+    let arg = ctx.get_arg(0)?;
+    
+    // Check that the argument is a table
+    let table = match arg {
+        Value::Table(t) => t,
+        _ => return Err(LuaError::TypeError(format!("bad argument #1 to 'pairs' (table expected, got {})", arg.type_name()))),
+    };
+    
+    // Phase 1: Collect next function with a single immutable borrow
     let next_fn = {
-        let key = ctx.heap().create_string("next");
         let globals = ctx.vm.globals();
-        match ctx.vm.table_get(globals, Value::String(key))? {
-            Value::CFunction(f) => f,
+        let next_key = ctx.heap().create_string("next");
+        
+        // Get globals table and look up next function
+        let globals_obj = ctx.heap().get_table(globals)?;
+        match globals_obj.get(&Value::String(next_key)) {
+            Some(&Value::CFunction(f)) => Value::CFunction(f),
+            Some(&Value::Closure(c)) => Value::Closure(c), 
             _ => return Err(LuaError::Runtime("next function not found".to_string())),
         }
     };
     
-    // Push the three return values
-    ctx.push_result(Value::CFunction(next_fn))?; // Iterator function
-    ctx.push_result(ctx.get_arg(0)?)?;            // Table
-    ctx.push_result(Value::Nil)?;                 // Initial state (nil)
+    // Phase 2: Push results without holding any borrows
+    ctx.push_result(next_fn)?;               // Iterator function
+    ctx.push_result(Value::Table(table))?;   // Table
+    ctx.push_result(Value::Nil)?;            // Initial state (nil)
     
     Ok(3) // Three return values
 }
 
-/// Implementation of Lua's ipairs() function
-pub fn lua_ipairs(ctx: &mut ExecutionContext) -> Result<i32> {
-    // Similar to pairs but for array-like tables
-    // For now, let's use pairs as ipairs is similar in behavior though specialized for arrays
-    lua_pairs(ctx)
-}
-
-/// Implementation of Lua's next() function
-pub fn lua_next(ctx: &mut ExecutionContext) -> Result<i32> {
-    if ctx.get_arg_count() < 1 {
-        return Err(LuaError::Runtime("next requires a table argument".to_string()));
+/// Implementation of ipairs_iter function for ipairs
+fn ipairs_iter(ctx: &mut ExecutionContext) -> Result<i32> {
+    if ctx.get_arg_count() < 2 {
+        return Err(LuaError::Runtime("ipairs iterator requires table and index arguments".to_string()));
     }
     
-    // Get table
-    let table = match ctx.get_arg(0)? {
+    // Get table and index arguments with proper error handling
+    let table_arg = ctx.get_arg(0)?;
+    let idx_arg = ctx.get_arg(1)?;
+    
+    let table = match table_arg {
         Value::Table(t) => t,
-        _ => return Err(LuaError::TypeError("next requires a table argument".to_string())),
+        _ => return Err(LuaError::TypeError("bad argument #1 to 'ipairs iterator' (table expected)".to_string())),
     };
     
-    // Get key (or nil for first iteration)
-    let key = if ctx.get_arg_count() > 1 { ctx.get_arg(1)? } else { Value::Nil };
+    let index = match idx_arg {
+        Value::Number(n) => n,
+        _ => return Err(LuaError::TypeError("bad argument #2 to 'ipairs iterator' (number expected)".to_string())),
+    };
     
-    // Get the next key-value pair
-    // For now, we'll return nil (indicating no more entries) since implementation is complex
-    // In a full implementation, we'd track table iteration
-    ctx.push_result(Value::Nil)?;  // No more keys
-    ctx.push_result(Value::Nil)?;  // No value
+    // Calculate next index (1-based)
+    let next_index = index + 1.0;
     
-    Ok(0) // Return 0 as signal that there are no more elements
+    // Phase 1: Get value at next_index using the two-phase pattern
+    let next_value = {
+        let table_obj = ctx.heap().get_table(table)?;
+        
+        let idx = next_index as usize - 1; // Convert to 0-based
+        if idx < table_obj.array.len() {
+            table_obj.array[idx]  // Values implement Copy, so this is efficient
+        } else {
+            match table_obj.map.get(&Value::Number(next_index)) {
+                Some(&v) => v,  // Copy the value
+                None => Value::Nil
+            }
+        }
+    };
+    
+    // Phase 2: Process the value without holding any borrows
+    if next_value == Value::Nil {
+        // End of iteration
+        return Ok(0); 
+    }
+    
+    // Return next index and value
+    ctx.push_result(Value::Number(next_index))?;
+    ctx.push_result(next_value)?;
+    
+    Ok(2) // 2 return values: index and value
+}
+
+/// Implementation of Lua's ipairs() function
+pub fn lua_ipairs(ctx: &mut ExecutionContext) -> Result<i32> {
+    if ctx.get_arg_count() < 1 {
+        return Err(LuaError::Runtime("ipairs requires a table argument".to_string()));
+    }
+    
+    let arg = ctx.get_arg(0)?;
+    
+    // Check that the argument is a table
+    let table = match arg {
+        Value::Table(t) => t,
+        _ => return Err(LuaError::TypeError(format!("bad argument #1 to 'ipairs' (table expected, got {})", arg.type_name()))),
+    };
+    
+    // Push iteration factory values
+    ctx.push_result(Value::CFunction(ipairs_iter))?; // Iterator function
+    ctx.push_result(Value::Table(table))?;           // Table
+    ctx.push_result(Value::Number(0.0))?;            // Initial index (0)
+    
+    Ok(3) // Return 3 values
+}
+
+/// Implementation of Lua's next() function for table iteration
+pub fn lua_next(ctx: &mut ExecutionContext) -> Result<i32> {
+    if ctx.get_arg_count() < 1 {
+        return Err(LuaError::TypeError("bad argument #1 to 'next' (table expected)".to_string()));
+    }
+    
+    let table_arg = ctx.get_arg(0)?;
+    let key_arg = if ctx.get_arg_count() >= 2 { ctx.get_arg(1)? } else { Value::Nil };
+    
+    // Get table
+    let table = match table_arg {
+        Value::Table(t) => t,
+        _ => return Err(LuaError::TypeError(format!("bad argument #1 to 'next' (table expected, got {})", table_arg.type_name()))),
+    };
+    
+    // Phase 1: Collect all data from the table with a single immutable borrow
+    let (array_values, map_entries) = {
+        let table_obj = ctx.heap().get_table(table)?;
+        
+        // Collect array part with non-nil values
+        let array_values: Vec<(usize, Value)> = table_obj.array
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| !matches!(v, Value::Nil))
+            .map(|(i, &v)| (i, v))  // Value implements Copy
+            .collect();
+        
+        // Collect map part
+        let map_entries: Vec<(Value, Value)> = table_obj.map
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))  // Clone key, copy value
+            .collect();
+        
+        (array_values, map_entries)
+    };
+    
+    // Phase 2: Find the next key-value pair without holding any borrows
+    
+    // Case 1: Start of iteration (key is nil)
+    if key_arg == Value::Nil {
+        if let Some((i, value)) = array_values.first() {
+            ctx.push_result(Value::Number((i + 1) as f64))?; // 1-indexed
+            ctx.push_result(*value)?;  // Value is Copy
+            return Ok(2);
+        }
+        
+        if let Some((key, value)) = map_entries.first() {
+            ctx.push_result(key.clone())?;
+            ctx.push_result(*value)?;  // Value is Copy
+            return Ok(2);
+        }
+        
+        return Ok(0); // Empty table
+    }
+    
+    // Case 2: Continue iteration after a numeric key
+    if let Value::Number(n) = key_arg {
+        if n.fract() == 0.0 && n >= 1.0 {
+            let idx = n as usize - 1; // Convert to 0-based
+            
+            // Find next array element
+            for (i, value) in &array_values {
+                if *i > idx {
+                    ctx.push_result(Value::Number((i + 1) as f64))?;
+                    ctx.push_result(*value)?; // Value is Copy
+                    return Ok(2);
+                }
+            }
+            
+            // If no more array elements, check map
+            if let Some((key, value)) = map_entries.first() {
+                ctx.push_result(key.clone())?;
+                ctx.push_result(*value)?; // Value is Copy
+                return Ok(2);
+            }
+            
+            return Ok(0); // No more elements
+        }
+    }
+    
+    // Case 3: Continue iteration after a non-numeric key
+    // Sort entries for consistent iteration
+    let mut sorted_entries = map_entries;
+    sorted_entries.sort_by(|(k1, _), (k2, _)| {
+        match (k1, k2) {
+            (Value::String(s1), Value::String(s2)) => s1.0.index.cmp(&s2.0.index),
+            (Value::Number(n1), Value::Number(n2)) => n1.partial_cmp(n2).unwrap_or(std::cmp::Ordering::Equal),
+            _ => std::cmp::Ordering::Equal, // Default ordering for mixed types
+        }
+    });
+    
+    let mut found_key = false;
+    for (key, value) in &sorted_entries {
+        if found_key {
+            // This is the next key after the one we found
+            ctx.push_result(key.clone())?;
+            ctx.push_result(*value)?; // Value is Copy
+            return Ok(2);
+        }
+        
+        if key == &key_arg {
+            found_key = true;
+        }
+    }
+    
+    // No more elements
+    Ok(0)
 }
 
 /// Implementation of Lua's pcall() function
 pub fn lua_pcall(ctx: &mut ExecutionContext) -> Result<i32> {
-    // Simplistic pcall implementation
-    // In a full implementation, this would catch errors
+    // Simplified pcall implementation
     if ctx.get_arg_count() < 1 {
         return Err(LuaError::Runtime("pcall requires a function argument".to_string()));
     }
     
-    // Get the function
-    let func = ctx.get_arg(0)?;
+    // Just return success without calling the function for now
+    ctx.push_result(Value::Boolean(true))?; // Success status
     
-    // For now just return success
-    ctx.push_result(Value::Boolean(true))?;  // Success
-    
-    Ok(1) // One return value
+    Ok(1) // One return value (success status)
 }
 
 /// Implementation of table.concat function
 fn table_concat(ctx: &mut ExecutionContext) -> Result<i32> {
     // Check arguments
-    if ctx.get_arg_count() == 0 {
+    if ctx.get_arg_count() < 1 {
         return Err(LuaError::Runtime(
             "table.concat requires a table argument".to_string()
         ));
     }
     
-    // Create empty result string
+    // Simple placeholder: return empty string
     let empty = ctx.heap().create_string("");
     ctx.push_result(Value::String(empty))?;
     
@@ -378,19 +514,21 @@ fn string_len(ctx: &mut ExecutionContext) -> Result<i32> {
         ));
     }
     
-    // Get string
-    let value = ctx.get_arg(0)?;
-    let len = match value {
-        Value::String(s) => {
-            let bytes = ctx.heap().get_string(s)?;
-            bytes.len()
+    // Phase 1: Get the string and calculate its length
+    let len = {
+        let value = ctx.get_arg(0)?;
+        match value {
+            Value::String(s) => {
+                let bytes = ctx.heap().get_string(s)?;
+                bytes.len()
+            }
+            _ => return Err(LuaError::TypeError(
+                "string.len: argument must be a string".to_string()
+            )),
         }
-        _ => return Err(LuaError::TypeError(
-            "string.len: argument must be a string".to_string()
-        )),
     };
     
-    // Return length
+    // Phase 2: Return the length
     ctx.push_result(Value::Number(len as f64))?;
     
     Ok(1) // One return value
@@ -452,15 +590,18 @@ fn math_abs(ctx: &mut ExecutionContext) -> Result<i32> {
         ));
     }
     
-    // Get number
-    let n = match ctx.get_arg(0)? {
-        Value::Number(n) => n,
-        _ => return Err(LuaError::TypeError(
-            "math.abs: argument must be a number".to_string()
-        )),
+    // Phase 1: Get and validate the number
+    let n = {
+        let value = ctx.get_arg(0)?;
+        match value {
+            Value::Number(n) => n,
+            _ => return Err(LuaError::TypeError(
+                "math.abs: argument must be a number".to_string()
+            )),
+        }
     };
     
-    // Return absolute value
+    // Phase 2: Return absolute value
     ctx.push_result(Value::Number(n.abs()))?;
     
     Ok(1) // One return value
@@ -475,15 +616,18 @@ fn math_floor(ctx: &mut ExecutionContext) -> Result<i32> {
         ));
     }
     
-    // Get number
-    let n = match ctx.get_arg(0)? {
-        Value::Number(n) => n,
-        _ => return Err(LuaError::TypeError(
-            "math.floor: argument must be a number".to_string()
-        )),
+    // Phase 1: Get and validate the number
+    let n = {
+        let value = ctx.get_arg(0)?;
+        match value {
+            Value::Number(n) => n,
+            _ => return Err(LuaError::TypeError(
+                "math.floor: argument must be a number".to_string()
+            )),
+        }
     };
     
-    // Return floor value
+    // Phase 2: Return floor value
     ctx.push_result(Value::Number(n.floor()))?;
     
     Ok(1) // One return value
@@ -498,15 +642,18 @@ fn math_ceil(ctx: &mut ExecutionContext) -> Result<i32> {
         ));
     }
     
-    // Get number
-    let n = match ctx.get_arg(0)? {
-        Value::Number(n) => n,
-        _ => return Err(LuaError::TypeError(
-            "math.ceil: argument must be a number".to_string()
-        )),
+    // Phase 1: Get and validate the number
+    let n = {
+        let value = ctx.get_arg(0)?;
+        match value {
+            Value::Number(n) => n,
+            _ => return Err(LuaError::TypeError(
+                "math.ceil: argument must be a number".to_string()
+            )),
+        }
     };
     
-    // Return ceiling value
+    // Phase 2: Return ceiling value
     ctx.push_result(Value::Number(n.ceil()))?;
     
     Ok(1) // One return value
@@ -521,10 +668,14 @@ fn assert_func(ctx: &mut ExecutionContext) -> Result<i32> {
         ));
     }
     
-    // Get value to assert
-    let value = ctx.get_arg(0)?;
+    // Phase 1: Get value and check if it's truthy
+    let (value, should_error) = {
+        let value = ctx.get_arg(0)?;
+        (value, !value.to_bool())
+    };
     
-    if !value.to_bool() {
+    // Phase 2: Handle the assertion
+    if should_error {
         // Get error message if provided
         let msg = if ctx.get_arg_count() > 1 {
             match ctx.get_arg(1)? {
@@ -558,32 +709,30 @@ fn tonumber_func(ctx: &mut ExecutionContext) -> Result<i32> {
         return Ok(1);
     }
     
-    // Get value to convert
-    let value = ctx.get_arg(0)?;
-    
-    match value {
-        Value::Number(n) => {
-            ctx.push_result(Value::Number(n))?;
-        }
-        Value::String(s) => {
-            let bytes = ctx.heap().get_string(s)?;
-            match std::str::from_utf8(bytes) {
-                Ok(s_str) => {
-                    if let Ok(n) = s_str.parse::<f64>() {
-                        ctx.push_result(Value::Number(n))?;
-                    } else {
-                        ctx.push_result(Value::Nil)?;
+    // Phase 1: Get the value to convert
+    let result = {
+        let value = ctx.get_arg(0)?;
+        
+        match value {
+            Value::Number(n) => Value::Number(n),
+            Value::String(s) => {
+                let bytes = ctx.heap().get_string(s)?;
+                match std::str::from_utf8(bytes) {
+                    Ok(s_str) => {
+                        match s_str.parse::<f64>() {
+                            Ok(n) => Value::Number(n),
+                            Err(_) => Value::Nil,
+                        }
                     }
-                }
-                Err(_) => {
-                    ctx.push_result(Value::Nil)?;
+                    Err(_) => Value::Nil,
                 }
             }
+            _ => Value::Nil,
         }
-        _ => {
-            ctx.push_result(Value::Nil)?;
-        }
-    }
+    };
+    
+    // Phase 2: Push the result
+    ctx.push_result(result)?;
     
     Ok(1) // One return value
 }
@@ -597,31 +746,30 @@ fn tostring_func(ctx: &mut ExecutionContext) -> Result<i32> {
         return Ok(1);
     }
     
-    // Get value to convert
-    let value = ctx.get_arg(0)?;
-    
-    let result = match value {
-        Value::Nil => "nil",
-        Value::Boolean(b) => if b { "true" } else { "false" },
-        Value::Number(n) => {
-            let num_str = n.to_string();
-            let handle = ctx.heap().create_string(&num_str);
-            ctx.push_result(Value::String(handle))?;
-            return Ok(1);
+    // Phase 1: Get value and determine representation
+    let result = {
+        let value = ctx.get_arg(0)?;
+        
+        match value {
+            Value::Nil => ctx.heap().create_string("nil"),
+            Value::Boolean(b) => {
+                let s = if b { "true" } else { "false" };
+                ctx.heap().create_string(s)
+            },
+            Value::Number(n) => {
+                let num_str = n.to_string();
+                ctx.heap().create_string(&num_str)
+            },
+            Value::String(s) => s, // Just return the string
+            Value::Table(_) => ctx.heap().create_string("table"),
+            Value::Closure(_) => ctx.heap().create_string("function"),
+            Value::CFunction(_) => ctx.heap().create_string("function"),
+            Value::Thread(_) => ctx.heap().create_string("thread"),
         }
-        Value::String(s) => {
-            // Just return the string
-            ctx.push_result(Value::String(s))?;
-            return Ok(1);
-        }
-        Value::Table(_) => "table",
-        Value::Closure(_) => "function",
-        Value::CFunction(_) => "function",
-        Value::Thread(_) => "thread",
     };
     
-    let handle = ctx.heap().create_string(result);
-    ctx.push_result(Value::String(handle))?;
+    // Phase 2: Push result
+    ctx.push_result(Value::String(result))?;
     
     Ok(1) // One return value
 }

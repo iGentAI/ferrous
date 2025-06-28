@@ -577,52 +577,142 @@ impl Compiler {
             },
             
             Statement::NumericFor { variable, start, limit, step, body } => {
-                // Compile initial expressions
-                let init_reg = self.compile_expression(start)?;
+                // Compile the start, limit and step expressions - these go into consecutive registers
+                let init_reg = self.reg_alloc.allocate();
+                let start_reg = self.compile_expression(start)?;
+                self.emit(OpCode::Move, init_reg, start_reg, 0);
+                self.reg_alloc.free(start_reg);
+                
                 let limit_reg = self.compile_expression(limit)?;
+                self.emit(OpCode::Move, init_reg + 1, limit_reg, 0);
+                self.reg_alloc.free(limit_reg);
                 
                 // Compile step (default to 1 if not provided)
-                let step_reg = if let Some(step_expr) = step {
-                    self.compile_expression(step_expr)?
+                if let Some(step_expr) = step {
+                    let step_reg = self.compile_expression(step_expr)?;
+                    self.emit(OpCode::Move, init_reg + 2, step_reg, 0);
+                    self.reg_alloc.free(step_reg);
                 } else {
                     // Use constant 1
                     let const_idx = self.add_constant(CompilationValue::Number(1.0));
-                    let reg = self.reg_alloc.allocate();
-                    self.emit_bx(OpCode::LoadK, reg, const_idx);
-                    reg
-                };
+                    self.emit_bx(OpCode::LoadK, init_reg + 2, const_idx);
+                }
                 
-                // Allocate register for loop variable
-                let var_reg = self.reg_alloc.allocate();
-                
-                // Define loop variable in scope
+                // Add the loop variable to scope
                 let var_idx = self.intern_string_handle(*variable);
-                self.scope.define(var_idx, var_reg);
+                self.scope.define(var_idx, init_reg + 3);
                 
                 // ForPrep (subtract step from init)
-                self.emit_sbx(OpCode::ForPrep, init_reg, 1); // Jump to ForLoop
+                let prep_jump = self.code.len();
+                self.emit_sbx(OpCode::ForPrep, init_reg, 0); // Placeholder jump offset
+                
+                // Compile loop body
+                let body_start = self.code.len();
+                for stmt in &body.statements {
+                    self.compile_statement(stmt)?;
+                }
+                
+                // ForLoop (increment and check)
+                // Jump back to start of loop body if condition is true
+                let loop_end = self.code.len();
+                self.emit_sbx(OpCode::ForLoop, init_reg, body_start as i32 - loop_end as i32 - 1);
+                
+                // Patch ForPrep jump to point to instruction after ForLoop
+                let loop_size = self.code.len() - prep_jump;
+                let instr = &mut self.code[prep_jump];
+                
+                // Create a new instruction with the same opcode and A field but updated sBx
+                let op = instr.opcode();
+                let a = instr.a();
+                *instr = Instruction::new(
+                    (op as u32) | ((a as u32) << 6) | ((loop_size as u32) << 14)
+                );
+                
+                // Free registers
+                for i in 0..=3 {
+                    self.reg_alloc.free(init_reg + i);
+                }
+            },
+            
+            Statement::GenericFor { variables, iterators, body } => {
+                // Implementation for generic for loops: for var1, var2, ... in iter1, iter2, ... do ... end
+                
+                // First, evaluate iterator expressions - this must go first
+                let mut iterator_regs = Vec::with_capacity(iterators.len());
+                for iter in iterators {
+                    let reg = self.compile_expression(iter)?;
+                    iterator_regs.push(reg);
+                }
+                
+                // Allocate base registers for the iterator state
+                let iter_func_reg = self.reg_alloc.allocate(); // Iterator function
+                let state_reg = self.reg_alloc.allocate();      // State
+                let control_reg = self.reg_alloc.allocate();    // Control variable
+                
+                // Move iterator function, state, and control variables to base registers
+                if !iterator_regs.is_empty() {
+                    self.emit(OpCode::Move, iter_func_reg, iterator_regs[0], 0);
+                } else {
+                    self.emit(OpCode::LoadNil, iter_func_reg, 0, 0);
+                }
+                
+                if iterator_regs.len() > 1 {
+                    self.emit(OpCode::Move, state_reg, iterator_regs[1], 0);
+                } else {
+                    self.emit(OpCode::LoadNil, state_reg, 0, 0);
+                }
+                
+                if iterator_regs.len() > 2 {
+                    self.emit(OpCode::Move, control_reg, iterator_regs[2], 0);
+                } else {
+                    self.emit(OpCode::LoadNil, control_reg, 0, 0);
+                }
+                
+                // Free iterator registers
+                for reg in iterator_regs {
+                    self.reg_alloc.free(reg);
+                }
+                
+                // Allocate registers for loop variables
+                let mut var_regs = Vec::with_capacity(variables.len());
+                for &var in variables {
+                    let var_reg = self.reg_alloc.allocate();
+                    let var_idx = self.intern_string_handle(var);
+                    self.scope.define(var_idx, var_reg);
+                    var_regs.push(var_reg);
+                }
+                
+                // Loop start point
+                let loop_start = self.code.len();
+                
+                // TFORLOOP: Call iterator function with state and control variable
+                // R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2))
+                self.emit(OpCode::TForLoop, iter_func_reg, var_regs.len() as u16, 0);
+                
+                // JMP: Jump to end of loop if iterator returned nil
+                let exit_jump = self.emit_jump();
                 
                 // Compile loop body
                 for stmt in &body.statements {
                     self.compile_statement(stmt)?;
                 }
                 
-                // ForLoop (increment and check)
-                // Jump back to body if condition is true
-                let body_size = self.code.len() - (init_reg as usize + 2);
-                self.emit_sbx(OpCode::ForLoop, init_reg, -(body_size as i32 + 1));
+                // Jump back to loop start
+                let offset = -(self.code.len() as i32 - loop_start as i32 + 1);
+                self.emit_sbx(OpCode::Jmp, 0, offset);
                 
-                // Free registers
-                self.reg_alloc.free(init_reg);
-                self.reg_alloc.free(limit_reg);
-                self.reg_alloc.free(step_reg);
-                self.reg_alloc.free(var_reg);
-            },
-            
-            // Fix GenericFor case to use ignore patterns for unused variables
-            Statement::GenericFor { variables: _, iterators: _, body: _ } => {
-                // Not fully implemented in the VM yet
-                return Err(LuaError::NotImplemented("generic for loops"));
+                // Patch exit jump to here
+                self.patch_jump(exit_jump);
+                
+                // Free loop variable registers
+                for reg in var_regs {
+                    self.reg_alloc.free(reg);
+                }
+                
+                // Free iterator registers
+                self.reg_alloc.free(iter_func_reg);
+                self.reg_alloc.free(state_reg);
+                self.reg_alloc.free(control_reg);
             },
             
             Statement::Break => {

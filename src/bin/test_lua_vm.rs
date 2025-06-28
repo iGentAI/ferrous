@@ -4,16 +4,12 @@
 //! different values (nil, strings, numbers, tables) and function calls.
 
 use ferrous::lua_new::vm::LuaVM;
-use ferrous::lua_new::value::{Value, StringHandle, TableHandle};
-use ferrous::lua_new::heap::LuaHeap;
-use ferrous::lua_new::parser::Parser;
+use ferrous::lua_new::value::Value;
 use ferrous::lua_new::compiler::Compiler;
 use ferrous::lua_new::VMConfig;
 use ferrous::lua_new::redis_api::RedisApiContext;
 use ferrous::lua_new::sandbox::LuaSandbox;
 use ferrous::lua_new::cjson;
-use std::rc::Rc;
-use std::cell::RefCell;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Lua VM Diagnostic Test ===");
@@ -88,29 +84,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // Test a single script
 fn test_script(vm: &mut LuaVM, script: &str) -> Result<Value, Box<dyn std::error::Error>> {
-    // Phase 1: Parse the script
-    println!("Phase 1: Parsing...");
-    let mut parser = Parser::new(script, &mut vm.heap)?;
-    let ast = parser.parse()?;
-    println!("✅ Parsing successful");
-    
-    // Phase 2: Compile to bytecode
-    println!("Phase 2: Compilation...");
+    // Phase 1: Compile the script (includes parsing and bytecode generation)
+    println!("Phase 1: Compiling script...");
     let mut compiler = Compiler::new();
     compiler.set_heap(&mut vm.heap as *mut _);
-    let proto = compiler.compile_chunk(&ast)?;
+    let compile_result = compiler.compile(script)?;
     println!("✅ Compilation successful");
-    println!("    - Bytecode instructions: {}", proto.code.len());
-    println!("    - Constants: {}", proto.constants.len());
-    println!("    - Max stack: {}", proto.max_stack_size);
+    println!("    - Bytecode instructions: {}", compile_result.main_proto().code.len());
+    println!("    - Constants: {}", compile_result.main_proto().constants.len());
+    println!("    - Max stack: {}", compile_result.main_proto().max_stack_size);
+    println!("    - String pool: {} strings", compile_result.string_pool.len());
     
-    // Phase 3: Create closure
-    println!("Phase 3: Creating closure...");
-    let closure = vm.heap.alloc_closure(proto, vec![]);
-    println!("✅ Closure created successfully");
+    // Phase 2: Load compiled script into VM
+    println!("Phase 2: Loading compiled script...");
+    let closure = vm.load_compilation_script(&compile_result)?;
+    println!("✅ Script loaded successfully");
     
-    // Phase 4: Execute the script
-    println!("Phase 4: Executing script...");
+    // Phase 3: Execute the script
+    println!("Phase 3: Executing script...");
     let result = vm.execute_function(closure, &[])?;
     println!("✅ Execution successful");
     
