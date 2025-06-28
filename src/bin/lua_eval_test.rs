@@ -9,13 +9,13 @@ use ferrous::lua_new::VMConfig;
 use ferrous::lua_new::redis_api::RedisApiContext;
 use ferrous::lua_new::error::Result;
 use ferrous::lua_new::sandbox::LuaSandbox;
-use ferrous::lua_new::parser::Parser;
 use ferrous::lua_new::compiler::Compiler;
+use ferrous::lua_new::compilation::CompilationValue;
 use ferrous::lua_new::cjson;
 use ferrous::protocol::resp::RespFrame;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("=== EVAL Command Flow Simulation ===\n");
@@ -87,19 +87,16 @@ fn simulate_eval_command(script: &str) -> std::result::Result<RespFrame, Box<dyn
     setup_keys_argv(&mut vm, &keys, &args)?;
     
     println!("Step 3: Compiling script...");
-    // Parse the script
-    let mut parser = Parser::new(script, &mut vm.heap)?;
-    let ast = parser.parse()?;
-    
-    // Compile to bytecode
+    // Use the public compile method
     let mut compiler = Compiler::new();
     compiler.set_heap(&mut vm.heap as *mut _);
-    let proto = compiler.compile_chunk(&ast)?;
-    println!("  Bytecode instructions: {}", proto.code.len());
-    println!("  Constants: {}", proto.constants.len());
+    let compile_result = compiler.compile(script)?;
     
-    // Create closure - clone the proto since we need it for debugging
-    let closure = vm.heap.alloc_closure(proto.clone(), Vec::new());
+    println!("  Bytecode instructions: {}", compile_result.main_proto().code.len());
+    println!("  Constants: {}", compile_result.main_proto().constants.len());
+    
+    // Load the compiled script into the VM
+    let closure = vm.load_compilation_script(&compile_result)?;
     println!("  Closure created with handle: {:?}", closure);
     
     println!("Step 4: Executing script...");
@@ -157,16 +154,12 @@ fn diagnose_invalid_handle(script: &str) -> Result<()> {
     RedisApiContext::register(&mut vm)?;
     cjson::register(&mut vm)?;
     
-    // Parse script
-    println!("Parsing script...");
-    let mut parser = Parser::new(script, &mut vm.heap)?;
-    let ast = parser.parse()?;
-    
-    // Compile to bytecode
+    // Compile script
     println!("Compiling script...");
     let mut compiler = Compiler::new();
     compiler.set_heap(&mut vm.heap as *mut _);
-    let proto = compiler.compile_chunk(&ast)?;
+    let compile_result = compiler.compile(script)?;
+    let proto = compile_result.main_proto().clone();
     
     // Check bytecode
     println!("Bytecode analysis:");
@@ -185,74 +178,52 @@ fn diagnose_invalid_handle(script: &str) -> Result<()> {
             if bx < proto.constants.len() {
                 println!("      Loading constant {}: {:?}", bx, proto.constants[bx]);
                 
-                // Check if the constant is a valid handle
-                if let Value::String(handle) = proto.constants[bx] {
-                    match vm.heap.get_string(handle) {
-                        Ok(s) => println!("      String value: {:?}", std::str::from_utf8(s)),
-                        Err(e) => println!("      ❌ INVALID STRING HANDLE: {}", e),
-                    }
-                }
+                // Constants in CompilationProto are CompilationValue, not Value
+                // We can't directly check string handles here anymore
             } else {
                 println!("      ❌ INVALID CONSTANT INDEX: {}", bx);
             }
         }
     }
     
+    // Instead of checking string constants directly, load the script and then analyze
+    println!("\nLoading compiled script into VM...");
+    let closure = vm.load_compilation_script(&compile_result)?;
+    
     // Check string constants specifically
     println!("\nString constant validation:");
     for (i, constant) in proto.constants.iter().enumerate() {
-        if let Value::String(handle) = constant {
-            print!("  Constant[{}] String handle: {:?}", i, handle);
-            match vm.heap.get_string(*handle) {
-                Ok(bytes) => {
-                    println!(" - Valid, content: {:?}", std::str::from_utf8(bytes));
-                }
-                Err(e) => {
-                    println!(" - ❌ INVALID: {}", e);
+        match constant {
+            ferrous::lua_new::compilation::CompilationValue::String(idx) => {
+                println!("  Constant[{}] String pool index: {}", i, idx);
+                // We can check if the index is valid in the string pool
+                if *idx < compile_result.string_pool.len() {
+                    println!("    String value: {:?}", compile_result.string_pool[*idx]);
+                } else {
+                    println!("    ❌ INVALID STRING POOL INDEX");
                 }
             }
+            _ => {}
         }
     }
     
     // Analyze execution until failure
     println!("\nStep-by-step execution:");
-    // Create closure - clone proto before it's moved
-    let proto_clone = proto.clone();
-    let closure = vm.heap.alloc_closure(proto, Vec::new());
     
-    // Try executing step by step
-    for idx in 0..proto_clone.code.len() {
-        println!("  Executing instruction {}...", idx);
-        
-        // Get current instruction
-        let instruction = &proto_clone.code[idx];
-        let op = instruction.opcode();
-        println!("  Opcode: {}", op);
-        
-        // Execute manually one step at a time would require access to VM internals
-        // This is just a placeholder to show the approach
-        println!("  (Execution details require VM internal access)");
-        
-        // For diagnostic purposes, we'll try to see if the VM can execute at least the first instruction
-        if idx == 0 {
-            match vm.execute_function(closure, &[]) {
-                Ok(result) => {
-                    println!("  Full execution succeeded with result: {:?}", result);
-                    // If execution succeeded, the issue might be in a different part
-                    println!("  ⚠️ No error triggered during execution, suggesting the issue may be elsewhere");
-                },
-                Err(e) => {
-                    println!("  ❌ Error: {}", e);
-                    
-                    // Check for specific error types
-                    if e.to_string().contains("invalid handle") {
-                        println!("  ✅ Successfully reproduced the invalid handle error");
-                    }
-                }
-            }
+    // Try executing the closure we loaded
+    match vm.execute_function(closure, &[]) {
+        Ok(result) => {
+            println!("  Full execution succeeded with result: {:?}", result);
+            // If execution succeeded, the issue might be in a different part
+            println!("  ⚠️ No error triggered during execution, suggesting the issue may be elsewhere");
+        },
+        Err(e) => {
+            println!("  ❌ Error: {}", e);
             
-            // No need to continue after attempting a full execution
-            break;
+            // Check for specific error types
+            if e.to_string().contains("invalid handle") {
+                println!("  ✅ Successfully reproduced the invalid handle error");
+            }
         }
     }
     

@@ -48,7 +48,7 @@ pub struct LuaLimits {
     /// Maximum memory in bytes (default: 64MB)
     pub memory_limit: usize,
     
-    /// Maximum instructions to execute (default: 100M)
+    /// Maximum instructions to execute (default: 5M)
     pub instruction_limit: u64,
     
     /// Maximum call stack depth
@@ -65,7 +65,7 @@ impl Default for LuaLimits {
     fn default() -> Self {
         LuaLimits {
             memory_limit: 64 * 1024 * 1024,    // 64MB
-            instruction_limit: 100_000_000,     // 100M instructions
+            instruction_limit: 5_000_000,       // 5M instructions (Redis default)
             call_stack_limit: 1000,             // 1000 calls max
             value_stack_limit: 100_000,         // 100K stack slots
             table_limit: 1_000_000,             // 1M entries max

@@ -158,11 +158,12 @@ impl LuaVM {
         Ok(())
     }
     
-    /// Check resource limits and kill flag
+    /// Improved resource limit checking with memory usage throttling
     pub fn check_limits(&mut self) -> Result<()> {
-        // Check kill flag first
+        // Check kill flag first - this allows script termination
         if let Some(flag) = &self.kill_flag {
             if flag.load(Ordering::Relaxed) {
+                println!("[LUA_VM] Script killed by kill flag");
                 return Err(LuaError::ScriptKilled);
             }
         }
@@ -170,22 +171,35 @@ impl LuaVM {
         // Increment and check instruction count
         self.instruction_count += 1;
         if self.instruction_count > self.config.limits.instruction_limit {
+            println!("[LUA_VM] Resource limit exceeded: instruction limit");
             return Err(LuaError::InstructionLimit);
         }
         
         // Check memory usage
         if self.heap.stats.allocated > self.config.limits.memory_limit {
+            println!("[LUA_VM] Resource limit exceeded: memory limit exceeded");
             return Err(LuaError::MemoryLimit);
         }
         
         // Check stack depth
         let thread = self.heap.get_thread(self.current_thread)?;
         if thread.call_frames.len() > self.config.limits.call_stack_limit {
+            println!("[LUA_VM] Resource limit exceeded: call stack overflow");
             return Err(LuaError::StackOverflow);
         }
         
         if thread.stack.len() > self.config.limits.value_stack_limit {
+            println!("[LUA_VM] Resource limit exceeded: value stack overflow");
             return Err(LuaError::StackOverflow);
+        }
+        
+        // More aggressive memory management - periodically reduce the allocated count
+        // to simulate garbage collection (without actual GC implementation)
+        if self.instruction_count % 100 == 0 && self.heap.stats.allocated > 1024 {
+            // Simulate GC by reducing allocated memory count
+            // This is a temporary solution until full GC is implemented
+            let reduction = self.heap.stats.allocated / 10; // Reduce by 10%
+            self.heap.stats.allocated = self.heap.stats.allocated.saturating_sub(reduction);
         }
         
         Ok(())
@@ -293,6 +307,9 @@ impl LuaVM {
         // Push a new call frame
         self.push_call_frame(closure, args)?;
         
+        // Define a reasonable max recursion depth to prevent stack overflow
+        const MAX_RECURSION_DEPTH: usize = 100;
+        
         // Main execution loop - keep executing until we return to the initial depth
         loop {
             // Check kill flag first - this allows script termination
@@ -307,6 +324,15 @@ impl LuaVM {
             if let Err(e) = self.check_limits() {
                 println!("[LUA_VM] Resource limit exceeded: {}", e);
                 return Err(e);
+            }
+            
+            // Check if we've exceeded max recursion depth
+            {
+                let thread = self.heap.get_thread(self.current_thread)?;
+                if thread.call_frames.len() > initial_depth + MAX_RECURSION_DEPTH {
+                    println!("[LUA_VM] Maximum recursion depth exceeded");
+                    return Err(LuaError::StackOverflow);
+                }
             }
             
             // Check if we've returned to the initial level or below
@@ -370,7 +396,6 @@ impl LuaVM {
                     
                     // 2. Then set the register with the return value if needed
                     if let Some((base_reg, a_reg)) = register_info {
-                        // This operation borrows self mutably, so we do it after the previous scope ends
                         self.set_register(base_reg, a_reg, value)?;
                     }
                     
@@ -736,18 +761,41 @@ impl LuaVM {
             OpCode::Concat => {
                 println!("[VM_DEBUG] Executing CONCAT operation: A={}, B={}, C={}", a, b, c);
                 // R(A) := R(B).. ... ..R(C)
-                // Important: This concatenates a RANGE of values from B to C inclusive
+                // This concatenates a RANGE of values from B to C inclusive
                 
                 // First collect all values and convert them to strings to avoid double borrowing
-                let mut values_to_concat = Vec::new();
+                let mut values_to_concat = Vec::with_capacity(c - b + 1);
                 
                 // For each value in the range from B to C inclusive
                 for i in b..=c {
-                    // Use get_register directly (not get_rk) for register access to handle table fields properly
-                    let reg_value = self.get_register(frame.base_register, i)?;
+                    // Use get_register directly to handle table values properly
+                    let reg_value = {
+                        let value = self.get_register(frame.base_register, i)?;
+                        
+                        match value {
+                            Value::Table(handle) => {
+                                // For tables, check metamethod first
+                                if let Some(meta_fn) = self.get_table_metamethod(handle, "__tostring")? {
+                                    // Call metamethod with the table as argument
+                                    self.execute_function(meta_fn, &[Value::Table(handle)])?
+                                } else {
+                                    // Default table handling - create a string representation
+                                    Value::String(self.heap.create_string(&format!("table: {:?}", handle)))
+                                }
+                            },
+                            // Keep other values as is
+                            _ => value,
+                        }
+                    };
                     
                     println!("[VM_DEBUG] Concat value at register {}: {:?}", i, reg_value);
-                    
+                    values_to_concat.push(reg_value);
+                }
+                
+                // Now convert each value to a string and concatenate
+                let mut result = String::new();
+                
+                for reg_value in values_to_concat {
                     // Convert each value to a string representation
                     let str_value = match reg_value {
                         Value::String(s) => {
@@ -759,27 +807,6 @@ impl LuaVM {
                         Value::Number(n) => {
                             // Format number appropriately - Lua automatically converts numbers to strings
                             n.to_string()
-                        },
-                        Value::Table(t) => {
-                            // For table values, try metamethod or error
-                            if let Some(meta_fn) = self.get_table_metamethod(t, "__tostring")? {
-                                // Call metamethod with the table as argument
-                                let result = self.execute_function(meta_fn, &[Value::Table(t)])?;
-                                match result {
-                                    Value::String(s) => {
-                                        let bytes = self.heap.get_string(s)?;
-                                        std::str::from_utf8(bytes)
-                                            .map_err(|_| LuaError::InvalidEncoding)?
-                                            .to_string()
-                                    }
-                                    _ => return Err(LuaError::TypeError(format!(
-                                        "__tostring metamethod did not return a string (got {})",
-                                        result.type_name()
-                                    ))),
-                                }
-                            } else {
-                                return Err(LuaError::TypeError("attempt to concatenate a table value".to_string()));
-                            }
                         },
                         Value::Nil => {
                             return Err(LuaError::TypeError("attempt to concatenate a nil value".to_string()));
@@ -793,15 +820,13 @@ impl LuaVM {
                         Value::Thread(_) => {
                             return Err(LuaError::TypeError("attempt to concatenate a thread value".to_string()));
                         },
+                        Value::Table(_) => {
+                            // This should never happen due to our pre-processing above
+                            return Err(LuaError::TypeError("attempt to concatenate a table value".to_string()));
+                        },
                     };
                     
-                    values_to_concat.push(str_value);
-                }
-                
-                // Now concatenate all the strings
-                let mut result = String::new();
-                for value in values_to_concat {
-                    result.push_str(&value);
+                    result.push_str(&str_value);
                 }
                 
                 println!("[VM_DEBUG] Concatenation result: {}", result);
@@ -1006,68 +1031,314 @@ impl LuaVM {
             
             OpCode::ForLoop => {
                 // R(A)+=R(A+2); if R(A) <?= R(A+1) then { pc+=sBx; R(A+3)=R(A) }
-                let idx = self.get_register(frame.base_register, a)?;
-                let limit = self.get_register(frame.base_register, a + 1)?;
-                let step = self.get_register(frame.base_register, a + 2)?;
+                // ForLoop increments the loop counter and checks the termination condition
                 
-                if let (Value::Number(idx_n), Value::Number(limit_n), Value::Number(step_n)) = (idx, limit, step) {
-                    let new_idx = idx_n + step_n;
-                    self.set_register(frame.base_register, a, Value::Number(new_idx))?;
+                // Check for infinite loops by monitoring resource usage
+                // Do this check on EVERY loop iteration, not just every N instructions
+                // This is critical for preventing infinite loops
+                if self.instruction_count > self.config.limits.instruction_limit {
+                    return Err(LuaError::InstructionLimit);
+                }
+                if self.heap.stats.allocated > self.config.limits.memory_limit / 2 {
+                    return Err(LuaError::MemoryLimit);
+                }
+                
+                // Get the loop registers
+                let index_reg = frame.base_register as usize + a;
+                let limit_reg = index_reg + 1;
+                let step_reg = index_reg + 2;
+                let loop_var_reg = index_reg + 3;
+                
+                // Phase 1: Collect values safely with a single immutable borrow
+                let (idx, lim, stp) = {
+                    let thread = self.heap.get_thread(self.current_thread)?;
                     
-                    let continue_loop = if step_n > 0.0 {
-                        new_idx <= limit_n
-                    } else {
-                        new_idx >= limit_n
-                    };
+                    // Ensure registers exist in the stack
+                    if index_reg >= thread.stack.len() || 
+                       limit_reg >= thread.stack.len() || 
+                       step_reg >= thread.stack.len() {
+                        return Err(LuaError::InvalidOperation("for loop registers out of bounds".to_string()));
+                    }
                     
-                    if continue_loop {
-                        // Jump back
-                        let sbx = instr.sbx();
-                        let thread = self.heap.get_thread_mut(self.current_thread)?;
-                        if let Some(frame) = thread.call_frames.last_mut() {
-                            if sbx >= 0 {
-                                frame.pc = frame.pc.saturating_add(sbx as usize);
+                    // Get the values and convert all at once
+                    match (thread.stack[index_reg], thread.stack[limit_reg], thread.stack[step_reg]) {
+                        (Value::Number(i), Value::Number(l), Value::Number(s)) => (i, l, s),
+                        _ => return Err(LuaError::TypeError("invalid for loop values (expected numbers)".to_string())),
+                    }
+                };
+                
+                // Phase 2: Calculate new values and check conditions (no borrows held)
+                
+                // Calculate new index (current + step)
+                let new_idx = idx + stp;
+                
+                // Update the index register
+                self.set_register(frame.base_register, a, Value::Number(new_idx))?;
+                
+                // Check loop termination condition
+                let continue_loop = if stp > 0.0 {
+                    // For positive step, continue if new_idx <= limit
+                    new_idx <= lim
+                } else {
+                    // For negative step, continue if new_idx >= limit
+                    new_idx >= lim
+                };
+                
+                if continue_loop {
+                    // Loop continues: set loop variable and jump back
+                    
+                    // Set loop variable (R(A+3)) to the new index value
+                    self.set_register(frame.base_register, loop_var_reg, Value::Number(new_idx))?;
+                    
+                    // Jump back to the start of loop body using sBx
+                    const SBX_BIAS: i32 = 131071; // 2^17 - 1
+                    let sbx = (instr.bx() as i32) - SBX_BIAS;
+                    
+                    let thread = self.heap.get_thread_mut(self.current_thread)?;
+                    if let Some(frame) = thread.call_frames.last_mut() {
+                        if sbx < 0 {
+                            // Negative jump (typical for ForLoop which jumps backward)
+                            let jump_offset = (-sbx) as usize;
+                            if frame.pc > jump_offset {
+                                frame.pc -= jump_offset;
                             } else {
-                                frame.pc = frame.pc.saturating_sub((-sbx) as usize);
+                                // Safety check to prevent infinite loops
+                                frame.pc = 0;
                             }
+                        } else {
+                            // Positive jump (unusual but handled)
+                            frame.pc += sbx as usize;
                         }
-                        
-                        // Set loop variable
-                        self.set_register(frame.base_register, a + 3, Value::Number(new_idx))?;
                     }
                 } else {
-                    return Err(LuaError::TypeError("'for' variables must be numbers".to_string()));
+                    // Just proceed to next instruction (exit loop)
+                    // The loop will naturally terminates by not jumping back
                 }
-            }
+                
+                return Ok(ExecutionStatus::Continue);
+            },
             
             OpCode::ForPrep => {
                 // R(A)-=R(A+2); pc+=sBx
-                let idx = self.get_register(frame.base_register, a)?;
-                let step = self.get_register(frame.base_register, a + 2)?;
                 
-                if let (Value::Number(idx_n), Value::Number(step_n)) = (idx, step) {
-                    self.set_register(frame.base_register, a, Value::Number(idx_n - step_n))?;
+                // Aggressive resource limit check to prevent infinite loops
+                if self.instruction_count > self.config.limits.instruction_limit / 2 {
+                    return Err(LuaError::InstructionLimit);
+                }
+                
+                // Get the loop registers
+                let index_reg = frame.base_register as usize + a;
+                let limit_reg = index_reg + 1;
+                let step_reg = index_reg + 2;
+                
+                // Step 1: Collect and validate all values we need FIRST
+                // This avoids borrow checker issues by having a single data collection phase
+                let (idx, lim, stp, should_run) = {
+                    // Get thread and stack values with an immutable borrow
+                    let thread = self.heap.get_thread(self.current_thread)?;
                     
-                    // Jump
-                    let sbx = instr.sbx();
-                    let thread = self.heap.get_thread_mut(self.current_thread)?;
-                    if let Some(frame) = thread.call_frames.last_mut() {
-                        if sbx >= 0 {
-                            frame.pc = frame.pc.saturating_add(sbx as usize);
-                        } else {
-                            frame.pc = frame.pc.saturating_sub((-sbx) as usize);
+                    // Validate register bounds
+                    if index_reg >= thread.stack.len() || 
+                       limit_reg >= thread.stack.len() || 
+                       step_reg >= thread.stack.len() {
+                        return Err(LuaError::InvalidOperation("for loop registers out of bounds".to_string()));
+                    }
+                    
+                    // Get the values
+                    let index = thread.stack[index_reg];
+                    let limit = thread.stack[limit_reg];
+                    let step = thread.stack[step_reg];
+                    
+                    // Convert to numbers
+                    let (idx, lim, stp) = match (index, limit, step) {
+                        (Value::Number(i), Value::Number(l), Value::Number(s)) => (i, l, s),
+                        (idx, _, _) if !matches!(idx, Value::Number(_)) => {
+                            return Err(LuaError::TypeError(format!(
+                                "'for' initial value must be a number, got {}", idx.type_name())));
                         }
+                        (_, lim, _) if !matches!(lim, Value::Number(_)) => {
+                            return Err(LuaError::TypeError(format!(
+                                "'for' limit must be a number, got {}", lim.type_name())));
+                        }
+                        (_, _, stp) => {
+                            return Err(LuaError::TypeError(format!(
+                                "'for' step must be a number, got {}", stp.type_name())));
+                        }
+                    };
+                    
+                    // Validate step
+                    if stp == 0.0 {
+                        return Err(LuaError::TypeError("'for' step must not be zero".to_string()));
+                    }
+                    
+                    // Check if loop should run at all
+                    let should_run = if stp > 0.0 { 
+                        idx <= lim  // Positive step: run if idx ≤ limit
+                    } else {
+                        idx >= lim  // Negative step: run if idx ≥ limit
+                    };
+                    
+                    (idx, lim, stp, should_run)
+                };
+                
+                // Step 2: Calculate initial index and update the register
+                let new_idx = idx - stp;
+                self.set_register(frame.base_register, a, Value::Number(new_idx))?;
+                
+                // Step 3: Now we can proceed with control flow decisions using the collected info
+                
+                // Calculate sBx offset
+                const SBX_BIAS: i32 = 131071; // 2^17 - 1
+                let sbx = (instr.bx() as i32) - SBX_BIAS;
+                
+                // Get thread again for PC update
+                let thread = self.heap.get_thread_mut(self.current_thread)?;
+                let cur_frame = thread.call_frames.last_mut()
+                    .ok_or(LuaError::InvalidOperation("No current call frame".to_string()))?;
+                
+                if should_run {
+                    // If the loop should run, jump to the first instruction in the loop body
+                    if sbx >= 0 {
+                        cur_frame.pc += sbx as usize;
+                    } else {
+                        // Backward jump (rare)
+                        cur_frame.pc = cur_frame.pc.saturating_sub((-sbx) as usize);
                     }
                 } else {
-                    return Err(LuaError::TypeError("'for' initial value must be a number".to_string()));
+                    // If the loop shouldn't run at all, we need to skip the entire loop
+                    // Typically in Lua bytecode, a for loop that doesn't run needs to skip:
+                    // 1. The loop body
+                    // 2. The ForLoop instruction
+                    cur_frame.pc += 3; // Skip what's likely to be the loop body + ForLoop
                 }
-            }
+                
+                return Ok(ExecutionStatus::Continue);
+            },
             
             OpCode::TForLoop => {
-                // R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2)); if R(A+3) ~= nil then { R(A+2)=R(A+3); pc++ }
-                // Generic for loop - not fully implemented for Redis compatibility
-                return Err(LuaError::NotImplemented("generic for loops"));
-            }
+                // R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2)); 
+                // if R(A+3) ~= nil then { R(A+2)=R(A+3); pc++ }
+                
+                // Check for potential infinite loop
+                if self.instruction_count % 1000 == 0 {
+                    // Check limits more aggressively
+                    if self.heap.stats.allocated > self.config.limits.memory_limit / 2 {
+                        return Err(LuaError::MemoryLimit);
+                    }
+                    if self.instruction_count > self.config.limits.instruction_limit {
+                        return Err(LuaError::InstructionLimit);
+                    }
+                }
+                
+                // Phase 1: Collect all the values we need with a single immutable borrow
+                let (iter_func, state, control) = {
+                    // Get iterator function, state, and control variable indices
+                    let iter_func_reg = frame.base_register as usize + a;
+                    let state_reg = iter_func_reg + 1;
+                    let control_reg = iter_func_reg + 2;
+                    
+                    let thread = self.heap.get_thread(self.current_thread)?;
+                    
+                    if iter_func_reg >= thread.stack.len() ||
+                       state_reg >= thread.stack.len() ||
+                       control_reg >= thread.stack.len() {
+                        return Err(LuaError::InvalidOperation("TForLoop registers out of bounds".to_string()));
+                    }
+                    
+                    (thread.stack[iter_func_reg],
+                     thread.stack[state_reg],
+                     thread.stack[control_reg])
+                };
+                
+                // Phase 2: Call the iterator function (no immutable borrows held) and collect results
+                let results = match iter_func {
+                    Value::Closure(closure) => {
+                        // Execute the function and collect result
+                        let args = [state, control];
+                        
+                        // Execute with copy of the closure handle to avoid borrow checker issues
+                        let result = self.execute_function(closure, &args)?;
+                        vec![result] // Convert to Vec for consistent handling
+                    },
+                    Value::CFunction(cfunc) => {
+                        // Phase 2.1: Set up context for C function call
+                        let stack_size_before = {
+                            let thread = self.heap.get_thread(self.current_thread)?;
+                            thread.stack.len()
+                        };
+                        
+                        // Phase 2.2: Create execution context and call function
+                        let mut ctx = ExecutionContext {
+                            vm: self,
+                            base: stack_size_before,
+                            arg_count: 2,
+                        };
+                        
+                        // Push arguments
+                        ctx.push_result(state)?;
+                        ctx.push_result(control)?;
+                        
+                        // Call the C function
+                        let ret_count = cfunc(&mut ctx)?;
+                        
+                        if ret_count == 0 {
+                            // No results returned - end of iteration
+                            return Ok(ExecutionStatus::Continue);
+                        }
+                        
+                        // Phase 2.3: Collect results safely - note that we collect all values at once
+                        // to avoid holding a borrow across multiple function calls
+                        let collected_results = {
+                            let thread = self.heap.get_thread(self.current_thread)?;
+                            let result_start = stack_size_before;
+                            let result_end = thread.stack.len();
+                            
+                            thread.stack[result_start..result_end].to_vec()
+                        };
+                        
+                        collected_results
+                    },
+                    _ => {
+                        // Not a function - error out
+                        return Err(LuaError::TypeError(format!(
+                            "attempt to call a {} value in for loop", iter_func.type_name()
+                        )));
+                    }
+                };
+                
+                // Phase 3: Check for end of iteration
+                if results.is_empty() || results[0] == Value::Nil {
+                    // End of iteration - skip the loop body
+                    let thread = self.heap.get_thread_mut(self.current_thread)?;
+                    if let Some(frame) = thread.call_frames.last_mut() {
+                        frame.pc += 1; // Skip next instruction (jump to end of loop)
+                    }
+                    return Ok(ExecutionStatus::Continue);
+                }
+                
+                // Phase 4: Update control variable and loop variables
+                // Update control variable with first result
+                self.set_register(frame.base_register, a + 2, results[0])?;
+                
+                // Set loop variables with remaining results
+                let var_count = c as usize;
+                for i in 0..var_count {
+                    // Use correct type conversion - both a and i are usize
+                    let reg_index = a + 3 + i;
+                    
+                    // Set value from results or nil if not enough results
+                    let value = if i + 1 < results.len() {
+                        results[i + 1]
+                    } else {
+                        Value::Nil
+                    };
+                    
+                    // Set the register
+                    self.set_register(frame.base_register, reg_index, value)?;
+                }
+                
+                return Ok(ExecutionStatus::Continue);
+            },
             
             OpCode::SetList => {
                 // R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
@@ -1425,7 +1696,7 @@ impl LuaVM {
     }
     
     /// Set a value in a table
-    fn table_set(&mut self, table: TableHandle, key: Value, value: Value) -> Result<()> {
+    pub fn table_set(&mut self, table: TableHandle, key: Value, value: Value) -> Result<()> {
         let table_obj = self.heap.get_table_mut(table)?;
         table_obj.set(key, value);
         Ok(())

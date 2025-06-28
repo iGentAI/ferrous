@@ -87,6 +87,11 @@ impl CompilationScript {
             sha1,
         }
     }
+    
+    /// Get the main prototype
+    pub fn main_proto(&self) -> &CompilationProto {
+        &self.main_proto
+    }
 }
 
 /// Helper function to compute SHA1 hash of a string

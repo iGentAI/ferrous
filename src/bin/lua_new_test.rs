@@ -1,6 +1,6 @@
 //! Test for the new Lua implementation with generational arena architecture
 
-use ferrous::lua_new::{LuaVM, VMConfig, Value, LuaHeap};
+use ferrous::lua_new::{LuaVM, VMConfig, Value};
 use ferrous::lua_new::value::{FunctionProto, Instruction, OpCode};
 use ferrous::lua_new::error::Result;
 use ferrous::storage::engine::StorageEngine;

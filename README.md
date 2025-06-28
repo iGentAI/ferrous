@@ -5,7 +5,7 @@ A Redis-compatible in-memory database server written in pure Rust with minimal p
 
 Ferrous is currently at Phase 4 implementation, with several key features completed:
 
-### Completed (Phases 1-3):
+### Current Status:
 - ✅ TCP Server with connection handling
 - ✅ Full RESP2 protocol implementation
 - ✅ Core data structures: Strings, Lists, Sets, Hashes, Sorted Sets
@@ -22,11 +22,13 @@ Ferrous is currently at Phase 4 implementation, with several key features comple
 - ✅ Enhanced RESP protocol parsing
 - ✅ Master-slave replication
 - ✅ SCAN command family for safe iteration
-- ✅ Improved Lua VM with proper memory management
-- ✅ cjson.encode support
+- ✅ Improved Lua VM with generational arena architecture
+- ✅ Table field concatenation and memory management in Lua
+- ✅ cjson.encode/decode support
 
 ### Known Limitations:
-- ⚠️ Table field concatenation issues with complex operations in Lua scripts
+- ⚠️ Nested function calls in Lua scripts have stack overflow issues
+- ⚠️ Generic for loops (pairs/ipairs) in Lua have implementation issues
 - ⚠️ Command renaming/disabling not implemented yet
 - ⚠️ Protected mode not implemented
 

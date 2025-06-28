@@ -689,7 +689,6 @@ impl<'a> JsonParser<'a> {
 fn json_to_lua_value(ctx: &mut ExecutionContext, json: JsonValue) -> Result<Value> {
     match json {
         JsonValue::Null => {
-            println!("[CJSON_DECODE] Converting JSON null");
             // Get cjson.null from global cjson table (or create it if needed)
             let globals = ctx.vm.globals();
             let cjson_name = ctx.heap().create_string("cjson");
@@ -697,7 +696,6 @@ fn json_to_lua_value(ctx: &mut ExecutionContext, json: JsonValue) -> Result<Valu
                 Some(Value::Table(t)) => *t,
                 _ => {
                     // cjson table not found, return nil
-                    println!("[CJSON_DECODE] cjson table not found, returning nil for null");
                     return Ok(Value::Nil); 
                 }
             };
@@ -705,34 +703,22 @@ fn json_to_lua_value(ctx: &mut ExecutionContext, json: JsonValue) -> Result<Valu
             // Look up cjson.null or create it
             let null_name = ctx.heap().create_string("null");
             match ctx.heap().get_table(cjson_table)?.get(&Value::String(null_name)) {
-                Some(value) => {
-                    println!("[CJSON_DECODE] Using existing cjson.null");
-                    Ok(*value)
-                },
+                Some(value) => Ok(*value),
                 _ => {
                     // Create a new cjson.null table
-                    println!("[CJSON_DECODE] Creating new cjson.null table");
                     let null_table = ctx.heap().alloc_table();
                     ctx.heap().get_table_mut(cjson_table)?.set(Value::String(null_name), Value::Table(null_table));
                     Ok(Value::Table(null_table))
                 }
             }
         },
-        JsonValue::Boolean(b) => {
-            println!("[CJSON_DECODE] Converting JSON boolean: {}", b);
-            Ok(Value::Boolean(b))
-        },
-        JsonValue::Number(n) => {
-            println!("[CJSON_DECODE] Converting JSON number: {}", n);
-            Ok(Value::Number(n))
-        },
+        JsonValue::Boolean(b) => Ok(Value::Boolean(b)),
+        JsonValue::Number(n) => Ok(Value::Number(n)),
         JsonValue::String(s) => {
-            println!("[CJSON_DECODE] Converting JSON string: {}", s);
             let handle = ctx.heap().create_string(&s);
             Ok(Value::String(handle))
         },
         JsonValue::Array(values) => {
-            println!("[CJSON_DECODE] Converting JSON array with {} elements", values.len());
             // Create a new table for the array
             let table = ctx.heap().alloc_table();
             
@@ -740,29 +726,14 @@ fn json_to_lua_value(ctx: &mut ExecutionContext, json: JsonValue) -> Result<Valu
                 let lua_value = json_to_lua_value(ctx, value)?;
                 let index = Value::Number((i + 1) as f64); // Lua uses 1-based indexing
                 
-                // Set array element - we set both the array part and the hash part to ensure it works
+                // Set array element
                 ctx.heap().get_table_mut(table)?
                     .set(index, lua_value);
             }
             
-            println!("[CJSON_DECODE] Created Lua table from array");
-            
-            // For debugging: verify we can access array elements directly from C
-            /*
-            if let Ok(table_obj) = ctx.heap().get_table(table) {
-                println!("[CJSON_DECODE] Array table len: {}", table_obj.len());
-                for i in 0..table_obj.len() {
-                    if let Some(v) = table_obj.get(&Value::Number((i + 1) as f64)) {
-                        println!("[CJSON_DECODE] Array[{}] = {:?}", i + 1, v);
-                    }
-                }
-            }
-            */
-            
             Ok(Value::Table(table))
         },
         JsonValue::Object(entries) => {
-            println!("[CJSON_DECODE] Converting JSON object with {} entries", entries.len());
             // Create a new table for the object
             let table = ctx.heap().alloc_table();
             
@@ -783,22 +754,6 @@ fn json_to_lua_value(ctx: &mut ExecutionContext, json: JsonValue) -> Result<Valu
                 }
             }
             
-            println!("[CJSON_DECODE] Created Lua table from object");
-            
-            // For debugging: verify we can access object properties directly from C
-            /*
-            if let Ok(table_obj) = ctx.heap().get_table(table) {
-                for (k, v) in table_obj.iter() {
-                    if let Value::String(s) = k {
-                        if let Ok(s_str) = ctx.heap().get_string(*s) {
-                            let key = std::str::from_utf8(s_str).unwrap_or("<invalid UTF-8>");
-                            println!("[CJSON_DECODE] Object[{}] = {:?}", key, v);
-                        }
-                    }
-                }
-            }
-            */
-            
             Ok(Value::Table(table))
         }
     }
@@ -806,8 +761,6 @@ fn json_to_lua_value(ctx: &mut ExecutionContext, json: JsonValue) -> Result<Valu
 
 /// cjson.decode implementation
 fn cjson_decode(ctx: &mut ExecutionContext) -> Result<i32> {
-    println!("[CJSON_DECODE] Decoding JSON with {} arguments", ctx.get_arg_count());
-    
     if ctx.get_arg_count() < 1 {
         return Err(LuaError::Runtime("cjson.decode requires a JSON string".to_string()));
     }
@@ -820,7 +773,6 @@ fn cjson_decode(ctx: &mut ExecutionContext) -> Result<i32> {
                 Ok(str) => str.to_string(),
                 Err(_) => {
                     // Invalid UTF-8, return nil
-                    println!("[CJSON_DECODE] Invalid UTF-8 in JSON string");
                     ctx.push_result(Value::Nil)?;
                     return Ok(1);
                 }
@@ -828,7 +780,6 @@ fn cjson_decode(ctx: &mut ExecutionContext) -> Result<i32> {
         },
         _ => {
             // Not a string, return nil
-            println!("[CJSON_DECODE] Argument is not a string: {:?}", ctx.get_arg(0)?);
             ctx.push_result(Value::Nil)?;
             return Ok(1);
         }
@@ -838,13 +789,10 @@ fn cjson_decode(ctx: &mut ExecutionContext) -> Result<i32> {
     let json_str = json_str.trim();
     if json_str.is_empty() {
         // Empty string, return empty table
-        println!("[CJSON_DECODE] Empty JSON string, returning empty table");
         let table = ctx.heap().alloc_table();
         ctx.push_result(Value::Table(table))?;
         return Ok(1);
     }
-    
-    println!("[CJSON_DECODE] Parsing JSON: {}", json_str);
     
     // Create JSON parser
     let mut parser = JsonParser::new(json_str);
@@ -852,39 +800,21 @@ fn cjson_decode(ctx: &mut ExecutionContext) -> Result<i32> {
     // Parse JSON
     match parser.parse_value() {
         Ok(json_value) => {
-            println!("[CJSON_DECODE] Successfully parsed JSON value");
-            
             // Convert JSON value to Lua value
             match json_to_lua_value(ctx, json_value) {
                 Ok(lua_value) => {
-                    println!("[CJSON_DECODE] JSON converted to Lua value: {:?}", lua_value);
-                    
-                    // Test the type of the value
-                    let type_name = match lua_value {
-                        Value::Nil => "nil",
-                        Value::Boolean(_) => "boolean",
-                        Value::Number(_) => "number",
-                        Value::String(_) => "string",
-                        Value::Table(_) => "table",
-                        Value::Closure(_) | Value::CFunction(_) => "function",
-                        Value::Thread(_) => "thread",
-                    };
-                    println!("[CJSON_DECODE] Type of converted value: {}", type_name);
-                    
                     // Push the result
                     ctx.push_result(lua_value)?;
                     Ok(1)
                 },
-                Err(e) => {
-                    println!("[CJSON_DECODE] Error converting JSON to Lua: {}", e);
+                Err(_) => {
                     // Error converting to Lua value, return nil
                     ctx.push_result(Value::Nil)?;
                     Ok(1)
                 }
             }
         },
-        Err(e) => {
-            println!("[CJSON_DECODE] Error parsing JSON: {}", e);
+        Err(_) => {
             // Error parsing JSON, return nil
             ctx.push_result(Value::Nil)?;
             Ok(1)

@@ -296,11 +296,18 @@ Redis Lua support:
   - [❌] bit - Not yet implemented (optional in Redis)
 - [✅] Table operations:
   - [✅] Table field access now works correctly
-  - [✅] Complex table field concatenation now works 
+  - [✅] Table field concatenation now works correctly 
   - [✅] Direct number field concatenation now works
 - [🟡] Transaction semantics:
   - [✅] Basic transaction support implemented
   - [🟡] Transaction rollback needs improvement for error cases
+- [🟡] Loop and control flow:
+  - [✅] Basic control flow (if/else, while, repeat) works 
+  - [🟡] Numeric for loops have correct borrow handling but execution issues
+  - [🟡] Generic for loops still have issues with the next/pairs implementation
+- [🟡] Function execution:
+  - [✅] Basic function definition works
+  - [🟡] Nested functions still have stack overflow issues
 ```
 
 ### Priority 5.2: Streams
