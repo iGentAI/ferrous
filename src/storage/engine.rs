@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use std::thread;
 use rand::seq::SliceRandom;
 use crate::error::{FerrousError, Result, StorageError, CommandError};
+use crate::lua::LuaGIL;
 use super::value::{Value, StoredValue};
 use super::memory::MemoryManager;
 use super::skiplist::SkipList;
@@ -2144,6 +2145,20 @@ impl StorageEngine {
         }
     }
     
+    /// Get the current database ID
+    pub fn get_current_db(&self) -> usize {
+        // For now, just return 0 (the default database)
+        0
+    }
+    
+    /// Get the Lua GIL
+    pub fn get_lua_gil(&self) -> Result<Arc<LuaGIL>> {
+        // For simplicity, create a new GIL each time
+        // In a production implementation, this would be stored as a field and reused
+        let gil = LuaGIL::new()?;
+        Ok(Arc::new(gil))
+    }
+
     /// Background thread for cleaning up expired keys
     fn expiration_cleanup_loop(engine: Arc<StorageEngine>) {
         loop {

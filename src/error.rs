@@ -33,6 +33,27 @@ pub enum FerrousError {
     
     /// Internal server errors
     Internal(String),
+    
+    /// Script not found
+    ScriptNotFound(String),
+    
+    /// No script running
+    NoScriptRunning,
+    
+    /// Lua error 
+    LuaError(String),
+    
+    /// Lua busy
+    LuaBusy,
+    
+    /// Lua compilation error
+    LuaCompilationError(String),
+    
+    /// Lua runtime error
+    LuaRuntimeError(String),
+    
+    /// Lua timeout
+    LuaTimeout,
 }
 
 /// Command-specific errors that map to Redis error responses
@@ -124,6 +145,13 @@ impl fmt::Display for FerrousError {
             FerrousError::Connection(msg) => write!(f, "Connection error: {}", msg),
             FerrousError::Script(err) => write!(f, "{}", err),
             FerrousError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            FerrousError::ScriptNotFound(msg) => write!(f, "NOSCRIPT {}", msg),
+            FerrousError::NoScriptRunning => write!(f, "ERR No script running"),
+            FerrousError::LuaError(msg) => write!(f, "ERR {}", msg),
+            FerrousError::LuaBusy => write!(f, "BUSY Redis is busy running a script"),
+            FerrousError::LuaCompilationError(msg) => write!(f, "ERR Error compiling script: {}", msg),
+            FerrousError::LuaRuntimeError(msg) => write!(f, "ERR Error running script: {}", msg),
+            FerrousError::LuaTimeout => write!(f, "ERR Script execution time limit exceeded"),
         }
     }
 }

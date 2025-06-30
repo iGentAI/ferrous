@@ -11,8 +11,9 @@ pub mod pubsub;
 pub mod replication;
 pub mod config;
 
-// NEW lua implementation with generational arena architecture
-pub mod lua_new;
+// Note: Lua module has been removed for reimplementation
+// Uncomment when new implementation is ready:
+// pub mod lua;
 
 // Re-export commonly used types
 pub use error::FerrousError;
@@ -21,5 +22,4 @@ pub use network::server::Server;
 pub use protocol::resp::RespFrame;
 pub use config::Config;
 
-// Re-export from new lua module as the primary interface
-pub use lua_new::{LuaError as ScriptError, ScriptExecutor};
+// Lua exports will be readded once reimplemented

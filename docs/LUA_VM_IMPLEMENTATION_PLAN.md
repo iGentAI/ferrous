@@ -1,127 +1,206 @@
-# Ferrous Lua VM Implementation Plan
+# Lua VM Implementation Plan for Ferrous
 
-## Executive Summary
+## Current State Assessment
 
-This document outlines the comprehensive plan for refactoring and completing the Lua VM implementation in Ferrous to address the fundamental architectural issues identified in our analysis. The plan focuses on creating a robust, maintainable, and Rust-friendly architecture that naturally supports all required Lua features while working with (rather than against) Rust's ownership model.
+After our implementation attempts, we've identified several critical architectural issues that must be addressed in a systematic reimplementation:
 
-## Root Causes of Current Issues
+1. **Inconsistent Transaction Usage**: The transaction pattern is applied inconsistently, causing borrow checker conflicts.
+2. **Recursive Execution Model**: Despite the design spec calling for a non-recursive model, many operations call directly into recursive functions.
+3. **Direct Heap Access**: Many operations bypass the transaction system, causing ownership conflicts.
+4. **C Function Integration Issues**: Special handling for C functions creates borrow checker conflicts.
+5. **Metamethod Handling Inconsistency**: Metamethods are sometimes called directly rather than queued.
 
-Our architectural analysis has identified several fundamental issues that prevent the current implementation from supporting complex Lua features:
+## Revised Implementation Phases
 
-1. **Central Ownership Conflict**: Multiple components need simultaneous mutable access to the heap, creating irreconcilable conflicts with Rust's borrow checker.
-   
-2. **Missing Abstraction Layers**: No clear separation exists between compile-time and runtime operations, with direct heap manipulation scattered throughout the codebase.
-   
-3. **Incomplete Type Representations**: Critical data structures like `FunctionProto` lack fields required to support nested functions.
-   
-4. **Unsafe Context Passing**: The current approach uses unsafe pointer casting to pass context between components.
+### Phase 1: Core Infrastructure (1-2 weeks)
 
-These root causes manifest as symptoms like:
-- Inability to support nested functions ("not implemented: nested prototypes")
-- Generic for loop failures ("not implemented: generic for loops")
-- Table field concatenation failures
-- Borrow checker conflicts in the VM
+1. **Memory Management System**
+   - Implement generational arena with proper handle validation
+   - Create typed handles for all object types
+   - Implement validation scope for safe handle usage
+   - Comprehensive unit testing for memory safety
 
-## Architectural Solution
+2. **Value System**
+   - Implement all Lua value types with proper handle references
+   - Ensure values have proper Clone but not Copy implementations
+   - Create value comparison and conversion utilities
+   - Unit test all value operations
 
-Our solution is based on the following key principles:
+### Phase 2: Heap and Transaction System (1-2 weeks)
 
-1. **Separate Compilation from Execution**: Compilation produces immutable artifacts that execution consumes.
-2. **Clean Ownership Boundaries**: Components interact through clear APIs that respect Rust's ownership rules.
-3. **Complete Type Representations**: Data structures fully represent all required Lua concepts.
-4. **Safe Context Management**: Replace unsafe pointers with proper context handling mechanisms.
-5. **Command-Based Interfaces**: Use command patterns for operations to avoid borrow checker conflicts.
+1. **Heap Implementation**
+   - Implement arenas for all object types
+   - Create proper access methods that enforce handle validation
+   - Ensure no direct arena access is possible outside the heap
+   - Unit test heap operations
 
-## Implementation Phases and Progress
+2. **Transaction System**
+   - Implement change tracking for all operations
+   - Create a commit system that applies changes atomically
+   - Ensure transaction.commit() doesn't consume self
+   - Implement rollback capability for error handling
+   - Test transaction isolation and consistency
 
-### Phase 1: Decouple Compilation from Runtime ✅ (Complete)
+### Phase 3: VM Core (2-3 weeks)
 
-- ✅ Create a new compilation module with self-contained types:
-  - ✅ `CompilationValue`: Represents constants during compilation
-  - ✅ `CompilationProto`: Represents function prototypes without heap dependency
-  - ✅ `CompilationScript`: Encapsulates compilation results with string pool
+1. **VM State Machine**
+   - Implement single execution loop with no recursion
+   - Create pending operation queue for state transitions
+   - Implement proper frame stack in the heap
+   - Create execution context for C function calls
+   - Test execution of basic operations
 
-- ✅ Update compiler to use the new types:
-  - ✅ Add string pooling for string deduplication
-  - ✅ Properly handle nested function prototypes
-  - ✅ Update all compile methods
+2. **Opcode Handlers**
+   - Implement handlers for all Lua opcodes
+   - Ensure all handlers use transactions consistently
+   - Implement proper CALL/RETURN handling without recursion
+   - Test each opcode handler individually and in combination
 
-- ✅ Update VM to load from compiled artifacts:
-  - ✅ Implement loading compiled scripts
-  - ✅ Create functions to materialize values from compilation artifacts
-  - ✅ Update execution to work with loaded scripts
+### Phase 4: Compiler and Parser (2-3 weeks)
 
-### Phase 2: Implement Proper Nested Functions 🔄 (In Progress)
+1. **Parser Implementation**
+   - Create AST representation of Lua code
+   - Implement recursive descent parser
+   - Handle all Lua syntax features
+   - Test parser with various inputs
 
-- ✅ Add proper function prototype representation (through `CompilationProto`)
-- ✅ Ensure compiler correctly builds nested function hierarchy
-- ✅ Update VM's `get_proto` function to access nested prototypes
-- 🔄 Fix nested function execution (stack overflow bug)
-- ⏲️ Complete proper upvalue handling
+2. **Compiler Implementation**
+   - Create bytecode generation from AST
+   - Implement register allocation
+   - Handle upvalue and closure creation
+   - Test compiler with various functions
 
-### Phase 3: Safe Context Management ⏲️
+### Phase 5: Standard Library and Redis Integration (1-2 weeks)
 
-- ⏲️ Implement thread-local storage for execution context
-- ⏲️ Create a safe context registry for Redis API integration 
-- ⏲️ Remove unsafe pointer usage
-- ⏲️ Implement proper error handling and propagation
+1. **Standard Library**
+   - Implement Lua standard library functions
+   - Create proper C function bindings
+   - Test library functions
 
-### Phase 4: Fix Table Operations ⏲️
+2. **Redis API**
+   - Implement redis.call and redis.pcall
+   - Create Redis command integration
+   - Test with Redis command suite
 
-- ⏲️ Redesign table operations to avoid borrow checker conflicts
-- ⏲️ Implement clean register allocation for concatenation
-- ⏲️ Add support for proper metamethods
-- ⏲️ Fix table field concatenation bugs
+### Phase 6: Production Readiness (1-2 weeks)
 
-## Current Progress (June 27, 2025)
+1. **Performance Optimization**
+   - Implement instruction caching
+   - Optimize memory usage
+   - Implement string interning
+   - Benchmark against Redis Lua
 
-We have successfully completed:
+2. **Error Handling and Diagnostics**
+   - Implement comprehensive error messages
+   - Create debugging utilities
+   - Add logging and tracing
+   - Test error scenarios
 
-1. The creation of a self-contained compilation module (`compilation.rs`) ✅
-2. Full update of the `Compiler` to use the new compilation types ✅
-3. Integration of nested function prototype support in the compiler ✅
-4. Update of the VM to load and execute compiled scripts ✅
-5. Update of the executor to support our new compilation model ✅
-6. Update of the GIL to connect compilation and execution properly ✅
+## Implementation Requirements
 
-A test program has been created to verify our changes, and it shows that basic functionality is now working properly:
-- Simple scripts ✅
-- Local variables ✅
-- Lua expressions ✅
-- Basic table operations ✅
+### Transaction Consistency
 
-However, one test that uses nested functions is still failing with a stack overflow error. This is progress compared to before (where "nested prototypes" were not implemented at all), but indicates that we still have work to do to properly handle execution of nested functions.
+**ALL** operations that access the heap must go through transactions:
 
-The update to the compiler was extensive and included:
-- A complete rewrite to use `CompilationValue` instead of `Value`
-- A string pooling system for deduplication of strings
-- Proper storage of nested function prototypes in the parent prototype
-- Complete support for all the existing language features
+```rust
+// Create transaction
+let mut tx = HeapTransaction::new(&mut self.heap);
 
-Next steps:
-1. Fix the stack overflow issue with nested function execution
-2. Implement safe context management
-3. Fix table operations, particularly concatenation
+// Use transaction for ALL access
+let index_str = tx.create_string("__index")?;
+let metatable = tx.get_metatable(table)?;
 
-## Implementation Strategy
+// Only commit at the very end
+tx.commit()?;
+```
 
-Rather than making small changes to the current architecture, this approach requires a more significant refactoring:
+### Function Call Requirements
 
-1. **Start with clean separation**: Implement the compilation/execution boundary first
-2. **Build on solid foundation**: Then implement nested functions properly
-3. **Improve safety**: Replace unsafe context passing with proper registry
-4. **Fix operand handling**: Implement clean register allocation for table operations
+**NO** recursive function calls are allowed:
 
-Each phase builds on the previous one, creating a solid foundation for the next set of changes. This ensures a coherent solution rather than a collection of patches.
+```rust
+// NEVER do this
+let result = self.execute_function(closure, &args)?;
 
-## Why This Approach Will Succeed
+// ALWAYS do this
+tx.queue_operation(PendingOperation::FunctionCall {
+    closure,
+    args: args.clone(),
+    context: CallContext::Register { base, offset },
+});
+// ... and let the main execution loop handle it
+```
 
-Previous attempts failed because they tried to work within the constraints of the existing architecture, which fundamentally conflicts with Rust's ownership model. By redesigning the architecture to align with Rust's ownership patterns:
+### Metamethod Handling
 
-1. We eliminate the need for unsafe workarounds
-2. We create clean abstraction layers with well-defined interfaces
-3. We enable natural implementation of all required Lua features
-4. We simplify the code by removing defensive handle checks
+Metamethods must be handled non-recursively:
 
-This approach requires more upfront investment but will lead to a more robust, maintainable, and complete implementation in the long run.
+```rust
+// Queue metamethod call for later execution
+tx.queue_operation(PendingOperation::MetamethodCall {
+    method_name,
+    table,
+    args: vec![table_value, key_value],
+    context: CallContext::OpResult { register },
+});
 
+// Commit transaction
+tx.commit()?;
+
+// Let main loop handle the call
+```
+
+### C Function Integration
+
+C functions require special handling:
+
+```rust
+// Extract needed values before any borrows
+let cfunc_copy = cfunc.clone();
+let args_copy = args.clone();
+
+// Create a clean execution context
+let mut ctx = ExecutionContext::new(self, stack_base, args_copy.len());
+
+// Call C function with clean borrow boundaries
+let ret_count = cfunc_copy(&mut ctx)?;
+```
+
+## Testing Strategy
+
+1. **Unit Tests**
+   - Test each component in isolation
+   - Test transaction consistency
+   - Test handle validation
+   - Test memory management
+
+2. **Integration Tests**
+   - Test opcode sequence execution
+   - Test function calls and returns
+   - Test error propagation
+   - Test C function integration
+
+3. **Compatibility Tests**
+   - Test against Lua 5.1 test suite
+   - Test Redis-specific functionality
+   - Test error behavior matches Redis
+
+4. **Performance Tests**
+   - Benchmark against Redis Lua
+   - Measure memory usage
+   - Test with large scripts
+
+## Success Criteria
+
+The implementation will be considered successful when:
+
+1. All unit and integration tests pass
+2. The Lua specification test suite passes
+3. Redis integration tests pass
+4. Performance is within 20% of Redis Lua
+5. Memory usage is reasonable
+6. No Rust safety or borrow checker errors occur
+
+## Conclusion
+
+This revised implementation plan addresses the architectural issues we've encountered in our previous attempts. By systematically rebuilding with proper transaction discipline, non-recursive execution, and consistent access patterns, we can create a Rust Lua VM that works harmoniously with Rust's ownership system rather than fighting against it.
