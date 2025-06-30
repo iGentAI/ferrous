@@ -65,6 +65,11 @@ impl StorageEngine {
         Self::with_config(16, MemoryManager::unlimited())
     }
     
+    /// Create a new in-memory storage engine for testing
+    pub fn new_in_memory() -> Arc<Self> {
+        Self::new()
+    }
+    
     /// Create storage engine with configuration
     pub fn with_config(num_databases: usize, memory_manager: MemoryManager) -> Arc<Self> {
         let mut databases = Vec::with_capacity(num_databases);

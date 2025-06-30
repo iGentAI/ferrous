@@ -82,6 +82,10 @@ pub enum LuaError {
     
     /// Argument error
     ArgError(usize, String),
+    
+    // Add compiler-specific error (required for our implementation)
+    /// Compiler error
+    CompileError(String),
 }
 
 impl fmt::Display for LuaError {
@@ -150,6 +154,9 @@ impl fmt::Display for LuaError {
             LuaError::ArgError(index, msg) => {
                 write!(f, "bad argument #{}: {}", index, msg)
             }
+            LuaError::CompileError(msg) => {
+                write!(f, "compile error: {}", msg)
+            }
         }
     }
 }
@@ -171,7 +178,41 @@ pub fn syntax_error(message: &str, line: usize, column: usize) -> LuaError {
     }
 }
 
+/// Create a runtime error
+pub fn runtime_error(message: &str) -> LuaError {
+    LuaError::RuntimeError(message.to_string())
+}
+
 /// Create a type error
 pub fn type_error(expected: &str, got: &str) -> LuaError {
     LuaError::TypeError(format!("expected {}, got {}", expected, got))
+}
+
+/// Create an argument error
+pub fn arg_error(index: usize, message: &str) -> LuaError {
+    LuaError::ArgError(index, message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_error_display() {
+        let err = LuaError::TypeError("expected number, got string".to_string());
+        assert_eq!(err.to_string(), "type error: expected number, got string");
+        
+        let err = LuaError::SyntaxError {
+            message: "unexpected symbol".to_string(),
+            line: 1,
+            column: 5,
+        };
+        assert_eq!(err.to_string(), "syntax error at line 1, column 5: unexpected symbol");
+    }
+    
+    #[test]
+    fn test_error_conversion() {
+        let lua_err = LuaError::RuntimeError("test error".to_string());
+        let _ferrous_err: crate::error::FerrousError = lua_err.into();
+    }
 }

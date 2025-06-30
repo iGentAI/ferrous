@@ -32,7 +32,7 @@ impl SyncProtocol {
     pub fn handle_sync(
         manager: &Arc<ReplicationManager>,
         storage: &Arc<StorageEngine>,
-        rdb_engine: &Arc<RdbEngine>,
+        _rdb_engine: &Arc<RdbEngine>,
     ) -> Result<RespFrame> {
         // Check if we're a master
         if !manager.is_master() {
@@ -40,7 +40,7 @@ impl SyncProtocol {
         }
         
         // For SYNC, always do full resynchronization
-        Self::perform_full_sync(manager, storage, rdb_engine)
+        Self::perform_full_sync(manager, storage, _rdb_engine)
     }
     
     /// Handle PSYNC command from replica
@@ -146,7 +146,7 @@ impl SyncProtocol {
     pub fn sync_with_master(
         master_addr: std::net::SocketAddr,
         manager: &Arc<ReplicationManager>,
-        storage: &Arc<StorageEngine>,
+        _storage: &Arc<StorageEngine>,
     ) -> Result<TcpStream> {
         // Connect to master
         let mut stream = TcpStream::connect(master_addr)?;

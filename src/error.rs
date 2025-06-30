@@ -54,6 +54,21 @@ pub enum FerrousError {
     
     /// Lua timeout
     LuaTimeout,
+    
+    /// Script timeout
+    ScriptTimeout,
+    
+    /// Script killed
+    ScriptKilled,
+    
+    /// Wrong number of arguments
+    WrongNumberOfArguments(String),
+    
+    /// Invalid argument
+    InvalidArgument(String),
+    
+    /// Unknown command
+    UnknownCommand(String),
 }
 
 /// Command-specific errors that map to Redis error responses
@@ -152,6 +167,11 @@ impl fmt::Display for FerrousError {
             FerrousError::LuaCompilationError(msg) => write!(f, "ERR Error compiling script: {}", msg),
             FerrousError::LuaRuntimeError(msg) => write!(f, "ERR Error running script: {}", msg),
             FerrousError::LuaTimeout => write!(f, "ERR Script execution time limit exceeded"),
+            FerrousError::ScriptTimeout => write!(f, "ERR Script execution time limit exceeded"),
+            FerrousError::ScriptKilled => write!(f, "ERR Script killed by user"),
+            FerrousError::WrongNumberOfArguments(cmd) => write!(f, "ERR wrong number of arguments for '{}' command", cmd),
+            FerrousError::InvalidArgument(msg) => write!(f, "ERR {}", msg),
+            FerrousError::UnknownCommand(cmd) => write!(f, "ERR unknown command '{}'", cmd),
         }
     }
 }

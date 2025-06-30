@@ -1,23 +1,22 @@
 //! Lua Heap Implementation
 //!
-//! This module implements the memory management for the Lua VM,
-//! using arenas and handles to avoid raw pointers and memory issues.
+//! This module implements the memory management for the Lua VM using
+//! generational arenas and a transaction-based access pattern that works
+//! harmoniously with Rust's ownership model.
 
 use std::collections::HashMap;
-use std::any::Any;
-use std::sync::Arc;
 
-use super::arena::{Arena, TypedHandle, Handle, ValidScope};
+use super::arena::Arena;
 use super::error::{LuaError, Result};
 use super::value::{
-    Value, LuaString, Table, Closure, LuaThread, Upvalue, ThreadStatus,
+    Value, LuaString, Table, Closure, Thread, Upvalue, UserData,
     StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle,
-    UserData, UserDataHandle, CallFrame, FunctionProto, CallFrameType,
+    UserDataHandle, FunctionProto, CallFrame, ThreadStatus,
 };
 
-/// Lua heap implementation
+/// The Lua heap containing all allocated objects
 pub struct LuaHeap {
-    /// Current generation
+    /// Current generation for validation
     generation: u32,
     
     /// String arena
@@ -30,7 +29,7 @@ pub struct LuaHeap {
     closures: Arena<Closure>,
     
     /// Thread arena
-    threads: Arena<LuaThread>,
+    threads: Arena<Thread>,
     
     /// Upvalue arena
     upvalues: Arena<Upvalue>,
@@ -38,20 +37,20 @@ pub struct LuaHeap {
     /// User data arena
     userdata: Arena<UserData>,
     
+    /// String interning cache
+    string_cache: HashMap<Vec<u8>, StringHandle>,
+    
     /// Registry table
     registry: Option<TableHandle>,
     
     /// Globals table
     globals: Option<TableHandle>,
     
-    /// String interning cache
-    string_cache: HashMap<Vec<u8>, StringHandle>,
-    
     /// Main thread
     main_thread: Option<ThreadHandle>,
     
-    /// Pending operations
-    pending_operations: Vec<super::vm::PendingOperation>,
+    /// Metatables by type
+    metatables: HashMap<&'static str, TableHandle>,
 }
 
 impl LuaHeap {
@@ -65,222 +64,221 @@ impl LuaHeap {
             threads: Arena::new(),
             upvalues: Arena::new(),
             userdata: Arena::new(),
+            string_cache: HashMap::new(),
             registry: None,
             globals: None,
-            string_cache: HashMap::new(),
             main_thread: None,
-            pending_operations: Vec::new(),
+            metatables: HashMap::new(),
         };
         
-        // Create registry and globals table
-        let registry = heap.create_table_internal().unwrap();
-        let globals = heap.create_table_internal().unwrap();
-        
-        heap.registry = Some(registry);
-        heap.globals = Some(globals);
-        
-        // Create main thread
-        let main_thread = heap.create_thread_internal().unwrap();
-        heap.main_thread = Some(main_thread);
+        // Initialize core structures
+        heap.initialize();
         
         heap
     }
     
-    /// Create a validation scope
-    pub fn validation_scope(&self) -> ValidScope {
-        ValidScope::new(self.generation)
+    /// Initialize core structures
+    fn initialize(&mut self) {
+        // Create registry table
+        let registry = self.create_table_internal();
+        self.registry = Some(registry);
+        
+        // Create globals table  
+        let globals = self.create_table_internal();
+        self.globals = Some(globals);
+        
+        // Create main thread
+        let main_thread = self.create_thread_internal();
+        self.main_thread = Some(main_thread);
+    }
+    
+    /// Begin a transaction for heap modifications
+    pub fn begin_transaction(&mut self) -> super::transaction::HeapTransaction {
+        super::transaction::HeapTransaction::new(self)
+    }
+    
+    /// Get the current generation
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
     
     /// Get the registry table
     pub fn get_registry(&self) -> Result<TableHandle> {
-        self.registry.ok_or_else(|| LuaError::InternalError("registry not initialized".to_string()))
+        self.registry.clone().ok_or(LuaError::InternalError("registry not initialized".to_string()))
     }
     
     /// Get the globals table
     pub fn get_globals(&self) -> Result<TableHandle> {
-        self.globals.ok_or_else(|| LuaError::InternalError("globals not initialized".to_string()))
+        self.globals.clone().ok_or(LuaError::InternalError("globals not initialized".to_string()))
     }
     
     /// Get the main thread
     pub fn get_main_thread(&self) -> Result<ThreadHandle> {
-        self.main_thread.ok_or_else(|| LuaError::InternalError("main thread not initialized".to_string()))
+        self.main_thread.clone().ok_or(LuaError::InternalError("main thread not initialized".to_string()))
     }
     
-    /// Create a string
-    pub fn create_string(&mut self, s: &str) -> Result<StringHandle> {
+    // String operations
+    
+    /// Create a string (internal - use through transactions)
+    pub(crate) fn create_string_internal(&mut self, s: &str) -> Result<StringHandle> {
         let bytes = s.as_bytes().to_vec();
         
         // Check if already interned
-        if let Some(handle) = self.string_cache.get(&bytes) {
-            return Ok(*handle);
+        if let Some(handle) = self.string_cache.get(&bytes).cloned() {
+            return Ok(handle);
         }
         
         // Create new string
-        let lua_string = LuaString {
-            bytes: bytes.clone(),
-        };
+        let lua_string = LuaString { bytes: bytes.clone() };
+        let handle = self.strings.insert(lua_string);
+        let typed_handle = StringHandle::new(handle);
         
-        let handle = StringHandle(self.strings.insert(lua_string));
+        // Cache for interning
+        self.string_cache.insert(bytes, typed_handle.clone());
         
-        // Cache it
-        self.string_cache.insert(bytes, handle);
-        
-        Ok(handle)
+        Ok(typed_handle)
     }
     
-    /// Get string value
+    /// Get string bytes
+    pub fn get_string(&self, handle: StringHandle) -> Result<&LuaString> {
+        self.strings.get(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Get string value as UTF-8
     pub fn get_string_value(&self, handle: StringHandle) -> Result<String> {
-        let string = self.strings.get(handle.0).ok_or(LuaError::InvalidHandle)?;
-        String::from_utf8(string.bytes.clone()).map_err(|_| LuaError::InvalidEncoding)
+        let lua_str = self.get_string(handle)?;
+        String::from_utf8(lua_str.bytes.clone())
+            .map_err(|_| LuaError::InvalidEncoding)
     }
     
     /// Get string bytes
     pub fn get_string_bytes(&self, handle: StringHandle) -> Result<&[u8]> {
-        let string = self.strings.get(handle.0).ok_or(LuaError::InvalidHandle)?;
-        Ok(&string.bytes)
+        let lua_str = self.get_string(handle)?;
+        Ok(&lua_str.bytes)
     }
     
-    /// Append to a string
-    pub fn append_string(&mut self, handle: StringHandle, s: &str) -> Result<()> {
-        let string = self.strings.get_mut(handle.0).ok_or(LuaError::InvalidHandle)?;
-        string.bytes.extend_from_slice(s.as_bytes());
-        Ok(())
+    /// Check if string handle is valid
+    pub fn is_valid_string(&self, handle: StringHandle) -> bool {
+        self.strings.contains(&handle.0)
     }
     
-    /// Create a table (internal version)
-    fn create_table_internal(&mut self) -> Result<TableHandle> {
-        let table = Table {
-            array: Vec::new(),
-            hash_map: Vec::new(),
-            metatable: None,
-        };
-        
-        Ok(TableHandle(self.tables.insert(table)))
+    // Table operations
+    
+    /// Create a table (internal)
+    fn create_table_internal(&mut self) -> TableHandle {
+        let table = Table::new();
+        let handle = self.tables.insert(table);
+        TableHandle::new(handle)
     }
     
-    /// Create a table
-    pub fn create_table(&mut self) -> Result<TableHandle> {
-        self.create_table_internal()
+    /// Create a table (use through transactions)
+    pub(crate) fn create_table(&mut self) -> Result<TableHandle> {
+        Ok(self.create_table_internal())
     }
     
     /// Get a table
     pub fn get_table(&self, handle: TableHandle) -> Result<&Table> {
-        self.tables.get(handle.0).ok_or(LuaError::InvalidHandle)
+        self.tables.get(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
     }
     
     /// Get a mutable table
     pub fn get_table_mut(&mut self, handle: TableHandle) -> Result<&mut Table> {
-        self.tables.get_mut(handle.0).ok_or(LuaError::InvalidHandle)
+        self.tables.get_mut(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
     }
     
-    /// Get a table field
+    /// Get table field
     pub fn get_table_field(&self, handle: TableHandle, key: &Value) -> Result<Value> {
         let table = self.get_table(handle)?;
-        
-        // Check array part for integer keys
-        if let Value::Number(n) = key {
-            if n.fract() == 0.0 && *n > 0.0 && *n <= table.array.len() as f64 {
-                let idx = *n as usize - 1; // Lua is 1-indexed
-                return Ok(table.array[idx].clone());
-            }
-        }
-        
-        // Check hash part
-        for (k, v) in &table.hash_map {
-            if k == key {
-                return Ok(v.clone());
-            }
-        }
-        
-        // Not found
-        Err(LuaError::TableKeyNotFound)
+        Ok(table.get(key).cloned().unwrap_or(Value::Nil))
     }
     
-    /// Set a table field
-    pub fn set_table_field(&mut self, handle: TableHandle, key: Value, value: Value) -> Result<()> {
+    /// Set table field (internal - use through transactions)
+    pub(crate) fn set_table_field_internal(&mut self, handle: TableHandle, key: Value, value: Value) -> Result<()> {
         let table = self.get_table_mut(handle)?;
-        
-        // Check if key is a valid array index
-        if let Value::Number(n) = &key {
-            if n.fract() == 0.0 && *n > 0.0 {
-                let idx = *n as usize - 1; // Lua is 1-indexed
-                
-                // Extend array if needed
-                if idx >= table.array.len() {
-                    table.array.resize(idx + 1, Value::Nil);
-                }
-                
-                table.array[idx] = value;
-                return Ok(());
-            }
-        }
-        
-        // Check hash part
-        for (k, v) in table.hash_map.iter_mut() {
-            if *k == key {
-                *v = value;
-                return Ok(());
-            }
-        }
-        
-        // Not found, add new entry
-        table.hash_map.push((key, value));
+        table.set(key, value);
         Ok(())
     }
     
-    /// Get a table's metatable
+    /// Get table metatable
     pub fn get_metatable(&self, handle: TableHandle) -> Result<Option<TableHandle>> {
         let table = self.get_table(handle)?;
-        Ok(table.metatable)
+        Ok(table.metatable.clone())
     }
     
-    /// Set a table's metatable
-    pub fn set_metatable(&mut self, handle: TableHandle, metatable: Option<TableHandle>) -> Result<()> {
+    /// Set table metatable (internal - use through transactions)
+    pub(crate) fn set_metatable_internal(&mut self, handle: TableHandle, metatable: Option<TableHandle>) -> Result<()> {
         let table = self.get_table_mut(handle)?;
         table.metatable = metatable;
         Ok(())
     }
     
-    /// Get a metamethod from a table
+    /// Get metamethod
     pub fn get_metamethod(&self, handle: TableHandle, method: StringHandle) -> Result<Value> {
-        let metatable = self.get_metatable(handle)?;
-        
-        if let Some(mt) = metatable {
-            match self.get_table_field(mt, &Value::String(method)) {
-                Ok(value) => Ok(value),
-                Err(LuaError::TableKeyNotFound) => Ok(Value::Nil),
-                Err(e) => Err(e),
-            }
+        if let Some(metatable) = self.get_metatable(handle)? {
+            self.get_table_field(metatable, &Value::String(method))
         } else {
-            // No metatable
             Ok(Value::Nil)
         }
     }
     
-    /// Create a thread (internal version)
-    fn create_thread_internal(&mut self) -> Result<ThreadHandle> {
-        let thread = LuaThread {
-            call_frames: Vec::new(),
-            stack: Vec::new(),
-            status: ThreadStatus::Ready,
-        };
-        
-        Ok(ThreadHandle(self.threads.insert(thread)))
+    /// Check if table handle is valid
+    pub fn is_valid_table(&self, handle: TableHandle) -> bool {
+        self.tables.contains(&handle.0)
     }
     
-    /// Create a thread
-    pub fn create_thread(&mut self) -> Result<ThreadHandle> {
-        self.create_thread_internal()
+    // Closure operations
+    
+    /// Create a closure (use through transactions)
+    pub(crate) fn create_closure(&mut self, proto: FunctionProto, upvalues: Vec<UpvalueHandle>) -> Result<ClosureHandle> {
+        let closure = Closure { proto, upvalues };
+        let handle = self.closures.insert(closure);
+        Ok(ClosureHandle::new(handle))
+    }
+    
+    /// Get a closure
+    pub fn get_closure(&self, handle: ClosureHandle) -> Result<&Closure> {
+        self.closures.get(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Get a mutable closure
+    pub fn get_closure_mut(&mut self, handle: ClosureHandle) -> Result<&mut Closure> {
+        self.closures.get_mut(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Check if closure handle is valid
+    pub fn is_valid_closure(&self, handle: ClosureHandle) -> bool {
+        self.closures.contains(&handle.0)
+    }
+    
+    // Thread operations
+    
+    /// Create a thread (internal)
+    fn create_thread_internal(&mut self) -> ThreadHandle {
+        let thread = Thread::new();
+        let handle = self.threads.insert(thread);
+        ThreadHandle::new(handle)
+    }
+    
+    /// Create a thread (use through transactions)
+    pub(crate) fn create_thread(&mut self) -> Result<ThreadHandle> {
+        Ok(self.create_thread_internal())
     }
     
     /// Get a thread
-    pub fn get_thread(&self, handle: ThreadHandle) -> Result<&LuaThread> {
-        self.threads.get(handle.0).ok_or(LuaError::InvalidHandle)
+    pub fn get_thread(&self, handle: ThreadHandle) -> Result<&Thread> {
+        self.threads.get(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
     }
     
     /// Get a mutable thread
-    pub fn get_thread_mut(&mut self, handle: ThreadHandle) -> Result<&mut LuaThread> {
-        self.threads.get_mut(handle.0).ok_or(LuaError::InvalidHandle)
+    pub fn get_thread_mut(&mut self, handle: ThreadHandle) -> Result<&mut Thread> {
+        self.threads.get_mut(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
     }
     
     /// Get thread call depth
@@ -289,63 +287,24 @@ impl LuaHeap {
         Ok(thread.call_frames.len())
     }
     
-    /// Get current thread frame
-    pub fn get_thread_current_frame(&self, handle: ThreadHandle) -> Result<&CallFrame> {
+    /// Get thread stack size
+    pub fn get_thread_stack_size(&self, handle: ThreadHandle) -> Result<usize> {
         let thread = self.get_thread(handle)?;
-        thread.call_frames.last().ok_or(LuaError::StackEmpty)
-    }
-    
-    /// Get current thread frame mutably
-    pub fn get_thread_current_frame_mut(&mut self, handle: ThreadHandle) -> Result<&mut CallFrame> {
-        let thread = self.get_thread_mut(handle)?;
-        thread.call_frames.last_mut().ok_or(LuaError::StackEmpty)
-    }
-    
-    /// Create a call frame
-    pub fn create_call_frame(&self, closure: ClosureHandle) -> Result<CallFrame> {
-        // Just create the frame object - doesn't modify heap
-        Ok(CallFrame {
-            closure,
-            pc: 0,
-            base_register: 0, // Will be set by caller
-            return_count: 1,  // Default to 1 return value
-            frame_type: CallFrameType::Normal,
-        })
-    }
-    
-    /// Push a call frame
-    pub fn push_thread_call_frame(&mut self, handle: ThreadHandle, frame: CallFrame) -> Result<()> {
-        let thread = self.get_thread_mut(handle)?;
-        
-        // Check for stack overflow
-        if thread.call_frames.len() >= 1000 {
-            return Err(LuaError::StackOverflow);
-        }
-        
-        thread.call_frames.push(frame);
-        Ok(())
-    }
-    
-    /// Pop a call frame
-    pub fn pop_thread_call_frame(&mut self, handle: ThreadHandle) -> Result<CallFrame> {
-        let thread = self.get_thread_mut(handle)?;
-        thread.call_frames.pop().ok_or(LuaError::StackEmpty)
+        Ok(thread.stack.len())
     }
     
     /// Get thread register
     pub fn get_thread_register(&self, handle: ThreadHandle, index: usize) -> Result<Value> {
         let thread = self.get_thread(handle)?;
-        
-        // Check if the register exists
-        if index >= thread.stack.len() {
-            return Ok(Value::Nil);
+        if index < thread.stack.len() {
+            Ok(thread.stack[index].clone())
+        } else {
+            Ok(Value::Nil)
         }
-        
-        Ok(thread.stack[index].clone())
     }
     
-    /// Set thread register
-    pub fn set_thread_register(&mut self, handle: ThreadHandle, index: usize, value: Value) -> Result<()> {
+    /// Set thread register (internal - use through transactions)
+    pub(crate) fn set_thread_register_internal(&mut self, handle: ThreadHandle, index: usize, value: Value) -> Result<()> {
         let thread = self.get_thread_mut(handle)?;
         
         // Extend stack if needed
@@ -357,172 +316,54 @@ impl LuaHeap {
         Ok(())
     }
     
-    /// Get thread stack size
-    pub fn get_thread_stack_size(&self, handle: ThreadHandle) -> Result<usize> {
-        let thread = self.get_thread(handle)?;
-        Ok(thread.stack.len())
-    }
-    
-    /// Set thread stack size
-    pub fn set_thread_stack_size(&mut self, handle: ThreadHandle, size: usize) -> Result<()> {
-        let thread = self.get_thread_mut(handle)?;
-        thread.stack.truncate(size);
-        Ok(())
-    }
-    
-    /// Get thread stack value
-    pub fn get_thread_stack_value(&self, handle: ThreadHandle, index: usize) -> Result<Value> {
-        let thread = self.get_thread(handle)?;
-        
-        if index >= thread.stack.len() {
-            return Ok(Value::Nil);
-        }
-        
-        Ok(thread.stack[index].clone())
-    }
-    
-    /// Push value to thread stack
-    pub fn push_thread_stack(&mut self, handle: ThreadHandle, value: Value) -> Result<()> {
+    /// Push call frame (internal - use through transactions)
+    pub(crate) fn push_call_frame_internal(&mut self, handle: ThreadHandle, frame: CallFrame) -> Result<()> {
         let thread = self.get_thread_mut(handle)?;
         
-        // Check for stack overflow
-        if thread.stack.len() >= 1000 {
+        // Check stack depth
+        if thread.call_frames.len() >= 1000 {
             return Err(LuaError::StackOverflow);
         }
         
-        thread.stack.push(value);
+        thread.call_frames.push(frame);
         Ok(())
     }
     
-    /// Pop value from thread stack
-    pub fn pop_thread_stack(&mut self, handle: ThreadHandle) -> Result<Value> {
+    /// Pop call frame (internal - use through transactions)
+    pub(crate) fn pop_call_frame_internal(&mut self, handle: ThreadHandle) -> Result<CallFrame> {
         let thread = self.get_thread_mut(handle)?;
-        thread.stack.pop().ok_or(LuaError::StackEmpty)
+        thread.call_frames.pop()
+            .ok_or(LuaError::StackEmpty)
     }
     
-    /// Get thread PC
-    pub fn get_thread_pc(&self, handle: ThreadHandle, frame_index: usize) -> Result<usize> {
+    /// Get current call frame
+    pub fn get_current_frame(&self, handle: ThreadHandle) -> Result<&CallFrame> {
         let thread = self.get_thread(handle)?;
-        
-        if frame_index >= thread.call_frames.len() {
-            return Err(LuaError::InvalidOperation("Frame index out of range".to_string()));
-        }
-        
-        Ok(thread.call_frames[frame_index].pc)
+        thread.call_frames.last()
+            .ok_or(LuaError::StackEmpty)
     }
     
-    /// Set thread PC
-    pub fn set_thread_pc(&mut self, handle: ThreadHandle, frame_index: usize, pc: usize) -> Result<()> {
+    /// Get current call frame mutably 
+    pub fn get_current_frame_mut(&mut self, handle: ThreadHandle) -> Result<&mut CallFrame> {
         let thread = self.get_thread_mut(handle)?;
-        
-        if frame_index >= thread.call_frames.len() {
-            return Err(LuaError::InvalidOperation("Frame index out of range".to_string()));
-        }
-        
-        thread.call_frames[frame_index].pc = pc;
+        thread.call_frames.last_mut()
+            .ok_or(LuaError::StackEmpty)
+    }
+    
+    /// Increment PC (internal - use through transactions)
+    pub(crate) fn increment_pc_internal(&mut self, handle: ThreadHandle) -> Result<()> {
+        let frame = self.get_current_frame_mut(handle)?;
+        frame.pc += 1;
         Ok(())
     }
     
-    /// Create a closure
-    pub fn create_closure(&mut self, proto: FunctionProto, upvalues: Vec<UpvalueHandle>) -> Result<ClosureHandle> {
-        let closure = Closure {
-            proto,
-            upvalues,
-        };
-        
-        Ok(ClosureHandle(self.closures.insert(closure)))
+    /// Check if thread handle is valid
+    pub fn is_valid_thread(&self, handle: ThreadHandle) -> bool {
+        self.threads.contains(&handle.0)
     }
     
-    /// Get a closure
-    pub fn get_closure(&self, handle: ClosureHandle) -> Result<&Closure> {
-        self.closures.get(handle.0).ok_or(LuaError::InvalidHandle)
-    }
-    
-    /// Get a mutable closure
-    pub fn get_closure_mut(&mut self, handle: ClosureHandle) -> Result<&mut Closure> {
-        self.closures.get_mut(handle.0).ok_or(LuaError::InvalidHandle)
-    }
-    
-    /// Create an upvalue
-    pub fn create_upvalue(&mut self, value: Value) -> Result<UpvalueHandle> {
-        let upvalue = Upvalue::Closed(value);
-        Ok(UpvalueHandle(self.upvalues.insert(upvalue)))
-    }
-    
-    /// Get an upvalue
-    pub fn get_upvalue(&self, handle: UpvalueHandle) -> Result<&Upvalue> {
-        self.upvalues.get(handle.0).ok_or(LuaError::InvalidHandle)
-    }
-    
-    /// Get a mutable upvalue
-    pub fn get_upvalue_mut(&mut self, handle: UpvalueHandle) -> Result<&mut Upvalue> {
-        self.upvalues.get_mut(handle.0).ok_or(LuaError::InvalidHandle)
-    }
-    
-    /// Get upvalue value
-    pub fn get_upvalue_value(&self, closure: ClosureHandle, index: usize) -> Result<Value> {
-        let closure_obj = self.get_closure(closure)?;
-        
-        if index >= closure_obj.upvalues.len() {
-            return Err(LuaError::InvalidUpvalue);
-        }
-        
-        let upvalue_handle = closure_obj.upvalues[index];
-        
-        match self.get_upvalue(upvalue_handle)? {
-            Upvalue::Closed(value) => Ok(value.clone()),
-            Upvalue::Open { thread, stack_index } => {
-                self.get_thread_register(*thread, *stack_index)
-            }
-        }
-    }
-    
-    /// Set upvalue value
-    pub fn set_upvalue(&mut self, closure: ClosureHandle, index: usize, value: Value) -> Result<()> {
-        let closure_obj = self.get_closure(closure)?;
-        
-        if index >= closure_obj.upvalues.len() {
-            return Err(LuaError::InvalidUpvalue);
-        }
-        
-        let upvalue_handle = closure_obj.upvalues[index];
-        
-        match self.get_upvalue_mut(upvalue_handle)? {
-            Upvalue::Closed(v) => {
-                *v = value;
-                Ok(())
-            }
-            Upvalue::Open { thread, stack_index } => {
-                // Copy the thread and index so we don't borrow the upvalue anymore
-                let t = *thread;
-                let idx = *stack_index;
-                self.set_thread_register(t, idx, value)
-            }
-        }
-    }
-    
-    /// Create userdata
-    pub fn create_userdata(&mut self, type_name: String) -> Result<UserDataHandle> {
-        let userdata = UserData {
-            data_type: type_name,
-            metatable: None,
-        };
-        
-        Ok(UserDataHandle(self.userdata.insert(userdata)))
-    }
-    
-    /// Get userdata
-    pub fn get_userdata(&self, handle: UserDataHandle) -> Result<&UserData> {
-        self.userdata.get(handle.0).ok_or(LuaError::InvalidHandle)
-    }
-    
-    /// Get mutable userdata
-    pub fn get_userdata_mut(&mut self, handle: UserDataHandle) -> Result<&mut UserData> {
-        self.userdata.get_mut(handle.0).ok_or(LuaError::InvalidHandle)
-    }
-    
-    /// Reset a thread
-    pub fn reset_thread(&mut self, handle: ThreadHandle) -> Result<()> {
+    /// Reset thread (internal - use through transactions)
+    pub(crate) fn reset_thread_internal(&mut self, handle: ThreadHandle) -> Result<()> {
         let thread = self.get_thread_mut(handle)?;
         thread.call_frames.clear();
         thread.stack.clear();
@@ -530,44 +371,129 @@ impl LuaHeap {
         Ok(())
     }
     
-    /// Check if a string handle is valid
-    pub fn is_valid_string(&self, handle: StringHandle) -> bool {
-        self.strings.contains(handle.0)
-    }
-    
-    /// Check if a table handle is valid
-    pub fn is_valid_table(&self, handle: TableHandle) -> bool {
-        self.tables.contains(handle.0)
-    }
-    
-    /// Check if a closure handle is valid
-    pub fn is_valid_closure(&self, handle: ClosureHandle) -> bool {
-        self.closures.contains(handle.0)
-    }
-    
-    /// Check if a thread handle is valid
-    pub fn is_valid_thread(&self, handle: ThreadHandle) -> bool {
-        self.threads.contains(handle.0)
-    }
-    
-    /// Check if an upvalue handle is valid
-    pub fn is_valid_upvalue(&self, handle: UpvalueHandle) -> bool {
-        self.upvalues.contains(handle.0)
-    }
-    
-    /// Check if a userdata handle is valid
-    pub fn is_valid_userdata(&self, handle: UserDataHandle) -> bool {
-        self.userdata.contains(handle.0)
-    }
-    
-    /// Queue an operation for processing
-    pub fn queue_operation(&mut self, operation: super::vm::PendingOperation) -> Result<()> {
-        self.pending_operations.push(operation);
+    /// Push to thread stack (internal - use through transactions)
+    pub(crate) fn push_thread_stack_internal(&mut self, handle: ThreadHandle, value: Value) -> Result<()> {
+        let thread = self.get_thread_mut(handle)?;
+        
+        // Check stack size limit
+        if thread.stack.len() >= 1000000 {
+            return Err(LuaError::StackOverflow);
+        }
+        
+        thread.stack.push(value);
         Ok(())
     }
     
-    /// Get and clear pending operations
-    pub fn take_pending_operations(&mut self) -> Vec<super::vm::PendingOperation> {
-        std::mem::take(&mut self.pending_operations)
+    /// Get thread stack value
+    pub fn get_thread_stack_value(&self, handle: ThreadHandle, index: usize) -> Result<Value> {
+        let thread = self.get_thread(handle)?;
+        if index < thread.stack.len() {
+            Ok(thread.stack[index].clone())
+        } else {
+            Ok(Value::Nil)
+        }
+    }
+    
+    // Upvalue operations
+    
+    /// Create an upvalue (use through transactions)
+    pub(crate) fn create_upvalue(&mut self, value: Upvalue) -> Result<UpvalueHandle> {
+        let handle = self.upvalues.insert(value);
+        Ok(UpvalueHandle::new(handle))
+    }
+    
+    /// Get an upvalue
+    pub fn get_upvalue(&self, handle: UpvalueHandle) -> Result<&Upvalue> {
+        self.upvalues.get(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Get a mutable upvalue
+    pub fn get_upvalue_mut(&mut self, handle: UpvalueHandle) -> Result<&mut Upvalue> {
+        self.upvalues.get_mut(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Check if upvalue handle is valid
+    pub fn is_valid_upvalue(&self, handle: UpvalueHandle) -> bool {
+        self.upvalues.contains(&handle.0)
+    }
+    
+    // UserData operations
+    
+    /// Create userdata (use through transactions)
+    pub(crate) fn create_userdata(&mut self, data_type: String) -> Result<UserDataHandle> {
+        let userdata = UserData {
+            data_type,
+            metatable: None,
+        };
+        let handle = self.userdata.insert(userdata);
+        Ok(UserDataHandle::new(handle))
+    }
+    
+    /// Get userdata
+    pub fn get_userdata(&self, handle: UserDataHandle) -> Result<&UserData> {
+        self.userdata.get(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Get mutable userdata
+    pub fn get_userdata_mut(&mut self, handle: UserDataHandle) -> Result<&mut UserData> {
+        self.userdata.get_mut(&handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Check if userdata handle is valid
+    pub fn is_valid_userdata(&self, handle: UserDataHandle) -> bool {
+        self.userdata.contains(&handle.0)
+    }
+}
+
+impl Default for LuaHeap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_heap_creation() {
+        let heap = LuaHeap::new();
+        
+        // Core structures should be initialized
+        assert!(heap.registry.is_some());
+        assert!(heap.globals.is_some());
+        assert!(heap.main_thread.is_some());
+    }
+    
+    #[test]
+    fn test_string_interning() {
+        let mut heap = LuaHeap::new();
+        
+        let s1 = heap.create_string_internal("hello").unwrap();
+        let s2 = heap.create_string_internal("hello").unwrap();
+        
+        // Should return same handle for same string
+        assert_eq!(s1, s2);
+    }
+    
+    #[test]
+    fn test_table_operations() {
+        let mut heap = LuaHeap::new();
+        
+        let table = heap.create_table().unwrap();
+        assert!(heap.is_valid_table(table));
+        
+        // Set and get field
+        let key = Value::String(heap.create_string_internal("key").unwrap());
+        let value = Value::Number(42.0);
+        
+        heap.set_table_field_internal(table, key.clone(), value).unwrap();
+        
+        let retrieved = heap.get_table_field(table, &key).unwrap();
+        assert_eq!(retrieved, value);
     }
 }

@@ -1,27 +1,23 @@
-//! Generational Arena Implementation
-//!
-//! This module provides a type-safe, handle-based memory management system
-//! that avoids the common issues with raw pointers while providing efficient
-//! access to dynamic objects.
+//! Generational Arena Memory Management for Lua VM
+//! 
+//! This module implements a generational arena allocator that provides:
+//! - Type-safe handles instead of raw pointers
+//! - Generation tracking to prevent use-after-free
+//! - Efficient allocation and deallocation
+//! - No unsafe code required
 
 use std::marker::PhantomData;
 use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::collections::HashMap;
 
-use super::error::{LuaError, Result};
-
-/// A handle to an object in an arena
-#[derive(Debug, PartialEq, Eq, Hash)]
+/// A handle to an object in the arena
+#[derive(PartialEq, Eq, Hash)]
 pub struct Handle<T> {
     /// Index in the arena
-    pub index: u32,
-    
-    /// Generation - incremented when an object is freed
-    pub generation: u32,
-    
-    /// Phantom data for type safety
-    pub _phantom: PhantomData<T>,
+    index: usize,
+    /// Generation number to detect stale handles
+    generation: u32,
+    /// Type marker
+    _phantom: PhantomData<T>,
 }
 
 impl<T> Clone for Handle<T> {
@@ -37,330 +33,282 @@ impl<T> Clone for Handle<T> {
 impl<T> Copy for Handle<T> {}
 
 impl<T> Handle<T> {
-    /// Create a new handle
+    /// Get the index
+    pub fn index(&self) -> usize {
+        self.index
+    }
+    
+    /// Get the generation
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+    
+    /// Create a new handle directly (for testing/creating dummy handles)
     pub fn new(index: u32, generation: u32) -> Self {
         Handle {
-            index,
+            index: index as usize,
             generation,
             _phantom: PhantomData,
         }
     }
 }
 
-impl<T> Default for Handle<T> {
-    fn default() -> Self {
-        Handle {
-            index: 0,
-            generation: 0,
-            _phantom: PhantomData,
-        }
+impl<T> fmt::Debug for Handle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Handle({}:{})", self.index, self.generation)
     }
 }
 
 /// An entry in the arena
 enum Entry<T> {
-    /// An occupied slot
+    /// Occupied slot with value and generation
     Occupied {
-        /// The value
         value: T,
-        
-        /// Generation
         generation: u32,
     },
-    
-    /// A free slot
+    /// Free slot pointing to next free
     Free {
-        /// Next free index
         next_free: Option<usize>,
     },
 }
 
-/// A generational arena
+/// A generational arena for storing objects
 pub struct Arena<T> {
-    /// The entries in the arena
+    /// Storage for entries
     entries: Vec<Entry<T>>,
-    
     /// Head of the free list
     free_head: Option<usize>,
-    
     /// Current generation
     generation: u32,
+    /// Number of occupied entries
+    len: usize,
 }
 
 impl<T> Arena<T> {
-    /// Create a new arena
+    /// Create a new empty arena
     pub fn new() -> Self {
         Arena {
             entries: Vec::new(),
             free_head: None,
             generation: 0,
+            len: 0,
         }
     }
     
-    /// Insert a value into the arena
-    pub fn insert(&mut self, value: T) -> Handle<T> {
-        // Increment generation to avoid ABA problem
-        self.generation = self.generation.wrapping_add(1);
-        
-        // If we have a free slot, use it
-        if let Some(index) = self.free_head {
-            match &mut self.entries[index] {
-                Entry::Free { next_free } => {
-                    // Update free head
-                    self.free_head = *next_free;
-                    
-                    // Store value
-                    self.entries[index] = Entry::Occupied {
-                        value,
-                        generation: self.generation,
-                    };
-                    
-                    // Return handle
-                    Handle {
-                        index: index as u32,
-                        generation: self.generation,
-                        _phantom: PhantomData,
-                    }
-                }
-                _ => unreachable!("Free list invariant violation"),
-            }
-        } else {
-            // No free slots, add a new one
-            let index = self.entries.len();
-            
-            // Store value
-            self.entries.push(Entry::Occupied {
-                value,
-                generation: self.generation,
-            });
-            
-            // Return handle
-            Handle {
-                index: index as u32,
-                generation: self.generation,
-                _phantom: PhantomData,
-            }
-        }
-    }
-    
-    /// Get a reference to a value in the arena
-    pub fn get(&self, handle: Handle<T>) -> Option<&T> {
-        if handle.index as usize >= self.entries.len() {
-            return None;
-        }
-        
-        match &self.entries[handle.index as usize] {
-            Entry::Occupied { value, generation } => {
-                if *generation == handle.generation {
-                    Some(value)
-                } else {
-                    None
-                }
-            }
-            Entry::Free { .. } => None,
-        }
-    }
-    
-    /// Get a mutable reference to a value in the arena
-    pub fn get_mut(&mut self, handle: Handle<T>) -> Option<&mut T> {
-        if handle.index as usize >= self.entries.len() {
-            return None;
-        }
-        
-        match &mut self.entries[handle.index as usize] {
-            Entry::Occupied { value, generation } => {
-                if *generation == handle.generation {
-                    Some(value)
-                } else {
-                    None
-                }
-            }
-            Entry::Free { .. } => None,
-        }
-    }
-    
-    /// Remove a value from the arena
-    pub fn remove(&mut self, handle: Handle<T>) -> Option<T> {
-        if handle.index as usize >= self.entries.len() {
-            return None;
-        }
-        
-        match &self.entries[handle.index as usize] {
-            Entry::Occupied { generation, .. } => {
-                if *generation != handle.generation {
-                    return None;
-                }
-            }
-            Entry::Free { .. } => return None,
-        }
-        
-        // Take the entry and replace it with a free entry
-        let entry = std::mem::replace(
-            &mut self.entries[handle.index as usize],
-            Entry::Free {
-                next_free: self.free_head,
-            },
-        );
-        
-        // Update free head
-        self.free_head = Some(handle.index as usize);
-        
-        // Extract value
-        match entry {
-            Entry::Occupied { value, .. } => Some(value),
-            Entry::Free { .. } => unreachable!(),
-        }
-    }
-    
-    /// Check if the arena contains a handle
-    pub fn contains(&self, handle: Handle<T>) -> bool {
-        if handle.index as usize >= self.entries.len() {
-            return false;
-        }
-        
-        match &self.entries[handle.index as usize] {
-            Entry::Occupied { generation, .. } => *generation == handle.generation,
-            Entry::Free { .. } => false,
-        }
-    }
-    
-    /// Get the current generation
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
-    
-    /// Get the number of entries in the arena
+    /// Get the number of items in the arena
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.len
     }
     
     /// Check if the arena is empty
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len == 0
     }
     
-    /// Clear the arena
+    /// Insert a value and return a handle
+    pub fn insert(&mut self, value: T) -> Handle<T> {
+        // Increment generation (wrapping is OK)
+        self.generation = self.generation.wrapping_add(1);
+        
+        // Get an index to use
+        let index = if let Some(free_index) = self.free_head {
+            // Reuse a free slot
+            match &mut self.entries[free_index] {
+                Entry::Free { next_free } => {
+                    self.free_head = *next_free;
+                    self.entries[free_index] = Entry::Occupied {
+                        value,
+                        generation: self.generation,
+                    };
+                    free_index
+                }
+                _ => unreachable!("free_head pointed to occupied entry"),
+            }
+        } else {
+            // Allocate new slot
+            let index = self.entries.len();
+            self.entries.push(Entry::Occupied {
+                value,
+                generation: self.generation,
+            });
+            index
+        };
+        
+        self.len += 1;
+        
+        Handle {
+            index,
+            generation: self.generation,
+            _phantom: PhantomData,
+        }
+    }
+    
+    /// Get a reference to a value by handle
+    pub fn get(&self, handle: &Handle<T>) -> Option<&T> {
+        if handle.index >= self.entries.len() {
+            return None;
+        }
+        
+        match &self.entries[handle.index] {
+            Entry::Occupied { value, generation } if *generation == handle.generation => {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+    
+    /// Get a mutable reference to a value by handle
+    pub fn get_mut(&mut self, handle: &Handle<T>) -> Option<&mut T> {
+        if handle.index >= self.entries.len() {
+            return None;
+        }
+        
+        match &mut self.entries[handle.index] {
+            Entry::Occupied { value, generation } if *generation == handle.generation => {
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+    
+    /// Remove a value by handle and return it
+    pub fn remove(&mut self, handle: &Handle<T>) -> Option<T> {
+        if handle.index >= self.entries.len() {
+            return None;
+        }
+        
+        match &mut self.entries[handle.index] {
+            Entry::Occupied { generation, .. } if *generation == handle.generation => {
+                // Valid handle, remove it
+                let old_entry = std::mem::replace(
+                    &mut self.entries[handle.index],
+                    Entry::Free {
+                        next_free: self.free_head,
+                    },
+                );
+                
+                self.free_head = Some(handle.index);
+                self.len -= 1;
+                
+                match old_entry {
+                    Entry::Occupied { value, .. } => Some(value),
+                    _ => unreachable!(),
+                }
+            }
+            _ => None,
+        }
+    }
+    
+    /// Check if a handle is valid
+    pub fn contains(&self, handle: &Handle<T>) -> bool {
+        if handle.index >= self.entries.len() {
+            return false;
+        }
+        
+        matches!(
+            &self.entries[handle.index],
+            Entry::Occupied { generation, .. } if *generation == handle.generation
+        )
+    }
+    
+    /// Clear all entries
     pub fn clear(&mut self) {
         self.entries.clear();
         self.free_head = None;
-        self.generation = 0;
+        self.len = 0;
+        // Don't reset generation to prevent old handles from becoming valid again
     }
     
-    /// Iterate over all valid entries
+    /// Iterate over all values
     pub fn iter(&self) -> impl Iterator<Item = (Handle<T>, &T)> {
         self.entries
             .iter()
             .enumerate()
-            .filter_map(|(index, entry)| match entry {
-                Entry::Occupied { value, generation } => Some((
-                    Handle {
-                        index: index as u32,
-                        generation: *generation,
-                        _phantom: PhantomData,
-                    },
-                    value,
-                )),
-                Entry::Free { .. } => None,
+            .filter_map(move |(index, entry)| {
+                match entry {
+                    Entry::Occupied { value, generation } => {
+                        Some((
+                            Handle {
+                                index,
+                                generation: *generation,
+                                _phantom: PhantomData,
+                            },
+                            value,
+                        ))
+                    }
+                    Entry::Free { .. } => None,
+                }
             })
     }
     
-    /// Iterate over all valid entries mutably
+    /// Iterate over all values mutably
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
         self.entries
             .iter_mut()
             .enumerate()
-            .filter_map(|(index, entry)| match entry {
-                Entry::Occupied { value, generation } => {
-                    let gen = *generation;
-                    Some((
-                        Handle {
-                            index: index as u32,
-                            generation: gen,
+            .filter_map(move |(index, entry)| {
+                match entry {
+                    Entry::Occupied { value, generation } => {
+                        let handle = Handle {
+                            index,
+                            generation: *generation,
                             _phantom: PhantomData,
-                        },
-                        value,
-                    ))
+                        };
+                        Some((handle, value))
+                    }
+                    Entry::Free { .. } => None,
                 }
-                Entry::Free { .. } => None,
             })
     }
+    
+    /// Drain all values from the arena
+    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.len = 0;
+        self.free_head = None;
+        self.entries.drain(..).filter_map(|entry| {
+            match entry {
+                Entry::Occupied { value, .. } => Some(value),
+                Entry::Free { .. } => None,
+            }
+        })
+    }
 }
 
-/// A typed handle for an object in an arena
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+impl<T> Default for Arena<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A typed handle wrapper for compile-time type safety
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypedHandle<T>(pub Handle<T>);
 
-impl<T> Default for TypedHandle<T> {
-    fn default() -> Self {
-        TypedHandle(Handle::default())
+impl<T> TypedHandle<T> {
+    /// Create a new typed handle
+    pub fn new(handle: Handle<T>) -> Self {
+        TypedHandle(handle)
+    }
+    
+    /// Get the underlying handle
+    pub fn handle(&self) -> &Handle<T> {
+        &self.0
     }
 }
 
-/// A registry for handles
-pub struct HandleRegistry<K, V> {
-    /// Map from keys to handles
-    map: HashMap<K, V>,
-}
-
-impl<K: Eq + Hash, V> HandleRegistry<K, V> {
-    /// Create a new registry
-    pub fn new() -> Self {
-        HandleRegistry {
-            map: HashMap::new(),
-        }
-    }
-    
-    /// Insert a handle into the registry
-    pub fn insert(&mut self, key: K, handle: V) {
-        self.map.insert(key, handle);
-    }
-    
-    /// Get a handle from the registry
-    pub fn get(&self, key: &K) -> Option<&V> {
-        self.map.get(key)
-    }
-    
-    /// Remove a handle from the registry
-    pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.map.remove(key)
-    }
-    
-    /// Check if the registry contains a key
-    pub fn contains_key(&self, key: &K) -> bool {
-        self.map.contains_key(key)
-    }
-    
-    /// Clear the registry
-    pub fn clear(&mut self) {
-        self.map.clear();
-    }
-    
-    /// Get the number of handles in the registry
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-    
-    /// Check if the registry is empty
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
-    }
-    
-    /// Iterate over all handles
-    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.map.iter()
+impl<T> fmt::Debug for TypedHandle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TypedHandle({:?})", self.0)
     }
 }
 
-/// Validation scope for handles
-pub struct ValidScope<'heap> {
-    /// Heap generation
+/// A validation scope for safe handle usage
+pub struct ValidScope<'a> {
     generation: u32,
-    
-    /// Phantom data for heap lifetime
-    _phantom: PhantomData<&'heap ()>,
+    _phantom: PhantomData<&'a ()>,
 }
 
-impl<'heap> ValidScope<'heap> {
+impl<'a> ValidScope<'a> {
     /// Create a new validation scope
     pub fn new(generation: u32) -> Self {
         ValidScope {
@@ -369,29 +317,27 @@ impl<'heap> ValidScope<'heap> {
         }
     }
     
-    /// Validate a handle
-    pub fn validate<T>(&self, handle: Handle<T>) -> Result<ValidHandle<'heap, T>> {
-        if handle.generation != self.generation {
-            return Err(LuaError::StaleHandle(handle.index, handle.generation));
+    /// Validate a handle within this scope
+    pub fn validate<T>(&self, handle: &Handle<T>) -> Option<ValidHandle<'a, T>> {
+        if handle.generation == self.generation {
+            Some(ValidHandle {
+                handle: *handle,
+                _scope: PhantomData,
+            })
+        } else {
+            None
         }
-        
-        Ok(ValidHandle {
-            handle,
-            _scope: PhantomData,
-        })
     }
 }
 
-/// A handle validated within a scope
-pub struct ValidHandle<'scope, T> {
-    /// The handle
-    pub handle: Handle<T>,
-    
-    /// Phantom data for scope lifetime
-    _scope: PhantomData<&'scope ()>,
+/// A validated handle that's guaranteed to be valid within a scope
+#[derive(Clone, Copy)]
+pub struct ValidHandle<'a, T> {
+    handle: Handle<T>,
+    _scope: PhantomData<&'a ()>,
 }
 
-impl<'scope, T> ValidHandle<'scope, T> {
+impl<'a, T> ValidHandle<'a, T> {
     /// Get the underlying handle
     pub fn handle(&self) -> Handle<T> {
         self.handle
@@ -401,113 +347,46 @@ impl<'scope, T> ValidHandle<'scope, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
-    fn test_arena_basics() {
+    fn test_arena_basic() {
         let mut arena = Arena::new();
         
-        // Insert some values
-        let h1 = arena.insert(42);
-        let h2 = arena.insert(43);
+        let h1 = arena.insert("hello");
+        let h2 = arena.insert("world");
         
-        // Get values
-        assert_eq!(arena.get(h1), Some(&42));
-        assert_eq!(arena.get(h2), Some(&43));
-        
-        // Modify a value
-        if let Some(v) = arena.get_mut(h1) {
-            *v = 100;
-        }
-        
-        assert_eq!(arena.get(h1), Some(&100));
-        
-        // Remove a value
-        assert_eq!(arena.remove(h1), Some(100));
-        assert_eq!(arena.get(h1), None);
-        
-        // Handle is no longer valid
-        assert!(!arena.contains(h1));
-        
-        // But the other handle is still valid
-        assert!(arena.contains(h2));
-        assert_eq!(arena.get(h2), Some(&43));
-        
-        // Reuse the slot
-        let h3 = arena.insert(200);
-        
-        // Different handle, same slot
-        assert_ne!(h1.index, h3.index);
-        assert_ne!(h1.generation, h3.generation);
-        
-        // Get the value
-        assert_eq!(arena.get(h3), Some(&200));
+        assert_eq!(arena.get(&h1), Some(&"hello"));
+        assert_eq!(arena.get(&h2), Some(&"world"));
+        assert_eq!(arena.len(), 2);
     }
     
     #[test]
-    fn test_arena_generation_wrapping() {
-        let mut arena = Arena::<i32>::new();
+    fn test_arena_remove() {
+        let mut arena = Arena::new();
         
-        // Force generation to wrap
-        arena.generation = u32::MAX;
+        let h1 = arena.insert(1);
+        let h2 = arena.insert(2);
+        let h3 = arena.insert(3);
         
-        // Insert a value
-        let h1 = arena.insert(42);
+        assert_eq!(arena.remove(&h2), Some(2));
+        assert_eq!(arena.get(&h2), None);
+        assert_eq!(arena.len(), 2);
         
-        // Generation wrapped to 0
-        assert_eq!(h1.generation, 0);
-        assert_eq!(arena.generation, 0);
-        
-        // Value is still accessible
-        assert_eq!(arena.get(h1), Some(&42));
+        // h1 and h3 should still be valid
+        assert_eq!(arena.get(&h1), Some(&1));
+        assert_eq!(arena.get(&h3), Some(&3));
     }
     
     #[test]
-    fn test_handle_registry() {
-        let mut registry = HandleRegistry::new();
+    fn test_arena_generation() {
+        let mut arena = Arena::new();
         
-        // Insert some handles
-        registry.insert("foo", 42);
-        registry.insert("bar", 43);
+        let h1 = arena.insert("first");
+        arena.remove(&h1);
+        let h2 = arena.insert("second");
         
-        // Get handles
-        assert_eq!(registry.get(&"foo"), Some(&42));
-        assert_eq!(registry.get(&"bar"), Some(&43));
-        
-        // Remove a handle
-        assert_eq!(registry.remove(&"foo"), Some(42));
-        assert_eq!(registry.get(&"foo"), None);
-        
-        // Check if it contains a key
-        assert!(!registry.contains_key(&"foo"));
-        assert!(registry.contains_key(&"bar"));
-        
-        // Clear the registry
-        registry.clear();
-        assert_eq!(registry.len(), 0);
-        assert!(registry.is_empty());
-    }
-    
-    #[test]
-    fn test_validation_scope() {
-        // Create a handle with a specific generation
-        let handle = Handle::<i32> {
-            index: 1,
-            generation: 42,
-            _phantom: PhantomData,
-        };
-        
-        // Create a scope with the same generation
-        let scope = ValidScope::new(42);
-        
-        // Validate the handle
-        let valid_handle = scope.validate(handle);
-        assert!(valid_handle.is_ok());
-        
-        // Create a scope with a different generation
-        let scope = ValidScope::new(43);
-        
-        // Validate the handle
-        let valid_handle = scope.validate(handle);
-        assert!(valid_handle.is_err());
+        // Old handle should be invalid even though index is reused
+        assert_eq!(arena.get(&h1), None);
+        assert_eq!(arena.get(&h2), Some(&"second"));
     }
 }

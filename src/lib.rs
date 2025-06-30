@@ -11,9 +11,7 @@ pub mod pubsub;
 pub mod replication;
 pub mod config;
 
-// Note: Lua module has been removed for reimplementation
-// Uncomment when new implementation is ready:
-// pub mod lua;
+pub mod lua;
 
 // Re-export commonly used types
 pub use error::FerrousError;
@@ -22,4 +20,4 @@ pub use network::server::Server;
 pub use protocol::resp::RespFrame;
 pub use config::Config;
 
-// Lua exports will be readded once reimplemented
+pub use lua::LuaGIL;
