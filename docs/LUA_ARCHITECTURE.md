@@ -54,6 +54,27 @@ pub struct ClosureHandle(Handle<Closure>);
 pub struct ThreadHandle(Handle<Thread>);
 ```
 
+All typed handles MUST implement `Clone` and `Copy` to avoid ownership issues when passing handles between components:
+
+```rust
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Handle<T> {}
+
+// Also implement for typed handles
+impl<T> Clone for TypedHandle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for TypedHandle<T> {}
+```
+
 #### 2.1.3 Handle Validation
 
 ```rust
@@ -70,6 +91,14 @@ impl<'a> ValidScope<'a> {
     }
 }
 ```
+
+Handle validation MUST occur at these specific points:
+1. When a handle enters a transaction from outside
+2. Before any operation that might cause memory reallocation
+3. When receiving handles from C functions
+4. When loading handles from persistent storage
+
+Handles created within the same transaction do not require validation.
 
 ### 2.2 Lua Heap
 
@@ -89,7 +118,35 @@ impl LuaHeap {
         HeapTransaction {
             heap: self,
             changes: Vec::new(),
+            pending_operations: Vec::new(),
+            state: TransactionState::Active,
+            validation_cache: HashMap::new(),
         }
+    }
+    
+    // Validate a handle
+    pub fn validate_handle<T>(&self, handle: &Handle<T>) -> Result<()> {
+        if handle.generation != self.generation {
+            return Err(LuaError::StaleHandle);
+        }
+        
+        // Validate in appropriate arena based on type
+        let is_valid = match std::any::TypeId::of::<T>() {
+            // Check appropriate arena based on type
+            _ => handle.index < self.max_index_for_type::<T>(),
+        };
+        
+        if is_valid {
+            Ok(())
+        } else {
+            Err(LuaError::InvalidHandle)
+        }
+    }
+    
+    // Get max index for a given type
+    fn max_index_for_type<T>(&self) -> u32 {
+        // Implementation depends on type
+        0 // Placeholder
     }
 }
 ```
@@ -100,6 +157,23 @@ impl LuaHeap {
 pub struct HeapTransaction<'a> {
     heap: &'a mut LuaHeap,
     changes: Vec<HeapChange>,
+    pending_operations: Vec<PendingOperation>,
+    state: TransactionState,
+    validation_cache: HashMap<HandleKey, ()>, // Cache of validated handles
+}
+
+pub enum TransactionState {
+    Active,     // Transaction can accept changes
+    Committed,  // Transaction has been committed
+    Aborted     // Transaction has been aborted
+}
+
+// Key for validation cache
+#[derive(Hash, Eq, PartialEq)]
+struct HandleKey {
+    type_id: std::any::TypeId,
+    index: u32,
+    generation: u32,
 }
 
 pub enum HeapChange {
@@ -110,24 +184,105 @@ pub enum HeapChange {
 
 impl<'a> HeapTransaction<'a> {
     // Queue changes without immediate application
-    pub fn set_table_field(&mut self, table: TableHandle, key: Value, value: Value) {
+    pub fn set_table_field(&mut self, table: TableHandle, key: Value, value: Value) -> Result<()> {
+        self.ensure_active()?;
+        self.validate_handle(table)?;
         self.changes.push(HeapChange::SetTableField { table, key, value });
+        Ok(())
     }
     
-    // Apply all changes in one go
-    pub fn commit(self) -> Result<()> {
-        for change in self.changes {
+    // Validate a handle only once per transaction
+    pub fn validate_handle<T>(&mut self, handle: Handle<T>) -> Result<()> {
+        // Create a key for the validation cache
+        let key = HandleKey {
+            type_id: std::any::TypeId::of::<T>(),
+            index: handle.index,
+            generation: handle.generation,
+        };
+        
+        // Check cache first
+        if self.validation_cache.contains_key(&key) {
+            return Ok(());
+        }
+        
+        // Validate through heap
+        self.heap.validate_handle(&handle)?;
+        
+        // Cache validation result
+        self.validation_cache.insert(key, ());
+        
+        Ok(())
+    }
+    
+    // Apply all changes in one go - DOES NOT CONSUME SELF
+    pub fn commit(&mut self) -> Result<Vec<PendingOperation>> {
+        self.ensure_active()?;
+        
+        // Extract pending operations to return
+        let pending_ops = std::mem::take(&mut self.pending_operations);
+        
+        // Apply all changes atomically - if any fail, none are applied
+        for change in &self.changes {
             match change {
                 HeapChange::SetTableField { table, key, value } => {
-                    self.heap.get_table_mut(table)?.set(key, value);
-                }
+                    self.heap.get_table_mut(*table)?.set(key.clone(), value.clone());
+                },
+                HeapChange::SetRegister { thread, frame, register, value } => {
+                    // Implementation to set register
+                },
                 // Handle other change types...
             }
         }
+        
+        // Clear changes and mark as committed
+        self.changes.clear();
+        self.state = TransactionState::Committed;
+        
+        Ok(pending_ops)
+    }
+    
+    // Ensure transaction is in active state
+    fn ensure_active(&self) -> Result<()> {
+        match self.state {
+            TransactionState::Active => Ok(()),
+            TransactionState::Committed => Err(LuaError::TransactionAlreadyCommitted),
+            TransactionState::Aborted => Err(LuaError::TransactionAborted),
+        }
+    }
+    
+    // Reset transaction to active state for reuse
+    pub fn reset(&mut self) -> Result<()> {
+        self.changes.clear();
+        self.pending_operations.clear();
+        self.validation_cache.clear();
+        self.state = TransactionState::Active;
         Ok(())
+    }
+    
+    // Queue an operation for VM execution
+    pub fn queue_operation(&mut self, op: PendingOperation) {
+        self.pending_operations.push(op);
     }
 }
 ```
+
+#### Transaction Lifecycle
+
+All heap operations MUST go through transactions, following this pattern:
+
+```
+┌─────────┐       ┌──────────┐       ┌───────────┐       ┌─────────┐
+│  Create  │──────►  Active   │──────►  Committed │──────►  Reset  │
+└─────────┘       └──────────┘       └───────────┘       └─────────┘
+                       │                                      ▲
+                       │                                      │
+                       ▼                                      │
+                  ┌──────────┐                               │
+                  │  Aborted  │───────────────────────────────┘
+                  └──────────┘
+```
+
+Transactions MUST NOT be nested: one transaction must be committed or aborted before a new one is created.
 
 ### 2.4 Lua Values
 
@@ -210,6 +365,30 @@ pub enum ReturnContext {
     Metamethod { type_: MetamethodType },
 }
 ```
+
+#### Operation Priority System
+
+Operations processed by the VM have explicit priorities:
+
+```rust
+pub enum OperationPriority {
+    /// Must complete before current instruction continues (e.g., type coercions)
+    Immediate,
+    
+    /// Queued for after current instruction completes (e.g., function calls)
+    Deferred,
+    
+    /// Queued with explicit ordering requirements (e.g., chained metamethods)
+    Ordered { after: OperationId },
+}
+```
+
+The rules for operation queueing are:
+1. Immediate operations must complete before the current instruction proceeds
+2. Deferred operations are processed after the current instruction completes
+3. Metamethods are always deferred operations
+4. Function calls are always deferred operations
+5. Concatenation is a deferred operation
 
 ### 2.6 Non-Recursive Execution Loop
 
@@ -445,6 +624,157 @@ impl LuaGIL {
 }
 ```
 
+### 2.10 C Function Integration
+
+C functions require special handling due to borrow checker considerations:
+
+```rust
+// C Function signature
+pub type CFunction = fn(&mut CExecutionContext) -> Result<i32>;
+
+// Execution context for C functions (isolated from VM internals)
+pub struct CExecutionContext<'vm> {
+    // Stack and argument information
+    stack_base: usize,
+    arg_count: usize,
+    
+    // Private handle to VM for controlled access
+    vm_access: CContextAccess<'vm>,
+}
+
+// Provides controlled access to VM functionality
+struct CContextAccess<'vm> {
+    vm: &'vm mut LuaVM,
+    transaction: Option<HeapTransaction<'vm>>,
+}
+
+impl<'vm> CExecutionContext<'vm> {
+    // Create a new context from VM
+    pub fn new(vm: &'vm mut LuaVM, stack_base: usize, arg_count: usize) -> Self {
+        Self {
+            stack_base,
+            arg_count,
+            vm_access: CContextAccess {
+                vm,
+                transaction: None,
+            },
+        }
+    }
+    
+    // Access VM through transaction to avoid borrowing issues
+    pub fn with_transaction<F, R>(&mut self, f: F) -> Result<R>
+    where F: FnOnce(&mut HeapTransaction) -> Result<R>
+    {
+        // Create transaction if none exists
+        if self.vm_access.transaction.is_none() {
+            self.vm_access.transaction = Some(HeapTransaction::new(&mut self.vm_access.vm.heap));
+        }
+        
+        // Execute function with transaction
+        let result = f(self.vm_access.transaction.as_mut().unwrap())?;
+        
+        Ok(result)
+    }
+    
+    // Finalize when C function returns
+    pub fn finalize(self) -> Result<Vec<Value>> {
+        // Commit transaction if one exists
+        if let Some(mut tx) = self.vm_access.transaction {
+            tx.commit()?;
+        }
+        
+        // Return all values pushed to the stack
+        let mut values = Vec::new();
+        
+        // Implementation returns values from stack...
+        
+        Ok(values)
+    }
+}
+
+// Calling a C function from VM
+impl LuaVM {
+    fn call_c_function(&mut self, func: CFunction, args: &[Value]) -> Result<Vec<Value>> {
+        // Setup C execution context
+        let stack_base = self.prepare_stack_for_c_function(args)?;
+        let mut ctx = CExecutionContext::new(self, stack_base, args.len());
+        
+        // Call function with isolated context
+        let result_count = func(&mut ctx)?;
+        
+        // Finalize and get results
+        let results = ctx.finalize()?;
+        
+        Ok(results)
+    }
+}
+```
+
+Rules for C Functions:
+1. C functions must never access VM state directly
+2. All heap access must go through the execution context's transaction
+3. C functions can only modify their own stack frame
+4. Return values are validated before integration with VM state
+
+### 2.11 Metamethod Execution Model
+
+Metamethods require special handling to avoid recursion:
+
+```rust
+pub enum MetamethodContinuation {
+    // Replace the original operation result
+    ReplaceResult { register: usize },
+    
+    // Continue with metamethod result as operand
+    ContinueOperation { operation: Operation, operand_slot: usize },
+}
+
+pub struct MetamethodContext {
+    method: StringHandle,
+    target_object: Value,
+    args: Vec<Value>,
+    continuation: MetamethodContinuation,
+}
+
+// Queue a metamethod call
+fn queue_metamethod(&mut self, tx: &mut HeapTransaction, context: MetamethodContext) -> Result<()> {
+    tx.queue_operation(PendingOperation::MetamethodCall {
+        method: context.method,
+        object: context.target_object,
+        args: context.args,
+        continuation: context.continuation,
+    });
+    
+    Ok(())
+}
+
+// Handle metamethod returns
+fn handle_metamethod_return(&mut self, result: Value, continuation: MetamethodContinuation) -> Result<()> {
+    // Create new transaction - NEVER reuse previous transactions
+    let mut tx = HeapTransaction::new(&mut self.heap);
+    
+    match continuation {
+        MetamethodContinuation::ReplaceResult { register } => {
+            tx.set_register(self.current_thread, register, result);
+        },
+        MetamethodContinuation::ContinueOperation { operation, operand_slot } => {
+            // Replace operand and retry operation
+            self.update_operation_operand(operation, operand_slot, result);
+            tx.queue_operation(operation);
+        },
+    }
+    
+    tx.commit()?;
+    Ok(())
+}
+```
+
+Metamethod Rules:
+1. All metamethod calls must be queued, never executed directly
+2. Metamethod execution must occur in the main VM loop
+3. Each metamethod call creates a new execution context
+4. Result handling must follow the continuation pattern
+
 ## 3. Key Implementation Details
 
 ### 3.1 Handle Validation
@@ -473,6 +803,13 @@ fn get_table_field(&mut self, table: TableHandle, key: Value) -> Result<Value> {
 }
 ```
 
+#### Handle Validation Rules
+
+1. **Transaction-Created Handles**: Never need validation (created in current transaction scope)
+2. **VM State Handles**: Must be validated once per transaction (e.g., current thread)
+3. **External Handles**: Must be validated on every use (e.g., from C functions)
+4. **Cached Handles**: Must be validated on first use after cache retrieval
+
 ### 3.2 Two-Phase Heap Access
 
 All operations must follow a two-phase pattern to avoid borrow checker issues:
@@ -490,7 +827,8 @@ if let Some(meta) = metatable {
 // CORRECT - Two-phase access
 let metatable = {
     let table_obj = self.heap.get_table(table)?;
-    table_obj.metatable
+    // Copy the handle to avoid moving from borrowed content
+    table_obj.metatable.clone()
 };
 
 if let Some(meta) = metatable {
@@ -499,6 +837,17 @@ if let Some(meta) = metatable {
     // ...
 }
 ```
+
+#### Operations Requiring Two-Phase Pattern
+
+The following operations MUST use the two-phase pattern:
+
+1. Table operations with potential metamethod calls
+2. String operations that might need metamethods (__concat)
+3. Any operation that accesses the heap multiple times
+4. Any operation that might queue a pending operation
+
+Simple operations like register moves or constant loading do not require two phases.
 
 ### 3.3 Transaction Pattern for VM Operations
 
@@ -672,6 +1021,7 @@ pub enum LuaError {
     // System errors
     StackOverflow,
     MemoryError,
+    MemoryLimit,  // For string/table size limits
     InstructionLimitExceeded,
     KilledByTimeout,
     
@@ -679,11 +1029,63 @@ pub enum LuaError {
     InvalidHandle,
     StaleHandle,
     
+    // Transaction errors
+    TransactionAlreadyCommitted,
+    TransactionAborted,
+    InvalidTransactionState,
+    
     // Other errors
     InternalError(String),
     NotImplemented(String),
 }
 ```
+
+### 5.1 Transaction Error Recovery
+
+When errors occur during transaction execution, a systematic recovery approach is required:
+
+```rust
+pub struct TransactionRecovery {
+    // Savepoint before transaction started
+    savepoint: HeapSavepoint,
+    
+    // The operation that failed
+    failed_op: Operation,
+    
+    // Error details
+    error: LuaError,
+}
+
+impl<'a> HeapTransaction<'a> {
+    // Create a savepoint for later rollback if needed
+    pub fn savepoint(&self) -> HeapSavepoint {
+        HeapSavepoint {
+            generation: self.heap.generation,
+            // Other savepoint data...
+        }
+    }
+    
+    // Roll back to a savepoint
+    pub fn rollback(&mut self, savepoint: HeapSavepoint) -> Result<()> {
+        // Restore heap state to savepoint
+        self.heap.generation = savepoint.generation;
+        
+        // Clear transaction
+        self.changes.clear();
+        self.pending_operations.clear();
+        self.validation_cache.clear();
+        self.state = TransactionState::Active;
+        
+        Ok(())
+    }
+}
+```
+
+Error Handling Rules:
+1. Transactions must be atomic - all changes succeed or none do
+2. On error, all changes within the transaction must be rolled back
+3. Nested error handling requires savepoints
+4. Error recovery strategies depend on error type
 
 ## 6. Performance Considerations
 
@@ -744,6 +1146,7 @@ tx.queue_operation(PendingOperation::FunctionCall {
     args: args.clone(),
     context: ReturnContext::Register { base, offset },
 });
+// ... and let the main execution loop handle it
 ```
 
 ### 8.4 Two-Phase Borrow Pattern is Essential
@@ -754,7 +1157,8 @@ All complex operations need a two-phase borrow pattern:
 // Phase 1: Gather needed handles
 let metatable_handle = {
     let table_obj = self.heap.get_table(table)?;
-    table_obj.metatable // Copy the handle, borrow ends here
+    // Copy the handle, borrow ends here
+    table_obj.metatable.clone()
 };
 
 // Phase 2: Use extracted handles
