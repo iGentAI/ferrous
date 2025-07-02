@@ -413,6 +413,19 @@ impl<'a> HeapTransaction<'a> {
         Ok(())
     }
 
+    /// Get the globals table
+    pub fn get_globals_table(&mut self) -> LuaResult<TableHandle> {
+        self.ensure_active()?;
+        
+        // Get the globals table handle from the heap
+        let globals = self.heap.globals()?;
+        
+        // Validate the handle
+        self.validate_with_context(&globals, "get_globals_table")?;
+        
+        Ok(globals)
+    }
+
     /// Get metatable from a table using the two-phase pattern
     pub fn get_table_metatable_two_phase(&mut self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
         self.ensure_active()?;

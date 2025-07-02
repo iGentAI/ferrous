@@ -107,39 +107,25 @@ fn handle_c_function_call(
 }
 ```
 
-## Remaining Implementation Phases
+### Table Operations & Metamethods
 
-### Phase 1: Metamethod System (Days 1-3)
+The basic table operations and metamethod support have been implemented:
 
-The metamethod system is the next priority as it's required for proper Lua semantics:
+- **GetTable/SetTable** with proper __index/__newindex metamethod handling
+- **Two-phase pattern** for metamethod resolution to avoid borrow checker issues
+- **Non-recursive metamethod execution** through the pending operations queue
 
-#### 1.1 Create Metamethod Types
-
-```rust
-// In metamethod.rs
-pub enum MetamethodType {
-    Index,        // __index
-    NewIndex,     // __newindex
-    Call,         // __call
-    Add,          // __add
-    Sub,          // __sub
-    // ... other metamethods ...
-}
-```
-
-#### 1.2 Implement Metamethod Resolution
-
-Using the two-phase pattern for proper borrow management:
+Core implementation:
 
 ```rust
-// In metamethod.rs
+// Metamethod resolution using two-phase pattern
 pub fn resolve_metamethod(
     tx: &mut HeapTransaction, 
-    value: Value,
+    value: &Value,
     mm_type: MetamethodType
 ) -> LuaResult<Option<Value>> {
     // Phase 1: Extract metatable information
-    let metatable_opt = match &value {
+    let metatable_opt = match value {
         Value::Table(handle) => tx.get_table_metatable(*handle)?,
         Value::UserData(handle) => tx.get_userdata_metatable(*handle)?,
         _ => None,
@@ -163,75 +149,117 @@ pub fn resolve_metamethod(
 }
 ```
 
-#### 1.3 Non-Recursive Metamethod Processing
+### Arithmetic & Comparison Operations
+
+Arithmetic and comparison operations with metamethod support have been implemented:
+
+- **Add, Sub, Mul, Div** with proper __add, __sub, __mul, __div metamethods
+- **Eq, Lt, Le** with proper __eq, __lt, __le metamethods
+- **String-to-number coercion** for arithmetic and comparison operations
+- **Special handling for Le** with fallback to inverted Lt
+
+### Control Flow & Loops
+
+Control flow operations and loop constructs have been implemented:
+
+- **Jmp, Test, TestSet** for basic control flow
+- **ForPrep/ForLoop** for numeric for loops (`for i=1,10,1 do ... end`)
+- **TForLoop** for generic for loops (`for k,v in pairs(t) do ... end`)
+- **C function and closure iterators** support in TForLoop
+
+## Remaining Implementation Phases
+
+### Phase 1: Complete VM Core Operations (Days 1-3)
+
+#### 1.1 Table Construction
 
 ```rust
-// Add to PendingOperation enum
-pub enum PendingOperation {
-    // ... other operations ...
-    MetamethodCall {
-        mm_type: MetamethodType,
-        target: Value,
-        args: Vec<Value>,
-        continuation: MetamethodContext,
-    },
-    // ...
+// NewTable opcode
+fn execute_new_table(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
+    // Create new table with array and map capacity hints from b and c
+    let table = tx.create_table_with_capacity(b, c)?;
+    
+    // Store in register
+    let base = frame.base_register as usize;
+    tx.set_register(self.current_thread, base + a, Value::Table(table))?;
+    
+    StepResult::Continue
 }
 
-// In vm.rs
-fn process_metamethod_call(
-    &mut self,
-    mm_type: MetamethodType,
-    target: Value,
-    args: Vec<Value>,
-    continuation: MetamethodContext,
-) -> LuaResult<StepResult> {
-    // Implementation that follows the non-recursive pattern
+// SetList opcode for constructing array part efficiently
+fn execute_set_list(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
+    // Implementation for array part construction
     // ...
 }
 ```
 
-### Phase 2: VM Operations Implementation (Days 4-7)
-
-#### 2.1 Table Operations
-
-Implement GetTable and SetTable with metamethod support:
+#### 1.2 String Operations
 
 ```rust
-fn execute_get_table(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
-    // Implementation with __index metamethod support
+// Concat opcode with __concat metamethod support
+fn execute_concat(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
+    // Implementation with appropriate metamethod support
     // ...
 }
 
-fn execute_set_table(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
-    // Implementation with __newindex metamethod support
-    // ...
-}
-```
-
-#### 2.2 Arithmetic Operations
-
-Implement Add, Sub, Mul, Div, etc. with metamethod support:
-
-```rust
-fn execute_arithmetic(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize, op: ArithmeticOperation) -> LuaResult<StepResult> {
+// Len opcode with __len metamethod support
+fn execute_len(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
     // Implementation with appropriate metamethod support
     // ...
 }
 ```
 
-#### 2.3 Comparison Operations
-
-Implement Eq, Lt, Le with metamethod support:
+#### 1.3 Additional Arithmetic
 
 ```rust
-fn execute_comparison(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize, op: ComparisonOperation) -> LuaResult<StepResult> {
-    // Implementation with appropriate metamethod support
+// Complete remaining arithmetic operations
+fn execute_mod(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
+    // Implementation with __mod metamethod support
+    // ...
+}
+
+fn execute_pow(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
+    // Implementation with __pow metamethod support
+    // ...
+}
+
+fn execute_unm(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
+    // Implementation with __unm metamethod support
     // ...
 }
 ```
 
-### Phase 3: Redis API Integration (Days 8-10)
+### Phase 2: Closure Support (Days 4-6)
+
+#### 2.1 Upvalue Operations
+
+```rust
+fn execute_get_upval(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
+    // Implementation for GetUpval opcode
+    // ...
+}
+
+fn execute_set_upval(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
+    // Implementation for SetUpval opcode
+    // ...
+}
+
+fn execute_close(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize) -> LuaResult<StepResult> {
+    // Implementation for Close opcode
+    // ...
+}
+```
+
+#### 2.2 Closure Creation
+
+```rust
+fn execute_closure(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, bx: usize) -> LuaResult<StepResult> {
+    // Implementation for Closure opcode
+    // ...
+}
+```
+
+### Phase 3: Redis API Integration (Days 7-9)
 
 #### 3.1 Create Redis API Module
 
@@ -281,7 +309,7 @@ fn setup_redis_api(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle
 }
 ```
 
-### Phase 4: Compiler Implementation (Days 11-15)
+### Phase 4: Compiler Implementation (Days 10-14)
 
 #### 4.1 Create Parser
 
@@ -345,7 +373,7 @@ impl Compiler {
 }
 ```
 
-### Phase 5: Testing and Integration (Days 16-20)
+### Phase 5: Testing and Integration (Days 15-18)
 
 #### 5.1 Create Component Tests
 
@@ -395,6 +423,7 @@ This section tracks implementation progress:
 |------|----------------------|-------|
 | 2025-06-30 | Arena, Handle, Value, Heap, basic Transaction, basic VM Core | Initial implementation with core architecture in place |
 | 2025-07-02 | Handle Validation, C Function Execution | Fixed unsafe code, implemented proper type-safe validation, added C function execution pattern per architecture specs |
+| 2025-07-02 | Control Flow, Comparison Operations, For Loops | Implemented Jmp, Test, TestSet, Eq, Lt, Le, ForPrep, ForLoop, TForLoop opcodes with proper metamethod support |
 | | | |
 
 ## References
