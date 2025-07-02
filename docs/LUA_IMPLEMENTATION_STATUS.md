@@ -4,7 +4,7 @@
 
 This document tracks the implementation status of the Lua VM for Ferrous Redis. It is based on the architectural specifications in the `LUA_ARCHITECTURE.md`, `LUA_TRANSACTION_PATTERNS.md`, and other design documents.
 
-**Current Overall Status**: Core foundation components implemented and validated with comprehensive test suite. Key architectural patterns (handle validation and C function execution) in place, but higher-level components still missing.
+**Current Overall Status**: Core foundation components implemented and validated with comprehensive test suite. Key architectural patterns (handle validation and C function execution) in place with working control flow and loop opcodes, but several higher-level components are still missing.
 
 ## Core Components Status
 
@@ -17,9 +17,9 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 | **Transaction** | ✅ Complete | Fully implemented with proper validation and caching | Done |
 | **Handle Validation** | ✅ Complete | Type-safe validation framework with validation caching implemented | Done |
 | **C Function Execution** | ✅ Complete | Isolated execution context with transaction-safe boundaries | Done |
-| **VM Structure** | ⚠️ Partial | Core state machine in place, but many operations missing | High |
+| **VM Structure** | ⚠️ Partial | Core state machine in place with many opcodes implemented, but some still missing | High |
 | **Compiler** | ❌ Missing | No parser or bytecode generation | Medium |
-| **Metamethod System** | ❌ Missing | No metamethod support | High |
+| **Metamethod System** | ⚠️ Partial | Basic metamethod support for tables, arithmetic, and comparisons, but many metamethods missing | High |
 | **Redis API Integration** | ❌ Missing | No Redis function interface | High |
 | **Error Handling** | ⚠️ Partial | Error types defined but not fully implemented | Medium |
 
@@ -105,12 +105,20 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 - **Features Implemented**:
   - Non-recursive execution loop
   - Step-by-step instruction execution
-  - Basic opcode handlers (Move, LoadK, LoadBool, LoadNil, Return, Call)
+  - Implemented opcode handlers (21/~37):
+    - Basic: Move, LoadK, LoadBool, LoadNil
+    - Table: GetTable, SetTable
+    - Global: GetGlobal, SetGlobal
+    - Arithmetic: Add, Sub, Mul, Div
+    - Comparison: Eq, Lt, Le
+    - Control Flow: Jmp, Test, TestSet
+    - Function: Call, Return
+    - Loops: ForPrep, ForLoop, TForLoop
   - Function call mechanism with proper state management
   - C function execution pattern
 - **Missing/Stubbed**:
-  - Most opcode handlers (~35 opcodes missing)
-  - Metamethod handling
+  - Several opcode handlers still missing
+  - Comprehensive error handling
   - Memory limits enforcement
 
 ### Compiler
@@ -133,37 +141,47 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 - **Dependencies**: VM Core, Transaction System, C Function Execution
 
 ### Metamethod System
-- **Status**: ❌ Missing
-- **Requirements**:
-  - Metamethod resolution that follows two-phase pattern
-  - Non-recursive metamethod execution
-  - Support for all standard metamethods (__index, __newindex, etc.)
-  - Integration with VM operation queue
-- **Dependencies**: VM Core, Handle Validation
+- **Status**: ⚠️ Partial
+- **Features Implemented**:
+  - Metamethod type definitions
+  - Metamethod resolution for tables
+  - Support for arithmetic metamethods (__add, __sub, __mul, __div)
+  - Support for comparison metamethods (__eq, __lt, __le)
+  - Support for __index, __newindex for tables
+- **Missing**:
+  - Several metamethods (__concat, __len, __mod, __pow, __unm)
+  - Integration with some VM operations
 
 ## Implementation Priorities
 
-1. **Implement Missing VM Operations** (High Priority)
-   - Add table operations (GetTable, SetTable, etc.)
-   - Add arithmetic operations (Add, Sub, etc.)
-   - Add comparison operations
+1. **Complete Missing VM Operations** (High Priority)
+   - Implement NewTable for table creation
+   - Implement Concat opcode with __concat metamethod
+   - Implement Len opcode with __len metamethod
+   - Add remaining arithmetic operations (Mod, Pow, Unm)
+   - Implement Not for logical operations
 
-2. **Develop Metamethod System** (High Priority)
-   - Implement metamethod resolution with proper validation
-   - Add two-phase pattern support for metamethods
-   - Ensure non-recursive execution
+2. **Finish Metamethod System** (High Priority)
+   - Complete all missing metamethods
+   - Ensure proper integration with VM operations
+   - Add comprehensive tests for metamethod interactions
 
-3. **Develop Redis API Integration** (High Priority)
+3. **Develop Closure Support** (High Priority)
+   - Implement GetUpval, SetUpval, and Close opcodes
+   - Add Closure opcode for function creation
+   - Ensure proper upvalue handling
+
+4. **Develop Redis API Integration** (High Priority)
    - Create Redis context handling
    - Implement redis.call and redis.pcall functions
    - Set up proper KEYS and ARGV tables
 
-4. **Add Error Handling Improvements** (Medium Priority)
+5. **Add Error Handling Improvements** (Medium Priority)
    - Implement proper error propagation
    - Add line number information
    - Improve error messages
 
-5. **Develop Compiler** (Medium Priority)
+6. **Develop Compiler** (Medium Priority)
    - Create parser for Lua source code
    - Implement bytecode generation
    - Add register allocation
@@ -171,14 +189,22 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 ## Current Work Items
 
 ### VM Operations
-- [ ] Implement GetTable and SetTable operations with metamethod support
-- [ ] Add arithmetic operations (Add, Sub, Mul, Div)
-- [ ] Add comparison operations
+- [x] Add global variable access (GetGlobal/SetGlobal)
+- [x] Add control flow operations (Jmp, Test, TestSet)
+- [x] Add basic for loops (ForPrep, ForLoop) 
+- [x] Add generic for loops (TForLoop)
+- [ ] Add table creation operations (NewTable, SetList)
+- [ ] Add string operations (Concat, Len)
+- [ ] Add remaining arithmetic (Mod, Pow, Unm)
+- [ ] Add logical operations (Not)
 
 ### Metamethod System
-- [ ] Design metamethod lookup mechanism
-- [ ] Implement non-recursive metamethod execution
-- [ ] Create proper integration with VM operation queue
+- [x] Basic metamethod resolution framework
+- [x] Table operations with __index, __newindex
+- [x] Arithmetic operations (__add, __sub, __mul, __div)
+- [x] Comparison operations (__eq, __lt, __le)
+- [ ] Implement remaining metamethods
+- [ ] Add comprehensive tests for metamethods
 
 ### Redis Integration
 - [ ] Create redis_api.rs module
@@ -187,13 +213,12 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 
 ## Recent Changes
 
-- ✅ Replaced unsafe transmute with safe `from_raw_parts` method for handle creation
-- ✅ Implemented proper C function execution pattern with isolated execution context
-- ✅ Fixed borrow checker issues in transaction tests
-- ✅ Implemented comprehensive handle validation system
-- ✅ Added two-phase borrowing pattern for complex operations
-- ✅ Implemented proper validation caching for performance
-- ✅ Added context-aware error messages for handle validation
+- ✅ Implemented comparison operations (Eq, Lt, Le) with proper metamethod support
+- ✅ Implemented control flow operations (Jmp, Test, TestSet)
+- ✅ Implemented numeric for loops (ForPrep, ForLoop) with proper register handling
+- ✅ Implemented generic for loops (TForLoop) with both closure and C function support
+- ✅ Fixed various borrow checker issues in the core VM execution model
+- ✅ Added comprehensive test coverage for new opcodes
 
 ## Testing Status
 
@@ -202,9 +227,9 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 | Arena Tests | ✅ Passing | Basic arena operations verified |
 | Handle Tests | ✅ Passing | Type safety and validation confirmed |
 | Transaction Tests | ✅ Passing | 13 comprehensive tests covering all aspects of handle validation |
-| VM Tests | ⚠️ Partial | Basic operations tested, but not all opcodes |
+| VM Tests | ⚠️ Partial | Many operations tested and passing, but not all opcodes |
 | Redis Interface Tests | ❌ Not Started | Pending implementation |
-| Metamethod Tests | ❌ Not Started | Pending implementation |
+| Metamethod Tests | ⚠️ Partial | Basic metamethod functionality tested, but not comprehensive |
 
 ## Architecture Compliance
 
@@ -213,10 +238,12 @@ The implementation strictly follows these architectural principles:
 1. **Non-Recursive State Machine**: ✅ Compliant
    - Execution loop implemented with no recursion
    - Operations queued for later execution
+   - Proper handling of function calls, metamethods, and control flow
 
 2. **Transaction-Based Heap Access**: ✅ Compliant
    - All heap operations go through transactions
    - No direct heap access outside transactions
+   - Proper commit/rollback semantics
 
 3. **Handle-Based Memory Management**: ✅ Compliant
    - All dynamic objects use arena-based handles

@@ -12,6 +12,7 @@ mod heap;
 mod transaction;
 mod vm;
 mod error;
+mod metamethod;
 
 #[cfg(test)]
 mod test_basic;
