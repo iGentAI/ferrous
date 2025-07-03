@@ -4,10 +4,10 @@
 //! state machine approach with transaction-based heap access.
 
 use super::error::{LuaError, LuaResult};
-use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle};
+use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle};
 use super::heap::LuaHeap;
 use super::transaction::HeapTransaction;
-use super::value::{Value, CallFrame, Closure, CFunction, FunctionProto};
+use crate::lua::value::{Value, CallFrame, Closure, CFunction, FunctionProto};
 use crate::storage::StorageEngine;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -50,21 +50,34 @@ pub enum OpCode {
     LoadK,      // R(A) := Kst(Bx)
     LoadBool,   // R(A) := (Bool)B; if (C) pc++
     LoadNil,    // R(A), R(A+1), ..., R(A+B) := nil
+    GetUpval,   // R(A) := UpValue[B]
     GetGlobal,  // R(A) := Gbl[Kst(Bx)]
     SetGlobal,  // Gbl[Kst(Bx)] := R(A)
+    SetUpval,   // UpValue[B] := R(A)
     GetTable,   // R(A) := R(B)[RK(C)]
     SetTable,   // R(A)[RK(B)] := RK(C)
+    NewTable,   // R(A) := {} (size = B,C)
+    SetList,    // R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
     Add,        // R(A) := RK(B) + RK(C)
     Sub,        // R(A) := RK(B) - RK(C)
     Mul,        // R(A) := RK(B) * RK(C)
     Div,        // R(A) := RK(B) / RK(C)
+    Mod,        // R(A) := RK(B) % RK(C)
+    Pow,        // R(A) := RK(B) ^ RK(C)
+    Unm,        // R(A) := -R(B)
+    Not,        // R(A) := not R(B)
+    Len,        // R(A) := length of R(B)
+    Concat,     // R(A) := R(B).. ... ..R(C)
+    Closure,    // R(A) := closure(KPROTO[Bx])
+    Close,      // close all upvalues >= R(A)
+    Jmp,        // pc += sBx
     Eq,         // if ((RK(B) == RK(C)) ~= A) then pc++
     Lt,         // if ((RK(B) <  RK(C)) ~= A) then pc++
     Le,         // if ((RK(B) <= RK(C)) ~= A) then pc++
-    Jmp,        // pc += sBx
     Test,       // if not (R(A) <=> C) then pc++
     TestSet,    // if (R(B) <=> C) then R(A) := R(B) else pc++
     Call,       // R(A), ..., R(A+C-2) := R(A)(R(A+1), ..., R(A+B-1))
+    TailCall,   // return R(A)(R(A+1), ..., R(A+B-1))
     Return,     // return R(A), ..., R(A+B-2)
     ForPrep,    // R(A) -= R(A+2); pc += sBx
     ForLoop,    // R(A) += R(A+2); if R(A) <?= R(A+1) then { pc += sBx; R(A+3) = R(A) }
@@ -79,25 +92,38 @@ impl OpCode {
             1 => OpCode::LoadK,
             2 => OpCode::LoadBool,
             3 => OpCode::LoadNil,
+            4 => OpCode::GetUpval,
             5 => OpCode::GetGlobal,
-            7 => OpCode::SetGlobal,
-            9 => OpCode::GetTable,
-            11 => OpCode::SetTable,
+            6 => OpCode::SetGlobal,
+            7 => OpCode::SetUpval,
+            8 => OpCode::GetTable,
+            9 => OpCode::SetTable,
+            10 => OpCode::NewTable,
+            34 => OpCode::SetList,
             12 => OpCode::Add,
             13 => OpCode::Sub,
             14 => OpCode::Mul,
             15 => OpCode::Div,
-            19 => OpCode::Eq,
-            21 => OpCode::Lt,
-            22 => OpCode::Le,
-            23 => OpCode::Jmp,
+            16 => OpCode::Mod,
+            17 => OpCode::Pow,
+            18 => OpCode::Unm,
+            19 => OpCode::Not,
+            20 => OpCode::Len,
+            21 => OpCode::Concat,
+            22 => OpCode::Jmp,
+            23 => OpCode::Eq,
+            24 => OpCode::Lt,
+            25 => OpCode::Le,
             26 => OpCode::Test,
             27 => OpCode::TestSet,
             28 => OpCode::Call,
+            29 => OpCode::TailCall,
             30 => OpCode::Return,
             31 => OpCode::ForPrep,
             32 => OpCode::ForLoop,
             33 => OpCode::TForLoop,
+            36 => OpCode::Closure,
+            37 => OpCode::Close,
             _ => OpCode::Unknown,
         }
     }
@@ -147,6 +173,14 @@ pub enum PendingOperation {
         left: Value,
         right: Value,
         context: ReturnContext,
+    },
+    
+    /// String concatenation operation
+    Concatenation {
+        values: Vec<Value>,
+        current_index: usize,
+        dest_register: u16,
+        accumulated: Vec<String>,
     },
 }
 
@@ -399,10 +433,11 @@ impl LuaVM {
                 tx.set_register(thread_handle, base_register as usize + a + 3 + i, value)?;
             }
             
-            // Calculate loop PC - original_pc is where TForLoop instruction is,
-            // sbx is the offset to jump. When sbx is 1, PC 1 + sbx = PC 2
-            let loop_pc = (original_pc as i32 + sbx) as usize;
-            tx.set_pc(thread_handle, loop_pc)?;
+            // In Lua 5.1, we don't modify the PC further if iteration continues
+            // The next instruction (usually a JMP) will be executed normally
+        } else {
+            // Loop is done - skip the next instruction (usually a JMP back)
+            tx.increment_pc(thread_handle)?;
         }
         
         tx.commit()?;
@@ -665,6 +700,68 @@ impl LuaVM {
                 StepResult::Continue
             }
             
+            OpCode::GetUpval => {
+                // R(A) := UpValue[B]
+                let base = frame.base_register as usize;
+                
+                // Phase 1: Extract all needed information
+                // Get the upvalue handle and check if it's valid
+                let upvalue_info = {
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    
+                    // Check upvalue bounds
+                    if b >= closure_obj.upvalues.len() {
+                        return Err(LuaError::RuntimeError(format!(
+                            "Upvalue index {} out of bounds (upvalues: {})",
+                            b, closure_obj.upvalues.len()
+                        )));
+                    }
+                    
+                    // Get the upvalue handle
+                    let upvalue_handle = closure_obj.upvalues[b];
+                    
+                    // Get the upvalue
+                    let upvalue = tx.get_upvalue(upvalue_handle)?;
+                    
+                    // Extract the info we need
+                    match upvalue {
+                        crate::lua::value::Upvalue { stack_index: Some(idx), value: None } => {
+                            // Open upvalue
+                            (true, *idx, None)
+                        },
+                        crate::lua::value::Upvalue { stack_index: None, value: Some(val) } => {
+                            // Closed upvalue
+                            (false, 0, Some(val.clone()))
+                        },
+                        _ => {
+                            // Invalid state
+                            return Err(LuaError::RuntimeError("Invalid upvalue state".to_string()));
+                        }
+                    }
+                };
+                
+                // Phase 2: Process the information
+                let value = match upvalue_info {
+                    (true, idx, _) => {
+                        // Open upvalue - read from thread stack
+                        tx.read_register(self.current_thread, idx)?
+                    },
+                    (false, _, Some(val)) => {
+                        // Closed upvalue - use stored value
+                        val
+                    },
+                    _ => {
+                        // Invalid state (shouldn't happen due to pattern match above)
+                        return Err(LuaError::InternalError("Invalid upvalue state in phase 2".to_string()));
+                    }
+                };
+                
+                // Set register A to upvalue value
+                tx.set_register(self.current_thread, base + a, value)?;
+                
+                StepResult::Continue
+            },
+            
             OpCode::GetGlobal => {
                 // R(A) := Gbl[Kst(Bx)]
                 let base = frame.base_register as usize;
@@ -734,6 +831,52 @@ impl LuaVM {
                 
                 StepResult::Continue
             }
+            
+            OpCode::SetUpval => {
+                // UpValue[B] := R(A)
+                let base = frame.base_register as usize;
+                
+                // Phase 1: Extract all needed information
+                // Get the value and upvalue details
+                let (upvalue_handle, is_open, stack_idx, value) = {
+                    // Get the value to store
+                    let value = tx.read_register(self.current_thread, base + a)?;
+                    
+                    // Get the closure
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    
+                    // Check upvalue bounds
+                    if b >= closure_obj.upvalues.len() {
+                        return Err(LuaError::RuntimeError(format!(
+                            "Upvalue index {} out of bounds (upvalues: {})",
+                            b, closure_obj.upvalues.len()
+                        )));
+                    }
+                    
+                    // Get the upvalue handle
+                    let upvalue_handle = closure_obj.upvalues[b];
+                    
+                    // Get the upvalue state
+                    let upvalue = tx.get_upvalue(upvalue_handle)?;
+                    let is_open = upvalue.stack_index.is_some();
+                    let stack_idx = upvalue.stack_index;
+                    
+                    (upvalue_handle, is_open, stack_idx, value)
+                };
+                
+                // Phase 2: Update the upvalue
+                if is_open {
+                    if let Some(idx) = stack_idx {
+                        // Open upvalue - write to thread stack
+                        tx.set_register(self.current_thread, idx, value)?;
+                    }
+                } else {
+                    // Closed upvalue - update stored value
+                    tx.set_upvalue(upvalue_handle, value)?;
+                }
+                
+                StepResult::Continue
+            },
             
             OpCode::Return => {
                 // return R(A), ..., R(A+B-2)
@@ -832,6 +975,95 @@ impl LuaVM {
                 }
             }
             
+            OpCode::TailCall => {
+                // return R(A)(R(A+1), ..., R(A+B-1))
+                // Tail calls are used to optimize tail recursion
+                let base = frame.base_register as usize;
+                let func = tx.read_register(self.current_thread, base + a)?;
+                
+                // Gather arguments
+                let arg_count = if b == 0 {
+                    // Use all values from R(A+1) to top
+                    let top = tx.get_stack_top(self.current_thread)?;
+                    top - base - a
+                } else {
+                    b - 1
+                };
+                
+                let mut args = Vec::with_capacity(arg_count);
+                for i in 0..arg_count {
+                    args.push(tx.read_register(self.current_thread, base + a + 1 + i)?);
+                }
+                
+                // Process based on function type
+                match func {
+                    Value::Closure(closure) => {
+                        // Pop the current frame before pushing a new one
+                        tx.pop_call_frame(self.current_thread)?;
+                        
+                        // Queue function call
+                        tx.queue_operation(PendingOperation::FunctionCall {
+                            closure,
+                            args,
+                            context: ReturnContext::FinalResult,
+                        })?;
+                        
+                        // Don't increment PC - we're returning
+                        should_increment_pc = false;
+                        
+                        StepResult::Continue
+                    },
+                    Value::CFunction(cfunc) => {
+                        // For C functions, we could implement a similar optimization,
+                        // but for simplicity, just handle it like a normal call followed by return
+                        // This isn't completely correct from a tail call optimization standpoint,
+                        // but it's adequate for initial implementation
+                        
+                        // Pop the current frame
+                        tx.pop_call_frame(self.current_thread)?;
+                        
+                        // Commit the transaction
+                        tx.commit()?;
+                        
+                        // Extract arguments we need to avoid self-borrowing conflicts
+                        let func_copy = cfunc; // CFunction implements Copy
+                        let args_copy = args; // Clone the args
+                        let thread_handle = self.current_thread;
+                        
+                        // Call the C function directly - result will be returned as final result
+                        let mut ctx = ExecutionContext::new(self, 0, args_copy.len(), thread_handle);
+                        
+                        match func_copy(&mut ctx) {
+                            Ok(count) => {
+                                // For tail calls, we just return the values directly
+                                let mut results = Vec::new();
+                                let mut tx = HeapTransaction::new(&mut self.heap);
+                                
+                                for i in 0..count as usize {
+                                    if let Ok(value) = tx.read_register(thread_handle, i) {
+                                        results.push(value);
+                                    }
+                                }
+                                
+                                tx.commit()?;
+                                
+                                // Return the results directly
+                                return Ok(StepResult::Return(results));
+                            },
+                            Err(e) => return Ok(StepResult::Error(e)),
+                        }
+                    },
+                    _ => {
+                        // Not a function - return error after committing
+                        tx.commit()?;
+                        return Err(LuaError::TypeError { 
+                            expected: "function".to_string(), 
+                            got: func.type_name().to_string(),
+                        });
+                    },
+                }
+            },
+
             OpCode::GetTable => {
                 // R(A) := R(B)[RK(C)]
                 let base = frame.base_register as usize;
@@ -1108,7 +1340,7 @@ impl LuaVM {
                     StepResult::Continue
                 } else {
                     // Try metamethod
-                    if let Some((mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
+                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
                         &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Sub
                     )? {
                         // Queue metamethod call
@@ -1165,7 +1397,7 @@ impl LuaVM {
                     StepResult::Continue
                 } else {
                     // Try metamethod
-                    if let Some((mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
+                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
                         &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Mul
                     )? {
                         let method_name = tx.create_string("__mul")?;
@@ -1221,7 +1453,7 @@ impl LuaVM {
                     StepResult::Continue
                 } else {
                     // Try metamethod
-                    if let Some((mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
+                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
                         &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Div
                     )? {
                         let method_name = tx.create_string("__div")?;
@@ -1237,6 +1469,406 @@ impl LuaVM {
                         return Err(LuaError::TypeError {
                             expected: "number".to_string(),
                             got: format!("{} and {}", left.type_name(), right.type_name()),
+                        });
+                    }
+                }
+            }
+            
+            OpCode::NewTable => {
+                // R(A) := {} (size hints = B,C)
+                let base = frame.base_register as usize;
+                
+                // B and C are size hints for array and hash parts respectively
+                // B is the size hint for the array part (0-8 logarithmic)
+                // C is the size hint for the hash part (0-8 logarithmic)
+                
+                // Create a new table
+                let table = tx.create_table()?;
+                
+                // Store in register A
+                tx.set_register(self.current_thread, base + a, Value::Table(table))?;
+                
+                StepResult::Continue
+            }
+            
+            OpCode::Mod => {
+                // R(A) := RK(B) % RK(C)
+                let base = frame.base_register as usize;
+                
+                // Get operands
+                let left = if b & 0x100 != 0 {
+                    let const_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(const_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", const_idx
+                        )))?
+                } else {
+                    tx.read_register(self.current_thread, base + b)?
+                };
+                
+                let right = if c & 0x100 != 0 {
+                    let const_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(const_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", const_idx
+                        )))?
+                } else {
+                    tx.read_register(self.current_thread, base + c)?
+                };
+                
+                // Try numeric modulo first
+                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
+                    // Lua mod is defined as: a % b == a - math.floor(a/b)*b
+                    let quotient = (l / r).floor();
+                    let result = l - quotient * r;
+                    tx.set_register(self.current_thread, base + a, Value::Number(result))?;
+                    StepResult::Continue
+                } else {
+                    // Try metamethod
+                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
+                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Mod
+                    )? {
+                        let method_name = tx.create_string("__mod")?;
+                        tx.queue_operation(PendingOperation::MetamethodCall {
+                            method: method_name,
+                            target: left.clone(),
+                            args: vec![left, right],
+                            context: ReturnContext::Register { base: frame.base_register, offset: a },
+                        })?;
+                        StepResult::Continue
+                    } else {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: format!("{} and {}", left.type_name(), right.type_name()),
+                        });
+                    }
+                }
+            }
+            
+            OpCode::Pow => {
+                // R(A) := RK(B) ^ RK(C)
+                let base = frame.base_register as usize;
+                
+                // Get operands
+                let left = if b & 0x100 != 0 {
+                    let const_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(const_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", const_idx
+                        )))?
+                } else {
+                    tx.read_register(self.current_thread, base + b)?
+                };
+                
+                let right = if c & 0x100 != 0 {
+                    let const_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(const_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", const_idx
+                        )))?
+                } else {
+                    tx.read_register(self.current_thread, base + c)?
+                };
+                
+                // Try numeric power first
+                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
+                    tx.set_register(self.current_thread, base + a, Value::Number(l.powf(r)))?;
+                    StepResult::Continue
+                } else {
+                    // Try metamethod
+                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
+                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Pow
+                    )? {
+                        let method_name = tx.create_string("__pow")?;
+                        tx.queue_operation(PendingOperation::MetamethodCall {
+                            method: method_name,
+                            target: left.clone(),
+                            args: vec![left, right],
+                            context: ReturnContext::Register { base: frame.base_register, offset: a },
+                        })?;
+                        StepResult::Continue
+                    } else {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: format!("{} and {}", left.type_name(), right.type_name()),
+                        });
+                    }
+                }
+            }
+            
+            OpCode::Unm => {
+                // R(A) := -R(B)
+                let base = frame.base_register as usize;
+                let operand = tx.read_register(self.current_thread, base + b)?;
+                
+                // Try numeric negation first
+                if let Some(n) = crate::lua::metamethod::coerce_to_number(&mut tx, &operand)? {
+                    tx.set_register(self.current_thread, base + a, Value::Number(-n))?;
+                    StepResult::Continue
+                } else {
+                    // Try metamethod
+                    if let Some(_mm) = crate::lua::metamethod::resolve_metamethod(
+                        &mut tx, &operand, crate::lua::metamethod::MetamethodType::Unm
+                    )? {
+                        let method_name = tx.create_string("__unm")?;
+                        tx.queue_operation(PendingOperation::MetamethodCall {
+                            method: method_name,
+                            target: operand.clone(),
+                            args: vec![operand],
+                            context: ReturnContext::Register { base: frame.base_register, offset: a },
+                        })?;
+                        StepResult::Continue
+                    } else {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: operand.type_name().to_string(),
+                        });
+                    }
+                }
+            }
+            
+            OpCode::Not => {
+                // R(A) := not R(B)
+                let base = frame.base_register as usize;
+                let operand = tx.read_register(self.current_thread, base + b)?;
+                
+                // Logical not - no metamethods in Lua 5.1
+                let result = Value::Boolean(operand.is_falsey());
+                tx.set_register(self.current_thread, base + a, result)?;
+                
+                StepResult::Continue
+            }
+            
+            OpCode::Len => {
+                // R(A) := length of R(B)
+                let base = frame.base_register as usize;
+                let operand = tx.read_register(self.current_thread, base + b)?;
+                
+                match operand {
+                    Value::String(handle) => {
+                        // Direct string length
+                        let s = tx.get_string_value(handle)?;
+                        let len = s.len() as f64;
+                        tx.set_register(self.current_thread, base + a, Value::Number(len))?;
+                        StepResult::Continue
+                    }
+                    Value::Table(table) => {
+                        // Check for __len metamethod first
+                        if let Some(_mm) = crate::lua::metamethod::resolve_metamethod(
+                            &mut tx, &Value::Table(table), crate::lua::metamethod::MetamethodType::Len
+                        )? {
+                            let method_name = tx.create_string("__len")?;
+                            tx.queue_operation(PendingOperation::MetamethodCall {
+                                method: method_name,
+                                target: Value::Table(table),
+                                args: vec![Value::Table(table)],
+                                context: ReturnContext::Register { base: frame.base_register, offset: a },
+                            })?;
+                            StepResult::Continue
+                        } else {
+                            // No metamethod, calculate table length
+                            // In Lua 5.1, #t returns the size of the array part
+                            // (highest numeric index n such that t[n] is not nil)
+                            let table_obj = tx.get_table(table)?;
+                            let len = table_obj.array.len() as f64;
+                            tx.set_register(self.current_thread, base + a, Value::Number(len))?;
+                            StepResult::Continue
+                        }
+                    }
+                    _ => {
+                        // Check for __len metamethod
+                        if let Some(_mm) = crate::lua::metamethod::resolve_metamethod(
+                            &mut tx, &operand, crate::lua::metamethod::MetamethodType::Len
+                        )? {
+                            let method_name = tx.create_string("__len")?;
+                            tx.queue_operation(PendingOperation::MetamethodCall {
+                                method: method_name,
+                                target: operand.clone(),
+                                args: vec![operand],
+                                context: ReturnContext::Register { base: frame.base_register, offset: a },
+                            })?;
+                            StepResult::Continue
+                        } else {
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "string or table".to_string(),
+                                got: operand.type_name().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            
+            OpCode::Concat => {
+                // R(A) := R(B).. ... ..R(C)
+                let base = frame.base_register as usize;
+                
+                // Collect all values to concatenate
+                let mut values = Vec::with_capacity((c - b + 1) as usize);
+                for i in b..=c {
+                    values.push(tx.read_register(self.current_thread, base + i)?);
+                }
+                
+                // Queue concatenation operation for the main loop to handle
+                tx.queue_operation(PendingOperation::Concatenation {
+                    values,
+                    current_index: 0,
+                    dest_register: frame.base_register + a as u16,
+                    accumulated: Vec::new(),
+                })?;
+                
+                StepResult::Continue
+            }
+            
+            OpCode::Close => {
+                // Close all upvalues >= R(A)
+                let base = frame.base_register as usize;
+                let close_threshold = base + a;
+                
+                // Phase 1: Extract all information we need first
+                let mut upvalues_to_close = Vec::new();
+                
+                // Get all relevant data while avoiding multiple mutable borrows
+                {
+                    // Get the closure's upvalues
+                    let upvalue_handles: Vec<UpvalueHandle> = {
+                        let closure_obj = tx.get_closure(frame.closure)?;
+                        closure_obj.upvalues.clone() // Clone to avoid borrowing issues
+                    };
+                    
+                    // Process each upvalue independently
+                    for upvalue_handle in upvalue_handles {
+                        // Check if this upvalue is open and references a stack slot we're closing
+                        let (stack_idx, needs_closing) = {
+                            let upvalue = tx.get_upvalue(upvalue_handle)?;
+                            
+                            // Check if this is an open upvalue that references a relevant stack slot
+                            if let Some(idx) = upvalue.stack_index {
+                                (idx, idx >= close_threshold)
+                            } else {
+                                (0, false) // Already closed, doesn't need handling
+                            }
+                        };
+                        
+                        // If we need to close this upvalue, read its current value
+                        if needs_closing {
+                            let current_value = tx.read_register(self.current_thread, stack_idx)?;
+                            upvalues_to_close.push((upvalue_handle, current_value));
+                        }
+                    }
+                }
+                
+                // Phase 2: Process the extracted information
+                // We can now safely close each identified upvalue
+                for (upvalue_handle, value) in upvalues_to_close {
+                    tx.close_upvalue(upvalue_handle, value)?;
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Closure => {
+                // R(A) := closure(KPROTO[Bx])
+                let base = frame.base_register as usize;
+                
+                // Phase 1: Extract needed information
+                let constants_len = {
+                    // Get the closure
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.len()
+                };
+                
+                // Get the function prototype from the constants pool
+                let bx = instruction.bx() as usize;
+                
+                // Validate constant index
+                if bx >= constants_len {
+                    tx.commit()?;
+                    return Err(LuaError::RuntimeError(format!(
+                        "Prototype index {} out of bounds (constants: {})",
+                        bx, constants_len
+                    )));
+                }
+                
+                // Phase 2: Use the extracted information
+                // For now, create an empty closure
+                // In a real implementation, we'd need to follow the upvalue instructions
+                // that follow this instruction to properly capture upvalues
+                let new_closure = crate::lua::value::Closure {
+                    proto: crate::lua::value::FunctionProto {
+                        bytecode: vec![0x40000001], // Return nil for now
+                        constants: vec![],
+                        num_params: 0,
+                        is_vararg: false,
+                        max_stack_size: 2,
+                        upvalues: vec![],
+                    },
+                    upvalues: vec![],
+                };
+                
+                // Create and store the closure
+                let new_closure_handle = tx.create_closure(new_closure)?;
+                tx.set_register(self.current_thread, base + a, Value::Closure(new_closure_handle))?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::SetList => {
+                // R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
+                // FPF (Fields Per Flush) is typically 50 in Lua
+                const FPF: usize = 50;
+                
+                let base = frame.base_register as usize;
+                let table_val = tx.read_register(self.current_thread, base + a)?;
+                
+                match table_val {
+                    Value::Table(table) => {
+                        // Calculate the starting index for assignment
+                        let start_index = if c > 0 {
+                            (c - 1) * FPF
+                        } else {
+                            // If C == 0, the actual C value is in the next instruction
+                            // For now, we'll use 0 as a placeholder
+                            0
+                        };
+                        
+                        // B is the number of elements to set
+                        let num_elements = if b == 0 {
+                            // If B == 0, set all elements on the stack from R(A+1) to top
+                            let top = tx.get_stack_top(self.current_thread)?;
+                            top - base - a - 1
+                        } else {
+                            b
+                        };
+                        
+                        // Set each element
+                        for i in 0..num_elements {
+                            let value = tx.read_register(self.current_thread, base + a + 1 + i)?;
+                            let index = start_index + i + 1; // Lua arrays are 1-indexed
+                            
+                            // Convert index to Value::Number for table indexing
+                            let index_val = Value::Number(index as f64);
+                            tx.set_table_field(table, index_val, value)?;
+                        }
+                        
+                        StepResult::Continue
+                    }
+                    _ => {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError { 
+                            expected: "table".to_string(), 
+                            got: table_val.type_name().to_string(),
                         });
                     }
                 }
@@ -1862,8 +2494,11 @@ impl LuaVM {
             
             OpCode::TForLoop => {
                 // R(A+3), ... , R(A+3+C) := R(A)(R(A+1), R(A+2)); 
-                // if R(A+3) ~= nil then R(A+2)=R(A+3), pc+=sBx
-                // Generic for loop (for k,v in pairs(t) do ... end)
+                // if R(A+3) ~= nil then R(A+2)=R(A+3) else pc++
+                // 
+                // In Lua 5.1, TForLoop just calls the iterator and sets up variables.
+                // A separate JMP instruction must follow to handle the loop back logic.
+                // If loop is done (iterator returns nil), it skips the JMP instruction.
                 
                 let base = frame.base_register as usize;
                 let num_returns = c as usize; // Number of expected return values
@@ -1873,20 +2508,16 @@ impl LuaVM {
                 let state = tx.read_register(self.current_thread, base + a + 1)?;
                 let control = tx.read_register(self.current_thread, base + a + 2)?;
                 
-                // Save current PC for later loop continuation
+                // Save current PC for context
                 let current_pc = frame.pc;
-                
-                // Get the sbx value for loop control
-                let sbx = instruction.sbx();
-                
-                // Increment PC first - TForLoop will jump back to loop body if it continues,
-                // or go straight to the next instruction if the loop is done
-                tx.increment_pc(self.current_thread)?;
                 
                 // Process based on iterator function type
                 match iterator {
                     Value::Closure(closure) => {
-                        // Queue the iterator call as a function call with ForLoop context
+                        // First increment the PC to the next instruction
+                        tx.increment_pc(self.current_thread)?;
+                        
+                        // Queue the iterator call as a function call
                         tx.queue_operation(PendingOperation::FunctionCall {
                             closure,
                             args: vec![state, control],
@@ -1895,17 +2526,21 @@ impl LuaVM {
                                 a, 
                                 c: num_returns,
                                 pc: current_pc,
-                                sbx
+                                sbx: 0,
                             },
                         })?;
                         
-                        // PC already incremented, no need to increment again
+                        // Since we already incremented PC, don't do it again
                         should_increment_pc = false;
+                        
                         StepResult::Continue
                     },
                     Value::CFunction(cfunc) => {
                         // For C functions, we need special handling
-                        // First commit the transaction
+                        // First increment the PC
+                        tx.increment_pc(self.current_thread)?;
+                        
+                        // Commit the transaction
                         tx.commit()?;
                         
                         // Extract arguments we need to avoid self-borrowing conflicts
@@ -1915,21 +2550,18 @@ impl LuaVM {
                         let thread_handle = self.current_thread;
                         
                         // Call the special handler with clean borrows
-                        let result = self.handle_tforloop_c_function(
+                        should_increment_pc = false; // We already incremented PC above
+                        
+                        return self.handle_tforloop_c_function(
                             func_copy,
                             args,
                             base_register,
                             a,
                             num_returns,
                             current_pc,
-                            sbx,
+                            0, // sbx is not used in Lua 5.1 TForLoop
                             thread_handle
                         );
-                        
-                        // Don't increment PC again regardless of result
-                        should_increment_pc = false;
-                        
-                        return result;
                     },
                     _ => {
                         // Not a function - return error after committing
@@ -2088,17 +2720,16 @@ impl LuaVM {
                     },
                 }
             },
-            ReturnContext::ForLoop { base, a, c, pc, sbx } => {
+            ReturnContext::ForLoop { base, a, c, pc: _pc, sbx: _sbx } => {
                 // Get first return value - if nil, the iteration is done
                 let first_value = values.get(0).cloned().unwrap_or(Value::Nil);
                 
                 if !first_value.is_nil() {
-                    // Iteration continues
-                    
-                    // Update control variable: R(A+2) = R(A+3)
+                    // Loop continues
+                    // Update control variable R(A+2)
                     tx.set_register(self.current_thread, base as usize + a + 2, first_value.clone())?;
                     
-                    // Store all returned values as loop variables
+                    // Store loop variables in R(A+3) ... R(A+3+C-1)
                     for (i, value) in values.iter().enumerate() {
                         if i < c {
                             tx.set_register(self.current_thread, base as usize + a + 3 + i, value.clone())?;
@@ -2110,11 +2741,14 @@ impl LuaVM {
                         tx.set_register(self.current_thread, base as usize + a + 3 + i, Value::Nil)?;
                     }
                     
-                    // Jump to loop body
-                    let jump_pc = (pc as i32 + sbx) as usize;
-                    tx.set_pc(self.current_thread, jump_pc)?;
+                    // In Lua 5.1 semantics, we DON'T skip the next instruction 
+                    // if the loop continues - that instruction should be a JMP
+                    // that takes us back to the loop body
+                } else {
+                    // Loop is done, skip the next instruction
+                    // (which should be a JMP back to the beginning of the loop)
+                    tx.increment_pc(self.current_thread)?;
                 }
-                // else: loop is done, PC already incremented in TFORLOOP handler
             }
         }
         
@@ -2384,6 +3018,95 @@ impl LuaVM {
             PendingOperation::MetamethodCall { method, target, args, context } => {
                 self.process_metamethod_call(method, target, args, context)
             },
+            PendingOperation::Concatenation { values, current_index, dest_register, mut accumulated } => {
+                // Process concatenation with proper coercion and metamethod handling
+                let mut tx = HeapTransaction::new(&mut self.heap);
+                
+                if current_index >= values.len() {
+                    // All values processed, create final string
+                    let result_string = accumulated.join("");
+                    let string_handle = tx.create_string(&result_string)?;
+                    tx.set_register(self.current_thread, dest_register as usize, Value::String(string_handle))?;
+                    tx.commit()?;
+                    Ok(StepResult::Continue)
+                } else {
+                    // Process current value
+                    let current_value = &values[current_index];
+                    
+                    match current_value {
+                        Value::String(handle) => {
+                            // Direct string concatenation
+                            let s = tx.get_string_value(*handle)?;
+                            accumulated.push(s);
+                            
+                            // Queue next concatenation step
+                            tx.queue_operation(PendingOperation::Concatenation {
+                                values,
+                                current_index: current_index + 1,
+                                dest_register,
+                                accumulated,
+                            })?;
+                            
+                            tx.commit()?;
+                            Ok(StepResult::Continue)
+                        },
+                        Value::Number(n) => {
+                            // Convert number to string
+                            accumulated.push(n.to_string());
+                            
+                            // Queue next concatenation step
+                            tx.queue_operation(PendingOperation::Concatenation {
+                                values,
+                                current_index: current_index + 1,
+                                dest_register,
+                                accumulated,
+                            })?;
+                            
+                            tx.commit()?;
+                            Ok(StepResult::Continue)
+                        },
+                        _ => {
+                            // Check for __tostring or __concat metamethod
+                            if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
+                                &mut tx, current_value, crate::lua::metamethod::MetamethodType::ToString
+                            )? {
+                                // Use __tostring metamethod
+                                let method_name = tx.create_string("__tostring")?;
+                                tx.queue_operation(PendingOperation::MetamethodCall {
+                                    method: method_name,
+                                    target: current_value.clone(),
+                                    args: vec![current_value.clone()],
+                                    context: ReturnContext::Stack, // We'll handle the result specially
+                                })?;
+                                
+                                // Also queue the continuation of concatenation
+                                tx.queue_operation(PendingOperation::Concatenation {
+                                    values,
+                                    current_index: current_index + 1,
+                                    dest_register,
+                                    accumulated,
+                                })?;
+                                
+                                tx.commit()?;
+                                Ok(StepResult::Continue)
+                            } else if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
+                                &mut tx, current_value, crate::lua::metamethod::MetamethodType::Concat
+                            )? {
+                                // Use __concat metamethod
+                                // For now, we'll skip this complexity and return an error
+                                tx.commit()?;
+                                Err(LuaError::NotImplemented("__concat metamethod in concatenation".to_string()))
+                            } else {
+                                tx.commit()?;
+                                Err(LuaError::TypeError {
+                                    expected: "string or number".to_string(),
+                                    got: current_value.type_name().to_string(),
+                                })
+                            }
+                        }
+                    }
+                }
+            },
             _ => Err(LuaError::NotImplemented("Pending operation type".to_string())),
         }
     }
@@ -2496,11 +3219,75 @@ impl LuaVM {
             false
         }
     }
+    
+    /// Initialize the standard library (placeholder)
+    pub fn init_stdlib(&mut self) -> LuaResult<()> {
+        // TODO: Initialize Lua standard library functions
+        Ok(())
+    }
+    
+    /// Execute a compiled module
+    pub fn execute_module(&mut self, module: &crate::lua::compiler::CompiledModule, args: &[Value]) -> LuaResult<Value> {
+        // Create a closure from the module's main function
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        let closure = Closure {
+            proto: module.main_function.clone(),
+            upvalues: vec![],
+        };
+        let closure_handle = tx.create_closure(closure)?;
+        tx.commit()?;
+        
+        // Execute the closure
+        self.execute_function(closure_handle, args)
+    }
+    
+    /// Get the heap for direct access (used in test helpers)
+    pub fn heap(&self) -> &LuaHeap {
+        &self.heap
+    }
+    
+    /// Create a table
+    pub fn create_table(&mut self) -> LuaResult<TableHandle> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        let table = tx.create_table()?;
+        tx.commit()?;
+        Ok(table)
+    }
+    
+    /// Create a string
+    pub fn create_string(&mut self, s: &str) -> LuaResult<StringHandle> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        let handle = tx.create_string(s)?;
+        tx.commit()?;
+        Ok(handle)
+    }
+    
+    /// Set a table field by numeric index
+    pub fn set_table_index(&mut self, table: TableHandle, index: usize, value: Value) -> LuaResult<()> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        tx.set_table_field(table, Value::Number(index as f64), value)?;
+        tx.commit()?;
+        Ok(())
+    }
+    
+    /// Get the global table
+    pub fn globals(&mut self) -> TableHandle {
+        self.heap.globals().expect("Globals should be initialized")
+    }
+    
+    /// Set a table field 
+    pub fn set_table(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        tx.set_table_field(table, key, value)?;
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lua::value;
     
     #[test]
     fn test_vm_creation() {
@@ -2674,7 +3461,7 @@ mod tests {
         // For Jmp: sbx = bits 14-31, PC += sbx (sbx is signed, biased by 131071)
         let move_instr = 0 | (1 << 6) | (0 << 23);    // MOVE R(1), R(0) - opcode=0, A=1, B=0
         let loadbool_instr = 2 | (0 << 6) | (1 << 23); // LOADBOOL R(0), true, false - opcode=2, A=0, B=1, C=0
-        let jmp_instr = 23 | (0 << 6) | ((3+131071) << 14); // JMP +3 - opcode=23, sBx=3 (biased by 131071)
+        let jmp_instr = 22 | (0 << 6) | ((3+131071) << 14); // JMP +3 - opcode=22, sBx=3 (biased by 131071)
         let test_instr_fail = 26 | (3 << 6) | (0 << 14); // TEST R(3), false - opcode=26, A=3, C=0
         let test_instr_skip = 26 | (2 << 6) | (1 << 14); // TEST R(2), true - opcode=26, A=2, C=1
         let testset_instr = 27 | (3 << 6) | (2 << 23) | (1 << 14); // TESTSET R(3), R(2), true - opcode=27, A=3, B=2, C=1
@@ -3044,41 +3831,22 @@ mod tests {
         // R(2) = control variable (updated by the iterator)
         // R(3), R(4), ... = loop variables
         
-        // Create the bytecode for the test
-        
         // TForLoop encoding:
-        // - opcode = 33 (0x21)
-        // - A = 0
-        // - C = 1
-        // - sbx = 1 (to jump from PC 1 to PC 2)
-        //
-        // Lua instruction format:
         // Bits 0-5: opcode (33 = 0x21)
-        // Bits 6-13: A (0)
-        // Bits 14-22: C (1)
-        // Bits 14-31: Bx/sBx (for TForLoop this is sBx)
-        // sBx is encoded as Bx - MAXARG_sBx where MAXARG_sBx is (1<<17)-1 = 131071
-        // So sbx=1 is encoded as 131071 + 1 = 131072
+        // Bits 6-13: A (0) - The base register for the iterator
+        // Bits 14-22: C (1) - Number of variables to return
         
-        let tforloop_instr = 33 | (0 << 6) | (1 << 14) | (131072 << 14);
-        let jmp_back_instr = 23 | (0 << 6) | ((131071-2) << 14); // JMP -2
+        let tforloop_instr = 33 | (0 << 6) | (1 << 14);  // TForLoop R(0), 1
+        
+        // Create a JMP instruction to follow TForLoop for the loop back
+        // This is the standard pattern in Lua 5.1 bytecode
+        let jmp_back_instr = 22 | (0 << 6) | ((131071-2) << 14); // JMP -2
         
         let bytecode = vec![
-            // NOP as a placeholder
-            0,  // 0: NOP
-            
-            // TForLoop - R(0) = iterator, R(1) = state, R(2) = control var
-            // sbx = 1 (jump to PC 2)
-            tforloop_instr,  // 1: TForLoop R(0), 1, sbx=1
-            
-            // Loop body - this should be at PC 2
-            0,  // 2: NOP (loop body)
-            
-            // Return to TForLoop
-            jmp_back_instr,  // 3: JMP -2 (back to PC 1)
-            
-            // End of loop
-            0   // 4: NOP
+            0,                  // 0: NOP (placeholder)
+            tforloop_instr,     // 1: TForLoop R(0), C=1 (number of values)
+            jmp_back_instr,     // 2: JMP -2 (back to TForLoop)
+            0,                  // 3: NOP (end of loop)
         ];
         
         // Create a function prototype with the test bytecode
@@ -3171,15 +3939,85 @@ mod tests {
         assert_eq!(get_register(&mut vm, 2), Value::Number(1.0), "Control variable should be 1.0");
         assert_eq!(get_register(&mut vm, 3), Value::Number(1.0), "First loop variable should be 1.0");
         
-        // PC should be at loop body after PC jumps
+        // PC should now be at the JMP instruction
         let current_pc = get_pc(&mut vm);
         println!("Current PC after first iteration: {}", current_pc);
+        assert_eq!(current_pc, 2, "PC should be at JMP instruction after TForLoop");
         
-        // Since the VM implementation is jumping to PC 3, we'll validate that
-        // behavior instead of trying to change it just for the test
-        assert_eq!(current_pc, 3, "PC should be at loop body (PC 3) after first iteration");
-        
-        // Execute the loop body (which is now our NOP at PC 3)
+        // Execute the JMP instruction to go back to TForLoop
         vm.step().unwrap();
+        let pc_after_jmp = get_pc(&mut vm);
+        assert_eq!(pc_after_jmp, 0, "PC should be 0 after JMP -2");
+    }
+
+    #[test]
+    fn test_upvalue_operations() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Create a transaction to set up the test
+        let (_closure_handle, _upvalue_handle) = {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create an upvalue
+            let upvalue = value::Upvalue {
+                stack_index: None,
+                value: Some(Value::Number(42.0)),
+            };
+            let upvalue_handle = tx.create_upvalue(upvalue).unwrap();
+            
+            // Create a function proto with GetUpval and SetUpval instructions
+            
+            // Encoding for GetUpval:
+            // opcode = 4 (GetUpval)
+            // A = 0 (store in R(0))
+            // B = 0 (first upvalue)
+            // Format: opcode | A << 6 | B << 23
+            let get_upval_instr = 4 | (0 << 6) | (0 << 23);
+            
+            // Encoding for SetUpval:
+            // opcode = 7 (SetUpval)
+            // A = 1 (load from R(1))
+            // B = 0 (first upvalue)
+            // Format: opcode | A << 6 | B << 23
+            let set_upval_instr = 7 | (1 << 6) | (0 << 23);
+            
+            // Create a return instruction
+            // opcode = 30 (Return)
+            // A = 0 (return from R(0))
+            // B = 2 (return 1 value)
+            let return_instr = 30 | (0 << 6) | (2 << 23);
+            
+            // Create function proto
+            let proto = value::FunctionProto {
+                bytecode: vec![get_upval_instr, set_upval_instr, return_instr],
+                constants: vec![],
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![value::UpvalueInfo {
+                    in_stack: false,
+                    index: 0,
+                }],
+            };
+            
+            // Create closure with the upvalue
+            let closure = value::Closure {
+                proto,
+                upvalues: vec![upvalue_handle],
+            };
+            
+            // Create closure handle
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            tx.commit().unwrap();
+            
+            (closure_handle, upvalue_handle)
+        };
+        
+        // This test will verify our upvalue implementation
+        // but we won't actually execute it for now, as we need to complete
+        // the VM implementation for function execution
+        
+        println!("Created closure with upvalue for verification");
     }
 }

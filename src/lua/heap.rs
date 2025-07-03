@@ -231,6 +231,13 @@ impl LuaHeap {
             .ok_or(LuaError::InvalidHandle)
     }
     
+    /// Get the string value from a handle
+    pub fn get_string_value(&self, handle: StringHandle) -> LuaResult<String> {
+        self.strings.get(handle.0)
+            .map(|s| String::from_utf8_lossy(&s.bytes).to_string())
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
     pub(crate) fn get_table(&self, handle: TableHandle) -> LuaResult<&Table> {
         self.tables.get(handle.0)
             .ok_or(LuaError::InvalidHandle)

@@ -360,6 +360,16 @@ impl<'a> HeapTransaction<'a> {
         
         Ok(handle)
     }
+
+    /// Get a table reference
+    pub fn get_table(&mut self, handle: TableHandle) -> LuaResult<&super::value::Table> {
+        self.ensure_active()?;
+        
+        // Validate the handle
+        self.validate_with_context(&handle, "get_table")?;
+        
+        self.heap.get_table(handle)
+    }
     
     /// Read a table field
     pub fn read_table_field(&mut self, table: TableHandle, key: &Value) -> LuaResult<Value> {
@@ -513,6 +523,16 @@ impl<'a> HeapTransaction<'a> {
         self.validation_scope.mark_created(&handle);
         
         Ok(handle)
+    }
+    
+    /// Get a thread
+    pub fn get_thread(&mut self, handle: ThreadHandle) -> LuaResult<&super::value::Thread> {
+        self.ensure_active()?;
+        
+        // Validate the handle
+        self.validate_with_context(&handle, "get_thread")?;
+        
+        self.heap.get_thread(handle)
     }
     
     /// Read a register value
@@ -737,8 +757,8 @@ impl<'a> HeapTransaction<'a> {
         Ok(handle)
     }
     
-    /// Get upvalue
-    pub fn get_upvalue(&mut self, handle: UpvalueHandle) -> LuaResult<&Upvalue> {
+    /// Get an upvalue reference
+    pub fn get_upvalue(&mut self, handle: UpvalueHandle) -> LuaResult<&super::value::Upvalue> {
         self.ensure_active()?;
         
         // Validate the handle

@@ -155,7 +155,7 @@ impl std::hash::Hash for Value {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaString {
     /// UTF-8 bytes of the string
-    bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
 }
 
 impl LuaString {
@@ -209,7 +209,7 @@ impl From<String> for LuaString {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
     /// Array part of the table
-    array: Vec<Value>,
+    pub array: Vec<Value>,
     
     /// HashMap part of the table
     map: HashMap<HashableValue, Value>,

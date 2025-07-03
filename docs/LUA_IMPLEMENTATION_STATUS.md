@@ -4,7 +4,7 @@
 
 This document tracks the implementation status of the Lua VM for Ferrous Redis. It is based on the architectural specifications in the `LUA_ARCHITECTURE.md`, `LUA_TRANSACTION_PATTERNS.md`, and other design documents.
 
-**Current Overall Status**: Core foundation components implemented and validated with comprehensive test suite. Key architectural patterns (handle validation and C function execution) in place with working control flow and loop opcodes, but several higher-level components are still missing.
+**Current Overall Status**: Core foundation components implemented and validated with comprehensive test suite. Key architectural patterns (handle validation and transaction system) in place with working control flow and basic opcodes, but several critical components are incomplete or contain placeholder implementations.
 
 ## Core Components Status
 
@@ -17,219 +17,157 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 | **Transaction** | ✅ Complete | Fully implemented with proper validation and caching | Done |
 | **Handle Validation** | ✅ Complete | Type-safe validation framework with validation caching implemented | Done |
 | **C Function Execution** | ✅ Complete | Isolated execution context with transaction-safe boundaries | Done |
-| **VM Structure** | ⚠️ Partial | Core state machine in place with many opcodes implemented, but some still missing | High |
-| **Compiler** | ❌ Missing | No parser or bytecode generation | Medium |
-| **Metamethod System** | ⚠️ Partial | Basic metamethod support for tables, arithmetic, and comparisons, but many metamethods missing | High |
-| **Redis API Integration** | ❌ Missing | No Redis function interface | High |
+| **VM Structure** | ⚠️ Partial | Core state machine in place with many opcodes implemented, but some still missing or contain placeholders | High |
+| **Compiler** | ❌ Missing | Stub implementation returns hardcoded function; no parser or bytecode generation | Medium |
+| **Metamethod System** | ⚠️ Partial | Basic metamethod support for tables, arithmetic, and comparisons, but many metamethods missing or incomplete | High |
+| **Redis API Integration** | ❌ Missing | Almost completely absent; returns "not implemented" errors | High |
 | **Error Handling** | ⚠️ Partial | Error types defined but not fully implemented | Medium |
 
-## Detailed Status
+## VM Opcode Implementation Status
 
-### Arena System
-- **Status**: ✅ Complete
-- **Features**:
-  - Generational arena with slot recycling
-  - Safe handle-based memory management
-  - Handle validation mechanisms
-- **Tests**: Basic arena operations test passes
+### Basic Operations
 
-### Handle System
-- **Status**: ✅ Complete
-- **Features**:
-  - Typed handle wrappers (StringHandle, TableHandle, etc.)
-  - Proper `Copy` trait implementation
-  - Resource trait for handled objects
-  - Safe type-specific handle creation with `from_raw_parts`
-- **Issues Fixed**:
-  - Fixed `Copy` trait implementation to work without requiring `T: Copy`
-  - Fixed `Hash` traits for all handle types
-  - Replaced unsafe transmute code with safe alternative
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **Move** | ✅ Complete | Correctly transfers values between registers |
+| **LoadK** | ✅ Complete | Loads constants into registers |
+| **LoadBool** | ✅ Complete | Loads boolean values with conditional PC increment |
+| **LoadNil** | ✅ Complete | Sets registers to nil |
 
-### Value System
-- **Status**: ✅ Complete
-- **Features**:
-  - All Lua types (nil, boolean, number, string, table, etc.)
-  - Proper table implementation with array and hash parts
-  - Support for metatables (structure only)
-- **Issues Fixed**:
-  - Fixed `Hash` implementation for `Table` to handle `HashMap` fields properly
+### Table Operations
 
-### Heap
-- **Status**: ✅ Complete
-- **Features**:
-  - Storage for all object types in arenas
-  - String interning for efficiency
-  - Base methods for object creation and access
-  - Proper pre-reallocation validation
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **GetTable** | ✅ Complete | Gets table values with proper metamethod handling |
+| **SetTable** | ✅ Complete | Sets table values with proper metamethod handling |
+| **NewTable** | ✅ Complete | Creates new tables |
+| **SetList** | ⚠️ Partial | Basic implementation, but C=0 case uses placeholder value instead of reading next instruction |
 
-### Transaction System
-- **Status**: ✅ Complete
-- **Features Implemented**:
-  - Transaction creation
-  - Change tracking
-  - Atomic commit mechanism
-  - Transaction state management
-  - Comprehensive handle validation
-  - Two-phase borrowing pattern
-  - Validation caching for performance
+### Global Variable Access 
 
-### Handle Validation
-- **Status**: ✅ Complete
-- **Features Implemented**:
-  - Type-safe validation via `ValidatableHandle` trait
-  - Validation caching for performance
-  - Explicit validation at transaction boundaries
-  - Pre-reallocation validation
-  - Context-aware error messages
-  - `ValidScope` for complex operations
-- **Tests Implemented**:
-  - Validation at transaction entry points
-  - Validation across transactions
-  - Validation during reallocation
-  - Invalid handle detection
-  - Stale handle detection
-  - Two-phase borrowing pattern tests
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **GetGlobal** | ✅ Complete | Gets global variables |
+| **SetGlobal** | ✅ Complete | Sets global variables |
 
-### C Function Execution
-- **Status**: ✅ Complete  
-- **Features Implemented**:
-  - Isolated `ExecutionContext` for C functions
-  - Safe transaction boundaries
-  - Proper borrow handling
-  - Return value collection and processing
-  - Integration with VM execution loop
-  - Pending operation pattern for async processing
+### Arithmetic Operations
 
-### VM Core
-- **Status**: ⚠️ Partial
-- **Features Implemented**:
-  - Non-recursive execution loop
-  - Step-by-step instruction execution
-  - Implemented opcode handlers (21/~37):
-    - Basic: Move, LoadK, LoadBool, LoadNil
-    - Table: GetTable, SetTable
-    - Global: GetGlobal, SetGlobal
-    - Arithmetic: Add, Sub, Mul, Div
-    - Comparison: Eq, Lt, Le
-    - Control Flow: Jmp, Test, TestSet
-    - Function: Call, Return
-    - Loops: ForPrep, ForLoop, TForLoop
-  - Function call mechanism with proper state management
-  - C function execution pattern
-- **Missing/Stubbed**:
-  - Several opcode handlers still missing
-  - Comprehensive error handling
-  - Memory limits enforcement
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **Add** | ✅ Complete | Addition with metamethod support |
+| **Sub** | ✅ Complete | Subtraction with metamethod support |
+| **Mul** | ✅ Complete | Multiplication with metamethod support |
+| **Div** | ✅ Complete | Division with metamethod support |
+| **Mod** | ✅ Complete | Modulo with metamethod support |
+| **Pow** | ✅ Complete | Power with metamethod support |
+| **Unm** | ✅ Complete | Unary minus with metamethod support |
+| **Not** | ✅ Complete | Logical not operator |
 
-### Compiler
-- **Status**: ❌ Missing
-- **Requirements**:
-  - Lua parser for source code
-  - AST representation
-  - Bytecode generation
-  - Register allocation
-  - Closure creation
-- **Dependencies**: Arena, Value, and Heap systems
+### String Operations
 
-### Redis API Integration
-- **Status**: ❌ Missing
-- **Requirements**:
-  - Setup of KEYS and ARGV tables
-  - Implementation of redis.call and redis.pcall
-  - Proper transaction isolation for Redis commands
-  - Value conversion between Lua and Redis
-- **Dependencies**: VM Core, Transaction System, C Function Execution
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **Len** | ✅ Complete | String/table length with metamethod support |
+| **Concat** | ⚠️ Partial | Basic string concatenation works, but `__concat` metamethod handling returns `NotImplemented` error |
 
-### Metamethod System
-- **Status**: ⚠️ Partial
-- **Features Implemented**:
-  - Metamethod type definitions
-  - Metamethod resolution for tables
-  - Support for arithmetic metamethods (__add, __sub, __mul, __div)
-  - Support for comparison metamethods (__eq, __lt, __le)
-  - Support for __index, __newindex for tables
-- **Missing**:
-  - Several metamethods (__concat, __len, __mod, __pow, __unm)
-  - Integration with some VM operations
+### Comparison Operations
 
-## Implementation Priorities
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **Eq** | ✅ Complete | Equality comparison with metamethod support |
+| **Lt** | ✅ Complete | Less-than comparison with metamethod support |
+| **Le** | ✅ Complete | Less-than-or-equal comparison with metamethod support |
 
-1. **Complete Missing VM Operations** (High Priority)
-   - Implement NewTable for table creation
-   - Implement Concat opcode with __concat metamethod
-   - Implement Len opcode with __len metamethod
-   - Add remaining arithmetic operations (Mod, Pow, Unm)
-   - Implement Not for logical operations
+### Control Flow
 
-2. **Finish Metamethod System** (High Priority)
-   - Complete all missing metamethods
-   - Ensure proper integration with VM operations
-   - Add comprehensive tests for metamethod interactions
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **Jmp** | ✅ Complete | Unconditional jump |
+| **Test** | ✅ Complete | Conditional test with PC increment |
+| **TestSet** | ✅ Complete | Conditional test with register assignment |
+| **Call** | ✅ Complete | Function calls with proper argument handling |
+| **TailCall** | ⚠️ Partial | Basic implementation works, but does not implement true tail call optimization |
+| **Return** | ✅ Complete | Function return with multiple value support |
 
-3. **Develop Closure Support** (High Priority)
-   - Implement GetUpval, SetUpval, and Close opcodes
-   - Add Closure opcode for function creation
-   - Ensure proper upvalue handling
+### Loop Control
 
-4. **Develop Redis API Integration** (High Priority)
-   - Create Redis context handling
-   - Implement redis.call and redis.pcall functions
-   - Set up proper KEYS and ARGV tables
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **ForPrep** | ✅ Complete | Numeric for loop initialization |
+| **ForLoop** | ✅ Complete | Numeric for loop iteration |
+| **TForLoop** | ✅ Complete | Generic for loop iteration |
 
-5. **Add Error Handling Improvements** (Medium Priority)
-   - Implement proper error propagation
-   - Add line number information
-   - Improve error messages
+### Closure Operations (Incomplete)
 
-6. **Develop Compiler** (Medium Priority)
-   - Create parser for Lua source code
-   - Implement bytecode generation
-   - Add register allocation
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **GetUpval** | ⚠️ Partial | Basic implementation with proper two-phase pattern, but incomplete upvalue lifecycle integration |
+| **SetUpval** | ⚠️ Partial | Basic implementation with proper two-phase pattern, but incomplete upvalue lifecycle integration |
+| **Close** | ⚠️ Partial | Only closes upvalues in current closure; does not handle thread-wide upvalue list |
+| **Closure** | ❌ Placeholder | **CRITICAL ISSUE**: Returns dummy closure instead of proper implementation. Does not extract real prototype from constants or capture upvalues correctly |
 
-## Current Work Items
+### Missing Opcodes (Not Implemented)
 
-### VM Operations
-- [x] Add global variable access (GetGlobal/SetGlobal)
-- [x] Add control flow operations (Jmp, Test, TestSet)
-- [x] Add basic for loops (ForPrep, ForLoop) 
-- [x] Add generic for loops (TForLoop)
-- [ ] Add table creation operations (NewTable, SetList)
-- [ ] Add string operations (Concat, Len)
-- [ ] Add remaining arithmetic (Mod, Pow, Unm)
-- [ ] Add logical operations (Not)
+| Opcode | Status | Description |
+|--------|--------|-------------|
+| **Self** | ❌ Missing | Method call syntax (obj:method()) |
+| **VarArg** | ❌ Missing | Variable argument handling |
+| **ExtraArg** | ❌ Missing | Extended argument support |
 
-### Metamethod System
-- [x] Basic metamethod resolution framework
-- [x] Table operations with __index, __newindex
-- [x] Arithmetic operations (__add, __sub, __mul, __div)
-- [x] Comparison operations (__eq, __lt, __le)
-- [ ] Implement remaining metamethods
-- [ ] Add comprehensive tests for metamethods
+## Pending Operation Status
 
-### Redis Integration
-- [ ] Create redis_api.rs module
-- [ ] Implement Redis context setup
-- [ ] Create redis.call and redis.pcall functions
+| Operation Type | Status | Description |
+|----------------|--------|-------------|
+| **FunctionCall** | ✅ Complete | Function call handling with proper context |
+| **MetamethodCall** | ⚠️ Partial | Basic implementation for arithmetic, but some metamethods return NotImplemented |
+| **Concatenation** | ⚠️ Partial | Basic string concatenation works, but `__concat` metamethod handling returns NotImplemented |
+| **TableIndex** | ❌ Missing | Defined but never constructed |
+| **TableNewIndex** | ❌ Missing | Defined but never constructed |
+| **ArithmeticOp** | ❌ Missing | Defined but never constructed |
+| **CFunctionReturn** | ✅ Complete | Properly handles results from C functions |
 
-## Recent Changes
+## Metamethod System
 
-- ✅ Implemented comparison operations (Eq, Lt, Le) with proper metamethod support
-- ✅ Implemented control flow operations (Jmp, Test, TestSet)
-- ✅ Implemented numeric for loops (ForPrep, ForLoop) with proper register handling
-- ✅ Implemented generic for loops (TForLoop) with both closure and C function support
-- ✅ Fixed various borrow checker issues in the core VM execution model
-- ✅ Added comprehensive test coverage for new opcodes
+| Metamethod | Status | Description |
+|------------|--------|-------------|
+| **__index** | ✅ Complete | Table index metamethod |
+| **__newindex** | ✅ Complete | Table assignment metamethod |
+| **__add, __sub, __mul, __div, __mod, __pow** | ✅ Complete | Arithmetic metamethods |
+| **__unm** | ✅ Complete | Unary minus metamethod |
+| **__concat** | ❌ Placeholder | Returns NotImplemented error |
+| **__eq, __lt, __le** | ✅ Complete | Comparison metamethods |
+| **__len** | ✅ Complete | Length metamethod |
+| **__call** | ❌ Missing | Function call metamethod |
+| **__tostring** | ⚠️ Partial | Used in string concatenation but handling is incomplete |
+| **__gc** | ❌ Missing | Not needed in this implementation |
+| **__mode** | ❌ Missing | Weak table support |
 
 ## Testing Status
 
-| Test | Status | Notes |
-|------|--------|-------|
-| Arena Tests | ✅ Passing | Basic arena operations verified |
-| Handle Tests | ✅ Passing | Type safety and validation confirmed |
-| Transaction Tests | ✅ Passing | 13 comprehensive tests covering all aspects of handle validation |
-| VM Tests | ⚠️ Partial | Many operations tested and passing, but not all opcodes |
-| Redis Interface Tests | ❌ Not Started | Pending implementation |
-| Metamethod Tests | ⚠️ Partial | Basic metamethod functionality tested, but not comprehensive |
+| Test Type | Status | Notes |
+|-----------|--------|-------|
+| **Arena Tests** | ✅ Passing | Basic arena operations verified |
+| **Handle Tests** | ✅ Passing | Type safety and validation confirmed |
+| **Transaction Tests** | ✅ Passing | 13 comprehensive tests covering all aspects of handle validation |
+| **VM Tests** | ⚠️ Partial | 47 passing tests for implemented opcodes; 127 additional tests disabled due to missing compiler |
+| **Redis Interface Tests** | ❌ Not Started | Pending implementation |
+| **Metamethod Tests** | ⚠️ Partial | Basic metamethod functionality tested, but not comprehensive |
+
+## Critical Implementation Gaps
+
+1. **Closure System**: The closure and upvalue implementation is fundamentally incomplete:
+   - Closure opcode creates dummy closures instead of extracting real function prototypes
+   - No upvalue capture or management via thread-wide upvalue list
+   - Missing support for upvalue instruction processing
+
+2. **Redis API**: Completely missing implementation of:
+   - redis.call() and redis.pcall() functions
+   - EVALSHA command implementation 
+   - SCRIPT command subcommands
+
+3. **Standard Library**: The init_stdlib() method is empty, leaving all standard library functions unimplemented.
+
+4. **Compiler**: The compile() function is a complete stub that returns a hardcoded function returning nil.
 
 ## Architecture Compliance
 
@@ -260,5 +198,39 @@ The implementation strictly follows these architectural principles:
    - Validation at transaction entry points
    - Validation before reallocation
    - Validation caching for performance
+
+## Implementation Priorities
+
+To complete the core VM, focus should be in this order:
+
+1. **Complete Closure System** (High Priority)
+   - Implement proper Closure opcode with prototype extraction
+   - Add upvalue capture and management
+   - Complete upvalue instruction processing
+   - Integrate with GetUpval, SetUpval, and Close opcodes
+
+2. **Fix Placeholder Operations** (High Priority)
+   - Complete `__concat` metamethod handling
+   - Implement SetList C=0 case properly
+   - Fix TailCall optimization
+
+3. **Implement Missing Opcodes** (Medium Priority)
+   - Add Self, VarArg, and ExtraArg opcodes
+
+4. **Complete Error Handling** (Medium Priority)
+   - Add source location information
+   - Improve error context
+   - Add proper propagation
+
+## Note on Closure Implementation
+
+**The closure system is the most complex part of the VM that remains incomplete.** Proper implementation requires:
+
+1. Constants supporting embedded function prototypes
+2. Upvalue instructions processing after Closure opcode
+3. Thread-level tracking of all open upvalues
+4. Proper closure of upvalues when variables go out of scope
+
+This will require a dedicated implementation session focusing solely on closures, upvalues, and lexical scoping.
 
 This document will be updated as implementation progresses.

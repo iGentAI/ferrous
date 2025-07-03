@@ -13,11 +13,16 @@ mod transaction;
 mod vm;
 mod error;
 mod metamethod;
+mod compiler;
 
 #[cfg(test)]
 mod test_basic;
 
 pub use self::error::{LuaError, LuaResult};
+pub use self::value::Value;
+pub use self::vm::LuaVM;
+pub use self::compiler::{compile, CompiledModule};
+pub use self::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle};
 
 // Implement handle_lua_command directly in the lua module
 pub fn handle_lua_command(

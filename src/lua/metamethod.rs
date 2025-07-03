@@ -319,7 +319,7 @@ mod tests {
         let mut heap = LuaHeap::new().unwrap();
         
         // Create a table with a metatable
-        let (table, metatable) = {
+        let (table, _metatable) = {
             let mut tx = HeapTransaction::new(&mut heap);
             
             let t = tx.create_table().unwrap();
