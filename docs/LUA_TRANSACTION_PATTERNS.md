@@ -626,6 +626,105 @@ impl<'a> HeapTransaction<'a> {
 }
 ```
 
+### 5.5 Value Semantics Patterns
+
+Ensure value semantics (especially for strings) are preserved despite handle-based implementation:
+
+```rust
+// String interning pattern - ensuring consistent handles for identical strings
+impl LuaHeap {
+    fn create_string_internal(&mut self, s: &str) -> LuaResult<StringHandle> {
+        // Check cache first for content-based lookup
+        if let Some(&handle) = self.string_cache.get(s.as_bytes()) {
+            if self.strings.contains(handle.0) {
+                // Debug output for critical strings
+                if s.len() < 30 && (s == "print" || s == "type" || s.starts_with("__")) {
+                    println!("Debug: Reused interned string '{}' with handle {:?}", s, handle);
+                }
+                return Ok(handle);
+            }
+            // Handle was invalidated, remove from cache
+            self.string_cache.remove(s.as_bytes());
+        }
+        
+        // Create new string
+        let lua_string = LuaString::new(s);
+        let handle = StringHandle::from(self.strings.insert(lua_string));
+        
+        // Add to cache for future lookups
+        self.string_cache.insert(s.as_bytes().to_vec(), handle);
+        
+        // Debug output for critical strings
+        if s.len() < 30 && (s == "print" || s == "type" || s.starts_with("__")) {
+            println!("Debug: Created new string '{}' with handle {:?}", s, handle);
+        }
+        
+        Ok(handle)
+    }
+    
+    fn pre_intern_common_strings(&mut self) -> LuaResult<()> {
+        // Pre-intern strings used for critical VM operations
+        const COMMON_STRINGS: &[&str] = &[
+            // Standard library functions
+            "print", "type", "tostring", "tonumber", 
+            "next", "pairs", "ipairs", 
+            "getmetatable", "setmetatable",
+            "rawget", "rawset", "rawequal",
+            
+            // Metamethods
+            "__index", "__newindex", "__call", "__tostring",
+            "__add", "__sub", "__mul", "__div", "__mod", "__pow",
+            "__concat", "__len", "__eq", "__lt", "__le",
+            
+            // Common keys and values
+            "value", "self", "key",
+        ];
+        
+        for s in COMMON_STRINGS {
+            self.create_string_internal(s)?;
+        }
+        
+        Ok(())
+    }
+}
+
+// Module loading pattern - ensure proper string handling during loading
+pub mod loader {
+    pub fn load_module<'a>(tx: &mut HeapTransaction<'a>, module: &CompiledModule) -> LuaResult<FunctionProtoHandle> {
+        // Step 1: Create all string handles with proper interning
+        let mut string_handles = Vec::with_capacity(module.strings.len());
+        for s in &module.strings {
+            // This leverages string interning to get consistent handles
+            string_handles.push(tx.create_string(s)?);
+        }
+        
+        // Rest of module loading...
+    }
+}
+```
+
+### 5.6 String Reference Patterns
+
+For string content access in performance-critical paths:
+
+```rust
+impl<'a> HeapTransaction<'a> {
+    // Fast path for string equality in table lookup
+    fn is_string_equal(&self, a: StringHandle, b: StringHandle) -> LuaResult<bool> {
+        // Fast path: same handle means same string (if interning works properly)
+        if a == b {
+            return Ok(true);
+        }
+        
+        // Slow path: compare content
+        let content_a = self.heap.get_string(a)?.to_str()?;
+        let content_b = self.heap.get_string(b)?.to_str()?;
+        
+        Ok(content_a == content_b)
+    }
+}
+```
+
 ## 6. Testing Transaction Correctness
 
 ### 6.1 Invariant Tests

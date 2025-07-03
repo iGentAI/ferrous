@@ -265,9 +265,10 @@ pub struct ExecutionContext<'vm> {
     stack_base: usize,
     arg_count: usize,
     thread: ThreadHandle,
+    results_pushed: usize,
     
-    // Private handle to VM for controlled access
-    vm_access: &'vm mut LuaVM,
+    // Public handle to VM for controlled access
+    pub vm_access: &'vm mut LuaVM,
 }
 
 impl<'vm> ExecutionContext<'vm> {
@@ -277,6 +278,7 @@ impl<'vm> ExecutionContext<'vm> {
             stack_base,
             arg_count,
             thread,
+            results_pushed: 0,
             vm_access: vm,
         }
     }
@@ -326,17 +328,39 @@ impl<'vm> ExecutionContext<'vm> {
     pub fn push_result(&mut self, value: Value) -> LuaResult<()> {
         // Create a fresh transaction
         let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        tx.set_register(self.thread, self.stack_base, value)?;
+        tx.set_register(self.thread, self.stack_base + self.results_pushed, value)?;
         tx.commit()?;
         
+        self.results_pushed += 1;
+        
         Ok(())
+    }
+    
+    // Get access to the heap for creating strings
+    pub fn get_heap(&mut self) -> &mut LuaHeap {
+        &mut self.vm_access.heap
+    }
+    
+    // Get the current thread handle
+    pub fn get_current_thread(&self) -> LuaResult<ThreadHandle> {
+        Ok(self.thread)
+    }
+    
+    // Get the base index for this context
+    pub fn get_base_index(&self) -> LuaResult<usize> {
+        Ok(self.stack_base)
+    }
+    
+    // Get the number of results pushed by this context
+    pub fn get_results_pushed(&self) -> usize {
+        self.results_pushed
     }
 }
 
 /// Main Lua Virtual Machine
 pub struct LuaVM {
     /// Lua heap
-    heap: LuaHeap,
+    pub(crate) heap: LuaHeap,
     
     /// Current thread handle
     current_thread: ThreadHandle,
@@ -828,11 +852,23 @@ impl LuaVM {
                     }
                 };
                 
+                // Add diagnostics for important lookups
+                let name_str = tx.get_string_value(name_handle)?;
+                if name_str == "print" || name_str == "type" || name_str == "tostring" || name_str == "pairs" {
+                    println!("DEBUG LOOKUP: Looking up global '{}' with handle {:?}", name_str, name_handle);
+                }
+                
                 // Get the globals table
                 let globals_table = tx.get_globals_table()?;
                 
                 // Get the value from the globals table
                 let value = tx.read_table_field(globals_table, &Value::String(name_handle))?;
+                
+                // Add diagnostics for result
+                if name_str == "print" || name_str == "type" || name_str == "tostring" || name_str == "pairs" {
+                    println!("DEBUG LOOKUP: Result for '{}': {:?} ({})", 
+                             name_str, value, value.type_name());
+                }
                 
                 // Store the value in register A
                 tx.set_register(self.current_thread, base + a, value)?;
@@ -2851,34 +2887,67 @@ impl LuaVM {
         &mut self,
         func: CFunction,
         args: Vec<Value>,
-        base_register: u16,
+        base_register: u16, 
         register_a: usize,
         thread_handle: ThreadHandle,
     ) -> LuaResult<StepResult> {
         // Setup C execution context
         let stack_base = base_register as usize + register_a;
-        let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
+        
+        println!("DEBUG CFUNC: Calling C function at {:?} with {} args", func as *const (), args.len());
+        
+        // First, copy arguments to the stack where the C function expects them
+        {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            for (i, arg) in args.iter().enumerate() {
+                println!("DEBUG CFUNC: Setting arg {} to {:?}", i, arg);
+                tx.set_register(thread_handle, stack_base + i, arg.clone())?;
+            }
+            tx.commit()?;
+        }
         
         // Call C function with isolated context
-        let result_count = match func(&mut ctx) {
-            Ok(count) => count as usize,
-            Err(e) => return Ok(StepResult::Error(e)),
+        let (result_count, results_pushed) = {
+            let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
+            let count = match func(&mut ctx) {
+                Ok(count) => {
+                    println!("DEBUG CFUNC: Function returned success with {} values", count);
+                    count as usize
+                },
+                Err(e) => {
+                    println!("DEBUG CFUNC: Function returned error: {:?}", e);
+                    return Ok(StepResult::Error(e));
+                },
+            };
+            (count, ctx.results_pushed)
         };
+        
+        // Verify result count matches what the context pushed
+        if result_count != results_pushed {
+            println!("DEBUG CFUNC: Warning: returned {} but pushed {} values", result_count, results_pushed);
+        }
         
         // Collect results after function returns
         let mut results = Vec::with_capacity(result_count);
         
         // Create a new transaction to read the results
         let mut tx = HeapTransaction::new(&mut self.heap);
+        println!("DEBUG CFUNC: Collecting {} results from stack", result_count);
         for i in 0..result_count {
-            if let Ok(value) = tx.read_register(thread_handle, stack_base + i) {
-                results.push(value);
-            } else {
-                break;
+            match tx.read_register(thread_handle, stack_base + i) {
+                Ok(value) => {
+                    println!("DEBUG CFUNC: Result {}: {:?} ({})", i, value, value.type_name());
+                    results.push(value);
+                },
+                Err(e) => {
+                    println!("DEBUG CFUNC: Error reading result {}: {:?}", i, e);
+                    break;
+                }
             }
         }
         
         // Queue results as a CFunctionReturn operation
+        println!("DEBUG CFUNC: Queueing CFunctionReturn with {} values", results.len());
         tx.queue_operation(PendingOperation::CFunctionReturn {
             values: results,
             context: ReturnContext::Register {
@@ -2897,29 +2966,43 @@ impl LuaVM {
         values: Vec<Value>, 
         context: ReturnContext
     ) -> LuaResult<StepResult> {
+        println!("DEBUG CFUNC_RETURN: Processing {} return values", values.len());
+        for (i, value) in values.iter().enumerate() {
+            println!("DEBUG CFUNC_RETURN:   Value {}: {:?} ({})", i, value, value.type_name());
+        }
+        
         let mut tx = HeapTransaction::new(&mut self.heap);
         
         match context {
             ReturnContext::Register { base, offset } => {
+                println!("DEBUG CFUNC_RETURN: Storing to registers starting at base={}, offset={}", base, offset);
+                
                 // Store return values in the appropriate registers
                 if !values.is_empty() {
                     // Store the first return value in the specified register
+                    println!("DEBUG CFUNC_RETURN: Setting register {} to {:?}", base as usize + offset, values[0]);
                     tx.set_register(self.current_thread, base as usize + offset, values[0].clone())?;
                     
                     // Store any additional return values in consecutive registers
                     for (i, value) in values.iter().skip(1).enumerate() {
+                        println!("DEBUG CFUNC_RETURN: Setting register {} to {:?}", 
+                                base as usize + offset + 1 + i, value);
                         tx.set_register(self.current_thread, 
                                        base as usize + offset + 1 + i, 
                                        value.clone())?;
                     }
                 } else {
+                    println!("DEBUG CFUNC_RETURN: No values to set, setting register {} to Nil", 
+                            base as usize + offset);
                     tx.set_register(self.current_thread, base as usize + offset, Value::Nil)?;
                 }
             },
             ReturnContext::FinalResult => {
+                println!("DEBUG CFUNC_RETURN: Final result context - will be handled by execute_function");
                 // Final result will be handled by execute_function
             },
             ReturnContext::TableField { table, key } => {
+                println!("DEBUG CFUNC_RETURN: Storing to table field, table={:?}, key={:?}", table, key);
                 // Store in table
                 if !values.is_empty() {
                     tx.set_table_field(table, key, values[0].clone())?;
@@ -2928,16 +3011,38 @@ impl LuaVM {
                 }
             },
             ReturnContext::Stack => {
+                println!("DEBUG CFUNC_RETURN: Pushing to stack, {} values", values.len());
                 // Push to stack
                 for value in values {
                     tx.push_stack(self.current_thread, value)?;
                 }
             },
             ReturnContext::Metamethod { context: mm_context } => {
+                println!("DEBUG CFUNC_RETURN: Processing metamethod continuation");
                 // Handle metamethod-specific continuations inline
                 use crate::lua::metamethod::MetamethodContinuation;
                 
                 let result_value = values.get(0).cloned().unwrap_or(Value::Nil);
+                println!("DEBUG CFUNC_RETURN: Metamethod result: {:?}", result_value);
+                
+                // Handle based on continuation type
+                match &mm_context.continuation {
+                    MetamethodContinuation::StoreInRegister { .. } => {
+                        println!("DEBUG CFUNC_RETURN: Storing metamethod result to register");
+                    },
+                    MetamethodContinuation::TableAssignment { .. } => {
+                        println!("DEBUG CFUNC_RETURN: Storing metamethod result to table");
+                    },
+                    MetamethodContinuation::ComparisonResult { .. } => {
+                        println!("DEBUG CFUNC_RETURN: Processing comparison result");
+                    },
+                    MetamethodContinuation::ComparisonSkip { .. } => {
+                        println!("DEBUG CFUNC_RETURN: Processing comparison skip");
+                    },
+                    MetamethodContinuation::ChainOperation { .. } => {
+                        println!("DEBUG CFUNC_RETURN: Chaining to next operation");
+                    },
+                }
                 
                 match mm_context.continuation {
                     MetamethodContinuation::StoreInRegister { base, offset } => {
@@ -2969,8 +3074,10 @@ impl LuaVM {
                 }
             },
             ReturnContext::ForLoop { base, a, c, pc: _pc, sbx: _sbx } => {
+                println!("DEBUG CFUNC_RETURN: Processing for-loop results");
                 // Get first return value - if nil, the iteration is done
                 let first_value = values.get(0).cloned().unwrap_or(Value::Nil);
+                println!("DEBUG CFUNC_RETURN: First loop value: {:?}", first_value);
                 
                 if !first_value.is_nil() {
                     // Loop continues
@@ -2988,18 +3095,15 @@ impl LuaVM {
                     for i in values.len()..c {
                         tx.set_register(self.current_thread, base as usize + a + 3 + i, Value::Nil)?;
                     }
-                    
-                    // In Lua 5.1 semantics, we DON'T skip the next instruction 
-                    // if the loop continues - that instruction should be a JMP
-                    // that takes us back to the loop body
                 } else {
                     // Loop is done, skip the next instruction
-                    // (which should be a JMP back to the beginning of the loop)
+                    println!("DEBUG CFUNC_RETURN: Loop is done, skipping next instruction");
                     tx.increment_pc(self.current_thread)?;
                 }
             }
         }
         
+        println!("DEBUG CFUNC_RETURN: Committing transaction");
         tx.commit()?;
         Ok(StepResult::Continue)
     }
@@ -3258,15 +3362,28 @@ impl LuaVM {
     fn process_pending_operation(&mut self, op: PendingOperation) -> LuaResult<StepResult> {
         match op {
             PendingOperation::FunctionCall { closure, args, context } => {
+                println!("DEBUG PENDING_OP: Processing FunctionCall operation");
                 self.process_function_call(closure, args, context)
             },
             PendingOperation::CFunctionReturn { values, context } => {
-                self.process_c_function_return(values, context)
+                println!("DEBUG PENDING_OP: Processing CFunctionReturn operation with {} values", values.len());
+                for (i, value) in values.iter().enumerate() {
+                    println!("DEBUG PENDING_OP:   CFunctionReturn value {}: {:?} ({})", 
+                             i, value, value.type_name());
+                }
+                println!("DEBUG PENDING_OP: Calling process_c_function_return...");
+                let result = self.process_c_function_return(values, context);
+                println!("DEBUG PENDING_OP: process_c_function_return completed with result: {:?}", 
+                         result.is_ok());
+                result
             },
             PendingOperation::MetamethodCall { method, target, args, context } => {
+                println!("DEBUG PENDING_OP: Processing MetamethodCall operation");
                 self.process_metamethod_call(method, target, args, context)
             },
             PendingOperation::Concatenation { values, current_index, dest_register, mut accumulated } => {
+                println!("DEBUG PENDING_OP: Processing Concatenation operation at index {}/{}", 
+                         current_index, values.len());
                 // Process concatenation with proper coercion and metamethod handling
                 let mut tx = HeapTransaction::new(&mut self.heap);
                 
@@ -3274,17 +3391,20 @@ impl LuaVM {
                     // All values processed, create final string
                     let result_string = accumulated.join("");
                     let string_handle = tx.create_string(&result_string)?;
+                    println!("DEBUG PENDING_OP: Concatenation complete, final result: '{}'", result_string);
                     tx.set_register(self.current_thread, dest_register as usize, Value::String(string_handle))?;
                     tx.commit()?;
                     Ok(StepResult::Continue)
                 } else {
                     // Process current value
                     let current_value = &values[current_index];
+                    println!("DEBUG PENDING_OP: Concatenating value: {:?}", current_value);
                     
                     match current_value {
                         Value::String(handle) => {
                             // Direct string concatenation
                             let s = tx.get_string_value(*handle)?;
+                            println!("DEBUG PENDING_OP: Adding string: '{}'", s);
                             accumulated.push(s);
                             
                             // Queue next concatenation step
@@ -3300,6 +3420,7 @@ impl LuaVM {
                         },
                         Value::Number(n) => {
                             // Convert number to string
+                            println!("DEBUG PENDING_OP: Converting number to string: {}", n);
                             accumulated.push(n.to_string());
                             
                             // Queue next concatenation step
@@ -3314,10 +3435,12 @@ impl LuaVM {
                             Ok(StepResult::Continue)
                         },
                         _ => {
+                            println!("DEBUG PENDING_OP: Non-string/number value, checking metamethods");
                             // First check for __tostring metamethod
                             if let Some(_) = crate::lua::metamethod::resolve_metamethod(
                                 &mut tx, current_value, crate::lua::metamethod::MetamethodType::ToString
                             )? {
+                                println!("DEBUG PENDING_OP: Found __tostring metamethod");
                                 // Use __tostring metamethod
                                 let method_name = tx.create_string("__tostring")?;
                                 
@@ -3351,6 +3474,7 @@ impl LuaVM {
                                 Ok(StepResult::Continue)
                             }
                             else {
+                                println!("DEBUG PENDING_OP: No __tostring metamethod, trying __concat");
                                 // Create a string from accumulated fragments outside of any mutable borrows
                                 let result_string = accumulated.join("");
                                 let mut tx2 = HeapTransaction::new(&mut self.heap); // Fresh transaction
@@ -3363,6 +3487,7 @@ impl LuaVM {
                                 if let Some(_) = crate::lua::metamethod::resolve_metamethod(
                                     &mut tx, &left_value, crate::lua::metamethod::MetamethodType::Concat
                                 )? {
+                                    println!("DEBUG PENDING_OP: Found __concat metamethod on left operand");
                                     // Use left operand's __concat metamethod
                                     let method_name = tx.create_string("__concat")?;
                                     tx.queue_operation(PendingOperation::MetamethodCall {
@@ -3390,6 +3515,7 @@ impl LuaVM {
                                 } else if let Some(_) = crate::lua::metamethod::resolve_metamethod(
                                     &mut tx, current_value, crate::lua::metamethod::MetamethodType::Concat
                                 )? {
+                                    println!("DEBUG PENDING_OP: Found __concat metamethod on right operand");
                                     // Try right operand's __concat if left doesn't have it
                                     let method_name = tx.create_string("__concat")?;
                                     tx.queue_operation(PendingOperation::MetamethodCall {
@@ -3415,6 +3541,7 @@ impl LuaVM {
                                     tx.commit()?;
                                     Ok(StepResult::Continue)
                                 } else {
+                                    println!("DEBUG PENDING_OP: No __concat or __tostring metamethod found, failing");
                                     // No __concat or __tostring metamethod
                                     tx.commit()?;
                                     Err(LuaError::TypeError {
@@ -3427,7 +3554,11 @@ impl LuaVM {
                     }
                 }
             },
-            _ => Err(LuaError::NotImplemented("Pending operation type".to_string())),
+            _ => {
+                println!("DEBUG PENDING_OP: Unimplemented operation type: {:?}", 
+                         std::mem::discriminant(&op));
+                Err(LuaError::NotImplemented("Pending operation type".to_string()))
+            },
         }
     }
     
@@ -3564,10 +3695,9 @@ impl LuaVM {
         }
     }
     
-    /// Initialize the standard library (placeholder)
+    /// Initialize the standard library
     pub fn init_stdlib(&mut self) -> LuaResult<()> {
-        // TODO: Initialize Lua standard library functions
-        Ok(())
+        super::stdlib::init_stdlib(self)
     }
     
     /// Execute a compiled module

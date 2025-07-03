@@ -655,11 +655,28 @@ impl CodeGenerator {
     
     /// Encode an AsBx instruction
     fn encode_AsBx(opcode: OpCode, a: u8, sbx: i32) -> u32 {
+        // Check if the signed offset is within bounds
+        let clamped_sbx = if sbx < -131071 {
+            // Clamp to minimum value with a warning
+            println!("Warning: Jump offset {} out of range, clamping to -131071", sbx);
+            -131071
+        } else if sbx > 131070 {
+            // Clamp to maximum value with a warning
+            println!("Warning: Jump offset {} out of range, clamping to 131070", sbx);
+            131070
+        } else {
+            sbx
+        };
+        
         let op = opcode_to_u8(opcode) as u32 & 0x3F;
         let a = (a as u32) << 6;
-        let sbx = ((sbx + 131071) as u32) << 14;
         
-        op | a | sbx
+        // Add the bias value to convert to unsigned value for encoding
+        // The bias is 2^17-1 = 131071
+        let sbx_biased = ((clamped_sbx + 131071) as u32) & 0x3FFFF; // Ensure we don't exceed 18 bits
+        let sbx_field = sbx_biased << 14;
+        
+        op | a | sbx_field
     }
     
     /// Compile a statement
@@ -1852,9 +1869,26 @@ impl CodeGenerator {
                     ));
                 }
                 
-                // Patch jump
-                let offset = label_info.pc as i32 - goto_pc as i32 - 1;
-                self.code[goto_pc] = Self::encode_AsBx(OpCode::Jmp, 0, offset);
+                // Calculate offset with overflow check
+                let offset = match (label_info.pc as i64).checked_sub(goto_pc as i64) {
+                    Some(diff) => diff - 1,  // Safe subtraction
+                    None => {
+                        return Err(LuaError::CompileError(
+                            format!("Jump offset too large from PC {} to label '{}' at PC {}", 
+                                    goto_pc, label, label_info.pc)
+                        ));
+                    }
+                };
+                
+                // Check if offset is within the allowed range for AsBx encoding
+                if offset < -131071 || offset > 131070 {
+                    return Err(LuaError::CompileError(
+                        format!("Jump offset {} out of range (must be between -131071 and 131070)", offset)
+                    ));
+                }
+                
+                // Encode the instruction
+                self.code[goto_pc] = Self::encode_AsBx(OpCode::Jmp, 0, offset as i32);
             } else {
                 i += 1;
             }
@@ -1868,8 +1902,25 @@ impl CodeGenerator {
         
         for i in start_idx..self.break_jumps.len() {
             let break_jump = &self.break_jumps[i];
-            let offset = end_pc as i32 - break_jump.pc as i32 - 1;
-            self.code[break_jump.pc] = Self::encode_AsBx(OpCode::Jmp, 0, offset);
+            
+            // Calculate offset with overflow check
+            let offset = match (end_pc as i64).checked_sub(break_jump.pc as i64) {
+                Some(diff) => (diff - 1) as i32,  // Safe subtraction
+                None => {
+                    // This shouldn't happen in practice, but handle it gracefully
+                    println!("Warning: Break jump offset overflow detected, using maximum offset");
+                    131070  // Use max positive offset
+                }
+            };
+            
+            // Check if offset is within the allowed range for AsBx encoding
+            if offset < -131071 || offset > 131070 {
+                println!("Warning: Break jump offset {} out of range, clamping to valid range", offset);
+                let clamped_offset = if offset < 0 { -131071 } else { 131070 };
+                self.code[break_jump.pc] = Self::encode_AsBx(OpCode::Jmp, 0, clamped_offset);
+            } else {
+                self.code[break_jump.pc] = Self::encode_AsBx(OpCode::Jmp, 0, offset);
+            }
         }
         
         self.break_jumps.truncate(start_idx);

@@ -1199,6 +1199,27 @@ let value2 = tx.read_register(thread, reg2)?;
 tx.commit()?;
 ```
 
+### 8.7 Value Semantics vs. Handle Identity
+
+**CRITICAL:** Lua has value semantics for strings, tables, and other types, while our implementation uses handle-based identity. This creates tension in several areas:
+
+```rust
+// Value semantics requires content-based equality
+// Especially for strings and tables
+"hello" == "hello"  // In Lua, this is true regardless of storage
+
+// But in our handle-based system, we might have:
+StringHandle(1) != StringHandle(2)  // Even if both point to "hello"
+```
+
+To address this tension:
+
+1. **String Interning**: Ensure strings with the same content always get the same handle
+2. **Pre-Interning**: Common strings (function names, metamethods) should be pre-interned
+3. **Content-Based Comparison**: For cases where interning fails, fall back to content comparison
+
+See `LUA_STRING_INTERNING_AND_VALUE_SEMANTICS.md` for detailed design on this issue.
+
 ## 9. Conclusion
 
 This architecture provides a robust foundation for a Redis-compatible Lua VM in Rust that:

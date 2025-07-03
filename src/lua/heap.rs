@@ -90,9 +90,37 @@ impl LuaHeap {
         self.initialize_thread_stack(main_thread_handle, 256)?;
         
         self.main_thread = Some(main_thread_handle);
+
+        // Pre-intern common strings to ensure handle consistency
+        self.pre_intern_common_strings()?;
         
         // Increment generation after initialization
         self.generation = self.generation.wrapping_add(1);
+        
+        Ok(())
+    }
+
+    /// Pre-intern common strings to ensure handle consistency
+    fn pre_intern_common_strings(&mut self) -> LuaResult<()> {
+        // Standard library function names
+        const COMMON_STRINGS: &[&str] = &[
+            // Standard library function names
+            "print", "type", "tostring", "tonumber", "assert", "error",
+            "select", "next", "pairs", "ipairs", "setmetatable", "getmetatable",
+            "rawget", "rawset", "rawequal", "pcall", "unpack", "load",
+            
+            // Metamethods
+            "__index", "__newindex", "__call", "__tostring", "__concat",
+            "__add", "__sub", "__mul", "__div", "__mod", "__pow",
+            "__unm", "__len", "__eq", "__lt", "__le",
+            
+            // Common keys
+            "self", "error", "value"
+        ];
+        
+        for &s in COMMON_STRINGS {
+            self.create_string_internal(s)?;
+        }
         
         Ok(())
     }
@@ -146,16 +174,26 @@ impl LuaHeap {
         if let Some(&handle) = self.string_cache.get(&bytes) {
             // Validate that the cached handle is still valid
             if self.strings.contains(handle.0) {
+                // Add debug output for important strings
+                if s.len() < 30 && (s == "print" || s == "type" || s == "tostring" || s.starts_with("__")) {
+                    println!("DEBUG INTERNING: Reused cached string '{}' with handle {:?}", s, handle);
+                }
                 return Ok(handle);
             } else {
                 // Remove stale cache entry
                 self.string_cache.remove(&bytes);
+                println!("DEBUG INTERNING: Removed stale cache entry for '{}'", s);
             }
         }
         
         // Create new string
         let lua_string = LuaString::from_bytes(bytes.clone());
         let handle = StringHandle::from(self.strings.insert(lua_string));
+        
+        // Add debug output for important strings
+        if s.len() < 30 && (s == "print" || s == "type" || s == "tostring" || s.starts_with("__")) {
+            println!("DEBUG INTERNING: Created new string '{}' with handle {:?}", s, handle);
+        }
         
         // Add to cache
         self.string_cache.insert(bytes, handle);

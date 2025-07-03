@@ -8,7 +8,7 @@ use super::error::{LuaError, LuaResult};
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, 
                     UpvalueHandle, UserDataHandle, FunctionProtoHandle};
 use super::heap::LuaHeap;
-use super::value::{Value, Closure, Thread, Upvalue, UserData, CallFrame, FunctionProto};
+use super::value::{Value, Closure, Thread, Upvalue, UserData, CallFrame, FunctionProto, HashableValue};
 use super::vm::{PendingOperation, ReturnContext};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
@@ -327,6 +327,11 @@ impl<'a> HeapTransaction<'a> {
         // Use validation-aware creation to ensure handles remain valid during reallocation
         let validated_handles = self.collect_validated_string_handles();
         let handle = self.heap.create_string_with_validation(s, &validated_handles)?;
+        
+        // Add debug output for string interning troubleshooting
+        if s.len() < 30 && (s == "print" || s == "type" || s == "tostring" || s.starts_with("__")) {
+            println!("DEBUG INTERNING: Created string '{}' with handle {:?}", s, handle);
+        }
         
         // Mark as created
         self.validation_scope.mark_created(&handle);
@@ -869,6 +874,94 @@ impl<'a> HeapTransaction<'a> {
         
         self.pending_operations.push_back(op);
         Ok(())
+    }
+    
+    /// Get the next key-value pair from a table following Lua's iteration semantics
+    pub fn table_next(&mut self, table: TableHandle, current_key: Value) -> LuaResult<Option<(Value, Value)>> {
+        // Get a reference to the table
+        let table_obj = self.get_table(table)?;
+        
+        // Case 1: nil key means get the first key/value pair
+        if current_key.is_nil() {
+            // First try array part (index 1, which is array[0])
+            if !table_obj.array.is_empty() && !table_obj.array[0].is_nil() {
+                return Ok(Some((Value::Number(1.0), table_obj.array[0].clone())));
+            }
+            
+            // Check rest of array part
+            for i in 1..table_obj.array.len() {
+                if !table_obj.array[i].is_nil() {
+                    return Ok(Some((Value::Number((i + 1) as f64), table_obj.array[i].clone())));
+                }
+            }
+            
+            // If no array elements or all nil, try hash part
+            if let Some((k, v)) = table_obj.map.iter().next() {
+                return Ok(Some((k.to_value(), v.clone())));
+            }
+            
+            // Empty table or all nils
+            return Ok(None);
+        }
+        
+        // Case 2: Current key is a numeric index in the array part
+        if let Value::Number(n) = &current_key {
+            // Check if it's a valid array index (an integer >= 1)
+            if n.fract() == 0.0 && *n >= 1.0 {
+                let idx = *n as usize;
+                
+                // Look for the next filled slot in the array part
+                if idx <= table_obj.array.len() {
+                    // Find next non-nil element in array
+                    for i in idx..table_obj.array.len() {
+                        if !table_obj.array[i].is_nil() {
+                            return Ok(Some((Value::Number((i + 1) as f64), table_obj.array[i].clone())));
+                        }
+                    }
+                    
+                    // Array exhausted, move to hash part
+                    if let Some((k, v)) = table_obj.map.iter().next() {
+                        return Ok(Some((k.to_value(), v.clone())));
+                    }
+                }
+                
+                // No more elements in array or hash part
+                return Ok(None);
+            }
+        }
+        
+        // Case 3: Current key is in the hash part
+        // Convert the current key to HashableValue for comparison
+        let current_hashable = match HashableValue::from_value(&current_key) {
+            Ok(k) => k,
+            Err(_) => return Ok(None), // Key can't be in hash part
+        };
+        
+        // Create a vector of all hash keys for stable ordering
+        let mut hash_keys: Vec<_> = table_obj.map.keys().collect();
+        hash_keys.sort_by_key(|k| match k {
+            HashableValue::Nil => 0,
+            HashableValue::Boolean(false) => 1,
+            HashableValue::Boolean(true) => 2,
+            HashableValue::Number(n) => 3,
+            HashableValue::String(_) => 4,
+        });
+        
+        // Find current key's position and return the next one
+        let mut found = false;
+        for k in hash_keys {
+            if found {
+                // This is the key after the current one
+                return Ok(Some((k.to_value(), table_obj.map.get(k).cloned().unwrap_or(Value::Nil))));
+            }
+            
+            if k == &current_hashable {
+                found = true;
+            }
+        }
+        
+        // If we get here, we've exhausted all keys
+        Ok(None)
     }
     
     /// Validate handles in a pending operation

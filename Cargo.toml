@@ -31,3 +31,23 @@ codegen-units = 1
 [profile.bench]
 lto = true
 opt-level = 3
+
+[[bin]]
+name = "compile_and_execute"
+path = "src/bin/compile_and_execute.rs"
+
+[[bin]]
+name = "lua_compiler_test"
+path = "src/bin/lua_compiler_test.rs"
+
+[[bin]]
+name = "standalone_lua_test"
+path = "src/bin/standalone_lua_test.rs"
+
+[[bin]]
+name = "run_lua_tests"
+path = "src/bin/run_lua_tests.rs"
+
+[[bin]]
+name = "test_stdlib"
+path = "src/bin/test_stdlib.rs"

@@ -24,6 +24,31 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 | **Redis API Integration** | ❌ Missing | Almost completely absent; returns "not implemented" errors | High |
 | **Error Handling** | ⚠️ Partial | Error types defined but not fully implemented | Medium |
 
+## Recently Identified Architectural Issues
+
+| Issue | Status | Description | Priority |
+|-------|--------|-------------|----------|
+| **String Interning** | 🔄 In Progress | String interning system needs enhancement to ensure consistent string handles between stdlib and module loading | High |
+| **Value Semantics** | ⚠️ Identified | Lua's value semantics for tables and functions may conflict with handle-based identity | Medium |
+| **Table Key Equality** | ⚠️ Identified | Table key equality needs to be content-based for strings | Medium |
+| **Function Equality** | ⚠️ Identified | Function comparison semantics need clarification | Low |
+| **Metamethod Consistency** | ⚠️ Identified | Metamethod dispatch may have inconsistent patterns | Medium |
+| **C Function Comparison** | ⚠️ Identified | C function comparison by pointer may lead to inconsistent behavior | Low |
+| **Memory Management** | ⚠️ Identified | No garbage collection means unbounded memory growth | Medium |
+| **Error Propagation** | ⚠️ Identified | Error handling doesn't fully integrate with Lua's pcall mechanism | Medium |
+
+### String Interning Solution
+
+The string interning issue has been identified as a critical architectural concern. The problem manifests when string handles created during standard library initialization don't match handles created during module loading, leading to function lookup failures.
+
+The recommended solution is Arena-Based String Deduplication with Static Lifetime Extension:
+
+1. **Pre-intern common strings** during heap initialization (function names, metamethod names)
+2. **Enhance string lookup** in the string cache to ensure consistent handles
+3. **Ensure module loader** properly reuses existing string handles
+
+This approach preserves the transaction-based architecture while ensuring Lua's string equality semantics. See `LUA_STRING_INTERNING_AND_VALUE_SEMANTICS.md` for detailed design.
+
 ## Recently Fixed Components (July 2025)
 
 ### 1. Bytecode Encoding

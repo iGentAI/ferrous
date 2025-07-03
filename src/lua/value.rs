@@ -217,10 +217,10 @@ pub struct Table {
     pub array: Vec<Value>,
     
     /// HashMap part of the table
-    map: HashMap<HashableValue, Value>,
+    pub map: HashMap<HashableValue, Value>,
     
     /// Optional metatable
-    metatable: Option<TableHandle>,
+    pub metatable: Option<TableHandle>,
 }
 
 impl Table {
@@ -293,6 +293,32 @@ impl Table {
         }
     }
     
+    /// Get a value from the table by key
+    pub fn get(&self, key: &Value) -> Option<&Value> {
+        match key {
+            Value::Number(n) if n.fract() == 0.0 && *n >= 1.0 => {
+                let idx = (*n as usize) - 1;
+                if idx < self.array.len() {
+                    self.array.get(idx)
+                } else {
+                    // Fall back to hash map for out-of-bounds array indices
+                    if let Ok(hashable) = HashableValue::from_value(key) {
+                        self.map.get(&hashable)
+                    } else {
+                        None
+                    }
+                }
+            },
+            _ => {
+                if let Ok(hashable) = HashableValue::from_value(key) {
+                    self.map.get(&hashable)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     /// Set a field in the table
     pub fn set_field(&mut self, key: Value, value: Value) -> LuaResult<()> {
         // Try array optimization for integer keys
@@ -357,7 +383,7 @@ impl std::hash::Hash for Table {
 
 /// Wrapper for hashable values (used as table keys)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum HashableValue {
+pub enum HashableValue {
     Nil,
     Boolean(bool),
     Number(OrderedFloat),
@@ -366,7 +392,7 @@ enum HashableValue {
 
 impl HashableValue {
     /// Try to create a hashable value from a Lua value
-    fn from_value(value: &Value) -> LuaResult<Self> {
+    pub fn from_value(value: &Value) -> LuaResult<Self> {
         match value {
             Value::Nil => Ok(HashableValue::Nil),
             Value::Boolean(b) => Ok(HashableValue::Boolean(*b)),
@@ -378,11 +404,21 @@ impl HashableValue {
             }),
         }
     }
+    
+    /// Convert back to a Lua Value
+    pub fn to_value(&self) -> Value {
+        match self {
+            HashableValue::Nil => Value::Nil,
+            HashableValue::Boolean(b) => Value::Boolean(*b),
+            HashableValue::Number(n) => Value::Number(n.0),
+            HashableValue::String(s) => Value::String(*s),
+        }
+    }
 }
 
 /// Wrapper for f64 that implements Eq and Hash
 #[derive(Debug, Clone, Copy)]
-struct OrderedFloat(f64);
+pub struct OrderedFloat(pub f64);
 
 impl PartialEq for OrderedFloat {
     fn eq(&self, other: &Self) -> bool {

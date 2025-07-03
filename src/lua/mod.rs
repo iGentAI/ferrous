@@ -13,6 +13,7 @@ mod transaction;
 mod vm;
 mod error;
 mod metamethod;
+mod stdlib;
 pub mod compiler;
 pub mod codegen;
 mod lexer;
@@ -188,7 +189,13 @@ impl LuaGIL {
         
         // Create initial VM
         match vm::LuaVM::new() {
-            Ok(vm) => pool.push(vm),
+            Ok(mut vm) => {
+                // Initialize standard library
+                if let Err(e) = vm.init_stdlib() {
+                    return Err(FerrousError::LuaError(format!("Failed to initialize stdlib: {}", e)));
+                }
+                pool.push(vm);
+            },
             Err(e) => return Err(FerrousError::LuaError(format!("Failed to create Lua VM: {}", e))),
         }
         
@@ -292,9 +299,16 @@ impl LuaGIL {
             Ok(vm)
         } else {
             // Create a new VM if pool is empty
-            vm::LuaVM::new().map_err(|e| {
+            let mut new_vm = vm::LuaVM::new().map_err(|e| {
                 FerrousError::LuaError(format!("Failed to create Lua VM: {}", e))
-            })
+            })?;
+            
+            // Initialize standard library
+            new_vm.init_stdlib().map_err(|e| {
+                FerrousError::LuaError(format!("Failed to initialize stdlib: {}", e))
+            })?;
+            
+            Ok(new_vm)
         }
     }
     

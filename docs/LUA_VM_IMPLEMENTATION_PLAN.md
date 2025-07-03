@@ -220,6 +220,44 @@ Our implementation is progressing well toward meeting these criteria:
 5. ✅ Memory safety maintained with clean Rust safety
 6. ⚠️ No borrow checker errors in core implementation, need more complex testing
 
+## Architectural Refinements
+
+Based on recent analysis, several architectural refinements are needed to ensure proper Lua semantics and Redis compatibility:
+
+### 1. String Interning Enhancement (High Priority)
+
+The current string interning system needs enhancement to ensure content-based string identity:
+
+- **Pre-intern common strings**: Enhance `LuaHeap::initialize()` to pre-intern standard library function names and Redis command names
+- **Improve string cache**: Ensure the string cache is properly maintained across all string creation points
+- **Enhance module loading**: Ensure module loading properly uses existing interned strings
+
+Implementation details can be found in `LUA_STRING_INTERNING_AND_VALUE_SEMANTICS.md`.
+
+### 2. Table Key Equality Refinement (Medium Priority)
+
+Table operations need enhancement to ensure proper value semantics:
+
+- **Key comparison**: Ensure table key comparison follows Lua's content-based equality for strings, not just handle equality
+- **Hash calculation**: Hash values must be computed based on string content, not just handles
+- **Metamethod resolution**: Verify metamethod resolution uses string content for lookup
+
+### 3. Value Semantics Validation (Medium Priority)
+
+Other value types may have similar semantic mismatches:
+
+- **Table equality**: Consider content-based equality for tables where appropriate
+- **Function equality**: Clarify function identity vs. equality semantics
+- **C function comparison**: Implement a registry-based approach for C functions rather than pointer comparison
+
+### 4. Error Handling Integration (Medium Priority)
+
+Error handling needs better integration with Lua's error model:
+
+- **pcall/xpcall**: Implement proper protected call mechanisms
+- **Error propagation**: Ensure errors can be caught and handled properly
+- **Stack unwinding**: Implement correct stack unwinding during errors
+
 ## Conclusion
 
 We've made significant progress by fixing critical issues in the Lua VM implementation. The fixes align the implementation with the architectural principles and demonstrate that the core design is sound. With these fixes in place, we can now proceed with completing the language feature set, implementing the standard library, and integrating with Redis.
