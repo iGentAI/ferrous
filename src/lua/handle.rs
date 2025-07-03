@@ -4,7 +4,7 @@
 //! for different Lua object types.
 
 use super::arena::Handle;
-use super::value::{LuaString, Table, Closure, Thread, Upvalue, UserData};
+use super::value::{LuaString, Table, Closure, Thread, Upvalue, UserData, FunctionProto};
 use std::marker::PhantomData;
 
 /// Macro to generate typed handle wrappers
@@ -41,6 +41,7 @@ typed_handle!(ClosureHandle, Closure);
 typed_handle!(ThreadHandle, Thread);
 typed_handle!(UpvalueHandle, Upvalue);
 typed_handle!(UserDataHandle, UserData);
+typed_handle!(FunctionProtoHandle, FunctionProto);
 
 /// Resource trait for objects that can be stored in the heap
 pub trait Resource: Sized {
@@ -70,6 +71,10 @@ impl Resource for Upvalue {
 
 impl Resource for UserData {
     type Handle = UserDataHandle;
+}
+
+impl Resource for FunctionProto {
+    type Handle = FunctionProtoHandle;
 }
 
 // Factory methods specific to handle types - these DON'T try to access private fields
@@ -114,6 +119,13 @@ impl UserDataHandle {
     /// Create a handle from raw parts
     pub(crate) fn from_raw_parts(index: u32, generation: u32) -> Self {
         UserDataHandle(Handle::from_raw_parts(index, generation))
+    }
+}
+
+impl FunctionProtoHandle {
+    /// Create a handle from raw parts
+    pub(crate) fn from_raw_parts(index: u32, generation: u32) -> Self {
+        FunctionProtoHandle(Handle::from_raw_parts(index, generation))
     }
 }
 
@@ -171,6 +183,14 @@ impl UserDataHandle {
     /// Create an invalid handle for testing
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         UserDataHandle::from_raw_parts(index, generation)
+    }
+}
+
+#[cfg(test)]
+impl FunctionProtoHandle {
+    /// Create an invalid handle for testing
+    pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
+        FunctionProtoHandle::from_raw_parts(index, generation)
     }
 }
 

@@ -6,9 +6,9 @@
 use super::arena::Handle;
 use super::error::{LuaError, LuaResult};
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, 
-                    UpvalueHandle, UserDataHandle};
+                    UpvalueHandle, UserDataHandle, FunctionProtoHandle};
 use super::heap::LuaHeap;
-use super::value::{Value, Closure, Thread, Upvalue, UserData, CallFrame};
+use super::value::{Value, Closure, Thread, Upvalue, UserData, CallFrame, FunctionProto};
 use super::vm::{PendingOperation, ReturnContext};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
@@ -109,6 +109,20 @@ impl ValidatableHandle for UserDataHandle {
     fn validation_key(&self) -> ValidationKey {
         ValidationKey {
             type_id: std::any::TypeId::of::<super::value::UserData>(),
+            index: self.0.index,
+            generation: self.0.generation,
+        }
+    }
+}
+
+impl ValidatableHandle for FunctionProtoHandle {
+    fn validate_against_heap(&self, heap: &LuaHeap) -> LuaResult<()> {
+        heap.validate_function_proto_handle(*self)
+    }
+    
+    fn validation_key(&self) -> ValidationKey {
+        ValidationKey {
+            type_id: std::any::TypeId::of::<super::value::FunctionProto>(),
             index: self.0.index,
             generation: self.0.generation,
         }
@@ -283,7 +297,7 @@ impl<'a> HeapTransaction<'a> {
     }
     
     /// Validate a handle with context for better error messages
-    fn validate_with_context<H: ValidatableHandle>(&mut self, handle: &H, context: &str) -> LuaResult<()> {
+    pub fn validate_with_context<H: ValidatableHandle>(&mut self, handle: &H, context: &str) -> LuaResult<()> {
         match self.validate_handle(handle) {
             Ok(_) => Ok(()),
             Err(LuaError::InvalidHandle) => {
@@ -1033,6 +1047,246 @@ impl<'a> HeapTransaction<'a> {
                 ClosureHandle::from_raw_parts(key.index, key.generation)
             })
             .collect()
+    }
+    
+    /// Create a function prototype
+    pub fn create_function_proto(&mut self, proto: FunctionProto) -> LuaResult<FunctionProtoHandle> {
+        self.ensure_active()?;
+        
+        // Use validation-aware creation to ensure handles remain valid during reallocation
+        let validated_handles = self.collect_validated_function_proto_handles();
+        let handle = self.heap.create_function_proto_with_validation(proto, &validated_handles)?;
+        
+        // Mark as created
+        self.validation_scope.mark_created(&handle);
+        
+        Ok(handle)
+    }
+    
+    /// Get function prototype
+    pub fn get_function_proto(&mut self, handle: FunctionProtoHandle) -> LuaResult<&FunctionProto> {
+        self.ensure_active()?;
+        
+        // Validate the handle
+        self.validate_with_context(&handle, "get_function_proto")?;
+        
+        self.heap.get_function_proto(handle)
+    }
+    
+    /// Collect all validated function proto handles in current transaction
+    fn collect_validated_function_proto_handles(&self) -> Vec<FunctionProtoHandle> {
+        self.validation_scope.validated.iter()
+            .filter(|key| key.type_id == std::any::TypeId::of::<super::value::FunctionProto>())
+            .map(|key| {
+                FunctionProtoHandle::from_raw_parts(key.index, key.generation)
+            })
+            .collect()
+    }
+    
+    /// Get function prototype as a copy
+    pub fn get_function_proto_copy(&mut self, handle: FunctionProtoHandle) -> LuaResult<FunctionProto> {
+        self.ensure_active()?;
+        
+        // Validate the handle
+        self.validate_with_context(&handle, "get_function_proto_copy")?;
+        
+        // Get the prototype and clone it
+        let proto = self.heap.get_function_proto(handle)?;
+        Ok(proto.clone())
+    }
+    
+    /// Find or create an upvalue for a given stack index
+    /// If an open upvalue already exists for the given stack index, returns it
+    /// Otherwise, creates a new upvalue and adds it to the thread's open_upvalues list
+    pub fn find_or_create_upvalue(
+        &mut self, 
+        thread: ThreadHandle, 
+        stack_index: usize
+    ) -> LuaResult<UpvalueHandle> {
+        self.ensure_active()?;
+        
+        // Validate thread handle
+        self.validate_with_context(&thread, "find_or_create_upvalue")?;
+        
+        // Phase 1: Extract needed data to avoid nested borrows
+        let open_upvalues = {
+            let thread_obj = self.heap.get_thread(thread)?;
+            thread_obj.open_upvalues.clone() // Clone the vector to avoid borrow issues
+        };
+        
+        // Phase 2: Search for existing upvalue (not holding heap borrow)
+        for &upvalue_handle in &open_upvalues {
+            // Validate the upvalue handle
+            self.validate_with_context(&upvalue_handle, "find_or_create_upvalue existing")?;
+            
+            // Check if it references our target stack slot
+            let upvalue = self.heap.get_upvalue(upvalue_handle)?;
+            if let Some(idx) = upvalue.stack_index {
+                if idx == stack_index {
+                    return Ok(upvalue_handle);
+                }
+            }
+        }
+        
+        // Phase 3: Create new upvalue (no heap borrows currently held)
+        let new_upvalue = Upvalue {
+            stack_index: Some(stack_index),
+            value: None,
+        };
+        
+        let upvalue_handle = self.create_upvalue(new_upvalue)?;
+        
+        // Phase 4: Add to thread's open_upvalues list
+        // First collect stack indices from open upvalues
+        let mut upvalue_indices = Vec::new();
+        for &handle in &open_upvalues {
+            if let Ok(upval) = self.heap.get_upvalue(handle) {
+                if let Some(idx) = upval.stack_index {
+                    upvalue_indices.push((handle, idx));
+                }
+            }
+        }
+        
+        // Now we can determine where to insert the new upvalue
+        // (sorted by stack index, highest first)
+        let insert_pos = upvalue_indices.iter()
+            .position(|(_, idx)| *idx < stack_index)
+            .unwrap_or(upvalue_indices.len());
+        
+        // Now we can safely add the upvalue to the thread
+        {
+            let thread_obj = self.heap.get_thread_mut(thread)?;
+            thread_obj.open_upvalues.insert(insert_pos, upvalue_handle);
+        }
+        
+        Ok(upvalue_handle)
+    }
+    
+    /// Find all upvalues in a thread that reference stack indices >= threshold
+    pub fn find_upvalues_above_threshold(
+        &mut self, 
+        thread: ThreadHandle, 
+        threshold: usize
+    ) -> LuaResult<Vec<UpvalueHandle>> {
+        self.ensure_active()?;
+        
+        // Validate thread handle
+        self.validate_with_context(&thread, "find_upvalues_above_threshold")?;
+        
+        // Phase 1: Extract needed data to avoid nested borrows
+        let open_upvalues = {
+            let thread_obj = self.heap.get_thread(thread)?;
+            thread_obj.open_upvalues.clone() // Clone to avoid borrow issues
+        };
+        
+        // Phase 2: Process upvalues (not holding heap borrow)
+        let mut to_close = Vec::new();
+        
+        // Examine each upvalue
+        for &upvalue_handle in &open_upvalues {
+            // Validate upvalue handle
+            self.validate_with_context(&upvalue_handle, "find_upvalues_above_threshold upvalue")?;
+            
+            // Check its stack index
+            let upvalue = self.heap.get_upvalue(upvalue_handle)?;
+            if let Some(idx) = upvalue.stack_index {
+                if idx >= threshold {
+                    to_close.push(upvalue_handle);
+                }
+            }
+        }
+        
+        Ok(to_close)
+    }
+    
+    /// Remove closed upvalues from thread's open_upvalues list
+    pub fn remove_closed_upvalues(&mut self, thread: ThreadHandle) -> LuaResult<()> {
+        self.ensure_active()?;
+        
+        // Validate thread handle
+        self.validate_with_context(&thread, "remove_closed_upvalues")?;
+        
+        // Phase 1: Extract needed data and find closed upvalues
+        let (open_upvalues, closed_indices) = {
+            let thread_obj = self.heap.get_thread(thread)?;
+            let upvalues = thread_obj.open_upvalues.clone();
+            
+            // Find indices of closed upvalues
+            let mut closed = Vec::new();
+            for (i, &handle) in upvalues.iter().enumerate() {
+                // We'll validate each handle in phase 2
+                if let Ok(upvalue) = self.heap.get_upvalue(handle) {
+                    if upvalue.stack_index.is_none() {
+                        closed.push(i);
+                    }
+                }
+            }
+            
+            (upvalues, closed)
+        };
+        
+        // Phase 2: Validate handles (not holding heap borrow)
+        for &upvalue_handle in &open_upvalues {
+            self.validate_with_context(&upvalue_handle, "remove_closed_upvalues upvalue")?;
+        }
+        
+        // Phase 3: Remove closed upvalues (if any)
+        if !closed_indices.is_empty() {
+            let mut thread_obj = self.heap.get_thread_mut(thread)?;
+            
+            // Remove in reverse order to avoid invalidating indices
+            for &idx in closed_indices.iter().rev() {
+                if idx < thread_obj.open_upvalues.len() {
+                    thread_obj.open_upvalues.remove(idx);
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Close thread upvalues at or above threshold
+    pub fn close_thread_upvalues(&mut self, thread: ThreadHandle, threshold: usize) -> LuaResult<()> {
+        self.ensure_active()?;
+        
+        // Validate thread handle
+        self.validate_with_context(&thread, "close_thread_upvalues")?;
+        
+        // Phase 1: Find upvalues to close and their stack values
+        let upvalues_with_values = {
+            // First get all open upvalues at or above the threshold
+            let to_close = self.find_upvalues_above_threshold(thread, threshold)?;
+            
+            // Then extract the current values from the stack
+            let mut result = Vec::new();
+            let thread_obj = self.heap.get_thread(thread)?;
+            
+            for upvalue_handle in to_close {
+                // Get the upvalue to check its stack index
+                if let Ok(upvalue) = self.heap.get_upvalue(upvalue_handle) {
+                    if let Some(idx) = upvalue.stack_index {
+                        // Get value from thread stack
+                        let value = thread_obj.stack.get(idx)
+                            .cloned()
+                            .unwrap_or(Value::Nil);
+                        
+                        result.push((upvalue_handle, value));
+                    }
+                }
+            }
+            
+            result
+        };
+        
+        // Phase 2: Close each upvalue (no heap borrows currently held)
+        for (upvalue_handle, value) in upvalues_with_values {
+            self.close_upvalue(upvalue_handle, value)?;
+        }
+        
+        // Phase 3: Remove closed upvalues from thread
+        self.remove_closed_upvalues(thread)?;
+        
+        Ok(())
     }
 }
 

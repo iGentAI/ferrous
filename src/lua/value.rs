@@ -4,7 +4,7 @@
 //! in the Ferrous Lua VM.
 
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, 
-                   UpvalueHandle, UserDataHandle};
+                   UpvalueHandle, UserDataHandle, FunctionProtoHandle};
 use super::error::{LuaError, LuaResult};
 use std::collections::HashMap;
 use std::fmt;
@@ -42,6 +42,9 @@ pub enum Value {
     
     /// Userdata (handle to heap-allocated userdata)
     UserData(UserDataHandle),
+    
+    /// Function prototype (handle to heap-allocated function prototype)
+    FunctionProto(FunctionProtoHandle),
 }
 
 impl Value {
@@ -53,7 +56,7 @@ impl Value {
             Value::Number(_) => "number",
             Value::String(_) => "string",
             Value::Table(_) => "table",
-            Value::Closure(_) | Value::CFunction(_) => "function",
+            Value::Closure(_) | Value::CFunction(_) | Value::FunctionProto(_) => "function",
             Value::Thread(_) => "thread",
             Value::UserData(_) => "userdata",
         }
@@ -88,9 +91,9 @@ impl Value {
         matches!(self, Value::Table(_))
     }
     
-    /// Check if this value is a function (closure or C function)
+    /// Check if this value is a function (closure, C function, or function prototype)
     pub fn is_function(&self) -> bool {
-        matches!(self, Value::Closure(_) | Value::CFunction(_))
+        matches!(self, Value::Closure(_) | Value::CFunction(_) | Value::FunctionProto(_))
     }
     
     /// Try to convert to a number
@@ -126,6 +129,7 @@ impl fmt::Display for Value {
             Value::CFunction(_) => write!(f, "<C function>"),
             Value::Thread(_) => write!(f, "<thread>"),
             Value::UserData(_) => write!(f, "<userdata>"),
+            Value::FunctionProto(_) => write!(f, "<function prototype>"),
         }
     }
 }
@@ -147,6 +151,7 @@ impl std::hash::Hash for Value {
             // Function pointers are not hashable in a stable way
             Value::CFunction(_) => 0.hash(state), // Use a constant hash value
             Value::UserData(u) => u.hash(state),
+            Value::FunctionProto(p) => p.hash(state),
         }
     }
 }
@@ -462,6 +467,9 @@ pub struct Thread {
     
     /// Thread status
     pub status: ThreadStatus,
+    
+    /// Open upvalues list (sorted by stack index, highest first)
+    pub open_upvalues: Vec<UpvalueHandle>,
 }
 
 impl Thread {
@@ -471,6 +479,7 @@ impl Thread {
             call_frames: Vec::new(),
             stack: Vec::new(),
             status: ThreadStatus::Normal,
+            open_upvalues: Vec::new(),
         }
     }
 }
@@ -489,6 +498,9 @@ pub struct CallFrame {
     
     /// Number of expected results  
     pub expected_results: Option<usize>,
+    
+    /// Variable arguments for this frame (if the function is vararg)
+    pub varargs: Option<Vec<Value>>,
 }
 
 /// Upvalue representation
