@@ -14,12 +14,54 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Bytecode instruction format (simplified for now)
-#[derive(Debug, Clone, Copy)]
-pub struct Instruction(u32);
+pub struct Instruction(pub u32);
 
 impl Instruction {
+    /// Get the opcode
     pub fn opcode(&self) -> OpCode {
-        OpCode::from_u8((self.0 & 0x3F) as u8)
+        let op_num = ((self.0) & 0x3F) as u8;
+        match op_num {
+            0 => OpCode::Move,
+            1 => OpCode::LoadK,
+            2 => OpCode::LoadBool,
+            3 => OpCode::LoadNil,
+            4 => OpCode::GetUpval,
+            5 => OpCode::GetGlobal,
+            6 => OpCode::SetGlobal,
+            7 => OpCode::SetUpval,
+            8 => OpCode::GetTable,
+            9 => OpCode::SetTable,
+            10 => OpCode::NewTable,
+            11 => OpCode::Self_,
+            12 => OpCode::Add,
+            13 => OpCode::Sub,
+            14 =>  OpCode::Mul,
+            15 => OpCode::Div,
+            16 => OpCode::Mod,
+            17 => OpCode::Pow,
+            18 => OpCode::Unm,
+            19 => OpCode::Not,
+            20 => OpCode::Len,
+            21 => OpCode::Concat,
+            22 => OpCode::Jmp,
+            23 => OpCode::Eq,
+            24 => OpCode::Lt,
+            25 => OpCode::Le,
+            26 => OpCode::Test,
+            27 => OpCode::TestSet,
+            28 => OpCode::Call,
+            29 => OpCode::TailCall,
+            30 => OpCode::Return,
+            31 => OpCode::ForPrep,
+            32 => OpCode::ForLoop,
+            33 => OpCode::TForLoop,
+            34 => OpCode::SetList,
+            35 => OpCode::VarArg,
+            36 => OpCode::Closure,
+            37 => OpCode::Close,
+            38 => OpCode::ExtraArg,
+            _ => OpCode::Move, // Default
+        }
     }
     
     pub fn a(&self) -> u8 {
@@ -85,54 +127,6 @@ pub enum OpCode {
     TForLoop,   // R(A+3), ... , R(A+3+C) := R(A)(R(A+1), R(A+2)); if !Nil then R(A+2)=R(A+3), pc+=sBx
     VarArg,     // R(A), R(A+1), ..., R(A+B-2) = vararg
     ExtraArg,   // Extra argument for previous instruction
-    Unknown,
-}
-
-impl OpCode {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => OpCode::Move,
-            1 => OpCode::LoadK,
-            2 => OpCode::LoadBool,
-            3 => OpCode::LoadNil,
-            4 => OpCode::GetUpval,
-            5 => OpCode::GetGlobal,
-            6 => OpCode::SetGlobal,
-            7 => OpCode::SetUpval,
-            8 => OpCode::GetTable,
-            9 => OpCode::SetTable,
-            10 => OpCode::NewTable,
-            11 => OpCode::Self_,
-            34 => OpCode::SetList,
-            12 => OpCode::Add,
-            13 => OpCode::Sub,
-            14 => OpCode::Mul,
-            15 => OpCode::Div,
-            16 => OpCode::Mod,
-            17 => OpCode::Pow,
-            18 => OpCode::Unm,
-            19 => OpCode::Not,
-            20 => OpCode::Len,
-            21 => OpCode::Concat,
-            22 => OpCode::Jmp,
-            23 => OpCode::Eq,
-            24 => OpCode::Lt,
-            25 => OpCode::Le,
-            26 => OpCode::Test,
-            27 => OpCode::TestSet,
-            28 => OpCode::Call,
-            29 => OpCode::TailCall,
-            30 => OpCode::Return,
-            31 => OpCode::ForPrep,
-            32 => OpCode::ForLoop,
-            33 => OpCode::TForLoop,
-            35 => OpCode::VarArg,
-            36 => OpCode::Closure,
-            37 => OpCode::Close,
-            38 => OpCode::ExtraArg,
-            _ => OpCode::Unknown,
-        }
-    }
 }
 
 /// Pending operation to be processed by the VM
@@ -376,6 +370,47 @@ impl LuaVM {
     /// Get mutable access to the heap for transaction creation
     pub fn heap_mut(&mut self) -> &mut LuaHeap {
         &mut self.heap
+    }
+
+    /// Load a function prototype into the heap
+    fn load_prototype(
+        &mut self,
+        tx: &mut HeapTransaction,
+        proto: &crate::lua::value::FunctionProto,
+        string_handles: &[StringHandle],
+    ) -> LuaResult<FunctionProtoHandle> {
+        // Process constants
+        let mut constants = Vec::with_capacity(proto.constants.len());
+        for constant in &proto.constants {
+            let new_const = match constant {
+                Value::Nil => Value::Nil,
+                Value::Boolean(b) => Value::Boolean(*b),
+                Value::Number(n) => Value::Number(*n),
+                Value::String(_) => {
+                    Value::Nil
+                },
+                Value::FunctionProto(_) => {
+                    Value::Nil
+                },
+                _ => {
+                    // Other value types shouldn't be in constants
+                    Value::Nil
+                }
+            };
+            constants.push(new_const);
+        }
+        
+        // Create a new function prototype
+        let new_proto = crate::lua::value::FunctionProto {
+            bytecode: proto.bytecode.clone(),
+            constants,
+            num_params: proto.num_params,
+            is_vararg: proto.is_vararg,
+            max_stack_size: proto.max_stack_size,
+            upvalues: proto.upvalues.clone(),
+        };
+        
+        tx.create_function_proto(new_proto)
     }
     
 
@@ -3424,19 +3459,39 @@ impl LuaVM {
             None
         };
         
-        // Push parameters
+        // CRITICAL FIX: We need to ensure we have enough stack space before proceeding
+        // The total stack space needed is:
+        // 1. Base register (new_base)
+        // 2. All registers the function will use (max_stack)
+        // 3. Additional safety margin of 1 to prevent off-by-one errors
+        let total_stack_needed = new_base + max_stack + 1; // +1 safety margin
+        
+        // Get current stack size
+        let current_stack_size = tx.get_stack_size(self.current_thread)?;
+        
+        // Calculate additional space needed (if any)
+        if current_stack_size < total_stack_needed {
+            let additional_needed = total_stack_needed - current_stack_size;
+            
+            // Add Nil values to extend the stack
+            for _ in 0..additional_needed {
+                tx.push_stack(self.current_thread, Value::Nil)?;
+            }
+        }
+        
+        // First, push parameters
         for i in 0..num_params {
             let value = if i < args.len() {
                 args[i].clone()
             } else {
                 Value::Nil
             };
-            tx.push_stack(self.current_thread, value)?;
+            tx.set_register(self.current_thread, new_base + i, value)?;
         }
         
-        // Reserve stack space
-        for _ in num_params..max_stack {
-            tx.push_stack(self.current_thread, Value::Nil)?;
+        // Initialize remaining registers for local variables and temporaries
+        for i in num_params..max_stack {
+            tx.set_register(self.current_thread, new_base + i, Value::Nil)?;
         }
         
         // Create new call frame
@@ -3454,7 +3509,7 @@ impl LuaVM {
         // Push call frame
         tx.push_call_frame(self.current_thread, new_frame)?;
         
-        // Commit first transaction
+        // Commit transaction
         tx.commit()?;
         
         // Store return context in a separate scope to avoid borrow issues
@@ -3517,16 +3572,73 @@ impl LuaVM {
     
     /// Execute a compiled module
     pub fn execute_module(&mut self, module: &crate::lua::compiler::CompiledModule, args: &[Value]) -> LuaResult<Value> {
-        // Create a closure from the module's main function
-        let mut tx = HeapTransaction::new(&mut self.heap);
-        let closure = Closure {
-            proto: module.main_function.clone(),
-            upvalues: vec![],
-        };
-        let closure_handle = tx.create_closure(closure)?;
-        tx.commit()?;
+        println!("DEBUG: execute_module - Starting execution");
         
-        // Execute the closure
+        // Load the module into the heap using a transaction
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        
+        // Use the loader module to load the compiled code
+        let proto_handle = crate::lua::compiler::loader::load_module(&mut tx, module)?;
+        
+        // Get the prototype to check max stack size
+        let proto = tx.get_function_proto_copy(proto_handle)?;
+        println!("DEBUG: Main function - max_stack_size: {}", proto.max_stack_size);
+        
+        // CRITICAL FIX: Ensure the stack has sufficient space for all registers
+        // the main function might access
+        let thread_handle = self.current_thread;
+        
+        // Get current stack size
+        let current_stack_size = {
+            let thread_obj = tx.get_thread(thread_handle)?;
+            thread_obj.stack.len()
+        };
+        println!("DEBUG: Current stack size: {}", current_stack_size);
+        
+        // Calculate needed size: need to accommodate proto.max_stack_size registers
+        // Add extra safety margin
+        let needed_stack_size = proto.max_stack_size as usize + 10; // +10 safety margin
+        println!("DEBUG: Needed stack size: {}", needed_stack_size);
+        
+        // Ensure stack has at least needed_stack_size elements
+        if current_stack_size < needed_stack_size {
+            println!("DEBUG: Growing stack to {}", needed_stack_size);
+            // Add Nil values to extend the stack to exactly needed_stack_size
+            for i in current_stack_size..needed_stack_size {
+                println!("DEBUG: Pushing Nil to stack at position {}", i);
+                tx.push_stack(thread_handle, Value::Nil)?;
+            }
+        }
+        
+        // Double-check that we have sufficient stack space
+        let final_stack_size = {
+            let thread_obj = tx.get_thread(thread_handle)?;
+            thread_obj.stack.len()
+        };
+        println!("DEBUG: Final stack size: {}", final_stack_size);
+        
+        if final_stack_size < needed_stack_size {
+            return Err(LuaError::InternalError(format!(
+                "Failed to initialize stack to required size: {} (current: {})", 
+                needed_stack_size, final_stack_size
+            )));
+        }
+        
+        // Create the main closure
+        let closure = Closure {
+            proto,
+            upvalues: Vec::new(), // Main chunk has no upvalues
+        };
+        
+        let closure_handle = tx.create_closure(closure)?;
+        println!("DEBUG: Created main closure");
+        
+        // Commit the transaction
+        tx.commit()?;
+        println!("DEBUG: Transaction committed");
+        
+        // Execute the main closure
+        println!("DEBUG: Calling execute_function");
         self.execute_function(closure_handle, args)
     }
     

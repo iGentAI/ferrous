@@ -177,182 +177,114 @@ The closure system has been fully implemented with proper upvalue handling:
 - **Upvalue sharing** between closures capturing the same variables
 - **Close opcode** with proper upvalue closing when variables go out of scope
 
-### Missing Opcodes
+### Bytecode Generation and Execution
 
-All previously missing opcodes have been implemented:
+Core bytecode generation and execution has been implemented:
 
-- **Self_** for method call syntax (`obj:method()`)
-- **VarArg** for variable argument functions
-- **ExtraArg** for extended instruction arguments
+- **Parser** for Lua 5.1 syntax with function body and return statement support
+- **AST** representation of Lua code
+- **Bytecode generator** with correct opcode encoding
+- **Module loading** with proper function prototype handling
+- **Register allocation** with proper scope tracking
+- **Stack initialization** with proper size reservations
+
+### Parser and Compiler
+
+The parser and compiler components have been implemented:
+
+- **Lexical analyzer** for tokenizing source code
+- **Recursive descent parser** for generating AST
+- **AST data structures** representing Lua syntax
+- **Register allocator** for optimizing variable storage
+- **Constant pool management** for strings and numbers
+- **Function prototype handling** with proper nesting support
+
+## Recently Fixed Components (July 2025)
+
+### 1. Bytecode Encoding
+
+Fixed the critical issue with bytecode instruction encoding:
+- **Root cause**: Opcode enum values were being directly cast to u32 instead of mapping to the correct opcode numbers
+- **Impact**: Generated incorrect opcodes (ADD being encoded as SUB, RETURN being encoded as FORPREP)
+- **Fix**: Modified encoding functions to use proper `opcode_to_u8` mapping function
+
+### 2. Stack Management
+
+Improved stack initialization and register access:
+- **Root cause**: Stack was not properly initialized before function execution
+- **Impact**: "Stack index out of bounds" errors during execution
+- **Fix**: Properly reserve stack space based on function's max_stack_size before execution
+- **Fix**: Enhanced register access safety with automatic stack growth
+
+### 3. Function Prototype Handling
+
+Fixed function prototype handling for nested functions:
+- **Root cause**: Prototype references weren't properly transferred from compiler to module loader
+- **Impact**: "Invalid function prototype index" errors when executing functions
+- **Fix**: Implemented two-pass loading approach that handles forward references
+- **Fix**: Proper propagation of function prototypes from code generator to module
+
+### 4. Register Allocation
+
+Improved register allocation for variables:
+- **Root cause**: Register lifetime tracking was incomplete
+- **Impact**: Inefficient register usage and potential conflicts
+- **Fix**: Enhanced register allocation with proper scoping and lifetime tracking
 
 ## Implementation Phases for Remaining Work
 
-### Phase 1: Implement Compiler (Weeks 1-3)
+### Phase 1: Standard Library (2-3 weeks)
 
-#### 1.1 Create Parser
+#### 1.1 Basic Library Functions
+- Implement `print`, `type`, `tonumber`, `tostring`, etc.
+- Implement error handling functions (`error`, `assert`, `pcall`, `xpcall`)
 
-Implement a Lua 5.1 parser using recursive descent:
+#### 1.2 String Library
+- Implement string manipulation (`string.sub`, `string.find`, `string.rep`, etc.)
+- Implement pattern matching (`string.match`, `string.gsub`, etc.)
 
-```rust
-pub struct Parser {
-    tokens: Vec<Token>,
-    current: usize,
-}
+#### 1.3 Table Library
+- Implement table functions (`table.insert`, `table.remove`, `table.concat`, etc.)
+- Implement table.sort with custom comparators
 
-impl Parser {
-    pub fn parse(&mut self) -> Result<Chunk, ParseError> {
-        self.chunk()
-    }
-    
-    fn chunk(&mut self) -> Result<Chunk, ParseError> {
-        // ...
-    }
-    
-    // ... other parse methods ...
-}
-```
+#### 1.4 Math Library
+- Implement basic math functions (`math.abs`, `math.sin`, `math.cos`, etc.)
+- Implement random number generation (`math.random`, `math.randomseed`)
 
-#### 1.2 Create AST Representation
+### Phase 2: Redis Integration (2-3 weeks)
 
-```rust
-pub enum Expr {
-    Nil,
-    Boolean(bool),
-    Number(f64),
-    String(String),
-    Table(TableConstructor),
-    Function(FunctionDef),
-    Var(Variable),
-    BinaryOp(Box<Expr>, BinaryOp, Box<Expr>),
-    UnaryOp(UnaryOp, Box<Expr>),
-    // ...
-}
-```
+#### 2.1 Redis Command Interface
+- Implement `redis.call` and `redis.pcall` for Redis command execution
+- Create sandboxing for Redis commands
 
-#### 1.3 Implement Bytecode Generation
+#### 2.2 EVAL/EVALSHA Commands
+- Implement Redis EVAL/EVALSHA command handler
+- Add script caching with SHA1 hashing
 
-```rust
-pub struct Compiler {
-    current_function: FunctionBuilder,
-    scope_stack: Vec<Scope>,
-    // ...
-}
+#### 2.3 Key & Argument Handling
+- Implement KEYS and ARGV table creation
+- Proper error propagation from Redis commands
 
-impl Compiler {
-    pub fn compile(&mut self, ast: &Chunk) -> Result<FunctionProto, CompileError> {
-        // ...
-    }
-    
-    fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
-        // ...
-    }
-    
-    // ... other compile methods ...
-}
-```
+### Phase 3: Advanced Features (2-3 weeks)
 
-### Phase 2: Redis API Integration (Weeks 4-5)
+#### 3.1 Metatable System Completion
+- Complete implementation of all metamethods
+- Add comprehensive tests for metatable behavior
 
-#### 2.1 Create Redis API Module
+#### 3.2 Error Handling
+- Implement proper traceback and error messages
+- Add error propagation from nested function calls
 
-```rust
-// redis_api.rs
-pub struct RedisApiContext {
-    pub storage: Arc<StorageEngine>,
-    pub db: usize,
-    pub keys: Vec<Vec<u8>>,
-    pub argv: Vec<Vec<u8>>,
-}
-```
+#### 3.3 Resource Limits & Security
+- Implement instruction and memory limits
+- Add timeout mechanism for script execution
 
-#### 2.2 Implement Redis Call and PCAll
+## Comprehensive Testing Plan
 
-```rust
-// redis.call implementation
-pub fn redis_call(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    // Implementation using C function pattern
-    // ...
-}
-
-// redis.pcall implementation
-pub fn redis_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    // Implementation with error catching
-    // ...
-}
-```
-
-#### 2.3 Register Redis API Functions
-
-```rust
-fn setup_redis_api(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
-    // Create redis table
-    let table = tx.create_table()?;
-    
-    // Register functions
-    let call_name = tx.create_string("call")?;
-    tx.set_table_field(table, Value::String(call_name), Value::CFunction(redis_call))?;
-    
-    let pcall_name = tx.create_string("pcall")?;
-    tx.set_table_field(table, Value::String(pcall_name), Value::CFunction(redis_pcall))?;
-    
-    // ... other Redis functions ...
-    
-    Ok(table)
-}
-```
-
-### Phase 3: Standard Library (Weeks 6-8)
-
-#### 3.1 Implement String Library
-
-```rust
-fn setup_string_lib(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
-    // Create string table
-    let table = tx.create_table()?;
-    
-    // Register functions
-    tx.set_table_field(table, Value::String(tx.create_string("len")?), Value::CFunction(string_len))?;
-    tx.set_table_field(table, Value::String(tx.create_string("sub")?), Value::CFunction(string_sub))?;
-    tx.set_table_field(table, Value::String(tx.create_string("upper")?), Value::CFunction(string_upper))?;
-    // ... other string functions ...
-    
-    Ok(table)
-}
-```
-
-#### 3.2 Implement Table Library
-
-```rust
-fn setup_table_lib(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
-    // Create table library
-    let table = tx.create_table()?;
-    
-    // Register functions
-    tx.set_table_field(table, Value::String(tx.create_string("insert")?), Value::CFunction(table_insert))?;
-    tx.set_table_field(table, Value::String(tx.create_string("remove")?), Value::CFunction(table_remove))?;
-    tx.set_table_field(table, Value::String(tx.create_string("concat")?), Value::CFunction(table_concat))?;
-    // ... other table functions ...
-    
-    Ok(table)
-}
-```
-
-#### 3.3 Implement Math Library
-
-```rust
-fn setup_math_lib(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
-    // Create math library
-    let table = tx.create_table()?;
-    
-    // Register functions
-    tx.set_table_field(table, Value::String(tx.create_string("abs")?), Value::CFunction(math_abs))?;
-    tx.set_table_field(table, Value::String(tx.create_string("sin")?), Value::CFunction(math_sin))?;
-    tx.set_table_field(table, Value::String(tx.create_string("cos")?), Value::CFunction(math_cos))?;
-    // ... other math functions ...
-    
-    Ok(table)
-}
-```
+1. **Unit Testing**: Test individual components in isolation
+2. **Integration Testing**: Test components working together
+3. **Conformance Testing**: Test compliance with Lua 5.1 specification
+4. **Performance Testing**: Benchmark against Redis Lua
 
 
 
@@ -364,8 +296,30 @@ This section tracks implementation progress:
 |------|----------------------|-------|
 | 2025-06-30 | Arena, Handle, Value, Heap, basic Transaction, basic VM Core | Initial implementation with core architecture in place |
 | 2025-07-02 | Handle Validation, C Function Execution | Fixed unsafe code, implemented proper type-safe validation, added C function execution pattern per architecture specs |
-| 2025-07-02 | Control Flow, Comparison Operations, For Loops | Implemented Jmp, Test, TestSet, Eq, Lt, Le, ForPrep, ForLoop, TForLoop opcodes with proper metamethod support |
-| 2025-07-03 | Closure System, Missing Opcodes, Metamethod Fixes | Implemented Function Prototype value type, thread-wide upvalue tracking, Closure opcode, Self_ opcode, VarArg opcode, ExtraArg opcode, fixed __concat metamethod with __tostring fallback |
+| 2025-07-03 | Parser, Function Bodies, Return Statements | Fixed parser to properly handle function bodies with return statements |
+| 2025-07-03 | Bytecode Generation, Stack Management | Fixed bytecode generation to use the correct opcode numbers, implemented stack initialization and growth |
+| 2025-07-03 | Function Prototype Loading, Register Allocation | Implemented two-pass function prototype loading, fixed register allocation and tracking |
+
+## Current Implementation Status Summary
+
+### ✅ Successfully Implemented and Working
+- **Core VM Architecture**: Non-recursive state machine, transaction-based memory, handle validation
+- **Memory Management**: Generational arena, string interning, handle management, stack management
+- **Types and Values**: Basic types (nil, boolean, number, string), tables, functions, closures
+- **Parser and Compiler**: Lexical analysis, syntax parsing, AST generation, bytecode generation
+- **Bytecode Operations**: Arithmetic, comparisons, table access, variable access, function calls, control flow
+- **Language Features**: Expressions, statements, local variables, functions, parameters, returns, tables, closures
+
+### ⚠️ Partially Implemented/Tested
+- **Tables**: Complex operations, length operations, iteration methods
+- **Functions**: Multiple return values, variable arguments, method syntax
+- **Metatables**: Basic support exists but needs comprehensive testing
+- **Control Structures**: Advanced loop constructs, nested control flow
+
+### ❌ Not Yet Implemented
+- **Standard Library**: Basic functions, string library, table library, math library
+- **Advanced Features**: Error handling, module system, coroutines
+- **Redis Integration**: Command interface, EVAL/EVALSHA, script caching
 
 ## References
 

@@ -1095,6 +1095,17 @@ impl<'a> HeapTransaction<'a> {
         Ok(proto.clone())
     }
     
+    /// Replace a function prototype with an updated version
+    pub fn replace_function_proto(&mut self, handle: FunctionProtoHandle, updated: FunctionProto) -> LuaResult<FunctionProtoHandle> {
+        self.ensure_active()?;
+        
+        // Validate the handle
+        self.validate_with_context(&handle, "replace_function_proto")?;
+        
+        // Create a new function prototype with the updated contents
+        self.create_function_proto(updated)
+    }
+    
     /// Find or create an upvalue for a given stack index
     /// If an open upvalue already exists for the given stack index, returns it
     /// Otherwise, creates a new upvalue and adds it to the thread's open_upvalues list

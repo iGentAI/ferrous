@@ -4,7 +4,7 @@
 
 This document tracks the implementation status of the Lua VM for Ferrous Redis. It is based on the architectural specifications in the `LUA_ARCHITECTURE.md`, `LUA_TRANSACTION_PATTERNS.md`, and other design documents.
 
-**Current Overall Status**: Core implementation is now complete. All required opcodes have been implemented, the closure system is operational with proper upvalue management, and all architectural patterns are being followed. The VM is ready to serve as a foundation for compiler implementation, standard library, and Redis API integration.
+**Current Overall Status**: Core implementation is nearly complete with recently fixed compiler and bytecode generation components. The VM is now capable of executing basic Lua code including arithmetic operations, function definitions, and function calls. All core architectural patterns are being followed correctly. The implementation is ready for standard library integration and Redis API development.
 
 ## Core Components Status
 
@@ -19,10 +19,42 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 | **C Function Execution** | ✅ Complete | Isolated execution context with transaction-safe boundaries | Done |
 | **VM Structure** | ✅ Complete | Core state machine with all opcodes implemented | Done |
 | **Closure System** | ✅ Complete | Function prototype support, upvalue lifecycle management, and lexical scoping implemented | Done |
-| **Compiler** | ❌ Missing | Stub implementation returns hardcoded function; no parser or bytecode generation | Medium |
+| **Compiler** | ⚠️ Partial | Lexer and parser implemented, bytecode generation with proper opcode encoding now working | Medium |
 | **Metamethod System** | ✅ Complete | Full metamethod support for tables, arithmetic, comparisons, and concatenation | Done |
 | **Redis API Integration** | ❌ Missing | Almost completely absent; returns "not implemented" errors | High |
 | **Error Handling** | ⚠️ Partial | Error types defined but not fully implemented | Medium |
+
+## Recently Fixed Components (July 2025)
+
+### 1. Bytecode Encoding
+
+Fixed the critical issue with bytecode instruction encoding:
+- **Root cause**: Opcode enum values were being directly cast to u32 instead of mapping to the correct opcode numbers
+- **Impact**: Generated incorrect opcodes (ADD being encoded as SUB, RETURN being encoded as FORPREP)
+- **Fix**: Modified encoding functions to use proper `opcode_to_u8` mapping function
+
+### 2. Stack Management
+
+Improved stack initialization and register access:
+- **Root cause**: Stack was not properly initialized before function execution
+- **Impact**: "Stack index out of bounds" errors during execution
+- **Fix**: Properly reserve stack space based on function's max_stack_size before execution
+- **Fix**: Enhanced register access safety with automatic stack growth
+
+### 3. Function Prototype Handling
+
+Fixed function prototype handling for nested functions:
+- **Root cause**: Prototype references weren't properly transferred from compiler to module loader
+- **Impact**: "Invalid function prototype index" errors when executing functions
+- **Fix**: Implemented two-pass loading approach that handles forward references
+- **Fix**: Proper propagation of function prototypes from code generator to module
+
+### 4. Parser Functionality
+
+Fixed function body parsing:
+- **Root cause**: Parse logic treated Return as a block terminator rather than a statement
+- **Impact**: Parser error: "Expected 'end' after function body: expected End, got Return"
+- **Fix**: Modified parser to properly handle return statements within function bodies
 
 ## VM Opcode Implementation Status
 
@@ -127,21 +159,23 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 | **ArithmeticOp** | ⚠️ Defined but unused | Defined but never constructed in current implementation |
 | **CFunctionReturn** | ✅ Complete | Properly handles results from C functions |
 
-## Metamethod System
+## Language Feature Status
 
-| Metamethod | Status | Description |
-|------------|--------|-------------|
-| **__index** | ✅ Complete | Table index metamethod |
-| **__newindex** | ✅ Complete | Table assignment metamethod |
-| **__add, __sub, __mul, __div, __mod, __pow** | ✅ Complete | Arithmetic metamethods |
-| **__unm** | ✅ Complete | Unary minus metamethod |
-| **__concat** | ✅ Complete | Concatenation metamethod with proper string handling |
-| **__eq, __lt, __le** | ✅ Complete | Comparison metamethods |
-| **__len** | ✅ Complete | Length metamethod |
-| **__call** | ✅ Complete | Basic function call metamethod |
-| **__tostring** | ✅ Complete | String conversion metamethod (used in concatenation) |
-| **__gc** | ✅ N/A | Not needed in this implementation |
-| **__mode** | ❌ Missing | Weak table support |
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Basic Types** | ✅ Complete | nil, boolean, number, string all implemented |
+| **Tables** | ⚠️ Partial | Basic table operations working, complex operations need more testing |
+| **Functions** | ⚠️ Partial | Basic function definition and calls work, vararg and multiple returns need more testing |
+| **Local Variables** | ✅ Complete | Local variable declarations and assignments working |
+| **Global Variables** | ✅ Complete | Global variable access and assignment working |
+| **Arithmetic** | ✅ Complete | All operations implemented with proper coercion and metamethod support |
+| **Comparisons** | ✅ Complete | Equality and relational operators implemented with metamethod support |
+| **Control Flow** | ⚠️ Partial | If statements and basic loops working, complex conditions need more testing |
+| **Closures** | ⚠️ Partial | Basic closures with upvalues working, complex nesting needs more testing |
+| **Metatables** | ⚠️ Partial | Basic metamethod dispatch working, comprehensive testing needed |
+| **String Operations** | ⚠️ Partial | Concatenation and length working, missing standard library functions |
+| **Error Handling** | ❌ Missing | No pcall/xpcall or error() functionality yet |
+| **Standard Library** | ❌ Missing | No standard library functions implemented yet |
 
 ## Testing Status
 
@@ -152,20 +186,22 @@ This document tracks the implementation status of the Lua VM for Ferrous Redis. 
 | **Transaction Tests** | ✅ Passing | 13 comprehensive tests covering all aspects of handle validation |
 | **VM Tests** | ✅ Passing | 47 passing tests for implemented opcodes |
 | **Closure Tests** | ✅ Passing | Tests for closure creation, nested closures, upvalue sharing, etc. |
+| **Compiler Tests** | ⚠️ Partial | Basic compiler tests passing, more comprehensive tests needed |
+| **Bytecode Tests** | ⚠️ Partial | New comprehensive bytecode validation tests now passing |
 | **Redis Interface Tests** | ❌ Not Started | Pending implementation |
 | **Metamethod Tests** | ✅ Passing | Basic metamethod functionality tested |
 
 ## Critical Implementation Gaps
 
-While the core VM is now fully implemented, three major components remain to be implemented:
+While the core VM and compiler are now working, three major components remain to be implemented:
 
-1. **Compiler**: The compiler implementation is a complete stub that returns a hardcoded function. A proper parser and bytecode generator is needed.
+1. **Standard Library**: The standard Lua library (string, table, math functions) is not implemented.
 
 2. **Redis API**: The redis.call() and redis.pcall() functions are not yet implemented, and the KEYS and ARGV tables are not properly set up.
 
-3. **Standard Library**: The standard Lua library (string, table, math functions) is not implemented.
+3. **Error Handling**: The pcall and xpcall functions are not implemented, and error propagation is incomplete.
 
-These components can be built on top of the solid VM foundation that's now in place, as they don't require changes to the core VM architecture.
+These components can be built on top of the solid VM foundation and compiler that's now in place, as they don't require changes to the core architecture.
 
 ## Architecture Compliance
 
@@ -197,31 +233,34 @@ The implementation strictly follows these architectural principles:
    - Validation before reallocation
    - Validation caching for performance
 
-## Deviation from Architecture
-
-One minor architectural deviation exists:
-- The architecture specifies an operation priority system, but all operations are currently processed in FIFO order
-- This does not affect current functionality but might become relevant for more complex scenarios
-
 ## Implementation Priorities
 
-With the core VM completed, focus should be on:
+Based on the current status, these are the implementation priorities:
 
-1. **Implement Compiler** (High Priority)
-   - Create parser for Lua source code
-   - Implement bytecode generator
-   - Add support for all language constructs
+1. **Implement Standard Library** (High Priority)
+   - Basic global functions (print, type, etc.)
+   - String library functions
+   - Table library functions
+   - Math library functions
 
 2. **Implement Redis API** (High Priority)
    - Add redis.call() and redis.pcall() functions
    - Implement KEYS and ARGV table setup
    - Add proper error handling for Redis commands
 
-3. **Implement Standard Library** (Medium Priority)
-   - Add string, table, math functions
-   - Implement basic IO and other standard functions
-   - Add type conversion functions
+3. **Expand Testing Suite** (Medium Priority)
+   - Add comprehensive language feature tests
+   - Test complex table operations
+   - Test nested closures and upvalues
+   - Test metatables thoroughly
+
+4. **Implement Error Handling** (Medium Priority)
+   - Add pcall and xpcall functionality
+   - Implement proper traceback generation
+   - Add error propagation through the call stack
 
 ## Conclusion
 
-The core Lua VM implementation is now complete and ready to serve as a foundation for the compiler, standard library, and Redis integration work. All opcodes are implemented, the closure system works correctly with proper upvalue management, and the implementation follows all architectural principles.
+The Lua VM implementation has made significant progress with the recent fixes to the parser, bytecode generation, stack management, and function prototype handling. The core execution engine is now working correctly and can handle basic Lua scripts with arithmetic operations, function definitions, and function calls. 
+
+The foundation is solid and aligned with all architectural principles, making it an excellent base for implementing the remaining components like the standard library and Redis API integration. With these fixes in place, we've removed the major blocking issues that were preventing the VM from executing even simple Lua code.

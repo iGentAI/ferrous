@@ -85,6 +85,10 @@ impl LuaHeap {
         
         // Create main thread
         let main_thread_handle = self.create_thread_internal()?;
+        
+        // Initialize main thread with reasonable stack space
+        self.initialize_thread_stack(main_thread_handle, 256)?;
+        
         self.main_thread = Some(main_thread_handle);
         
         // Increment generation after initialization
@@ -321,33 +325,72 @@ impl LuaHeap {
     pub(crate) fn get_thread_register_internal(&self, thread: ThreadHandle, index: usize) -> LuaResult<Value> {
         let thread_obj = self.get_thread(thread)?;
         
-        if index < thread_obj.stack.len() {
-            Ok(thread_obj.stack[index].clone())
-        } else {
-            Err(LuaError::RuntimeError(format!(
+        println!("DEBUG: get_register - index: {}, stack size: {}", 
+                 index, thread_obj.stack.len());
+        
+        // Check bounds
+        if index >= thread_obj.stack.len() {
+            // Out of bounds access - return an error with detailed information
+            return Err(LuaError::RuntimeError(format!(
                 "Stack index {} out of bounds (stack size: {})",
                 index,
                 thread_obj.stack.len()
-            )))
+            )));
         }
+        
+        // Clone value to avoid borrowing issues
+        Ok(thread_obj.stack[index].clone())
     }
     
     pub(crate) fn set_thread_register_internal(&mut self, thread: ThreadHandle, index: usize, value: Value) -> LuaResult<()> {
         let thread_obj = self.get_thread_mut(thread)?;
         
-        if index < thread_obj.stack.len() {
-            thread_obj.stack[index] = value;
-            Ok(())
-        } else if index == thread_obj.stack.len() {
+        // Print debug info for stack operations
+        println!("DEBUG: set_register - index: {}, stack size: {}, value: {:?}", 
+                 index, thread_obj.stack.len(), value);
+        
+        // If index is out of bounds, grow the stack
+        if index >= thread_obj.stack.len() {
+            println!("DEBUG: Growing stack from {} to {}", thread_obj.stack.len(), index + 1);
+            
+            // Need to ensure stack.len() becomes at least (index + 1)
+            let additional_needed = index + 1 - thread_obj.stack.len();
+            thread_obj.stack.reserve(additional_needed);
+            
+            // Add Nil values up to but not including index
+            for i in 0..additional_needed-1 {
+                println!("DEBUG: Pushing Nil at position {}", thread_obj.stack.len());
+                thread_obj.stack.push(Value::Nil);
+            }
+            
+            // Add the target value at index
+            println!("DEBUG: Pushing value at position {}", thread_obj.stack.len());
             thread_obj.stack.push(value);
-            Ok(())
-        } else {
-            Err(LuaError::RuntimeError(format!(
-                "Stack index {} out of bounds (stack size: {})",
-                index,
-                thread_obj.stack.len()
-            )))
+            println!("DEBUG: After push, stack size: {}", thread_obj.stack.len());
+            
+            return Ok(());
         }
+        
+        // Otherwise, we can just set the value directly
+        thread_obj.stack[index] = value;
+        Ok(())
+    }
+    
+    /// Initialize a thread's stack with a specific size
+    /// This ensures the stack has enough space for a function's registers
+    pub(crate) fn initialize_thread_stack(&mut self, thread: ThreadHandle, size: usize) -> LuaResult<()> {
+        let thread_obj = self.get_thread_mut(thread)?;
+        
+        let current_size = thread_obj.stack.len();
+        
+        if current_size < size {
+            thread_obj.stack.reserve(size - current_size);
+            for _ in current_size..size {
+                thread_obj.stack.push(Value::Nil);
+            }
+        }
+        
+        Ok(())
     }
     
     // Validation methods

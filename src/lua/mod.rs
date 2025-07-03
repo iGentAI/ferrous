@@ -13,7 +13,11 @@ mod transaction;
 mod vm;
 mod error;
 mod metamethod;
-mod compiler;
+pub mod compiler;
+pub mod codegen;
+mod lexer;
+mod parser;
+mod ast;
 
 #[cfg(test)]
 mod test_basic;
@@ -22,6 +26,7 @@ pub use self::error::{LuaError, LuaResult};
 pub use self::value::Value;
 pub use self::vm::LuaVM;
 pub use self::compiler::{compile, CompiledModule};
+pub use self::codegen::OpCode;
 pub use self::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle};
 
 // Implement handle_lua_command directly in the lua module
