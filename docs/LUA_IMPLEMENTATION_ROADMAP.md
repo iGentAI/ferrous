@@ -167,151 +167,29 @@ Control flow operations and loop constructs have been implemented:
 - **TForLoop** for generic for loops (`for k,v in pairs(t) do ... end`)
 - **C function and closure iterators** support in TForLoop
 
-## Remaining Implementation Phases
+### Closure System
 
-### Phase 1: Complete VM Core Operations (Days 1-3)
+The closure system has been fully implemented with proper upvalue handling:
 
-#### 1.1 Table Construction
+- **Function Prototype** value type for first-class function prototypes
+- **Closure opcode** with proper prototype extraction and upvalue capture
+- **Thread-wide upvalue list** for tracking open upvalues
+- **Upvalue sharing** between closures capturing the same variables
+- **Close opcode** with proper upvalue closing when variables go out of scope
 
-```rust
-// NewTable opcode
-fn execute_new_table(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
-    // Create new table with array and map capacity hints from b and c
-    let table = tx.create_table_with_capacity(b, c)?;
-    
-    // Store in register
-    let base = frame.base_register as usize;
-    tx.set_register(self.current_thread, base + a, Value::Table(table))?;
-    
-    StepResult::Continue
-}
+### Missing Opcodes
 
-// SetList opcode for constructing array part efficiently
-fn execute_set_list(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
-    // Implementation for array part construction
-    // ...
-}
-```
+All previously missing opcodes have been implemented:
 
-#### 1.2 String Operations
+- **Self_** for method call syntax (`obj:method()`)
+- **VarArg** for variable argument functions
+- **ExtraArg** for extended instruction arguments
 
-```rust
-// Concat opcode with __concat metamethod support
-fn execute_concat(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
-    // Implementation with appropriate metamethod support
-    // ...
-}
+## Implementation Phases for Remaining Work
 
-// Len opcode with __len metamethod support
-fn execute_len(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
-    // Implementation with appropriate metamethod support
-    // ...
-}
-```
+### Phase 1: Implement Compiler (Weeks 1-3)
 
-#### 1.3 Additional Arithmetic
-
-```rust
-// Complete remaining arithmetic operations
-fn execute_mod(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
-    // Implementation with __mod metamethod support
-    // ...
-}
-
-fn execute_pow(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize, c: usize) -> LuaResult<StepResult> {
-    // Implementation with __pow metamethod support
-    // ...
-}
-
-fn execute_unm(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
-    // Implementation with __unm metamethod support
-    // ...
-}
-```
-
-### Phase 2: Closure Support (Days 4-6)
-
-#### 2.1 Upvalue Operations
-
-```rust
-fn execute_get_upval(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
-    // Implementation for GetUpval opcode
-    // ...
-}
-
-fn execute_set_upval(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, b: usize) -> LuaResult<StepResult> {
-    // Implementation for SetUpval opcode
-    // ...
-}
-
-fn execute_close(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize) -> LuaResult<StepResult> {
-    // Implementation for Close opcode
-    // ...
-}
-```
-
-#### 2.2 Closure Creation
-
-```rust
-fn execute_closure(&mut self, tx: &mut HeapTransaction, frame: &CallFrame, a: usize, bx: usize) -> LuaResult<StepResult> {
-    // Implementation for Closure opcode
-    // ...
-}
-```
-
-### Phase 3: Redis API Integration (Days 7-9)
-
-#### 3.1 Create Redis API Module
-
-```rust
-// redis_api.rs
-pub struct RedisApiContext {
-    pub storage: Arc<StorageEngine>,
-    pub db: usize,
-    pub keys: Vec<Vec<u8>>,
-    pub argv: Vec<Vec<u8>>,
-}
-```
-
-#### 3.2 Implement Redis Call and PCAll
-
-```rust
-// redis.call implementation
-pub fn redis_call(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    // Implementation using C function pattern
-    // ...
-}
-
-// redis.pcall implementation
-pub fn redis_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    // Implementation with error catching
-    // ...
-}
-```
-
-#### 3.3 Register Redis API Functions
-
-```rust
-fn setup_redis_api(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
-    // Create redis table
-    let table = tx.create_table()?;
-    
-    // Register functions
-    let call_name = tx.create_string("call")?;
-    tx.set_table_field(table, Value::String(call_name), Value::CFunction(redis_call))?;
-    
-    let pcall_name = tx.create_string("pcall")?;
-    tx.set_table_field(table, Value::String(pcall_name), Value::CFunction(redis_pcall))?;
-    
-    // ... other Redis functions ...
-    
-    Ok(table)
-}
-```
-
-### Phase 4: Compiler Implementation (Days 10-14)
-
-#### 4.1 Create Parser
+#### 1.1 Create Parser
 
 Implement a Lua 5.1 parser using recursive descent:
 
@@ -334,7 +212,7 @@ impl Parser {
 }
 ```
 
-#### 4.2 Create AST Representation
+#### 1.2 Create AST Representation
 
 ```rust
 pub enum Expr {
@@ -351,7 +229,7 @@ pub enum Expr {
 }
 ```
 
-#### 4.3 Implement Bytecode Generation
+#### 1.3 Implement Bytecode Generation
 
 ```rust
 pub struct Compiler {
@@ -373,47 +251,110 @@ impl Compiler {
 }
 ```
 
-### Phase 5: Testing and Integration (Days 15-18)
+### Phase 2: Redis API Integration (Weeks 4-5)
 
-#### 5.1 Create Component Tests
-
-Implement detailed tests for each component:
+#### 2.1 Create Redis API Module
 
 ```rust
-#[test]
-fn test_metamethod_resolution() {
-    // Test metamethod lookup
-    // ...
+// redis_api.rs
+pub struct RedisApiContext {
+    pub storage: Arc<StorageEngine>,
+    pub db: usize,
+    pub keys: Vec<Vec<u8>>,
+    pub argv: Vec<Vec<u8>>,
 }
-
-#[test]
-fn test_arithmetic_metamethods() {
-    // Test arithmetic operations with metamethods
-    // ...
-}
-
-// ... other tests ...
 ```
 
-#### 5.2 Create Integration Tests
-
-Test the complete VM with complex scripts:
+#### 2.2 Implement Redis Call and PCAll
 
 ```rust
-#[test]
-fn test_complex_script() {
-    // Test a script with tables, functions, and metamethods
+// redis.call implementation
+pub fn redis_call(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    // Implementation using C function pattern
     // ...
 }
 
-#[test]
-fn test_redis_integration() {
-    // Test Redis API integration
+// redis.pcall implementation
+pub fn redis_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    // Implementation with error catching
     // ...
 }
-
-// ... other tests ...
 ```
+
+#### 2.3 Register Redis API Functions
+
+```rust
+fn setup_redis_api(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
+    // Create redis table
+    let table = tx.create_table()?;
+    
+    // Register functions
+    let call_name = tx.create_string("call")?;
+    tx.set_table_field(table, Value::String(call_name), Value::CFunction(redis_call))?;
+    
+    let pcall_name = tx.create_string("pcall")?;
+    tx.set_table_field(table, Value::String(pcall_name), Value::CFunction(redis_pcall))?;
+    
+    // ... other Redis functions ...
+    
+    Ok(table)
+}
+```
+
+### Phase 3: Standard Library (Weeks 6-8)
+
+#### 3.1 Implement String Library
+
+```rust
+fn setup_string_lib(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
+    // Create string table
+    let table = tx.create_table()?;
+    
+    // Register functions
+    tx.set_table_field(table, Value::String(tx.create_string("len")?), Value::CFunction(string_len))?;
+    tx.set_table_field(table, Value::String(tx.create_string("sub")?), Value::CFunction(string_sub))?;
+    tx.set_table_field(table, Value::String(tx.create_string("upper")?), Value::CFunction(string_upper))?;
+    // ... other string functions ...
+    
+    Ok(table)
+}
+```
+
+#### 3.2 Implement Table Library
+
+```rust
+fn setup_table_lib(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
+    // Create table library
+    let table = tx.create_table()?;
+    
+    // Register functions
+    tx.set_table_field(table, Value::String(tx.create_string("insert")?), Value::CFunction(table_insert))?;
+    tx.set_table_field(table, Value::String(tx.create_string("remove")?), Value::CFunction(table_remove))?;
+    tx.set_table_field(table, Value::String(tx.create_string("concat")?), Value::CFunction(table_concat))?;
+    // ... other table functions ...
+    
+    Ok(table)
+}
+```
+
+#### 3.3 Implement Math Library
+
+```rust
+fn setup_math_lib(&mut self, tx: &mut HeapTransaction) -> LuaResult<TableHandle> {
+    // Create math library
+    let table = tx.create_table()?;
+    
+    // Register functions
+    tx.set_table_field(table, Value::String(tx.create_string("abs")?), Value::CFunction(math_abs))?;
+    tx.set_table_field(table, Value::String(tx.create_string("sin")?), Value::CFunction(math_sin))?;
+    tx.set_table_field(table, Value::String(tx.create_string("cos")?), Value::CFunction(math_cos))?;
+    // ... other math functions ...
+    
+    Ok(table)
+}
+```
+
+
 
 ## Progress Tracking
 
@@ -424,7 +365,7 @@ This section tracks implementation progress:
 | 2025-06-30 | Arena, Handle, Value, Heap, basic Transaction, basic VM Core | Initial implementation with core architecture in place |
 | 2025-07-02 | Handle Validation, C Function Execution | Fixed unsafe code, implemented proper type-safe validation, added C function execution pattern per architecture specs |
 | 2025-07-02 | Control Flow, Comparison Operations, For Loops | Implemented Jmp, Test, TestSet, Eq, Lt, Le, ForPrep, ForLoop, TForLoop opcodes with proper metamethod support |
-| | | |
+| 2025-07-03 | Closure System, Missing Opcodes, Metamethod Fixes | Implemented Function Prototype value type, thread-wide upvalue tracking, Closure opcode, Self_ opcode, VarArg opcode, ExtraArg opcode, fixed __concat metamethod with __tostring fallback |
 
 ## References
 

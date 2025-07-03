@@ -3,6 +3,11 @@
 //! This test suite covers all Lua 5.1 features required by Redis,
 //! testing each feature in isolation to ensure correctness.
 
+// Include our tests for closures and opcodes
+#[cfg(test)]
+#[path = "lua/lua_closure_tests.rs"]
+mod lua_closure_tests;
+
 #[cfg(test)]
 mod lua_spec_tests {
     use ferrous::lua::{LuaVM, Value, compiler};

@@ -6,8 +6,8 @@
 use super::arena::{Arena, Handle};
 use super::error::{LuaError, LuaResult};
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, 
-                    UpvalueHandle, UserDataHandle};
-use super::value::{LuaString, Table, Closure, Thread, Upvalue, UserData, Value};
+                    UpvalueHandle, UserDataHandle, FunctionProtoHandle};
+use super::value::{LuaString, Table, Closure, Thread, Upvalue, UserData, FunctionProto, Value};
 use std::collections::HashMap;
 
 /// The main Lua heap containing all allocated objects
@@ -33,6 +33,9 @@ pub struct LuaHeap {
     /// Arena for userdata storage
     userdata: Arena<UserData>,
     
+    /// Arena for function prototype storage
+    function_protos: Arena<FunctionProto>,
+    
     /// Global table handle
     globals: Option<TableHandle>,
     
@@ -57,6 +60,7 @@ impl LuaHeap {
             threads: Arena::with_capacity(4),
             upvalues: Arena::with_capacity(32),
             userdata: Arena::with_capacity(16),
+            function_protos: Arena::with_capacity(32),
             globals: None,
             registry: None,
             main_thread: None,
@@ -475,6 +479,60 @@ impl LuaHeap {
         }
         
         if let Some(stored_gen) = self.userdata.get_generation(index) {
+            stored_gen == generation
+        } else {
+            false
+        }
+    }
+    
+    pub(crate) fn create_function_proto_internal(&mut self, proto: FunctionProto) -> LuaResult<FunctionProtoHandle> {
+        let handle = FunctionProtoHandle::from(self.function_protos.insert(proto));
+        Ok(handle)
+    }
+    
+    /// Get a function prototype reference
+    pub(crate) fn get_function_proto(&self, handle: FunctionProtoHandle) -> LuaResult<&FunctionProto> {
+        self.function_protos.get(handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Get a mutable function prototype reference
+    pub(crate) fn get_function_proto_mut(&mut self, handle: FunctionProtoHandle) -> LuaResult<&mut FunctionProto> {
+        self.function_protos.get_mut(handle.0)
+            .ok_or(LuaError::InvalidHandle)
+    }
+    
+    /// Create a function prototype with validation before potential reallocation
+    pub fn create_function_proto_with_validation(&mut self, proto: FunctionProto, validated_handles: &[FunctionProtoHandle]) -> LuaResult<FunctionProtoHandle> {
+        // Check if we might need to reallocate
+        if self.function_protos.might_reallocate_on_insert() {
+            // Validate all handles before reallocation
+            for handle in validated_handles {
+                self.validate_function_proto_handle(*handle)?;
+            }
+        }
+        
+        // Now it's safe to create the prototype
+        self.create_function_proto_internal(proto)
+    }
+    
+    /// Validate a function prototype handle
+    pub fn validate_function_proto_handle(&self, handle: FunctionProtoHandle) -> LuaResult<()> {
+        self.function_protos.validate_handle(&handle.0)
+    }
+    
+    /// Check if a function prototype index is valid
+    pub fn is_valid_function_proto_index(&self, index: u32) -> bool {
+        index < self.function_protos.len() as u32
+    }
+    
+    /// Check if a function prototype generation is valid
+    pub fn is_valid_function_proto_generation(&self, index: u32, generation: u32) -> bool {
+        if !self.is_valid_function_proto_index(index) {
+            return false;
+        }
+        
+        if let Some(stored_gen) = self.function_protos.get_generation(index) {
             stored_gen == generation
         } else {
             false
