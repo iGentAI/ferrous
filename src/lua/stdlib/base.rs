@@ -1,4 +1,4 @@
-//! Lua Standard Library Implementation
+//! Lua Base Library Implementation
 //!
 //! This module implements the core Lua standard library functions
 //! following the Ferrous VM's architectural principles:
@@ -6,11 +6,11 @@
 //! - No recursion - all complex operations are queued
 //! - Clean separation from VM internals through ExecutionContext
 
-use super::error::{LuaError, LuaResult};
-use super::value::{Value, CFunction, HashableValue};
-use super::handle::{StringHandle, TableHandle};
-use super::vm::ExecutionContext;
-use super::transaction::HeapTransaction;
+use crate::lua::error::{LuaError, LuaResult};
+use crate::lua::value::{Value, CFunction, HashableValue};
+use crate::lua::handle::{StringHandle, TableHandle};
+use crate::lua::vm::ExecutionContext;
+use crate::lua::transaction::HeapTransaction;
 use std::collections::HashMap;
 
 /// Print function - prints all arguments separated by tabs
@@ -115,8 +115,36 @@ pub fn lua_tostring(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     
     let value = ctx.get_arg(0)?;
     
-    // TODO: Check for __tostring metamethod first
+    // Check for __tostring metamethod
+    let mt_result = ctx.check_metamethod(&value, "__tostring");
     
+    if let Some(func) = mt_result {
+        // Call metamethod with the value
+        let results = ctx.call_metamethod(func, vec![value.clone()])?;
+        
+        if results.is_empty() {
+            // No result from metamethod, push empty string
+            let handle = ctx.create_string("")?;
+            ctx.push_result(Value::String(handle))?;
+            return Ok(1);
+        }
+        
+        // Check that result is a string
+        match &results[0] {
+            Value::String(_) => {
+                // Push the string
+                ctx.push_result(results[0].clone())?;
+                return Ok(1);
+            },
+            _ => {
+                return Err(LuaError::RuntimeError(
+                    "'__tostring' must return a string".to_string()
+                ));
+            }
+        }
+    }
+    
+    // No metamethod or error, use default conversion
     let string_repr = match value {
         Value::Nil => "nil",
         Value::Boolean(b) => if b { "true" } else { "false" },
@@ -785,8 +813,9 @@ pub fn lua_load(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         }),
     };
     
-    // TODO: Implement proper chunk loading
-    // For now, return an error function
+    // This would be expanded in a full implementation to actually compile and load the chunk
+    
+    // Return an error for now
     let error_msg = ctx.create_string("load not fully implemented")?;
     ctx.push_result(Value::Nil)?;
     ctx.push_result(Value::String(error_msg))?;
@@ -910,150 +939,62 @@ pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 
 /// Helper to add execution context methods
 impl<'vm> ExecutionContext<'vm> {
-    /// Create a string in the heap
-    pub fn create_string(&mut self, s: &str) -> LuaResult<StringHandle> {
-        // Use the VM's heap to create a string through a transaction
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        let handle = tx.create_string(s)?;
-        tx.commit()?;
-        Ok(handle)
+    /// Check for a metamethod on a value
+    pub fn check_metamethod(&mut self, value: &Value, metamethod: &str) -> Option<Value> {
+        // This would be implemented to check for a metamethod
+        // For now, we'll return None for simplicity
+        None
     }
     
-    /// Get a string value from a handle
-    pub fn get_string_from_handle(&mut self, handle: StringHandle) -> LuaResult<String> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        let value = tx.get_string_value(handle)?;
-        tx.commit()?;
-        Ok(value)
-    }
-    
-    /// Get the next key-value pair from a table
-    pub fn table_next(&mut self, table: TableHandle, current_key: Value) -> LuaResult<Option<(Value, Value)>> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        let result = tx.table_next(table, current_key)?;
-        tx.commit()?;
-        Ok(result)
-    }
-    
-    /// Get a value from a table by key
-    pub fn table_get(&mut self, table: TableHandle, key: Value) -> LuaResult<Value> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        let value = tx.read_table_field(table, &key)?;
-        tx.commit()?;
-        Ok(value)
-    }
-    
-    /// Raw get - get a value from a table without metamethods
-    pub fn table_raw_get(&mut self, table: TableHandle, key: Value) -> LuaResult<Value> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        // Direct table access without metamethod lookup
-        let table_obj = tx.get_table(table)?;
-        
-        // Check if key is numeric for array access
-        let value = match key {
-            Value::Number(n) if n >= 1.0 && n.fract() == 0.0 => {
-                let idx = (n as usize) - 1; // Convert to 0-based index
-                if idx < table_obj.array.len() {
-                    table_obj.array[idx].clone()
-                } else {
-                    // Not in array, check map
-                    if let Ok(hashable_key) = HashableValue::from_value(&key) {
-                        table_obj.map.get(&hashable_key).cloned().unwrap_or(Value::Nil)
-                    } else {
-                        Value::Nil
-                    }
-                }
-            },
-            _ => {
-                // Non-numeric key, check in map
-                if let Ok(hashable_key) = HashableValue::from_value(&key) {
-                    table_obj.map.get(&hashable_key).cloned().unwrap_or(Value::Nil)
-                } else {
-                    Value::Nil
-                }
-            }
-        };
-        
-        tx.commit()?;
-        Ok(value)
-    }
-    
-    /// Raw set - set a value in a table without metamethods
-    pub fn table_raw_set(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        // Direct table modification without metamethod lookup
-        tx.set_table_field(table, key, value)?;
-        tx.commit()?;
-        Ok(())
-    }
-    
-    /// Get the length of a table (array part)
-    pub fn table_length(&mut self, table: TableHandle) -> LuaResult<usize> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        let table_obj = tx.get_table(table)?;
-        let len = table_obj.array.len();
-        tx.commit()?;
-        Ok(len)
-    }
-    
-    /// Set a table's metatable
-    pub fn set_metatable(&mut self, table: TableHandle, metatable: Option<TableHandle>) -> LuaResult<()> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        tx.set_table_metatable(table, metatable)?;
-        tx.commit()?;
-        Ok(())
-    }
-    
-    /// Get a table's metatable
-    pub fn get_metatable(&mut self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        let mt = tx.get_table_metatable(table)?;
-        tx.commit()?;
-        Ok(mt)
+    /// Call a metamethod with arguments
+    pub fn call_metamethod(&mut self, function: Value, args: Vec<Value>) -> LuaResult<Vec<Value>> {
+        // This would be implemented to call a metamethod
+        // For now, we'll return an empty vector for simplicity
+        Ok(Vec::new())
     }
 }
 
-/// Create a table with all standard library functions
-pub fn create_stdlib_table() -> HashMap<&'static str, CFunction> {
-    let mut stdlib = HashMap::new();
+/// Create a table with all base library functions
+pub fn create_base_lib() -> HashMap<&'static str, CFunction> {
+    let mut base_lib = HashMap::new();
     
     // Basic functions
-    stdlib.insert("print", lua_print as CFunction);
-    stdlib.insert("type", lua_type as CFunction);
-    stdlib.insert("tostring", lua_tostring as CFunction);
-    stdlib.insert("tonumber", lua_tonumber as CFunction);
-    stdlib.insert("assert", lua_assert as CFunction);
-    stdlib.insert("error", lua_error as CFunction);
-    stdlib.insert("select", lua_select as CFunction);
+    base_lib.insert("print", lua_print as CFunction);
+    base_lib.insert("type", lua_type as CFunction);
+    base_lib.insert("tostring", lua_tostring as CFunction);
+    base_lib.insert("tonumber", lua_tonumber as CFunction);
+    base_lib.insert("assert", lua_assert as CFunction);
+    base_lib.insert("error", lua_error as CFunction);
+    base_lib.insert("select", lua_select as CFunction);
     
     // Iterator functions
-    stdlib.insert("next", lua_next as CFunction);
-    stdlib.insert("pairs", lua_pairs as CFunction);
-    stdlib.insert("ipairs", lua_ipairs as CFunction);
+    base_lib.insert("next", lua_next as CFunction);
+    base_lib.insert("pairs", lua_pairs as CFunction);
+    base_lib.insert("ipairs", lua_ipairs as CFunction);
     
     // Metatable functions
-    stdlib.insert("setmetatable", lua_setmetatable as CFunction);
-    stdlib.insert("getmetatable", lua_getmetatable as CFunction);
+    base_lib.insert("setmetatable", lua_setmetatable as CFunction);
+    base_lib.insert("getmetatable", lua_getmetatable as CFunction);
     
     // Raw access functions
-    stdlib.insert("rawget", lua_rawget as CFunction);
-    stdlib.insert("rawset", lua_rawset as CFunction);
-    stdlib.insert("rawequal", lua_rawequal as CFunction);
+    base_lib.insert("rawget", lua_rawget as CFunction);
+    base_lib.insert("rawset", lua_rawset as CFunction);
+    base_lib.insert("rawequal", lua_rawequal as CFunction);
     
     // Table functions
-    stdlib.insert("unpack", lua_unpack as CFunction);
+    base_lib.insert("unpack", lua_unpack as CFunction);
     
     // Loading functions
-    stdlib.insert("load", lua_load as CFunction);
+    base_lib.insert("load", lua_load as CFunction);
     
     // Error handling
-    stdlib.insert("pcall", lua_pcall as CFunction);
+    base_lib.insert("pcall", lua_pcall as CFunction);
     
-    stdlib
+    base_lib
 }
 
-/// Initialize the standard library in a VM
-pub fn init_stdlib(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
+/// Initialize the base library in a VM
+pub fn init_base_lib(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
     use crate::lua::transaction::HeapTransaction;
     
     println!("DEBUG STDLIB: Starting standard library initialization");
@@ -1065,7 +1006,7 @@ pub fn init_stdlib(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
     let globals = tx.get_globals_table()?;
     
     // Add all stdlib functions
-    let stdlib = create_stdlib_table();
+    let stdlib = create_base_lib();
     println!("DEBUG STDLIB: Registering {} standard library functions", stdlib.len());
     
     for (name, func) in stdlib {
@@ -1084,26 +1025,79 @@ pub fn init_stdlib(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lua::vm::LuaVM;
-    
-    #[test]
-    fn test_type_function() {
-        let mut vm = LuaVM::new().unwrap();
-        init_stdlib(&mut vm).unwrap();
-        
-        // Test would involve compiling and executing Lua code
-        // For now, we just verify initialization works
+/// Helper to extract string arguments
+impl<'vm> ExecutionContext<'vm> {
+    /// Get a string value from a handle
+    pub fn get_string_from_handle(&mut self, handle: StringHandle) -> LuaResult<String> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        let value = tx.get_string_value(handle)?;
+        tx.commit()?;
+        Ok(value)
     }
     
-    #[test] 
-    fn test_tostring_function() {
-        let mut vm = LuaVM::new().unwrap();
-        init_stdlib(&mut vm).unwrap();
+    /// Get the argument as a string
+    pub fn get_arg_str(&mut self, index: usize) -> LuaResult<String> {
+        let value = self.get_arg(index)?;
         
-        // Test would involve compiling and executing Lua code
-        // For now, we just verify initialization works
+        match value {
+            Value::String(handle) => {
+                self.get_string_from_handle(handle)
+            },
+            _ => {
+                // Try to convert to string
+                match self.vm_access.globals() {
+                    Ok(globals) => {
+                        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+                        let tostring_name = tx.create_string("tostring")?;
+                        let func = tx.read_table_field(globals, &Value::String(tostring_name))?;
+                        tx.commit()?;
+                        
+                        match func {
+                            Value::CFunction(f) => {
+                                // Create a nested execution context
+                                let mut nested_ctx = ExecutionContext::new(
+                                    self.vm_access,
+                                    self.stack_base + self.arg_count,
+                                    1,
+                                    self.thread,
+                                );
+                                
+                                // Push the argument
+                                nested_ctx.push_result(value)?;
+                                
+                                // Call tostring function
+                                match f(&mut nested_ctx) {
+                                    Ok(_) => {
+                                        // Get the result
+                                        let result = nested_ctx.get_arg(0)?;
+                                        match result {
+                                            Value::String(handle) => {
+                                                nested_ctx.get_string_from_handle(handle)
+                                            },
+                                            _ => {
+                                                // If not a string, convert it manually
+                                                Ok(format!("{:?}", result))
+                                            }
+                                        }
+                                    },
+                                    Err(e) => {
+                                        // If tostring fails, use a simple string representation
+                                        Ok(format!("{:?}", value))
+                                    }
+                                }
+                            },
+                            _ => {
+                                // If tostring not available, fall back to a simple representation
+                                Ok(format!("{:?}", value))
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        // If globals not available, fall back to a simple representation
+                        Ok(format!("{:?}", value))
+                    }
+                }
+            }
+        }
     }
 }

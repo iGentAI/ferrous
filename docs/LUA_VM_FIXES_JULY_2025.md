@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document details the critical fixes made to the Lua VM implementation in July 2025. These fixes resolved fundamental issues that were preventing the VM from executing even basic Lua code. Thanks to these changes, the VM is now capable of executing scripts with arithmetic operations, function definitions, function calls, and basic control flow.
+This document details the critical fixes made to the Lua VM implementation in July 2025. These fixes resolved fundamental issues that were preventing the VM from executing even basic Lua code. Thanks to these changes, the VM is now capable of executing scripts with arithmetic operations, function definitions, function calls, basic control flow, and string concatenation.
 
 ## 1. Bytecode Encoding Fix
 
@@ -242,110 +242,188 @@ else if self.match_token(Token::Return) {
 
 3. Added a `Return` variant to the `Statement` enum to represent return statements in the AST.
 
-## 5. Register Allocation and Tracking
+## 5. Register Allocation Architecture Fix
 
 ### Problem
-The register allocator wasn't effectively tracking register lifetimes, leading to inefficient register usage and potential conflicts.
+The compiler's register allocation system was fundamentally mismatched with the VM's execution model, leading to register conflicts particularly for nested expressions and function calls.
 
 #### Root Cause
-While the register allocator tracked `last_use` in the `VarInfo` structure, this information wasn't being properly used for allocation decisions:
-
+The register allocator's `free_to()` method was completely resetting allocation state:
 ```rust
-// Not using lifetime information
-fn allocate(&mut self) -> usize {
-    // Try to reuse a free register first
-    if let Some(reg) = self.free_registers.pop() {
-        return reg;
+fn free_to(&mut self, level: usize) {
+    // Add all registers above level to free list
+    for reg in level..self.used {
+        if !self.free_registers.contains(&reg) {
+            self.free_registers.push(reg);
+            
+            // Also remove from variable mapping if present
+            self.register_to_variable.remove(&reg);
+        }
     }
     
-    // Always allocate new register if none free
-    let reg = self.used;
-    self.used += 1;
-    // ...
+    // Update used register count - THIS IS THE ACTUAL PROBLEM
+    self.used = level;  // This completely resets allocation state!
+    
+    // Sort free registers for better allocation patterns
+    self.free_registers.sort_unstable();
 }
 ```
+
+This caused registers to be prematurely freed when they were still needed by the VM, especially during nested expressions like function calls with concatenation arguments (`print(a .. b)`).
 
 #### Impact
-- Less efficient register allocation
-- Potentially larger max_stack_size than necessary
-- Could cause problems with complex scripts
+- Register conflicts between parent and child contexts
+- Function handle being overwritten by concatenation result
+- Type errors when executing seemingly valid code 
+- Most notably: "expected function, got string" errors when passing concatenation results to functions
 
 #### Solution
-Enhanced the register allocator to properly use lifetime information:
+Implemented a proper register lifetime tracking system:
 
+1. Enhanced RegisterAllocator to track which registers need preservation:
 ```rust
+/// Register allocator with lifetime tracking
+struct RegisterAllocator {
+    // Existing fields...
+    
+    /// Registers that should be preserved during state restoration
+    preserved_registers: HashSet<usize>,
+}
+
 impl RegisterAllocator {
-    // When allocating registers, prioritize reuse of registers whose variables are no longer used
-    fn allocate(&mut self) -> usize {
-        // First try to reuse free registers
-        if let Some(reg) = self.free_registers.pop() {
-            return reg;
-        }
-        
-        // Allocate a new register if necessary
-        let reg = self.used;
-        self.used += 1;
-        if self.used > self.max_used {
-            self.max_used = self.used;
-        }
-        
-        reg
+    /// Mark a register to be preserved when restoring state
+    fn preserve_register(&mut self, reg: usize) {
+        self.preserved_registers.insert(reg);
     }
     
-    // When determining which registers to free, use last_use information
-    fn free_unused_registers(&mut self, current_instruction: usize, variables: &HashMap<String, VarInfo>) {
-        for (var_name, var_info) in variables {
-            if let Some(last_use) = var_info.last_use {
-                if last_use < current_instruction && !var_info.captured {
-                    // Variable no longer used, free its register
-                    self.free_registers.push(var_info.register);
-                }
+    /// Restore the allocation state to a previously saved state
+    fn restore_state(&mut self, saved_state: usize) {
+        // Add all registers allocated since saved_state to the free list
+        // EXCEPT those marked as preserved
+        for reg in saved_state..self.used {
+            if !self.preserved_registers.contains(&reg) && !self.free_registers.contains(&reg) {
+                self.free_registers.push(reg);
+                self.register_to_variable.remove(&reg);
             }
         }
+        
+        // Reset allocation pointer to saved state
+        self.used = saved_state;
+        
+        // Sort free registers
+        self.free_registers.sort_unstable();
     }
 }
 ```
 
-## Testing and Validation
+2. Updated all compiler operation handlers to use this system consistently:
+   - **Binary operations**: Preserved operand registers during expression evaluation
+   ```rust
+   // Mark the operand registers as preserved
+   self.registers.preserve_register(left_reg);
+   self.registers.preserve_register(right_reg);
+   ```
+   
+   - **Function calls**: Preserved function register during argument evaluation 
+   ```rust
+   // CRITICAL: Preserve the function register
+   // This ensures it won't be overwritten during argument evaluation
+   self.registers.preserve_register(func_reg);
+   ```
+   
+   - **Table operations**: Preserved all needed registers across operations
+   ```rust
+   // CRITICAL: Preserve the table register
+   self.registers.preserve_register(table_reg);
+   ```
 
-### Simple Addition Test
+3. Modified the VM's CONCAT handler to properly handle register values:
+   ```rust
+   // Create a vector of all operand register values first
+   // This ensures we don't modify any registers until after reading them all
+   let mut operand_values = Vec::with_capacity((c - b + 1) as usize);
+   for i in b..=c {
+       let value = tx.read_register(self.current_thread, base + i)?;
+       operand_values.push(value);
+   }
+   ```
 
-We created a minimal test case to verify the basic arithmetic operations:
+This solution follows standard compiler techniques for register allocation, ensuring that registers aren't freed until they're truly no longer needed.
 
-```lua
--- minimal_eval.lua
-return 1 + 2
+## 6. CONCAT Operation Handling Fix
+
+### Problem
+The CONCAT opcode was incorrectly implemented as a purely deferred operation, which didn't align with the VM's register-based execution model.
+
+#### Root Cause
+The VM was incorrectly classifying all string concatenation operations as deferred operations, even when metamethod invocation wasn't needed:
+
+```rust
+// Old implementation always queued a pending operation
+tx.queue_operation(PendingOperation::Concatenation {
+    values: values.clone(),
+    current_index: 0,
+    dest_register: frame.base_register + a as u16,
+    accumulated: Vec::new(),
+})?;
 ```
 
-This successfully compiles to:
+This broke the code when register values were needed immediately after the CONCAT instruction.
+
+#### Impact
+- Register state was inconsistent after CONCAT operations
+- Functions receiving concatenated strings would get incorrect values
+- "expected function, got string" errors in common patterns like `print(a .. b)`
+
+#### Solution
+Updated CONCAT to use a hybrid approach that distinguishes between immediate and deferred execution paths:
+
+```rust
+// Determine if we need metamethod handling
+let mut needs_metamethod = false;
+let mut mm_index = 0;
+
+for (i, value) in operand_values.iter().enumerate() {
+    // Only defer for actual metamethods, not just any non-string value
+    if let Some(_) = crate::lua::metamethod::resolve_metamethod(
+        &mut tx, value, crate::lua::metamethod::MetamethodType::Concat
+    )? {
+        needs_metamethod = true;
+        mm_index = i;
+        break;
+    }
+    
+    // Check for __tostring metamethod too
+    // ...
+}
+
+if needs_metamethod {
+    // Use the Pending Operation system for metamethod handling
+    tx.queue_operation(PendingOperation::Concatenation {
+        values: operand_values,
+        current_index: mm_index,
+        dest_register: frame.base_register + a as u16,
+        accumulated: Vec::new(),
+    })?;
+} else {
+    // We can concatenate immediately 
+    let mut result = String::new();
+    
+    // Process all values right away
+    for value in &operand_values {
+        // String conversion logic...
+    }
+    
+    // Create the final string
+    let string_handle = tx.create_string(&result)?;
+    tx.set_register(self.current_thread, base + a, Value::String(string_handle))?;
+}
 ```
-[0] LoadK 1, 0    # Load 1.0 into register 1
-[1] LoadK 2, 1    # Load 2.0 into register 2
-[2] Add 0, 1, 2   # Add registers 1 and 2, store in register 0
-[3] Return 0, 2   # Return value in register 0
-```
 
-And executes to produce the correct result: `3.0`.
-
-### Function Test
-
-We tested function definition and calling with:
-
-```lua
--- with_function.lua
-local x = 42
-
-local function add(a, b)
-  return a + b
-end
-
-return add(x, 10)
-```
-
-This now successfully compiles and executes, producing the result: `52`.
+This ensures that simple concatenations complete immediately, while complex ones that need metamethods still use the pending operation system.
 
 ## Conclusion
 
-These fixes have resolved the critical blocking issues that were preventing the Lua VM from executing even simple scripts. The implementation now correctly handles the core language features including arithmetic operations, functions, and basic control flow. 
+These fixes have resolved the critical blocking issues that were preventing the Lua VM from executing even moderately complex scripts. The implementation now correctly handles core language features including arithmetic operations, functions, control flow, and concatenation operations with nested expressions. 
 
-The fixes were carefully implemented to maintain alignment with the architectural principles, particularly the non-recursive state machine execution model and transaction-based memory management. With these issues resolved, development can now focus on implementing the standard library and Redis API integration.
+With these architectural fixes in place, the focus can now shift to completing the standard library, improving error handling, implementing garbage collection, and eventually integrating with Redis. There are still placeholder implementations throughout the codebase that will need to be addressed, but the core VM architecture is now sound.

@@ -4,7 +4,7 @@
 //! the AST into bytecode following the architectural principle of
 //! complete independence from the VM and heap.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use super::ast::*;
 use super::error::{LuaError, LuaResult};
 
@@ -108,6 +108,9 @@ struct RegisterAllocator {
     
     /// Current instruction index
     current_instruction: usize,
+    
+    /// Registers that need to be preserved during state restoration
+    preserved_registers: HashSet<usize>,
 }
 
 impl RegisterAllocator {
@@ -119,7 +122,64 @@ impl RegisterAllocator {
             free_registers: Vec::new(),
             register_to_variable: HashMap::new(),
             current_instruction: 0,
+            preserved_registers: HashSet::new(),
         }
+    }
+    
+    /// Save the current allocation state for later restoration
+    /// This is the key to proper scoped register allocation
+    pub fn save_state(&self) -> usize {
+        self.used
+    }
+    
+    /// Mark a register to be preserved when restoring state
+    fn preserve_register(&mut self, reg: usize) {
+        self.preserved_registers.insert(reg);
+    }
+    
+    /// Mark multiple registers to be preserved
+    fn preserve_registers(&mut self, regs: &[usize]) {
+        for &reg in regs {
+            self.preserve_register(reg);
+        }
+    }
+    
+    /// Clear all preserved register markings
+    fn clear_preserved(&mut self) {
+        self.preserved_registers.clear();
+    }
+    
+    /// Restore state to a previously saved point, preserving registers
+    /// allocated by parent contexts
+    pub fn restore_state(&mut self, saved_state: usize) {
+        // Free all registers allocated since saved_state
+        // EXCEPT those marked as preserved
+        for reg in saved_state..self.used {
+            // Skip preserved registers
+            if self.preserved_registers.contains(&reg) {
+                continue;
+            }
+            
+            if !self.free_registers.contains(&reg) {
+                self.free_registers.push(reg);
+                
+                // Also remove from variable mapping if present
+                self.register_to_variable.remove(&reg);
+            }
+        }
+        
+        // Reset allocation pointer to saved state
+        self.used = saved_state;
+        
+        // Sort free registers for better allocation patterns
+        self.free_registers.sort_unstable();
+    }
+    
+    /// The problematic function causing register conflicts
+    /// NOTE: This method is preserved for backwards compatibility but
+    /// now delegates to restore_state() for better scoping
+    fn free_to(&mut self, level: usize) {
+        self.restore_state(level);
     }
     
     /// Allocate a register, preferring to reuse a free register if possible
@@ -145,31 +205,13 @@ impl RegisterAllocator {
         reg
     }
     
-    /// Mark a register as containing a specific variable
-    fn mark_register(&mut self, register: usize, variable: String) {
-        self.register_to_variable.insert(register, variable);
-    }
-    
-    /// Mark the current instruction as using a variable
-    fn mark_variable_use(&self, variables: &mut HashMap<String, VarInfo>, name: &str) {
-        if let Some(var_info) = variables.get_mut(name) {
-            var_info.last_use = Some(self.current_instruction);
-        }
-    }
-    
-    /// Increment the current instruction counter
-    fn increment_instruction(&mut self) {
-        self.current_instruction += 1;
-    }
-    
     /// Free registers for variables at a specific scope level
     /// Updates the free_registers list for reuse
     fn free_scope(&mut self, level: usize, variables: &HashMap<String, VarInfo>) {
         // Find all variables at this scope level that are not captured
-        // Create a temporary vector to avoid borrow issues
         let mut to_free = Vec::new();
         
-        // First collect all registers/names to free
+        // First collect all registers/names to free to avoid borrow conflicts
         for (reg, var_name) in &self.register_to_variable {
             if let Some(var_info) = variables.get(var_name) {
                 if var_info.level == level && !var_info.captured {
@@ -178,39 +220,45 @@ impl RegisterAllocator {
             }
         }
         
-        // Now free them - no more borrow issues because we're using cloned values
+        // Now free them - avoid borrow checker issues
         for (reg, _) in to_free {
-            self.free_registers.push(reg);
-            self.register_to_variable.remove(&reg);
-        }
-        
-        // Sort free registers to prefer lower numbers (better locality)
-        self.free_registers.sort_unstable();
-    }
-    
-    /// Free all registers above a given level
-    /// This is used for temporary registers
-    fn free_to(&mut self, level: usize) {
-        // Add all registers above level to free list
-        for reg in level..self.used {
-            if !self.free_registers.contains(&reg) {
+            // Skip preserved registers
+            if !self.preserved_registers.contains(&reg) {
                 self.free_registers.push(reg);
-                
-                // Also remove from variable mapping if present
                 self.register_to_variable.remove(&reg);
             }
         }
         
-        // Update used register count
-        self.used = level;
-        
-        // Sort free registers for better allocation patterns
+        // Sort free registers to prefer lower numbers
         self.free_registers.sort_unstable();
+    }
+    
+    /// Mark a register as containing a specific variable
+    fn mark_register(&mut self, register: usize, variable: String) {
+        self.register_to_variable.insert(register, variable);
+    }
+    
+    /// Check if a register might be holding a function or critical value
+    fn is_register_used_for_function(&self, reg: usize) -> bool {
+        // Heuristic: If the register is already marked with a variable, it might be a function
+        self.register_to_variable.contains_key(&reg)
     }
     
     /// Get the current register usage level
     fn level(&self) -> usize {
         self.used
+    }
+    
+    /// Increment the current instruction counter
+    fn increment_instruction(&mut self) {
+        self.current_instruction += 1;
+    }
+    
+    /// Mark a variable as being used at the current instruction
+    fn mark_variable_use(&mut self, variables: &mut HashMap<String, VarInfo>, name: &str) {
+        if let Some(var_info) = variables.get_mut(name) {
+            var_info.last_use = Some(self.current_instruction);
+        }
     }
 }
 
@@ -288,6 +336,53 @@ pub struct CompiledFunction {
     
     /// Nested function prototypes (only populated for the main function)
     pub prototypes: Vec<CompiledFunction>,
+}
+
+fn process_array_batch(
+    codegen: &mut CodeGenerator,
+    target: usize,
+    fields: &[&Expression],
+    start_index: usize,
+) -> LuaResult<()> {
+    const FIELDS_PER_FLUSH: usize = 50;
+    
+    let batch_state = codegen.registers.save_state();
+    
+    // Allocate registers for all fields in this batch
+    let mut field_regs = Vec::with_capacity(fields.len());
+    
+    for _ in 0..fields.len() {
+        field_regs.push(codegen.registers.allocate());
+    }
+    
+    // Evaluate each expression in its own scope
+    for (i, &expr) in fields.iter().enumerate() {
+        let expr_state = codegen.registers.save_state();
+        
+        // Evaluate expression
+        codegen.expression(expr, field_regs[i], 1)?;
+        
+        // Preserve the field register
+        codegen.registers.preserve_register(field_regs[i]);
+        codegen.registers.restore_state(expr_state);
+    }
+    
+    // Emit SETLIST instruction for this batch
+    let batch_index = (start_index - 1) / FIELDS_PER_FLUSH + 1;
+    codegen.emit(CodeGenerator::encode_ABC(
+        OpCode::SetList,
+        target as u8,
+        fields.len() as u16,
+        batch_index as u16
+    ));
+    
+    // Clear preserved registers for this batch and restore
+    for &reg in &field_regs {
+        codegen.registers.preserved_registers.remove(&reg);
+    }
+    codegen.registers.restore_state(batch_state);
+    
+    Ok(())
 }
 
 /// Bytecode generator for Lua
@@ -1133,6 +1228,8 @@ impl CodeGenerator {
     fn assignment(&mut self, assignment: &Assignment) -> LuaResult<()> {
         // Special case for simple assignment
         if assignment.variables.len() == 1 && assignment.expressions.len() == 1 {
+            let saved_state = self.registers.save_state();
+            
             // Allocate a register for the value
             let value_reg = self.registers.allocate();
             
@@ -1142,18 +1239,24 @@ impl CodeGenerator {
             // Assign to the variable
             self.assign_to_variable(&assignment.variables[0], value_reg)?;
             
-            self.registers.free_to(value_reg);
+            self.registers.restore_state(saved_state);
             return Ok(());
         }
         
         // General case: multiple variables or expressions
         // In Lua, we evaluate all expressions before any assignments
         
-        // Allocate registers for expressions
-        let expr_base = self.registers.level();
+        let saved_state = self.registers.save_state();
+        
         let num_exprs = assignment.expressions.len();
         
-        // Evaluate expressions
+        // Allocate registers for all expression results
+        let mut expr_regs = Vec::with_capacity(num_exprs);
+        for _ in 0..num_exprs {
+            expr_regs.push(self.registers.allocate());
+        }
+        
+        // Evaluate each expression in its own scope
         for (i, expr) in assignment.expressions.iter().enumerate() {
             let want = if i == num_exprs - 1 && num_exprs < assignment.variables.len() {
                 // Last expression might produce multiple values
@@ -1162,25 +1265,28 @@ impl CodeGenerator {
                 1
             };
             
-            let expr_reg = self.registers.allocate();
-            self.expression(expr, expr_reg, want)?;
+            let expr_state = self.registers.save_state();
+            
+            // Evaluate expression
+            self.expression(expr, expr_regs[i], want)?;
+            
+            self.registers.restore_state(expr_state);
         }
         
         // Perform assignments
         for (i, var) in assignment.variables.iter().enumerate() {
             if i < num_exprs {
-                // Direct assignment
-                self.assign_to_variable(var, expr_base + i)?;
+                // Direct assignment from expression result
+                self.assign_to_variable(var, expr_regs[i])?;
             } else {
                 // Assign nil for missing expressions
                 let nil_reg = self.registers.allocate();
                 self.emit(Self::encode_ABC(OpCode::LoadNil, nil_reg as u8, 0, 0));
                 self.assign_to_variable(var, nil_reg)?;
-                self.registers.free_to(nil_reg);
             }
         }
         
-        self.registers.free_to(expr_base);
+        self.registers.restore_state(saved_state);
         
         Ok(())
     }
@@ -1254,7 +1360,6 @@ impl CodeGenerator {
         Ok(())
     }
     
-    /// Compile an expression
     fn expression(&mut self, expr: &Expression, target: usize, want: usize) -> LuaResult<()> {
         match expr {
             Expression::Nil => {
@@ -1275,6 +1380,8 @@ impl CodeGenerator {
                 self.emit(Self::encode_ABC(OpCode::VarArg, target as u8, 0, want as u16));
             }
             Expression::FunctionDef { parameters, is_vararg, body } => {
+                let saved_state = self.registers.save_state();
+                
                 // Compile function
                 let proto = self.compile_function(parameters, *is_vararg, body)?;
                 
@@ -1283,22 +1390,49 @@ impl CodeGenerator {
                 
                 // Create closure
                 self.emit(Self::encode_ABx(OpCode::Closure, target as u8, proto_idx as u32));
-
-                // EMIT UPVALUES HERE
+                
+                self.registers.restore_state(saved_state);
             }
             Expression::TableConstructor(table) => {
+                // Table constructor has its own scoped allocation
                 self.table_constructor(table, target)?;
             }
             Expression::BinaryOp { left, operator, right } => {
                 self.binary_op(*operator, left, right, target)?;
             }
             Expression::UnaryOp { operator, operand } => {
-                self.unary_op(*operator, operand, target)?;
+                let saved_state = self.registers.save_state();
+                
+                // Allocate register for operand
+                let op_reg = self.registers.allocate();
+                self.expression(operand, op_reg, 1)?;
+                
+                // Preserve the operand register
+                self.registers.preserve_register(op_reg);
+                
+                // Generate unary operation
+                match operator {
+                    UnaryOperator::Not => {
+                        self.emit(Self::encode_ABC(OpCode::Not, target as u8, op_reg as u16, 0));
+                    }
+                    UnaryOperator::Minus => {
+                        self.emit(Self::encode_ABC(OpCode::Unm, target as u8, op_reg as u16, 0));
+                    }
+                    UnaryOperator::Length => {
+                        self.emit(Self::encode_ABC(OpCode::Len, target as u8, op_reg as u16, 0));
+                    }
+                }
+                
+                self.registers.restore_state(saved_state);
+                
+                // Clear the preserved flag for this register
+                self.registers.preserved_registers.remove(&op_reg);
             }
             Expression::Variable(var) => {
                 self.compile_variable(var, target)?;
             }
             Expression::FunctionCall(call) => {
+                // Function call has its own scoped allocation
                 self.function_call(call, target, want)?;
             }
         }
@@ -1306,7 +1440,6 @@ impl CodeGenerator {
         Ok(())
     }
 
-    /// Binary operations handler
     fn binary_op(
         &mut self,
         op: BinaryOperator,
@@ -1315,70 +1448,91 @@ impl CodeGenerator {
         target: usize,
     ) -> LuaResult<()> {
         match op {
-            BinaryOperator::And => {
-                // Evaluate left operand
-                self.expression(left, target, 1)?;
-                
-                // Test and skip right operand if false
-                self.emit(Self::encode_ABC(OpCode::Test, target as u8, 0, 0));
-                let jmp = self.current_pc();
-                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder
-                
-                // Evaluate right operand into same register
-                self.expression(right, target, 1)?;
-                
-                // Patch jump
-                let end = self.current_pc();
-                self.code[jmp] = Self::encode_AsBx(
-                    OpCode::Jmp,
-                    0,
-                    end as i32 - jmp as i32 - 1 // Relative offset
-                );
-            }
-            BinaryOperator::Or => {
-                // Evaluate left operand
-                self.expression(left, target, 1)?;
-                
-                // Test and skip right operand if true
-                self.emit(Self::encode_ABC(OpCode::Test, target as u8, 0, 1));
-                let jmp = self.current_pc();
-                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder
-                
-                // Evaluate right operand into same register
-                self.expression(right, target, 1)?;
-                
-                // Patch jump
-                let end = self.current_pc();
-                self.code[jmp] = Self::encode_AsBx(
-                    OpCode::Jmp,
-                    0,
-                    end as i32 - jmp as i32 - 1 // Relative offset
-                );
-            }
+            BinaryOperator::And | BinaryOperator::Or => {
+                // Logic operations have special execution patterns, not changed
+                if op == BinaryOperator::And {
+                    // Evaluate left operand
+                    self.expression(left, target, 1)?;
+                    
+                    // Test and skip right operand if false
+                    self.emit(Self::encode_ABC(OpCode::Test, target as u8, 0, 0));
+                    let jmp = self.current_pc();
+                    self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder
+                    
+                    // Evaluate right operand into same register
+                    self.expression(right, target, 1)?;
+                    
+                    // Patch jump
+                    let end = self.current_pc();
+                    self.code[jmp] = Self::encode_AsBx(
+                        OpCode::Jmp,
+                        0,
+                        end as i32 - jmp as i32 - 1 // Relative offset
+                    );
+                } else { // Or
+                    // Evaluate left operand
+                    self.expression(left, target, 1)?;
+                    
+                    // Test and skip right operand if true
+                    self.emit(Self::encode_ABC(OpCode::Test, target as u8, 0, 1));
+                    let jmp = self.current_pc();
+                    self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder
+                    
+                    // Evaluate right operand into same register
+                    self.expression(right, target, 1)?;
+                    
+                    // Patch jump
+                    let end = self.current_pc();
+                    self.code[jmp] = Self::encode_AsBx(
+                        OpCode::Jmp,
+                        0,
+                        end as i32 - jmp as i32 - 1 // Relative offset
+                    );
+                }
+            },
             _ => {
-                // Arithmetic, concatenation, or comparison
+                // Arithmetic, concatenation, or comparison operations
+                
+                let saved_state = self.registers.save_state();
+                
+                // Allocate registers for operands
                 let left_reg = self.registers.allocate();
                 self.expression(left, left_reg, 1)?;
                 
                 let right_reg = self.registers.allocate();
                 self.expression(right, right_reg, 1)?;
                 
-                let opcode = match op {
-                    BinaryOperator::Add => OpCode::Add,
-                    BinaryOperator::Sub => OpCode::Sub,
-                    BinaryOperator::Mul => OpCode::Mul, 
-                    BinaryOperator::Div => OpCode::Div,
-                    BinaryOperator::Mod => OpCode::Mod,
-                    BinaryOperator::Pow => OpCode::Pow,
+                // Mark the operand registers as preserved
+                // This ensures they're not freed during restore_state()
+                self.registers.preserve_register(left_reg);
+                self.registers.preserve_register(right_reg);
+                
+                // Generate the specific opcode based on operation type
+                match op {
+                    BinaryOperator::Add => {
+                        self.emit(Self::encode_ABC(OpCode::Add, target as u8, left_reg as u16, right_reg as u16));
+                    },
+                    BinaryOperator::Sub => {
+                        self.emit(Self::encode_ABC(OpCode::Sub, target as u8, left_reg as u16, right_reg as u16));
+                    },
+                    BinaryOperator::Mul => {
+                        self.emit(Self::encode_ABC(OpCode::Mul, target as u8, left_reg as u16, right_reg as u16));
+                    },
+                    BinaryOperator::Div => {
+                        self.emit(Self::encode_ABC(OpCode::Div, target as u8, left_reg as u16, right_reg as u16));
+                    },
+                    BinaryOperator::Mod => {
+                        self.emit(Self::encode_ABC(OpCode::Mod, target as u8, left_reg as u16, right_reg as u16));
+                    },
+                    BinaryOperator::Pow => {
+                        self.emit(Self::encode_ABC(OpCode::Pow, target as u8, left_reg as u16, right_reg as u16));
+                    },
                     BinaryOperator::Concat => {
-                        // Special handling for concatenation
                         self.emit(Self::encode_ABC(OpCode::Concat, target as u8, left_reg as u16, right_reg as u16));
-                        self.registers.free_to(left_reg);
-                        return Ok(());
-                    }
+                    },
                     BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt | 
                     BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
-                        // Comparisons
+                        // Comparisons need special handling
                         let cmp_op = match op {
                             BinaryOperator::Eq => OpCode::Eq,
                             BinaryOperator::Ne => OpCode::Eq, // Invert test
@@ -1396,7 +1550,7 @@ impl CodeGenerator {
                         let b = if swap { right_reg } else { left_reg };
                         let c = if swap { left_reg } else { right_reg };
                         
-                        // Load true to target
+                        // Load true initially
                         self.emit(Self::encode_ABC(OpCode::LoadBool, target as u8, 1, 0));
                         
                         // Compare and skip next instruction if false
@@ -1405,50 +1559,27 @@ impl CodeGenerator {
                         
                         // Load false if comparison failed
                         self.emit(Self::encode_ABC(OpCode::LoadBool, target as u8, 0, 0));
-                        
-                        self.registers.free_to(left_reg);
-                        return Ok(());
-                    }
+                    },
                     _ => return Err(LuaError::CompileError("Invalid binary operator".to_string())),
-                };
+                }
                 
-                self.emit(Self::encode_ABC(opcode, target as u8, left_reg as u16, right_reg as u16));
-                self.registers.free_to(left_reg);
+                // Restore state with preserved registers
+                self.registers.restore_state(saved_state);
             }
         }
         
         Ok(())
     }
     
-    fn unary_op(
-        &mut self,
-        op: UnaryOperator,
-        operand: &Expression,
-        target: usize,
-    ) -> LuaResult<()> {
-        match op {
-            UnaryOperator::Not => {
-                self.expression(operand, target, 1)?;
-                self.emit(Self::encode_ABC(OpCode::Not, target as u8, target as u16, 0));
-            }
-            UnaryOperator::Minus => {
-                self.expression(operand, target, 1)?;
-                self.emit(Self::encode_ABC(OpCode::Unm, target as u8, target as u16, 0));
-            }
-            UnaryOperator::Length => {
-                self.expression(operand, target, 1)?;
-                self.emit(Self::encode_ABC(OpCode::Len, target as u8, target as u16, 0));
-            }
-        }
-        
-        Ok(())
-    }
+
     
     fn compile_variable(&mut self, var: &Variable, target: usize) -> LuaResult<()> {
         match var {
             Variable::Name(name) => {
-                // Check for local
-                if let Some(v) = self.resolve_variable_and_clone(name) {
+                // Check for local variable - pattern match in a way that avoids double mutable borrows
+                let var_info = self.resolve_variable_and_clone(name);
+                
+                if let Some(v) = var_info {
                     self.emit(Self::encode_ABC(OpCode::Move, target as u8, v.register as u16, 0));
                     return Ok(());
                 }
@@ -1464,19 +1595,36 @@ impl CodeGenerator {
                 self.emit(Self::encode_ABx(OpCode::GetGlobal, target as u8, key_idx as u32));
             }
             Variable::Index { table, key } => {
-                let table_reg = self.registers.allocate();
-                let key_reg = self.registers.allocate();
+                let saved_state = self.registers.save_state();
                 
+                let table_reg = self.registers.allocate();
                 self.expression(table, table_reg, 1)?;
+                
+                // Preserve the table register
+                self.registers.preserve_register(table_reg);
+                
+                let key_reg = self.registers.allocate();
                 self.expression(key, key_reg, 1)?;
+                
+                // Preserve the key register
+                self.registers.preserve_register(key_reg);
                 
                 self.emit(Self::encode_ABC(OpCode::GetTable, target as u8, table_reg as u16, key_reg as u16));
                 
-                self.registers.free_to(table_reg);
+                self.registers.restore_state(saved_state);
+                
+                // Clear preservation flags for these registers
+                self.registers.preserved_registers.remove(&table_reg);
+                self.registers.preserved_registers.remove(&key_reg);
             }
             Variable::Member { table, field } => {
+                let saved_state = self.registers.save_state();
+                
                 let table_reg = self.registers.allocate();
                 self.expression(table, table_reg, 1)?;
+                
+                // Preserve the table register
+                self.registers.preserve_register(table_reg);
                 
                 let key_idx = self.add_string_constant(field)?;
                 let key_const = key_idx | 0x100; // Mark as constant (high bit set)
@@ -1488,7 +1636,10 @@ impl CodeGenerator {
                     key_const as u16
                 ));
                 
-                self.registers.free_to(table_reg);
+                self.registers.restore_state(saved_state);
+                
+                // Clear preservation flag for the table register
+                self.registers.preserved_registers.remove(&table_reg);
             }
         }
         
@@ -1496,10 +1647,15 @@ impl CodeGenerator {
     }
     
     fn assign_to_variable(&mut self, var: &Variable, value_reg: usize) -> LuaResult<()> {
+        // Preserve the value register for the entire assignment
+        self.registers.preserve_register(value_reg);
+        
         match var {
             Variable::Name(name) => {
-                // Check for local
-                if let Some(v) = self.resolve_variable_and_clone(name) {
+                // Check for local - pattern match in a way that avoids double mutable borrows
+                let var_info = self.resolve_variable_and_clone(name);
+                
+                if let Some(v) = var_info {
                     self.emit(Self::encode_ABC(OpCode::Move, v.register as u8, value_reg as u16, 0));
                     return Ok(());
                 }
@@ -1515,22 +1671,39 @@ impl CodeGenerator {
                 self.emit(Self::encode_ABx(OpCode::SetGlobal, value_reg as u8, key_idx as u32));
             }
             Variable::Index { table, key } => {
-                let table_reg = self.registers.allocate();
-                let key_reg = self.registers.allocate();
+                let saved_state = self.registers.save_state();
                 
+                let table_reg = self.registers.allocate();
                 self.expression(table, table_reg, 1)?;
+                
+                // Preserve the table register
+                self.registers.preserve_register(table_reg);
+                
+                let key_reg = self.registers.allocate();
                 self.expression(key, key_reg, 1)?;
+                
+                // Preserve the key register
+                self.registers.preserve_register(key_reg);
                 
                 self.emit(Self::encode_ABC(OpCode::SetTable, table_reg as u8, key_reg as u16, value_reg as u16));
                 
-                self.registers.free_to(table_reg);
+                self.registers.restore_state(saved_state);
+                
+                // Clear preservation flags
+                self.registers.preserved_registers.remove(&table_reg);
+                self.registers.preserved_registers.remove(&key_reg);
             }
             Variable::Member { table, field } => {
+                let saved_state = self.registers.save_state();
+                
                 let table_reg = self.registers.allocate();
                 self.expression(table, table_reg, 1)?;
                 
+                // Preserve the table register
+                self.registers.preserve_register(table_reg);
+                
                 let key_idx = self.add_string_constant(field)?;
-                let key_const = key_idx | 0x100; // Mark as constant (high bit set)
+                let key_const = key_idx | 0x100; // Mark as constant
                 
                 self.emit(Self::encode_ABC(
                     OpCode::SetTable, 
@@ -1539,9 +1712,15 @@ impl CodeGenerator {
                     value_reg as u16
                 ));
                 
-                self.registers.free_to(table_reg);
+                self.registers.restore_state(saved_state);
+                
+                // Clear preservation flag
+                self.registers.preserved_registers.remove(&table_reg);
             }
         }
+        
+        // Clear preservation flag for the value register
+        self.registers.preserved_registers.remove(&value_reg);
         
         Ok(())
     }
@@ -1552,8 +1731,12 @@ impl CodeGenerator {
         target: usize,
         want: usize,
     ) -> LuaResult<()> {
-        let base_reg = self.registers.level();
+        // Save the allocation state for later restoration
+        let saved_state = self.registers.save_state();
+        
+        // Allocate register for function and mark it preserved
         let func_reg = self.registers.allocate();
+        self.registers.preserve_register(func_reg);
         
         // Handle method calls (:)
         if let Some(method) = &call.method {
@@ -1590,7 +1773,14 @@ impl CodeGenerator {
             } else {
                 // Complex case: expr:method(...)
                 let obj_reg = self.registers.allocate();
+                
+                // Compile with proper scoping
+                let obj_state = self.registers.save_state();
                 self.expression(&call.function, obj_reg, 1)?;
+                
+                // Preserve the object register
+                self.registers.preserve_register(obj_reg);
+                self.registers.restore_state(obj_state);
                 
                 let method_idx = self.add_string_constant(method)?;
                 self.emit(Self::encode_ABC(
@@ -1602,35 +1792,78 @@ impl CodeGenerator {
             }
         } else {
             // Regular function call
+            let func_state = self.registers.save_state();
             self.expression(&call.function, func_reg, 1)?;
+            
+            // Preserve the function register
+            // This ensures it won't be overwritten during argument evaluation
+            self.registers.preserve_register(func_reg);
+            self.registers.restore_state(func_state);
         }
         
-        // Push arguments
-        let _first_arg = self.registers.level(); // Keep but mark as unused
+        // Process arguments
+        let mut arg_regs = Vec::new();
         let num_args = match &call.args {
             CallArgs::Args(args) => {
-                let mut count = 0;
                 for arg in args {
+                    // Allocate a NEW register for each argument
+                    // Don't reuse the function register
                     let arg_reg = self.registers.allocate();
+                    
+                    if arg_reg == func_reg {
+                        // This should never happen since func_reg is preserved,
+                        // but just to be extra safe
+                        println!("WARNING: Argument register {} conflicts with function register", arg_reg);
+                        continue;
+                    }
+                    
+                    arg_regs.push(arg_reg);
+                    
+                    // Save state before compiling expression
+                    let arg_state = self.registers.save_state();
+                    
+                    // Mark function register as preserved before any subexpression
+                    self.registers.preserve_register(func_reg);
+                    
+                    // Compile expression
                     self.expression(arg, arg_reg, 1)?;
-                    count += 1;
+                    
+                    // Restore state, preserving function and this argument register
+                    self.registers.preserve_register(arg_reg);
+                    self.registers.restore_state(arg_state);
                 }
-                count
-            }
+                
+                args.len()
+            },
             CallArgs::Table(table) => {
                 let arg_reg = self.registers.allocate();
+                arg_regs.push(arg_reg);
+                
+                // Save state before compiling
+                let table_state = self.registers.save_state();
+                
+                // Ensure function register is preserved
+                self.registers.preserve_register(func_reg);
+                
+                // Compile table constructor
                 self.table_constructor(table, arg_reg)?;
+                
+                // Restore state, preserving both function and argument registers
+                self.registers.preserve_register(arg_reg);
+                self.registers.restore_state(table_state);
+                
                 1
-            }
+            },
             CallArgs::String(s) => {
                 let arg_reg = self.registers.allocate();
+                arg_regs.push(arg_reg);
                 let k = self.add_string_constant(s)?;
                 self.emit(Self::encode_ABx(OpCode::LoadK, arg_reg as u8, k as u32));
                 1
             }
         };
         
-        // Encode CALL instruction
+        // Emit CALL instruction
         let b = if num_args == 0 { 1 } else { num_args + 1 }; // +1 for function itself
         let c = if want == 0 { 1 } else { want + 1 }; // +1 for Lua's 1-based results
         
@@ -1645,11 +1878,17 @@ impl CodeGenerator {
             }
         }
         
-        self.registers.free_to(base_reg);
+        // Now we can restore state without preserving registers
+        // The CALL and MOVE instructions have been emitted
+        self.registers.clear_preserved();  // Clear the preserved set
+        self.registers.restore_state(saved_state);
+        
         Ok(())
     }
     
     fn table_constructor(&mut self, table: &TableConstructor, target: usize) -> LuaResult<()> {
+        let saved_state = self.registers.save_state();
+        
         // Estimate array and hash sizes
         let array_size = table.fields.iter()
             .filter(|f| matches!(f, TableField::List(_)))
@@ -1662,62 +1901,43 @@ impl CodeGenerator {
         // Create table
         self.emit(Self::encode_ABC(OpCode::NewTable, target as u8, array_size as u16, hash_size as u16));
         
-        // Array fields
-        let mut array_idx = 1;
-        let mut count = 0;
+        // Extract all list fields for array part processing
+        let list_fields: Vec<&Expression> = table.fields.iter()
+            .filter_map(|field| {
+                if let TableField::List(expr) = field {
+                    Some(expr)
+                } else {
+                    None
+                }
+            })
+            .collect();
         
-        for field in &table.fields {
-            match field {
-                TableField::List(expr) => {
-                    let val_reg = self.registers.allocate();
-                    self.expression(expr, val_reg, 1)?;
-                    
-                    // Using raw setlist for efficiency
-                    self.emit(Self::encode_ABC(
-                        OpCode::SetList,
-                        target as u8,
-                        1,
-                        ((array_idx - 1) / 50 + 1) as u16
-                    ));
-                    
-                    array_idx += 1;
-                    count += 1;
-                    
-                    // If we've accumulated 50 values, emit SETLIST
-                    if count % 50 == 0 {
-                        self.emit(Self::encode_ABC(
-                            OpCode::SetList,
-                            target as u8,
-                            count as u16,
-                            (count / 50) as u16
-                        ));
-                        count = 0;
-                    }
-                }
-                _ => {
-                    // Handle later
-                }
-            }
+        // Process list fields in batches of FIELDS_PER_FLUSH (50)
+        const FIELDS_PER_FLUSH: usize = 50;
+        let mut idx = 0;
+        while idx < list_fields.len() {
+            let end = std::cmp::min(idx + FIELDS_PER_FLUSH, list_fields.len());
+            let batch = &list_fields[idx..end];
+            
+            // Process this batch
+            process_array_batch(self, target, batch, idx + 1)?;
+            
+            idx = end;
         }
         
-        // If we have pending array fields, emit final SETLIST
-        if count > 0 {
-            self.emit(Self::encode_ABC(
-                OpCode::SetList,
-                target as u8,
-                count as u16,
-                (count / 50 + 1) as u16
-            ));
-        }
-        
-        // Hash fields
+        // Process hash fields (record and indexed fields)
         for field in &table.fields {
             match field {
                 TableField::Record { key, value } => {
+                    let expr_state = self.registers.save_state();
+                    
                     let key_idx = self.add_string_constant(key)?;
                     let val_reg = self.registers.allocate();
                     
                     self.expression(value, val_reg, 1)?;
+                    
+                    // Preserve the value register
+                    self.registers.preserve_register(val_reg);
                     
                     self.emit(Self::encode_ABC(
                         OpCode::SetTable,
@@ -1726,14 +1946,22 @@ impl CodeGenerator {
                         val_reg as u16
                     ));
                     
-                    self.registers.free_to(val_reg);
-                }
+                    self.registers.restore_state(expr_state);
+                },
                 TableField::Index { key, value } => {
-                    let key_reg = self.registers.allocate();
-                    let val_reg = self.registers.allocate();
+                    let expr_state = self.registers.save_state();
                     
+                    let key_reg = self.registers.allocate();
                     self.expression(key, key_reg, 1)?;
+                    
+                    // Preserve key register
+                    self.registers.preserve_register(key_reg);
+                    
+                    let val_reg = self.registers.allocate();
                     self.expression(value, val_reg, 1)?;
+                    
+                    // Preserve value register
+                    self.registers.preserve_register(val_reg);
                     
                     self.emit(Self::encode_ABC(
                         OpCode::SetTable,
@@ -1742,13 +1970,17 @@ impl CodeGenerator {
                         val_reg as u16
                     ));
                     
-                    self.registers.free_to(key_reg);
-                }
+                    self.registers.restore_state(expr_state);
+                },
                 TableField::List(_) => {
-                    // Already handled
-                }
+                    // Already processed in batches
+                },
             }
         }
+        
+        // Clean up all preserved registers from this table constructor
+        self.registers.clear_preserved();
+        self.registers.restore_state(saved_state);
         
         Ok(())
     }

@@ -1,153 +1,171 @@
-# Lua VM Placeholder and Incomplete Implementations
+# Lua VM Placeholder Implementations
 
-This document catalogs all placeholder, incomplete, or misleading implementations in the Lua VM code to provide a clear understanding of the system's true state. This information should guide future development efforts to complete the VM implementation.
+This document catalogues all current placeholder implementations, TODOs, and incomplete features in the Ferrous Lua VM. This serves as a reference for future development work.
 
-## 1. Script Execution Infrastructure
+Last updated: July 2025
 
-### 1.1 Script Evaluation (VM) ⚠️
-```rust
-pub fn eval_script(&mut self, _script: &str) -> LuaResult<Value> {
-    // TODO: Compile script
-    // For now, return a placeholder
-    
-    self.start_time = Some(Instant::now());
-    
-    // TODO: Execute compiled script
-    
-    // Return a placeholder string for now
-    let mut tx = HeapTransaction::new(&mut self.heap);
-    let handle = tx.create_string("placeholder result")?;
-    tx.commit()?;
-    
-    Ok(Value::String(handle))
-}
-```
-**Issue**: Returns a hardcoded string instead of actually compiling and executing Lua code.
+## Core VM Components
 
-### 1.2 Context Setup ⚠️
-```rust
-pub fn set_context(&mut self, context: crate::lua::ScriptContext) -> LuaResult<()> {
-    self.timeout = Some(context.timeout);
-    self.script_context = Some(context);
-    
-    // TODO: Setup KEYS and ARGV tables
-    
-    Ok(())
-}
-```
-**Issue**: Does not set up KEYS and ARGV tables needed for Redis script execution.
+### Virtual Machine (vm.rs)
 
-### 1.3 Standard Library ⚠️
-```rust
-pub fn init_stdlib(&mut self) -> LuaResult<()> {
-    // TODO: Initialize Lua standard library functions
-    Ok(())
-}
-```
-**Issue**: Empty method that doesn't initialize any standard library functions.
+1. **Script Execution**
+   ```rust
+   // TODO: Setup KEYS and ARGV tables
+   // TODO: Compile script
+   // TODO: Execute compiled script
+   // Return a placeholder string for now
+   ```
+   The VM's integration with Redis script execution is largely placeholder, with missing implementation for script compilation, evaluation, and environment setup.
 
-## 2. VM Opcode Implementation Status
+2. **Resource Management**
+   ```rust
+   // TODO: Check kill flag
+   ```
+   Script resource limits and cancellation are not fully implemented.
 
-All opcodes have now been properly implemented. The previously identified placeholders in:
-- Closure opcode implementation
-- SetList opcode (C=0 case)
-- Close opcode
-- Concatenation with metamethods
+3. **VM Reset**
+   ```rust
+   // TODO: Implement VM reset
+   ```
+   VM resets for reuse in a pool are not implemented.
 
-Have been fixed in the current implementation.
+### Module System (mod.rs)
 
-### 2.1 Closure Opcode ✅
-The Closure opcode now correctly:
-- Extracts function prototypes from constants
-- Processes upvalue instructions
-- Creates closures with proper upvalue capture
+1. **Redis Integration**
+   ```rust
+   "evalsha" => {
+       // Simplified implementation
+       Ok(RespFrame::error("ERR EVALSHA not implemented yet"))
+   }
+   ```
+   Cached script execution isn't implemented.
 
-### 2.2 SetList Opcode ✅
-The C=0 case now properly reads the next instruction for the C value.
+   ```rust
+   match subcommand.as_str() {
+       "load" | "exists" | "flush" | "kill" => {
+           Ok(RespFrame::error("ERR SCRIPT subcommand not implemented yet"))
+       }
+   }
+   ```
+   Script management commands are stub implementations.
 
-### 2.3 Close Opcode ✅
-Now properly closes all thread-wide upvalues, not just those from the current closure.
+2. **VM Pooling**
+   ```rust
+   // In a real implementation, we'd use a singleton
+   ```
+   The `LuaGIL` lacks proper singleton implementation.
 
-### 2.4 Concatenation with Metamethods ✅
-Now correctly handles __concat and falls back to __tostring metamethod when needed.
+### Compiler (compiler.rs, codegen.rs)
 
-### 2.5 Missing Opcodes ✅
-All previously missing opcodes are now implemented:
-- Self opcode for method calls
-- VarArg opcode for variable arguments
-- ExtraArg opcode for extended arguments
+1. **Jump Instructions**
+   ```rust
+   self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder
+   ```
+   Several jump offsets in control flow operations are initially set as placeholders then patched later.
 
-## 3. Compiler Implementation (Complete Stub) ⚠️
+2. **Function Prototypes**
+   ```rust
+   // Use Nil as placeholder for function prototypes
+   ```
+   The compiler uses Nil placeholders during initial function prototype creation before resolving real references.
 
-The entire compiler.rs file is still essentially a placeholder:
+## Standard Library Implementation
 
-```rust
-/// Compile Lua source code into a module
-pub fn compile(_source: &str) -> LuaResult<CompiledModule> {
-    // Placeholder implementation that returns a simple module
-    Ok(CompiledModule {
-        main_function: FunctionProto {
-            bytecode: vec![0x40000001], // Return nil
-            constants: vec![],
-            num_params: 0,
-            is_vararg: false,
-            max_stack_size: 2,
-            upvalues: vec![],
-        },
-    })
-}
-```
-**Issue**: No actual compilation occurs - it just returns a hardcoded function prototype that returns nil.
+### Base Library (stdlib.rs)
 
-## 4. Redis API Integration (Almost Entirely Missing) ⚠️
+1. **Metamethod Resolution**
+   ```rust
+   // TODO: Check for __tostring metamethod first
+   ```
+   Metamethod lookup for `tostring` is incomplete.
 
-### 4.1 EVALSHA Command ⚠️
-```rust
-"evalsha" => {
-    // Simplified implementation
-    Ok(RespFrame::error("ERR EVALSHA not implemented yet"))
-},
-```
-**Issue**: Simply returns "not implemented" error.
+2. **Error Handling**
+   ```rust
+   // TODO: Handle level argument for error location
+   ```
+   Error level and traceback generation for the `error()` function is missing.
 
-### 4.2 SCRIPT Command ⚠️
-```rust
-match subcommand.as_str() {
-    "load" | "exists" | "flush" | "kill" => {
-        Ok(RespFrame::error("ERR SCRIPT subcommand not implemented yet"))
-    }
-    _ => Ok(RespFrame::error(format!("ERR Unknown subcommand '{}'", subcommand))),
-}
-```
-**Issue**: All subcommands just return "not implemented" errors.
+3. **Load Function**
+   ```rust
+   // Currently a placeholder - would require more complex serialization
+   let error_msg = ctx.create_string("load not fully implemented")?;
+   ```
+   The `load()` function for loading Lua code at runtime is a stub.
 
-### 4.3 Table to RESP Conversion ⚠️
-```rust
-Value::Table(_) => {
-    // For now, return a placeholder for tables
-    Ok(RespFrame::bulk_string("<table>".to_string()))
-},
-```
-**Issue**: Does not actually convert tables to RESP format, just returns a placeholder string.
+### String Library (stdlib/string.rs)
 
-## Implementation Impact
+1. **String.dump**
+   ```rust
+   // Currently a placeholder - would require more complex serialization
+   let error_msg = ctx.create_string("string.dump not implemented yet")?;
+   ```
+   Function serialization isn't implemented.
 
-While the core VM structure is now fully implemented, these remaining placeholder implementations have several important consequences:
+2. **Pattern Matching**
+   ```rust
+   // Placeholder implementation - pattern matching in Lua requires 
+   // a significant implementation. This is a simple approach
+   return Err(LuaError::NotImplemented("pattern matching in string.find".to_string()));
+   ```
+   Pattern matching in string functions is either not implemented or uses naive approaches.
 
-1. **Cannot Run Real Lua Code**: Without a working compiler, the VM cannot run actual Lua scripts.
+## Memory Management
 
-2. **No Redis Integration**: Lua scripts cannot access Redis commands or data.
+1. **Garbage Collection**
+   The VM implements handle-based memory management but completely lacks garbage collection. Memory will grow unbounded with no reclamation.
 
-3. **No Standard Library**: Basic Lua functionality (string, table, math operations) is unavailable.
+## Error Handling
 
-## Future Implementation Requirements
+1. **Error Facilities**
+   ```rust
+   // NotImplemented error variant
+   ture) => write!(f, "not implemented: {}", feature),
+   ```
+   Some features throw "not implemented" errors rather than providing actual implementations.
 
-To address these issues, the implementation needs:
+2. **Tracebacks**
+   Error reporting lacks proper traceback generation and error location information.
 
-1. A proper compiler that can parse Lua code and generate bytecode with function prototypes.
+## Redis Integration
 
-2. Integration with Redis API and data structures, including redis.call() and redis.pcall().
+1. **Table Conversions**
+   ```rust
+   // For now, return a placeholder for tables
+   Ok(RespFrame::bulk_string("<table>".to_string()))
+   ```
+   Table-to-RESP conversion is incomplete.
 
-3. Standard library implementation.
+## Transaction Pattern
 
-The core VM is now fully functional and provides a solid foundation for implementing these remaining components.
+1. **Placeholder Support**
+   ```rust
+   // Must return nil as a placeholder
+   ```
+   Some transaction operations return stub values.
+
+## Planned Development Work
+
+Based on the placeholders identified, these are the key areas that need implementation:
+
+1. Complete standard library implementation, especially:
+   - String pattern matching functions
+   - Table manipulation functions
+   - String and function serialization
+
+2. Memory management:
+   - Non-recursive garbage collection
+   - Resource limits and memory pressure monitoring
+
+3. Error handling:
+   - Traceback generation
+   - Error location reporting
+   - Complete pcall/xpcall
+
+4. Redis integration:
+   - Script caching and management
+   - KEYS/ARGV tables
+   - External API boundaries
+
+5. Transaction pattern consistency:
+   - Standardize transaction creation/usage
+   - Ensure proper transaction nesting/isolation

@@ -5,20 +5,20 @@
 
 use std::sync::Arc;  // Ensure Arc is imported
 
-mod arena;
-mod handle;
-mod value;
-mod heap;
-mod transaction;
-mod vm;
-mod error;
-mod metamethod;
-mod stdlib;
+pub mod arena;
+pub mod handle;
+pub mod value;
+pub mod heap;
+pub mod transaction;
+pub mod vm;
+pub mod error;
+pub mod metamethod;
+pub mod stdlib;
 pub mod compiler;
 pub mod codegen;
-mod lexer;
-mod parser;
-mod ast;
+pub mod lexer;
+pub mod parser;
+pub mod ast;
 
 #[cfg(test)]
 mod test_basic;
