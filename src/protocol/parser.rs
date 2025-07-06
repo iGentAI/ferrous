@@ -8,6 +8,7 @@ use crate::error::{FerrousError, Result};
 use super::resp::RespFrame;
 
 /// Parser state for incremental RESP parsing
+#[derive(Clone)]
 pub struct RespParser {
     buffer: Vec<u8>,
     position: usize,

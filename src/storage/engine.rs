@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use std::thread;
 use rand::seq::SliceRandom;
 use crate::error::{FerrousError, Result, StorageError, CommandError};
+use crate::lua::LuaGIL;
 use super::value::{Value, StoredValue};
 use super::memory::MemoryManager;
 use super::skiplist::SkipList;
@@ -62,6 +63,11 @@ impl StorageEngine {
     /// Create a new storage engine with default settings
     pub fn new() -> Arc<Self> {
         Self::with_config(16, MemoryManager::unlimited())
+    }
+    
+    /// Create a new in-memory storage engine for testing
+    pub fn new_in_memory() -> Arc<Self> {
+        Self::new()
     }
     
     /// Create storage engine with configuration
@@ -2144,6 +2150,20 @@ impl StorageEngine {
         }
     }
     
+    /// Get the current database ID
+    pub fn get_current_db(&self) -> usize {
+        // For now, just return 0 (the default database)
+        0
+    }
+    
+    /// Get the Lua GIL
+    pub fn get_lua_gil(&self) -> Result<Arc<LuaGIL>> {
+        // For simplicity, create a new GIL each time
+        // In a production implementation, this would be stored as a field and reused
+        let gil = LuaGIL::new()?;
+        Ok(Arc::new(gil))
+    }
+
     /// Background thread for cleaning up expired keys
     fn expiration_cleanup_loop(engine: Arc<StorageEngine>) {
         loop {
@@ -2228,19 +2248,19 @@ mod tests {
     }
     
     #[test]
-    fn test_increment() {
-        let engine = StorageEngine::new();
+    fn test_incr_command() {
+        let engine = StorageEngine::new_in_memory();
         
-        // Increment non-existent key
-        let result = engine.incr(b"counter".to_vec(), 0).unwrap();
+        // Test incrementing a non-existent key
+        let result = engine.incr(0, b"counter".to_vec()).unwrap();
         assert_eq!(result, 1);
         
-        // Increment existing key
-        let result = engine.incr(b"counter".to_vec(), 0).unwrap();
+        // Test incrementing an existing key
+        let result = engine.incr(0, b"counter".to_vec()).unwrap();
         assert_eq!(result, 2);
         
-        // Increment by specific amount
-        let result = engine.incr_by(b"counter".to_vec(), 0, 5).unwrap();
+        // Test incrementing by a specific value
+        let result = engine.incr_by(0, b"counter".to_vec(), 5).unwrap();
         assert_eq!(result, 7);
     }
     

@@ -16,7 +16,7 @@ pub mod debug;
 pub mod monitor_cmd;
 pub mod client;
 pub mod memory;
-pub mod lua;
+// Note: lua module temporarily removed for reimplementation
 
 // Re-export all handlers for easy access
 pub use lists::*;
@@ -33,4 +33,5 @@ pub use debug::*;
 pub use monitor_cmd::*;
 pub use client::*;
 pub use memory::*;
-pub use lua::*;
+// Temporarily removed lua export
+// pub use lua::*;

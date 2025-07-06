@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::collections::{HashSet, VecDeque};
 
 /// Transaction state for a connection
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TransactionState {
     /// Whether we're in a transaction
     pub in_transaction: bool,

@@ -1,0 +1,1 @@
+local a, b = 10, 5; local sum = a + b; local diff = a - b; local product = a * b; local quotient = a / b; local equals = a == b; local greater = a > b; local less = a < b; if greater then result = "greater" else result = "not greater" end; return {sum=sum, diff=diff, product=product, quotient=quotient, equals=equals, greater=greater, less=less, result=result}

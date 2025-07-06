@@ -6,6 +6,7 @@
 use std::net::{TcpStream, SocketAddr};
 use std::io::{Read, Write, ErrorKind};
 use std::time::Instant;
+use std::sync::Arc;
 use crate::error::{FerrousError, Result};
 use crate::protocol::{RespParser, RespFrame, serialize_resp_frame};
 use crate::storage::commands::transactions::TransactionState;
@@ -27,12 +28,13 @@ pub enum ConnectionState {
 }
 
 /// Represents a client connection
+#[derive(Clone)]
 pub struct Connection {
     /// Unique connection ID
     pub id: u64,
     
-    /// TCP stream
-    stream: TcpStream,
+    /// TCP stream - wrapped in Arc to enable cloning
+    pub stream: Arc<TcpStream>,
     
     /// Client address
     pub addr: SocketAddr,
@@ -81,7 +83,7 @@ impl Connection {
         
         Ok(Connection {
             id,
-            stream,
+            stream: Arc::new(stream),
             addr,
             state: ConnectionState::Connected,
             parser: RespParser::new(),
@@ -101,7 +103,7 @@ impl Connection {
     pub fn read(&mut self) -> Result<bool> {
         let mut buf = [0u8; 8192]; // Larger read buffer for better pipelining
         
-        match self.stream.read(&mut buf) {
+        match self.stream.as_ref().read(&mut buf) {
             Ok(0) => {
                 // Connection closed by peer
                 self.state = ConnectionState::Closing;
@@ -152,7 +154,7 @@ impl Connection {
         const MAX_ATTEMPTS: usize = 3;
         
         while self.write_offset < self.write_buffer.len() && attempts < MAX_ATTEMPTS {
-            match self.stream.write(&self.write_buffer[self.write_offset..]) {
+            match self.stream.as_ref().write(&self.write_buffer[self.write_offset..]) {
                 Ok(0) => {
                     // Can't write, connection might be closed
                     return Err(FerrousError::Connection("Cannot write to connection".into()));
@@ -196,7 +198,7 @@ impl Connection {
         self.state = ConnectionState::Closing;
         // Try to flush remaining data before closing
         let _ = self.flush();
-        self.stream.shutdown(std::net::Shutdown::Both)?;
+        self.stream.as_ref().shutdown(std::net::Shutdown::Both)?;
         Ok(())
     }
     

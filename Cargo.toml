@@ -15,6 +15,7 @@ rand = "0.8.5"
 thiserror = "1.0"
 futures = "0.3" # For async/await support
 sha1 = "0.10.5" # For Lua script SHA1 computation
+hex = "0.4.3" # For hex encoding of SHA1 hashes
 uuid = { version = "1.3.0", features = ["v4"] } # For transaction IDs
 tokio = { version = "1.0", features = ["rt", "time"] } # For async operations and timeouts
 
@@ -30,3 +31,23 @@ codegen-units = 1
 [profile.bench]
 lto = true
 opt-level = 3
+
+[[bin]]
+name = "compile_and_execute"
+path = "src/bin/compile_and_execute.rs"
+
+[[bin]]
+name = "lua_compiler_test"
+path = "src/bin/lua_compiler_test.rs"
+
+[[bin]]
+name = "standalone_lua_test"
+path = "src/bin/standalone_lua_test.rs"
+
+[[bin]]
+name = "run_lua_tests"
+path = "src/bin/run_lua_tests.rs"
+
+[[bin]]
+name = "test_stdlib"
+path = "src/bin/test_stdlib.rs"

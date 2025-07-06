@@ -1,0 +1,145 @@
+//! Lua VM test script compiler and executor
+//!
+//! This binary compiles and executes a Lua script using the Ferrous Lua VM.
+//! It takes a filepath as the only argument and reports the result.
+
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::process;
+
+use ferrous::lua::{compile, vm as lua_vm, Value};
+
+fn main() {
+    // Parse command line arguments
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <luascript.lua>", args[0]);
+        process::exit(1);
+    }
+    
+    let filepath = &args[1];
+    
+    // Read the file
+    println!("Reading Lua script: {}", filepath);
+    let source = match fs::read_to_string(filepath) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!("Error reading file: {}", e);
+            process::exit(1);
+        }
+    };
+    
+    // Extract script name for reporting
+    let script_name = Path::new(filepath).file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(filepath);
+    
+    println!("Compiling script: {}", script_name);
+    
+    // Compile the script
+    let module = match compile(&source) {
+        Ok(m) => {
+            println!("Compilation successful!");
+            m
+        },
+        Err(e) => {
+            eprintln!("Compilation error: {}", e);
+            process::exit(1);
+        }
+    };
+    
+    println!("Running script...");
+    
+    // Create VM and initialize standard library
+    let mut vm = match lua_vm::LuaVM::new() {
+        Ok(vm) => vm,
+        Err(e) => {
+            eprintln!("Error creating VM: {}", e);
+            process::exit(1);
+        }
+    };
+    
+    // Initialize standard library
+    if let Err(e) = vm.init_stdlib() {
+        eprintln!("Error initializing standard library: {}", e);
+        process::exit(1);
+    }
+    
+    // Execute the module
+    let result = match vm.execute_module(&module, &[]) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Execution error: {}", e);
+            process::exit(1);
+        }
+    };
+    
+    // Print the result
+    match result {
+        Value::Nil => println!("Result: nil"),
+        Value::Boolean(b) => println!("Result: {}", b),
+        Value::Number(n) => println!("Result: {}", n),
+        Value::String(_) => {
+            // Create a transaction to access the string value
+            let mut tx = ferrous::lua::transaction::HeapTransaction::new(vm.heap_mut());
+            match tx.get_string_value(match result {
+                Value::String(h) => h,
+                _ => unreachable!(),
+            }) {
+                Ok(s) => println!("Result: \"{}\"", s),
+                Err(e) => println!("Result: <error reading string: {}>", e),
+            }
+        },
+        Value::Table(table_handle) => {
+            println!("DEBUG: Handling table return value with handle: {:?}", table_handle);
+            // Provide more information about the returned table
+            let mut tx = ferrous::lua::transaction::HeapTransaction::new(vm.heap_mut());
+            
+            // Try to get basic table info
+            match tx.get_table(table_handle) {
+                Ok(table) => {
+                    let array_len = table.array.len();
+                    let hash_len = table.map.len();
+                    
+                    println!("Result: <table with {} array elements and {} hash entries>", 
+                             array_len, hash_len);
+                    
+                    // For small tables, print some content
+                    if array_len > 0 {
+                        println!("  Array elements:");
+                        for i in 0..std::cmp::min(array_len, 5) {
+                            println!("    [{}]: {:?}", i+1, table.array[i]);
+                        }
+                        if array_len > 5 {
+                            println!("    ... ({} more elements)", array_len - 5);
+                        }
+                    }
+                    
+                    if hash_len > 0 {
+                        println!("  Hash entries:");
+                        let mut printed = 0;
+                        for (k, v) in &table.map {
+                            if printed < 5 {
+                                println!("    {:?} => {:?}", k, v);
+                                printed += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if hash_len > 5 {
+                            println!("    ... ({} more entries)", hash_len - 5);
+                        }
+                    }
+                },
+                Err(e) => println!("Result: <table - unable to read details: {}>", e),
+            }
+        },
+        Value::Closure(_) => println!("Result: <function>"),
+        Value::Thread(_) => println!("Result: <thread>"),
+        Value::CFunction(_) => println!("Result: <c function>"),
+        Value::UserData(_) => println!("Result: <userdata>"),
+        Value::FunctionProto(_) => println!("Result: <function prototype>"),
+    }
+    println!("Script execution completed successfully!");
+}
