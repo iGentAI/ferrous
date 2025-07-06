@@ -7,7 +7,7 @@ use super::error::{LuaError, LuaResult};
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle, FunctionProtoHandle};
 use super::heap::LuaHeap;
 use super::transaction::HeapTransaction;
-use crate::lua::value::{Value, CallFrame, Closure, CFunction, FunctionProto};
+use crate::lua::value::{Value, CallFrame, Closure, CFunction, FunctionProto, HashableValue};
 use crate::storage::StorageEngine;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -88,19 +88,90 @@ impl Instruction {
 /// Lua opcodes (subset for initial implementation)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OpCode {
-    Move,       // R(A) := R(B)
-    LoadK,      // R(A) := Kst(Bx)
-    LoadBool,   // R(A) := (Bool)B; if (C) pc++
-    LoadNil,    // R(A), R(A+1), ..., R(A+B) := nil
-    GetUpval,   // R(A) := UpValue[B]
-    GetGlobal,  // R(A) := Gbl[Kst(Bx)]
-    SetGlobal,  // Gbl[Kst(Bx)] := R(A)
-    SetUpval,   // UpValue[B] := R(A)
-    GetTable,   // R(A) := R(B)[RK(C)]
-    SetTable,   // R(A)[RK(B)] := RK(C)
-    NewTable,   // R(A) := {} (size = B,C)
-    Self_,      // R(A+1) := R(B); R(A) := R(B)[RK(C)]
-    SetList,    // R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
+    /// MOVE: Copy R(B) to R(A)
+    /// A: Target register
+    /// B: Source register
+    Move,
+    
+    /// LOADK: Load constant to register
+    /// A: Target register
+    /// Bx: Constant index in constants table
+    /// R(A) := Kst(Bx)
+    LoadK,
+    
+    /// LOADBOOL: Load boolean to register and optionally skip next instruction
+    /// A: Target register
+    /// B: Boolean value (0 = false, 1 = true)
+    /// C: Skip flag (0 = don't skip, 1 = skip next instruction)
+    /// R(A) := (Bool)B; if (C) pc++
+    LoadBool,
+    
+    /// LOADNIL: Set multiple registers to nil
+    /// A: First register to set
+    /// B: Number of registers to set (sets B registers total)
+    /// R(A), R(A+1), ..., R(A+B-1) := nil
+    LoadNil,
+    
+    /// GETUPVAL: Load upvalue into register
+    /// A: Target register
+    /// B: Upvalue index
+    /// R(A) := UpValue[B]
+    GetUpval,
+    
+    /// GETGLOBAL: Load global variable into register
+    /// A: Target register
+    /// Bx: Constant index containing global name
+    /// R(A) := Gbl[Kst(Bx)]
+    GetGlobal,
+    
+    /// SETGLOBAL: Set global variable
+    /// A: Source register
+    /// Bx: Constant index containing global name
+    /// Gbl[Kst(Bx)] := R(A)
+    SetGlobal,
+    
+    /// SETUPVAL: Set upvalue
+    /// A: Source register
+    /// B: Upvalue index
+    /// UpValue[B] := R(A)
+    SetUpval,
+    
+    /// GETTABLE: Get table field
+    /// A: Target register
+    /// B: Table register
+    /// C: Key register (or constant if C >= 256)
+    /// R(A) := R(B)[RK(C)]
+    GetTable,
+    
+    /// SETTABLE: Set table field
+    /// A: Table register
+    /// B: Key register (or constant if B >= 256)
+    /// C: Value register (or constant if C >= 256)
+    /// R(A)[RK(B)] := RK(C)
+    SetTable,
+    
+    /// NEWTABLE: Create new table
+    /// A: Target register
+    /// B: Array size hint (log2)
+    /// C: Hash size hint (log2)
+    /// R(A) := {} (size = B,C)
+    NewTable,
+    
+    /// SELF: Prepare for method call
+    /// A: Register for function
+    /// B: Register with table
+    /// C: Key register/constant for method name
+    /// R(A+1) := R(B); R(A) := R(B)[RK(C)]
+    Self_,
+    
+    /// SETLIST: Batch set array elements
+    /// A: Table register
+    /// B: Number of elements to set (0 = all)
+    /// C: Block index (starting at 1) * FPF + 1
+    /// R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
+    SetList,
+
+    // Arithmetic operations
     Add,        // R(A) := RK(B) + RK(C)
     Sub,        // R(A) := RK(B) - RK(C)
     Mul,        // R(A) := RK(B) * RK(C)
@@ -111,21 +182,101 @@ pub enum OpCode {
     Not,        // R(A) := not R(B)
     Len,        // R(A) := length of R(B)
     Concat,     // R(A) := R(B).. ... ..R(C)
-    Closure,    // R(A) := closure(KPROTO[Bx])
-    Close,      // close all upvalues >= R(A)
-    Jmp,        // pc += sBx
-    Eq,         // if ((RK(B) == RK(C)) ~= A) then pc++
-    Lt,         // if ((RK(B) <  RK(C)) ~= A) then pc++
-    Le,         // if ((RK(B) <= RK(C)) ~= A) then pc++
-    Test,       // if not (R(A) <=> C) then pc++
-    TestSet,    // if (R(B) <=> C) then R(A) := R(B) else pc++
-    Call,       // R(A), ..., R(A+C-2) := R(A)(R(A+1), ..., R(A+B-1))
-    TailCall,   // return R(A)(R(A+1), ..., R(A+B-1))
-    Return,     // return R(A), ..., R(A+B-2)
-    ForPrep,    // R(A) -= R(A+2); pc += sBx
-    ForLoop,    // R(A) += R(A+2); if R(A) <?= R(A+1) then { pc += sBx; R(A+3) = R(A) }
-    TForLoop,   // R(A+3), ... , R(A+3+C) := R(A)(R(A+1), R(A+2)); if !Nil then R(A+2)=R(A+3), pc+=sBx
-    VarArg,     // R(A), R(A+1), ..., R(A+B-2) = vararg
+    
+    /// CLOSURE: Create closure from function prototype
+    /// A: Target register for new closure
+    /// Bx: Function prototype index
+    /// R(A) := closure(KPROTO[Bx])
+    Closure,
+    
+    /// CLOSE: Close all upvalues at or above given register
+    /// A: Register threshold
+    /// close all upvalues >= R(A)
+    Close,
+    
+    /// JMP: Jump to offset
+    /// sBx: Signed offset (added to PC)
+    /// PC += sBx
+    Jmp,
+    
+    /// EQ: Equality comparison with conditional skip
+    /// A: Expected result (0=false, 1=true)
+    /// B: First operand (register or constant)
+    /// C: Second operand (register or constant)
+    /// if ((RK(B) == RK(C)) ~= A) then pc++
+    Eq,
+    
+    /// LT: Less-than comparison with conditional skip
+    /// A: Expected result (0=false, 1=true)
+    /// B: First operand (register or constant)
+    /// C: Second operand (register or constant)
+    /// if ((RK(B) < RK(C)) ~= A) then pc++
+    Lt,
+    
+    /// LE: Less-than-or-equal comparison with conditional skip
+    /// A: Expected result (0=false, 1=true)
+    /// B: First operand (register or constant)
+    /// C: Second operand (register or constant)
+    /// if ((RK(B) <= RK(C)) ~= A) then pc++
+    Le,
+    
+    /// TEST: Conditional skip based on register value
+    /// A: Value register to test
+    /// C: Expected truthiness (0=false, 1=true)
+    /// if not (R(A) <=> C) then pc++
+    Test,
+    
+    /// TESTSET: Conditional register set and skip
+    /// A: Target register
+    /// B: Value register to test
+    /// C: Expected truthiness (0=false, 1=true)
+    /// if (R(B) <=> C) then R(A) := R(B) else pc++
+    TestSet,
+    
+    /// CALL: Function call
+    /// A: Function register
+    /// B: Argument count + 1 (B=0: use all values from A+1 to top)
+    /// C: Return value count + 1 (C=0: all values returned are saved)
+    /// R(A), ..., R(A+C-2) := R(A)(R(A+1), ..., R(A+B-1))
+    Call,
+    
+    /// TAILCALL: Function call with tail call optimization
+    /// A: Function register
+    /// B: Argument count + 1 (B=0: use all values from A+1 to top)
+    /// return R(A)(R(A+1), ..., R(A+B-1))
+    TailCall,
+    
+    /// RETURN: Return values from function
+    /// A: First register to return
+    /// B: Number of values to return + 1 (B=0: return all values from A to top)
+    /// return R(A), ..., R(A+B-2)
+    Return,
+    
+    /// FORPREP: Prepare numeric for loop
+    /// A: Index register (R(A) = initial value)
+    /// sBx: Offset to jump to loop body
+    /// R(A) -= R(A+2); pc += sBx
+    ForPrep,
+    
+    /// FORLOOP: Numeric for loop iteration
+    /// A: Index register (R(A) = current value)
+    /// sBx: Offset to jump back to loop body
+    /// R(A) += R(A+2); if R(A) <?= R(A+1) then { pc+=sBx; R(A+3) = R(A) }
+    ForLoop,
+    
+    /// TFORLOOP: Generic for loop iteration
+    /// A: Iterator function register
+    /// C: Number of values to return
+    /// R(A+3), ... , R(A+3+C) := R(A)(R(A+1), R(A+2)); if !Nil then R(A+2)=R(A+3), pc+=sBx
+    TForLoop,
+    
+    /// VARARG: Load variable arguments
+    /// A: Target register for first vararg
+    /// B: Number of varargs to load + 1 (B=0: load all)
+    /// R(A), R(A+1), ..., R(A+B-2) = vararg
+    VarArg,
+
+    /// EXTRAARG: Extra argument for previous instruction
     ExtraArg,   // Extra argument for previous instruction
 }
 
@@ -386,6 +537,250 @@ impl<'vm> ExecutionContext<'vm> {
     // Get the number of results pushed by this context
     pub fn get_results_pushed(&self) -> usize {
         self.results_pushed
+    }
+    
+    // Create a string in the heap
+    pub fn create_string(&mut self, s: &str) -> LuaResult<StringHandle> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        let handle = tx.create_string(s)?;
+        tx.commit()?;
+        Ok(handle)
+    }
+    
+    // Get a string value from a handle
+    pub fn get_string_from_handle(&mut self, handle: StringHandle) -> LuaResult<String> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        let value = tx.get_string_value(handle)?;
+        tx.commit()?;
+        Ok(value)
+    }
+    
+    // Get an argument as a number with proper type checking
+    pub fn get_number_arg(&mut self, index: usize) -> LuaResult<f64> {
+        let value = self.get_arg(index)?;
+        
+        match value {
+            Value::Number(n) => Ok(n),
+            Value::String(handle) => {
+                // Try to parse string as number
+                let s = self.get_string_from_handle(handle)?;
+                match s.trim().parse::<f64>() {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(LuaError::TypeError {
+                        expected: "number".to_string(),
+                        got: "string (not convertible to number)".to_string(),
+                    }),
+                }
+            },
+            _ => Err(LuaError::TypeError {
+                expected: "number".to_string(),
+                got: value.type_name().to_string(),
+            }),
+        }
+    }
+    
+    // Get an argument as a string, with proper type checking and coercion
+    pub fn get_string_arg(&mut self, index: usize) -> LuaResult<String> {
+        let value = self.get_arg(index)?;
+        
+        match value {
+            Value::String(handle) => {
+                self.get_string_from_handle(handle)
+            },
+            Value::Number(n) => {
+                // Convert number to string
+                Ok(n.to_string())
+            },
+            Value::Boolean(b) => {
+                // Convert boolean to string
+                Ok(b.to_string())
+            },
+            Value::Nil => {
+                // Nil not allowed for string operations
+                Err(LuaError::TypeError {
+                    expected: "string".to_string(),
+                    got: "nil".to_string(),
+                })
+            },
+            _ => Err(LuaError::TypeError {
+                expected: "string".to_string(),
+                got: value.type_name().to_string(),
+            }),
+        }
+    }
+    
+    // Get an argument as a boolean, with proper type handling
+    pub fn get_bool_arg(&mut self, index: usize) -> LuaResult<bool> {
+        let value = self.get_arg(index)?;
+        
+        match value {
+            Value::Boolean(b) => Ok(b),
+            Value::Nil => Ok(false),
+            _ => Ok(true),
+        }
+    }
+    
+    // Table operations
+    pub fn table_next(&mut self, table: TableHandle, key: Value) -> LuaResult<Option<(Value, Value)>> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        let result = tx.table_next(table, key)?;
+        tx.commit()?;
+        Ok(result)
+    }
+    
+    pub fn table_get(&mut self, table: TableHandle, key: Value) -> LuaResult<Value> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        let value = tx.read_table_field(table, &key)?;
+        tx.commit()?;
+        Ok(value)
+    }
+    
+    pub fn table_raw_get(&mut self, table: TableHandle, key: Value) -> LuaResult<Value> {
+        // Raw get is same as regular get but without metamethods
+        // The transaction layer already provides raw access
+        self.table_get(table, key)
+    }
+    
+    pub fn table_raw_set(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        tx.set_table_field(table, key, value)?;
+        tx.commit()?;
+        Ok(())
+    }
+    
+    pub fn table_length(&mut self, table: TableHandle) -> LuaResult<usize> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        let table_obj = tx.get_table(table)?;
+        
+        // Find the length of the array part
+        // In Lua, the length is up to the highest numeric index before a nil
+        let mut len = 0;
+        
+        // First check the array part
+        let array_len = table_obj.array.len();
+        for i in 0..array_len {
+            if table_obj.array[i].is_nil() {
+                break;
+            }
+            len = i + 1;
+        }
+        
+        // Check the hash part for numeric indices
+        for (k, v) in &table_obj.map {
+            if let HashableValue::Number(n) = k {
+                let idx = n.0;
+                if idx > 0.0 && idx.fract() == 0.0 && !v.is_nil() {
+                    let idx_int = idx as usize;
+                    if idx_int > len {
+                        len = idx_int;
+                    }
+                }
+            }
+        }
+        
+        tx.commit()?;
+        Ok(len)
+    }
+    
+    // Metatable operations
+    pub fn set_metatable(&mut self, table: TableHandle, metatable: Option<TableHandle>) -> LuaResult<()> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        tx.set_table_metatable(table, metatable)?;
+        tx.commit()?;
+        Ok(())
+    }
+    
+    pub fn get_metatable(&mut self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        let mt = tx.get_table_metatable(table)?;
+        tx.commit()?;
+        Ok(mt)
+    }
+    
+    // Check for a metamethod on a value
+    pub fn check_metamethod(&mut self, value: &Value, metamethod: &str) -> Option<Value> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        
+        // Map metamethod name to type
+        let mm_type = match metamethod {
+            "__tostring" => crate::lua::metamethod::MetamethodType::ToString,
+            "__index" => crate::lua::metamethod::MetamethodType::Index,
+            "__newindex" => crate::lua::metamethod::MetamethodType::NewIndex,
+            "__add" => crate::lua::metamethod::MetamethodType::Add,
+            "__sub" => crate::lua::metamethod::MetamethodType::Sub,
+            "__mul" => crate::lua::metamethod::MetamethodType::Mul,
+            "__div" => crate::lua::metamethod::MetamethodType::Div,
+            "__mod" => crate::lua::metamethod::MetamethodType::Mod,
+            "__pow" => crate::lua::metamethod::MetamethodType::Pow,
+            "__unm" => crate::lua::metamethod::MetamethodType::Unm,
+            "__concat" => crate::lua::metamethod::MetamethodType::Concat,
+            "__len" => crate::lua::metamethod::MetamethodType::Len,
+            "__eq" => crate::lua::metamethod::MetamethodType::Eq,
+            "__lt" => crate::lua::metamethod::MetamethodType::Lt,
+            "__le" => crate::lua::metamethod::MetamethodType::Le,
+            "__call" => crate::lua::metamethod::MetamethodType::Call,
+            _ => return None,
+        };
+        
+        // Resolve the metamethod
+        match crate::lua::metamethod::resolve_metamethod(&mut tx, value, mm_type) {
+            Ok(mm) => {
+                // Commit transaction before returning
+                let _ = tx.commit();
+                mm
+            },
+            Err(_) => None,
+        }
+    }
+    
+    // Call a metamethod with arguments
+    pub fn call_metamethod(&mut self, function: Value, args: Vec<Value>) -> LuaResult<Vec<Value>> {
+        match function {
+            Value::Closure(closure) => {
+                // We need to extract all the necessary data first to avoid aliasing self.vm_access
+                let closure_copy = closure;
+                let args_copy = args.clone(); // Clone the args to avoid ownership issues
+                
+                // Execute the closure and return result - use self.vm_access directly
+                let result = self.vm_access.execute_function(closure_copy, &args_copy)?;
+                Ok(vec![result])
+            },
+            Value::CFunction(cfunc) => {
+                // Call the C function directly with the current context
+                // No ownership issues with this branch
+                let arg_count = args.len();
+                
+                // First, move all the arguments to the stack at register positions
+                // that won't conflict with the results
+                let stack_base = self.stack_base + self.results_pushed;
+                
+                // Setup arguments
+                for (i, arg) in args.iter().enumerate() {
+                    // Create a new transaction for each operation to avoid aliasing
+                    let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+                    tx.set_register(self.thread, stack_base + i, arg.clone())?;
+                    tx.commit()?;
+                }
+                
+                // Now call the C function with a fresh context
+                let result_count = cfunc(self)?;
+                
+                // Collect results
+                let mut results = Vec::with_capacity(result_count as usize);
+                for i in 0..result_count as usize {
+                    let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+                    let value = tx.read_register(self.thread, stack_base + i)?;
+                    tx.commit()?;
+                    results.push(value);
+                }
+                
+                Ok(results)
+            },
+            _ => Err(LuaError::TypeError {
+                expected: "function".to_string(),
+                got: function.type_name().to_string(),
+            }),
+        }
     }
 }
 
@@ -684,10 +1079,16 @@ impl LuaVM {
                     StepResult::Return(values) => {
                         if !values.is_empty() {
                             final_result = values[0].clone();
+                            
+                            println!("DEBUG VM: Function returned with value type: {}", final_result.type_name());
+                            if let Value::Table(handle) = &final_result {
+                                println!("DEBUG VM: Returned table with handle: {:?}", handle);
+                            }
                         }
                         
                         // Check if we're back to initial depth
                         if self.get_call_depth()? <= initial_depth {
+                            println!("DEBUG VM: Back to initial depth, returning final result: {:?}", final_result);
                             break;
                         }
                     }
@@ -705,10 +1106,16 @@ impl LuaVM {
                     StepResult::Return(values) => {
                         if !values.is_empty() {
                             final_result = values[0].clone();
+                            
+                            println!("DEBUG VM: Instruction returned with value type: {}", final_result.type_name());
+                            if let Value::Table(handle) = &final_result {
+                                println!("DEBUG VM: Returned table with handle: {:?}", handle);
+                            }
                         }
                         
                         // Check if we're back to initial depth
                         if self.get_call_depth()? <= initial_depth {
+                            println!("DEBUG VM: Back to initial depth, returning final result: {:?}", final_result);
                             break;
                         }
                     }
@@ -723,6 +1130,10 @@ impl LuaVM {
         }
         
         self.execution_state = ExecutionState::Completed;
+        
+        println!("DEBUG VM: Final result value type: {}", final_result.type_name());
+        
+        // Return the result directly without any additional processing or conversions
         Ok(final_result)
     }
     
@@ -791,9 +1202,10 @@ impl LuaVM {
             }
             
             OpCode::LoadNil => {
-                // R(A), R(A+1), ..., R(A+B) := nil
+                // R(A), R(A+1), ..., R(A+B-1) := nil
+                // Note: Lua 5.1 spec specifies this sets B registers to nil (not B+1)
                 let base = frame.base_register as usize;
-                for i in 0..=b {
+                for i in 0..b {
                     tx.set_register(self.current_thread, base + a + i, Value::Nil)?;
                 }
                 StepResult::Continue
@@ -994,16 +1406,33 @@ impl LuaVM {
                 let base = frame.base_register as usize;
                 let mut values = Vec::new();
                 
+                println!("DEBUG RETURN: Processing Return opcode with A={}, B={}", a, b);
+                
                 if b == 0 {
                     // Return all values from R(A) to top
                     let top = tx.get_stack_top(self.current_thread)?;
+                    println!("DEBUG RETURN: B=0, returning all values from R({}) to top ({})", base + a, top);
                     for i in a..=(top - base) {
-                        values.push(tx.read_register(self.current_thread, base + i)?);
+                        let val = tx.read_register(self.current_thread, base + i)?;
+                        println!("DEBUG RETURN: Adding return value [{}]: {:?} ({})", i, val, val.type_name());
+                        values.push(val);
                     }
                 } else {
                     // Return B-1 values
+                    println!("DEBUG RETURN: B={}, returning {} values", b, b - 1);
                     for i in 0..(b - 1) {
-                        values.push(tx.read_register(self.current_thread, base + a + i)?);
+                        let val = tx.read_register(self.current_thread, base + a + i)?;
+                        println!("DEBUG RETURN: Adding return value [{}]: {:?} ({})", i, val, val.type_name());
+                        values.push(val);
+                    }
+                }
+                
+                println!("DEBUG RETURN: Collected {} return values", values.len());
+                if !values.is_empty() {
+                    println!("DEBUG RETURN: First return value type: {}", values[0].type_name());
+                    
+                    if let Value::Table(handle) = &values[0] {
+                        println!("DEBUG RETURN: Returning table with handle: {:?}", handle);
                     }
                 }
                 
@@ -2027,10 +2456,6 @@ OpCode::Closure => {
                 )));
             }
             
-            // Get the upvalue instruction
-            let upval_instr = tx.get_instruction(frame.closure, upval_pc)?;
-            let _upval_instruction = Instruction(upval_instr);
-            
             // Process based on upvalue info
             let upvalue_info = proto.upvalues[i];
             
@@ -2060,7 +2485,7 @@ OpCode::Closure => {
                 
                 // Validate the upvalue handle outside of closure borrow
                 let upval_handle = parent_upvalues[idx];
-                tx.validate_with_context(&upval_handle, "Closure opcode parent upvalue")?;
+                tx.validate_handle(&upval_handle)?;
                 
                 upval_handle
             }
@@ -4084,8 +4509,8 @@ impl LuaVM {
     }
     
     /// Get the global table
-    pub fn globals(&mut self) -> TableHandle {
-        self.heap.globals().expect("Globals should be initialized")
+    pub fn globals(&mut self) -> LuaResult<TableHandle> {
+        self.heap.globals()
     }
     
     /// Set a table field 
@@ -4094,6 +4519,100 @@ impl LuaVM {
         tx.set_table_field(table, key, value)?;
         tx.commit()?;
         Ok(())
+    }
+    
+    /// Capture the current execution traceback for error reporting
+    pub fn capture_traceback(&mut self) -> LuaResult<crate::lua::error::LuaTraceback> {
+        let mut frames = Vec::new();
+        
+        // Two-phase borrowing to avoid borrow issues:
+        // First, collect all call frames
+        let call_frames = {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            let thread = tx.get_thread(self.current_thread)?;
+            
+            // Clone the call frames to avoid borrow issues
+            thread.call_frames.clone()
+        };
+        
+        // Process each call frame to build the traceback
+        // We walk backwards through the frames (most recent first)
+        for frame in call_frames.iter().rev() {
+            // Create a call info entry for this frame
+            let call_info = crate::lua::error::CallInfo {
+                function_name: Some("function".to_string()), // Default name
+                source_file: None,  // Would come from debug info in real implementation
+                line_number: None,  // Would come from debug info in real implementation
+                pc: frame.pc,
+            };
+            
+            frames.push(call_info);
+        }
+        
+        // Return the traceback
+        Ok(crate::lua::error::LuaTraceback { frames })
+    }
+    
+    /// Create a runtime error with traceback
+    pub fn create_runtime_error_with_trace(&mut self, message: String) -> LuaError {
+        use crate::lua::error::{LuaError, LuaTraceback, CallInfo};
+        
+        // Two-phase approach to avoid borrow checker issues
+        let call_frames = {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            // Get the current thread and clone its call frames
+            let thread = match tx.get_thread(self.current_thread) {
+                Ok(t) => t,
+                Err(_) => return LuaError::RuntimeError(message), // Fallback
+            };
+            
+            thread.call_frames.clone()
+        };
+        
+        // Create the traceback from cloned call frames
+        let frames = call_frames.iter().rev().map(|frame| {
+            CallInfo {
+                function_name: Some("function".to_string()), // Default name
+                source_file: None,  // Would come from debug info
+                line_number: None,  // Would come from debug info
+                pc: frame.pc,
+            }
+        }).collect();
+        
+        let traceback = LuaTraceback { frames };
+        LuaError::RuntimeErrorWithTrace { message, traceback }
+    }
+    
+    /// Create a type error with traceback
+    pub fn create_type_error_with_trace(&mut self, expected: String, got: String) -> LuaError {
+        use crate::lua::error::{LuaError, LuaTraceback, CallInfo};
+        
+        // Two-phase approach to avoid borrow checker issues
+        let call_frames = {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            // Get the current thread and clone its call frames
+            let thread = match tx.get_thread(self.current_thread) {
+                Ok(t) => t,
+                Err(_) => return LuaError::TypeError { expected, got }, // Fallback
+            };
+            
+            thread.call_frames.clone()
+        };
+        
+        // Create the traceback from cloned call frames
+        let frames = call_frames.iter().rev().map(|frame| {
+            CallInfo {
+                function_name: Some("function".to_string()), // Default name
+                source_file: None,  // Would come from debug info
+                line_number: None,  // Would come from debug info
+                pc: frame.pc,
+            }
+        }).collect();
+        
+        let traceback = LuaTraceback { frames };
+        LuaError::TypeErrorWithTrace { expected, got, traceback }
     }
 }
 

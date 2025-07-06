@@ -489,49 +489,7 @@ pub fn string_upper(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     Ok(1)
 }
 
-/// Helper to add string argument extraction to ExecutionContext
-impl<'vm> ExecutionContext<'vm> {
-    /// Get an argument as a string, with proper type checking and coercion
-    pub fn get_string_arg(&mut self, index: usize) -> LuaResult<String> {
-        let value = self.get_arg(index)?;
-        
-        match value {
-            Value::String(handle) => {
-                self.get_string_from_handle(handle)
-            },
-            Value::Number(n) => {
-                // Convert number to string
-                Ok(n.to_string())
-            },
-            Value::Boolean(b) => {
-                // Convert boolean to string
-                Ok(b.to_string())
-            },
-            Value::Nil => {
-                // Nil not allowed for string operations
-                Err(LuaError::TypeError {
-                    expected: "string".to_string(),
-                    got: "nil".to_string(),
-                })
-            },
-            _ => Err(LuaError::TypeError {
-                expected: "string".to_string(),
-                got: value.type_name().to_string(),
-            }),
-        }
-    }
-    
-    /// Get an argument as a boolean, with proper type checking
-    pub fn get_bool_arg(&mut self, index: usize) -> LuaResult<bool> {
-        let value = self.get_arg(index)?;
-        
-        match value {
-            Value::Boolean(b) => Ok(b),
-            Value::Nil => Ok(false),
-            _ => Ok(true),
-        }
-    }
-}
+
 
 /// Create a table with all string functions
 pub fn create_string_lib() -> Vec<(&'static str, CFunction)> {

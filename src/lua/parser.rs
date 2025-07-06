@@ -82,19 +82,27 @@ impl Parser {
             self.label_statement()
         } else if self.match_token(Token::Return) {
             // Parse a Return statement - can now appear inside functions
+            println!("DEBUG PARSER: Parsing RETURN statement");
             let mut expressions = Vec::new();
             
             // Parse return values if not at end of statement
             if !self.check_statement_end() {
-                expressions.push(self.expression()?);
+                println!("DEBUG PARSER: Found return values to parse");
+                let expr = self.expression()?;
+                println!("DEBUG PARSER: Parsed first return expression: {:?}", expr);
+                expressions.push(expr);
                 
                 while self.match_token(Token::Comma) {
-                    expressions.push(self.expression()?);
+                    let expr = self.expression()?;
+                    println!("DEBUG PARSER: Parsed additional return expression: {:?}", expr);
+                    expressions.push(expr);
                 }
             }
             
             // Optional semicolon after return
             self.match_token(Token::Semicolon);
+            
+            println!("DEBUG PARSER: Completed RETURN with {} expressions", expressions.len());
             
             Ok(Statement::Return { expressions })
         } else if self.match_token(Token::Break) {

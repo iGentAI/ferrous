@@ -4,15 +4,53 @@ This document outlines the roadmap for completing the Ferrous Lua VM implementat
 
 ## Current State
 
-The core VM architecture is now functional with the register allocation system fixed in July 2025. While the VM can execute basic Lua scripts with functions, control flow, and string operations, there are still numerous placeholder implementations and TODOs throughout the codebase that need to be addressed before the implementation can be considered complete and production-ready.
+As of July 2025, the core VM architecture is functional with several critical fixes implemented:
+
+1. **Register Allocation Fix (July 2025)**: Proper register lifetime tracking ensures registers aren't freed prematurely.
+2. **Table Return Value Fix (July 2025)**: Tables can now be properly returned from Lua scripts.
+3. **LOADNIL Opcode Fix (July 2025)**: Corrected parameter handling for LOADNIL opcode.
+
+The VM can now execute scripts with:
+- Basic arithmetic operations
+- Table creation and manipulation
+- Conditional logic and comparisons
+- Simple closures
+- Script functions that return tables or primitive values
+
+Many placeholder implementations and TODOs remain throughout the codebase that need to be addressed before the implementation can be considered complete and production-ready.
 
 ## Remaining Placeholders
 
 See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md) for a detailed list of all TODOs and placeholder implementations that need to be addressed.
 
-## 1. Standard Library Implementation
+## 1. Closure and Upvalue System
 
-### 1.1 Math Library (High Priority)
+### 1.1 Upvalue Management (High Priority)
+- **Description**: Fix and complete upvalue management for complex closure scenarios
+- **Required Work**:
+  - Ensure upvalues are properly closed when variables go out of scope
+  - Implement upvalue sharing between closures capturing the same variables
+  - Fix upvalue management in the Thread struct's open_upvalues list
+  - Add comprehensive tests for nested closures and mutual recursion
+- **Implementation Strategy**: 
+  - Update the CLOSE opcode to properly handle all upvalues
+  - Enhance find_or_create_upvalue to ensure proper sharing
+  - Complete the close_thread_upvalues implementation
+
+### 1.2 Complex Closure Scenarios (High Priority)
+- **Description**: Fix issues with complex closure patterns
+- **Required Work**:
+  - Test and fix nested closure scenarios
+  - Ensure proper upvalue sharing between closures
+  - Address edge cases in closures with mutual recursion
+- **Implementation Strategy**:
+  - Create comprehensive test cases for complex closure patterns
+  - Update the CLOSURE opcode implementation to handle all scenarios
+  - Fix any issues in how function prototypes are loaded and managed
+
+## 2. Standard Library Implementation
+
+### 2.1 Math Library (High Priority)
 - **Description**: Implement standard math operations
 - **Required Functions**:
   - `math.abs`, `math.ceil`, `math.floor`, `math.max`, `math.min`
@@ -24,7 +62,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Ensure proper error handling for domain/range errors
   - Add comprehensive tests for each function
 
-### 1.2 String Library (High Priority)
+### 2.2 String Library (High Priority)
 - **Description**: Implement string manipulation functions
 - **Required Functions**:
   - `string.byte`, `string.char`, `string.dump`
@@ -36,7 +74,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Implement pattern matching with proper Lua pattern semantics
   - Add full test coverage for all string operations
 
-### 1.3 Table Library (High Priority)
+### 2.3 Table Library (High Priority)
 - **Description**: Implement table manipulation functions
 - **Required Functions**:
   - `table.concat`, `table.insert`, `table.maxn`
@@ -47,7 +85,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Ensure proper metamethod invocation when needed
   - Pay special attention to algorithms like table.sort
 
-### 1.4 Error Handling (High Priority)
+### 2.4 Error Handling (High Priority)
 - **Description**: Complete the error handling system
 - **Required Functions and Features**:
   - `pcall` and `xpcall` completion
@@ -59,9 +97,9 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Add support for tracking error location
   - Create a proper error-to-string formatter
 
-## 2. Testing and Compliance
+## 3. Testing and Compliance
 
-### 2.1 Comprehensive Test Suite (High Priority)
+### 3.1 Comprehensive Test Suite (High Priority)
 - **Description**: Create a complete test suite covering all aspects of Lua 5.1
 - **Test Categories**:
   - Syntax tests: All language constructs
@@ -74,7 +112,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Add custom tests for Ferrous-specific behavior
   - Implement automated test runner
 
-### 2.2 Compliance Verification (Medium Priority)
+### 3.2 Compliance Verification (Medium Priority)
 - **Description**: Verify compliance with Lua 5.1 specification
 - **Key Components**:
   - Language compliance tests
@@ -85,9 +123,9 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Compare behavior against reference implementation
   - Document and resolve any discrepancies
 
-## 3. Performance and Optimization
+## 4. Performance and Optimization
 
-### 3.1 Memory Management (Medium Priority)
+### 4.1 Memory Management (Medium Priority)
 - **Description**: Implement garbage collection
 - **Key Components**:
   - Non-recursive mark-and-sweep
@@ -98,7 +136,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Add incremental collection to avoid pauses
   - Tune GC parameters for Redis workloads
 
-### 3.2 VM Optimization (Medium Priority)
+### 4.2 VM Optimization (Medium Priority)
 - **Description**: Optimize VM execution
 - **Key Components**:
   - Instruction dispatch optimization
@@ -109,7 +147,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Identify and optimize hotspots
   - Benchmark against reference implementation
 
-### 3.3 Compiler Optimization (Low Priority)
+### 4.3 Compiler Optimization (Low Priority)
 - **Description**: Optimize bytecode generation
 - **Key Components**:
   - Constant folding
@@ -120,9 +158,9 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Add optimization level control
   - Benchmark before/after improvements
 
-## 4. Documentation
+## 5. Documentation
 
-### 4.1 API Documentation (High Priority)
+### 5.1 API Documentation (High Priority)
 - **Description**: Document the Lua VM API
 - **Key Components**:
   - Public API functions
@@ -133,7 +171,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Create example usage documentation
   - Document performance characteristics
 
-### 4.2 Implementation Documentation (Medium Priority)
+### 5.2 Implementation Documentation (Medium Priority)
 - **Description**: Document internal implementation
 - **Key Components**:
   - Architecture overview
@@ -144,11 +182,11 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Document key algorithms and data structures
   - Include diagrams where helpful
 
-## 5. Redis Integration (Low Priority)
+## 6. Redis Integration (Low Priority)
 
 *Note: This is included for completeness but is lower priority per current direction*
 
-### 5.1 Basic Redis Integration
+### 6.1 Basic Redis Integration
 - **Description**: Implement Redis API for Lua
 - **Key Components**:
   - `redis.call()` and `redis.pcall()`
@@ -159,7 +197,7 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
   - Ensure proper error handling and type conversion
   - Add Redis-specific performance tests
 
-### 5.2 Redis Command Sandboxing
+### 6.2 Redis Command Sandboxing
 - **Description**: Implement safe execution environment
 - **Key Components**:
   - Resource limits (CPU, memory)
@@ -172,14 +210,14 @@ See [LUA_VM_PLACEHOLDER_IMPLEMENTATIONS.md](./LUA_VM_PLACEHOLDER_IMPLEMENTATIONS
 
 ## Implementation Timeline and Priorities
 
-In light of the current implementation state with numerous placeholders, this timeline reflects realistic priorities:
+In light of recent progress and current state, this timeline reflects revised priorities:
 
 | Phase | Component | Priority | Estimated Effort | Dependencies |
 |-------|-----------|----------|-----------------|--------------|
-| 1 | Remove Standard Library Placeholders | High | 1-2 weeks | None |
+| 1 | Fix Closure/Upvalue System | High | 1-2 weeks | None |
 | 1 | Complete Error Handling | High | 1 week | None |
-| 2 | Comprehensive Tests | High | 1-2 weeks | Standard Library |
-| 2 | Compliance Verification | Medium | 1 week | Tests |
+| 2 | Comprehensive Tests | High | 1-2 weeks | Closure System |
+| 2 | Complete Standard Library | High | 1-2 weeks | None |
 | 3 | Memory Management | Medium | 2 weeks | None |
 | 3 | VM Optimization | Medium | 1 week | Tests |
 | 3 | Compiler Optimization | Low | 1 week | Tests |
@@ -188,9 +226,9 @@ In light of the current implementation state with numerous placeholders, this ti
 
 ## Next Immediate Steps
 
-1. Replace placeholder implementations in the standard library with proper code
+1. Fix the closure and upvalue system to handle complex nested closures
 2. Complete the string manipulation functions, especially pattern matching
-3. Implement the remaining table library functions
+3. Implement xpcall and traceback generation for error handling
 4. Add memory management with garbage collection
 5. Create a comprehensive test suite for all implemented features
 

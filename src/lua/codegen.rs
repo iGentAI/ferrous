@@ -1989,8 +1989,12 @@ impl CodeGenerator {
     fn emit_return(&mut self, exprs: &[Expression]) -> LuaResult<()> {
         let start_reg = self.registers.level();
         
+        println!("DEBUG COMPILER_EMIT_RETURN: Start with {} expressions at register level {}", 
+                 exprs.len(), start_reg);
+        
         if exprs.is_empty() {
-            // Return no values
+            // Return no values - RETURN R(0), 1, 0 means return 0 values
+            println!("DEBUG COMPILER_EMIT_RETURN: Empty return - encoding RETURN R(0), 1, 0");
             self.emit(Self::encode_ABC(OpCode::Return, 0, 1, 0));
         } else {
             // Result registers start at the current level
@@ -2000,14 +2004,43 @@ impl CodeGenerator {
                 } else {
                     1
                 };
+                
+                // Allocate a register for this expression
                 let reg = self.registers.allocate();
+                println!("DEBUG COMPILER_EMIT_RETURN: Allocated register {} for expression {}", reg, i);
+                
+                // Compile expression to the allocated register
                 self.expression(expr, reg, want)?;
             }
             
-            // Return values from registers
+            // Calculate how many values to return
             let first = start_reg;
             let count = self.registers.level() - start_reg;
-            self.emit(Self::encode_ABC(OpCode::Return, first as u8, (count + 1) as u16, 0));
+            
+            // CRITICAL FIX: Ensure we're returning at least one value if expressions exist
+            // If count is 0 (no registers allocated), force it to 1
+            let actual_count = if count == 0 && !exprs.is_empty() {
+                println!("DEBUG COMPILER_EMIT_RETURN: No registers allocated but have expressions, forcing count=1");
+                1
+            } else {
+                count
+            };
+            
+            // Calculate B parameter (B=1 means return 0 values, B=2 means return 1 value)
+            let b_param = actual_count + 1;
+            
+            println!("DEBUG COMPILER_EMIT_RETURN: Generated values - first_reg: {}, count: {}, actual_count: {}, B param: {}", 
+                    first, count, actual_count, b_param);
+            println!("DEBUG COMPILER_EMIT_RETURN: Encoding RETURN R({}), {}, 0", first, b_param);
+            
+            let instruction = Self::encode_ABC(OpCode::Return, first as u8, b_param as u16, 0);
+            println!("DEBUG COMPILER_EMIT_RETURN: Final instruction: 0x{:08x}", instruction);
+            println!("DEBUG COMPILER_EMIT_RETURN: Parsed back A={}, B={}, C={}", 
+                     Instruction(instruction).a(), 
+                     Instruction(instruction).b(), 
+                     Instruction(instruction).c());
+            
+            self.emit(instruction);
             
             // Free the temporary registers used for return values
             self.registers.free_to(start_reg);
@@ -2229,6 +2262,21 @@ impl Instruction {
     pub fn opcode(&self) -> OpCode {
         let opcode_num = ((self.0) & 0x3F) as u8;
         u8_to_opcode(opcode_num)
+    }
+    
+    /// Get the A field
+    pub fn a(&self) -> u8 {
+        ((self.0 >> 6) & 0xFF) as u8
+    }
+    
+    /// Get the B field
+    pub fn b(&self) -> u16 {
+        ((self.0 >> 23) & 0x1FF) as u16
+    }
+    
+    /// Get the C field
+    pub fn c(&self) -> u16 {
+        ((self.0 >> 14) & 0x1FF) as u16
     }
 }
 

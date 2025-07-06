@@ -286,7 +286,7 @@ impl Table {
         }
         
         // Otherwise use hash map
-        if let Ok(hashable) = HashableValue::from_value(key) {
+        if let Ok(hashable) = HashableValue::from_value_with_context(key, "Table::get_field") {
             self.map.get(&hashable)
         } else {
             None
@@ -330,7 +330,7 @@ impl Table {
         }
         
         // Otherwise use hash map
-        let hashable = HashableValue::from_value(&key)?;
+        let hashable = HashableValue::from_value_with_context(&key, "Table::set_field")?;
         if value.is_nil() {
             self.map.remove(&hashable);
         } else {
@@ -391,18 +391,49 @@ pub enum HashableValue {
 }
 
 impl HashableValue {
-    /// Try to create a hashable value from a Lua value
-    pub fn from_value(value: &Value) -> LuaResult<Self> {
+    /// Check if a value is hashable without creating the HashableValue
+    /// This can be used for validation without generating errors.
+    pub fn is_hashable(value: &Value) -> bool {
+        match value {
+            Value::Nil | Value::Boolean(_) | Value::Number(_) | Value::String(_) => true,
+            _ => false
+        }
+    }
+
+    /// Try to create a hashable value from a Lua value with context for better error messages
+    pub fn from_value_with_context(value: &Value, context: &str) -> LuaResult<Self> {
         match value {
             Value::Nil => Ok(HashableValue::Nil),
             Value::Boolean(b) => Ok(HashableValue::Boolean(*b)),
             Value::Number(n) => Ok(HashableValue::Number(OrderedFloat(*n))),
             Value::String(s) => Ok(HashableValue::String(*s)),
-            _ => Err(LuaError::TypeError {
-                expected: "nil, boolean, number, or string".to_string(),
-                got: value.type_name().to_string(),
-            }),
+            Value::Table(_) => {
+                println!("DEBUG HASHABLE: Table value used in context: {} (tables can't be used as keys)", context);
+                Err(LuaError::TypeError {
+                    expected: format!("nil, boolean, number, or string (in {})", context),
+                    got: "table (tables cannot be used as keys)".to_string(),
+                })
+            },
+            Value::Closure(_) | Value::CFunction(_) | Value::FunctionProto(_) => {
+                println!("DEBUG HASHABLE: Function value used in context: {} (functions can't be used as keys)", context);
+                Err(LuaError::TypeError {
+                    expected: format!("nil, boolean, number, or string (in {})", context),
+                    got: "function (functions cannot be used as keys)".to_string(),
+                })
+            },
+            other => {
+                println!("DEBUG HASHABLE: Unhashable value used in context: {} (type: {})", context, other.type_name());
+                Err(LuaError::TypeError {
+                    expected: format!("nil, boolean, number, or string (in {})", context),
+                    got: format!("{} (cannot be used as a key)", other.type_name()),
+                })
+            }
         }
+    }
+    
+    /// Original method for backward compatibility
+    pub fn from_value(value: &Value) -> LuaResult<Self> {
+        Self::from_value_with_context(value, "unknown")
     }
     
     /// Convert back to a Lua Value

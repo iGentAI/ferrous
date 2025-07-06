@@ -227,8 +227,8 @@ pub fn table_maxn(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     for key in table_obj.map.keys() {
         match key {
             HashableValue::Number(n) => {
-                if *n > 0.0 && *n.fract() == 0.0 && *n > max_n {
-                    max_n = *n;
+                if n.0 > 0.0 && n.0.fract() == 0.0 && n.0 > max_n {
+                    max_n = n.0;
                 }
             },
             _ => {},

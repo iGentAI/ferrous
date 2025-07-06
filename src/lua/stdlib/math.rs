@@ -8,6 +8,7 @@
 
 use std::f64::consts::{PI, E};
 use rand::Rng;
+use rand::SeedableRng;
 
 use crate::lua::error::{LuaError, LuaResult};
 use crate::lua::value::{Value, CFunction};
@@ -593,33 +594,6 @@ pub fn math_tanh(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     ctx.push_result(Value::Number(x.tanh()))?;
     
     Ok(1)
-}
-
-/// Helper to add number argument extraction to ExecutionContext
-impl<'vm> ExecutionContext<'vm> {
-    /// Get an argument as a number, with proper type checking
-    pub fn get_number_arg(&mut self, index: usize) -> LuaResult<f64> {
-        let value = self.get_arg(index)?;
-        
-        match value {
-            Value::Number(n) => Ok(n),
-            Value::String(handle) => {
-                // Try to convert string to number
-                let s = self.get_string_from_handle(handle)?;
-                match s.parse::<f64>() {
-                    Ok(n) => Ok(n),
-                    Err(_) => Err(LuaError::TypeError {
-                        expected: "number".to_string(),
-                        got: format!("string '{}' (not a number)", s),
-                    }),
-                }
-            },
-            _ => Err(LuaError::TypeError {
-                expected: "number".to_string(),
-                got: value.type_name().to_string(),
-            }),
-        }
-    }
 }
 
 /// Create table with all math functions and constants

@@ -939,19 +939,7 @@ pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 
 /// Helper to add execution context methods
 impl<'vm> ExecutionContext<'vm> {
-    /// Check for a metamethod on a value
-    pub fn check_metamethod(&mut self, value: &Value, metamethod: &str) -> Option<Value> {
-        // This would be implemented to check for a metamethod
-        // For now, we'll return None for simplicity
-        None
-    }
-    
-    /// Call a metamethod with arguments
-    pub fn call_metamethod(&mut self, function: Value, args: Vec<Value>) -> LuaResult<Vec<Value>> {
-        // This would be implemented to call a metamethod
-        // For now, we'll return an empty vector for simplicity
-        Ok(Vec::new())
-    }
+    // All implementations removed - they're defined in vm.rs
 }
 
 /// Create a table with all base library functions
@@ -1025,79 +1013,3 @@ pub fn init_base_lib(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
     Ok(())
 }
 
-/// Helper to extract string arguments
-impl<'vm> ExecutionContext<'vm> {
-    /// Get a string value from a handle
-    pub fn get_string_from_handle(&mut self, handle: StringHandle) -> LuaResult<String> {
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        let value = tx.get_string_value(handle)?;
-        tx.commit()?;
-        Ok(value)
-    }
-    
-    /// Get the argument as a string
-    pub fn get_arg_str(&mut self, index: usize) -> LuaResult<String> {
-        let value = self.get_arg(index)?;
-        
-        match value {
-            Value::String(handle) => {
-                self.get_string_from_handle(handle)
-            },
-            _ => {
-                // Try to convert to string
-                match self.vm_access.globals() {
-                    Ok(globals) => {
-                        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-                        let tostring_name = tx.create_string("tostring")?;
-                        let func = tx.read_table_field(globals, &Value::String(tostring_name))?;
-                        tx.commit()?;
-                        
-                        match func {
-                            Value::CFunction(f) => {
-                                // Create a nested execution context
-                                let mut nested_ctx = ExecutionContext::new(
-                                    self.vm_access,
-                                    self.stack_base + self.arg_count,
-                                    1,
-                                    self.thread,
-                                );
-                                
-                                // Push the argument
-                                nested_ctx.push_result(value)?;
-                                
-                                // Call tostring function
-                                match f(&mut nested_ctx) {
-                                    Ok(_) => {
-                                        // Get the result
-                                        let result = nested_ctx.get_arg(0)?;
-                                        match result {
-                                            Value::String(handle) => {
-                                                nested_ctx.get_string_from_handle(handle)
-                                            },
-                                            _ => {
-                                                // If not a string, convert it manually
-                                                Ok(format!("{:?}", result))
-                                            }
-                                        }
-                                    },
-                                    Err(e) => {
-                                        // If tostring fails, use a simple string representation
-                                        Ok(format!("{:?}", value))
-                                    }
-                                }
-                            },
-                            _ => {
-                                // If tostring not available, fall back to a simple representation
-                                Ok(format!("{:?}", value))
-                            }
-                        }
-                    },
-                    Err(_) => {
-                        // If globals not available, fall back to a simple representation
-                        Ok(format!("{:?}", value))
-                    }
-                }
-            }
-        }
-    }
-}

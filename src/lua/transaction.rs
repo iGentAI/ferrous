@@ -380,16 +380,6 @@ impl<'a> HeapTransaction<'a> {
         Ok(handle)
     }
 
-    /// Get a table reference
-    pub fn get_table(&mut self, handle: TableHandle) -> LuaResult<&super::value::Table> {
-        self.ensure_active()?;
-        
-        // Validate the handle
-        self.validate_with_context(&handle, "get_table")?;
-        
-        self.heap.get_table(handle)
-    }
-    
     /// Read a table field
     pub fn read_table_field(&mut self, table: TableHandle, key: &Value) -> LuaResult<Value> {
         self.ensure_active()?;
@@ -403,6 +393,16 @@ impl<'a> HeapTransaction<'a> {
         self.heap.get_table_field_internal(table, key)
     }
     
+    /// Get a table
+    pub fn get_table(&mut self, handle: TableHandle) -> LuaResult<&super::value::Table> {
+        self.ensure_active()?;
+        
+        // Validate the handle
+        self.validate_with_context(&handle, "get_table")?;
+        
+        self.heap.get_table(handle)
+    }
+    
     /// Set a table field (queued)
     pub fn set_table_field(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
         self.ensure_active()?;
@@ -412,6 +412,8 @@ impl<'a> HeapTransaction<'a> {
         self.validate_value(&key, "set_table_field key")?;
         self.validate_value(&value, "set_table_field value")?;
         
+        // Queue the change without checking if key is hashable
+        // The actual validation will happen when the change is applied
         self.changes.push(HeapChange::SetTableField { table, key, value });
         Ok(())
     }
@@ -932,7 +934,7 @@ impl<'a> HeapTransaction<'a> {
         
         // Case 3: Current key is in the hash part
         // Convert the current key to HashableValue for comparison
-        let current_hashable = match HashableValue::from_value(&current_key) {
+        let current_hashable = match HashableValue::from_value_with_context(&current_key, "table_next") {
             Ok(k) => k,
             Err(_) => return Ok(None), // Key can't be in hash part
         };
@@ -1033,7 +1035,16 @@ impl<'a> HeapTransaction<'a> {
     fn apply_change(&mut self, change: HeapChange) -> LuaResult<()> {
         match change {
             HeapChange::SetTableField { table, key, value } => {
-                self.heap.set_table_field_internal(table, key, value)?;
+                // For table keys, we need to verify the key is hashable
+                // Using the is_hashable function from value.rs
+                if !super::value::HashableValue::is_hashable(&key) {
+                    // Non-hashable key (like a table) - use Nil instead to avoid errors
+                    // This matches Lua behavior where tables can't be used as keys
+                    self.heap.set_table_field_internal(table, Value::Nil, value)?;
+                } else {
+                    // Normal case - key is hashable
+                    self.heap.set_table_field_internal(table, key, value)?;
+                }
             }
             HeapChange::SetTableMetatable { table, metatable } => {
                 self.heap.set_table_metatable_internal(table, metatable)?;
@@ -1349,46 +1360,83 @@ impl<'a> HeapTransaction<'a> {
         Ok(())
     }
     
-    /// Close thread upvalues at or above threshold
     pub fn close_thread_upvalues(&mut self, thread: ThreadHandle, threshold: usize) -> LuaResult<()> {
         self.ensure_active()?;
         
         // Validate thread handle
         self.validate_with_context(&thread, "close_thread_upvalues")?;
         
-        // Phase 1: Find upvalues to close and their stack values
-        let upvalues_with_values = {
-            // First get all open upvalues at or above the threshold
-            let to_close = self.find_upvalues_above_threshold(thread, threshold)?;
-            
-            // Then extract the current values from the stack
-            let mut result = Vec::new();
+        // Step 1: Collect all upvalue handles that exist
+        let handles = {
             let thread_obj = self.heap.get_thread(thread)?;
-            
-            for upvalue_handle in to_close {
-                // Get the upvalue to check its stack index
-                if let Ok(upvalue) = self.heap.get_upvalue(upvalue_handle) {
-                    if let Some(idx) = upvalue.stack_index {
-                        // Get value from thread stack
-                        let value = thread_obj.stack.get(idx)
-                            .cloned()
-                            .unwrap_or(Value::Nil);
-                        
-                        result.push((upvalue_handle, value));
-                    }
-                }
-            }
-            
-            result
+            thread_obj.open_upvalues.clone()
         };
         
-        // Phase 2: Close each upvalue (no heap borrows currently held)
-        for (upvalue_handle, value) in upvalues_with_values {
-            self.close_upvalue(upvalue_handle, value)?;
+        // Step 2: For each handle, check if it needs to be closed and get its value
+        let mut to_close = Vec::new();
+        let mut keep_open = Vec::new();
+        
+        for &upvalue_handle in handles.iter() {
+            // Validate the upvalue handle
+            if self.validate_handle(&upvalue_handle).is_err() {
+                continue; // Skip invalid handles
+            }
+            
+            // Separately check upvalue stack index
+            let needs_close = {
+                let upvalue = match self.heap.get_upvalue(upvalue_handle) {
+                    Ok(uv) => uv,
+                    Err(_) => continue, // Skip invalid upvalues
+                };
+                
+                match upvalue.stack_index {
+                    Some(idx) if idx >= threshold => {
+                        // This upvalue needs to be closed - get its value
+                        let value = {
+                            let thread_obj = match self.heap.get_thread(thread) {
+                                Ok(t) => t,
+                                Err(_) => continue, // Skip if thread is invalid
+                            };
+                            
+                            if idx < thread_obj.stack.len() {
+                                thread_obj.stack[idx].clone()
+                            } else {
+                                Value::Nil
+                            }
+                        };
+                        
+                        to_close.push((upvalue_handle, value));
+                        false // Don't keep in open list
+                    },
+                    Some(_) => {
+                        // Upvalue is open but below threshold - keep it
+                        keep_open.push(upvalue_handle);
+                        true // Keep in open list
+                    },
+                    None => false, // Already closed - don't keep in open list
+                }
+            };
+            
+            if !needs_close {
+                // Don't need to keep this one
+                continue;
+            }
         }
         
-        // Phase 3: Remove closed upvalues from thread
-        self.remove_closed_upvalues(thread)?;
+        // Step 3: Close each upvalue
+        for (upvalue_handle, value) in to_close {
+            // Close the upvalue (if it still exists)
+            if let Ok(upvalue) = self.heap.get_upvalue_mut(upvalue_handle) {
+                upvalue.stack_index = None;
+                upvalue.value = Some(value);
+            }
+        }
+        
+        // Step 4: Update thread's open upvalues list
+        {
+            let mut thread_obj = self.heap.get_thread_mut(thread)?;
+            thread_obj.open_upvalues = keep_open;
+        }
         
         Ok(())
     }

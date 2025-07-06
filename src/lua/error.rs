@@ -8,6 +8,48 @@ use std::error::Error;
 /// Result type for Lua operations
 pub type LuaResult<T> = Result<T, LuaError>;
 
+/// Information about a stack frame for error reporting
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallInfo {
+    /// Name of the function if available
+    pub function_name: Option<String>,
+    
+    /// Source file name if available
+    pub source_file: Option<String>,
+    
+    /// Line number if available
+    pub line_number: Option<usize>,
+    
+    /// PC (program counter) value
+    pub pc: usize,
+}
+
+/// Traceback information for error reporting
+#[derive(Debug, Clone, PartialEq)]
+pub struct LuaTraceback {
+    /// Call frames in the traceback
+    pub frames: Vec<CallInfo>,
+}
+
+impl fmt::Display for LuaTraceback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "stack traceback:")?;
+        for (i, frame) in self.frames.iter().rev().enumerate() {
+            let location = if let (Some(file), Some(line)) = (&frame.source_file, frame.line_number) {
+                format!("{}:{}", file, line)
+            } else if let Some(file) = &frame.source_file {
+                file.clone()
+            } else {
+                format!("[pc={}]", frame.pc)
+            };
+            
+            let name = frame.function_name.as_deref().unwrap_or("<anonymous>");
+            writeln!(f, "\t{}: in function '{}'", location, name)?;
+        }
+        Ok(())
+    }
+}
+
 /// Errors that can occur in the Lua VM
 #[derive(Debug, Clone, PartialEq)]
 pub enum LuaError {
@@ -17,7 +59,9 @@ pub enum LuaError {
     
     // Runtime errors
     RuntimeError(String),
+    RuntimeErrorWithTrace { message: String, traceback: LuaTraceback },
     TypeError { expected: String, got: String },
+    TypeErrorWithTrace { expected: String, got: String, traceback: LuaTraceback },
     ArithmeticError(String),
     ConcatenationError(String),
     ComparisonError(String),
@@ -65,8 +109,16 @@ impl fmt::Display for LuaError {
             LuaError::CompileError(msg) => write!(f, "compile error: {}", msg),
             
             LuaError::RuntimeError(msg) => write!(f, "runtime error: {}", msg),
+            LuaError::RuntimeErrorWithTrace { message, traceback } => {
+                writeln!(f, "runtime error: {}", message)?;
+                write!(f, "{}", traceback)
+            }
             LuaError::TypeError { expected, got } => {
                 write!(f, "type error: expected {}, got {}", expected, got)
+            }
+            LuaError::TypeErrorWithTrace { expected, got, traceback } => {
+                writeln!(f, "type error: expected {}, got {}", expected, got)?;
+                write!(f, "{}", traceback)
             }
             LuaError::ArithmeticError(msg) => write!(f, "arithmetic error: {}", msg),
             LuaError::ConcatenationError(msg) => write!(f, "concatenation error: {}", msg),
@@ -119,6 +171,9 @@ impl From<LuaError> for crate::error::FerrousError {
             LuaError::RuntimeError(msg) => {
                 crate::error::FerrousError::LuaRuntimeError(msg)
             }
+            LuaError::RuntimeErrorWithTrace { message, traceback } => {
+                crate::error::FerrousError::LuaRuntimeError(format!("{}\n{}", message, traceback))
+            }
             LuaError::Timeout => {
                 crate::error::FerrousError::LuaTimeout
             }
@@ -162,5 +217,62 @@ mod tests {
             err.to_string(),
             "wrong number of arguments: expected 2, got 3"
         );
+    }
+    
+    #[test]
+    fn test_traceback_display() {
+        let frames = vec![
+            CallInfo {
+                function_name: Some("main".to_string()),
+                source_file: Some("test.lua".to_string()),
+                line_number: Some(10),
+                pc: 5,
+            },
+            CallInfo {
+                function_name: Some("helper".to_string()),
+                source_file: Some("utils.lua".to_string()),
+                line_number: Some(42),
+                pc: 12,
+            },
+        ];
+        
+        let traceback = LuaTraceback { frames };
+        
+        let err = LuaError::RuntimeErrorWithTrace {
+            message: "test error".to_string(),
+            traceback,
+        };
+        
+        // Assert that the traceback format is as expected
+        let err_string = err.to_string();
+        assert!(err_string.contains("runtime error: test error"));
+        assert!(err_string.contains("stack traceback:"));
+        assert!(err_string.contains("utils.lua:42: in function 'helper'"));
+        assert!(err_string.contains("test.lua:10: in function 'main'"));
+    }
+    
+    #[test]
+    fn test_type_error_with_trace() {
+        let frames = vec![
+            CallInfo {
+                function_name: None,
+                source_file: None,
+                line_number: None,
+                pc: 7,
+            },
+        ];
+        
+        let traceback = LuaTraceback { frames };
+        
+        let err = LuaError::TypeErrorWithTrace {
+            expected: "table".to_string(),
+            got: "nil".to_string(),
+            traceback,
+        };
+        
+        let err_string = err.to_string();
+        assert!(err_string.contains("type error: expected table, got nil"));
+        assert!(err_string.contains("stack traceback:"));
+        assert!(err_string.contains("[pc=7]")); // When no file/line available
     }
 }

@@ -60,6 +60,50 @@ self.used = level;  // This completely reset allocation state!
 - Modified encoding functions to use proper opcode mapping
 - Ensured consistency between compiler and VM opcode values
 
+### 4. RETURN Opcode Parameter Handling (Fixed July 2025)
+
+**Issue**: Table return values weren't being properly returned from Lua scripts.
+
+**Root Cause**: The compiler's `emit_return` method was generating RETURN instructions with B=1 (meaning "return 0 values") even when returning a table expression.
+
+**Impact**:
+- Tables created in scripts couldn't be returned
+- Scripts returning tables would instead return nil
+- Inability to return complex data structures from scripts
+
+**Solution**:
+- Fixed the `emit_return` method to properly calculate the B parameter
+- Ensured that B=2 (meaning "return 1 value") is used when expressions exist
+- Added fallback mechanism when register count doesn't match expression count
+- Verified that tables can now be returned from scripts
+
+### 5. LOADNIL Opcode Parameter Handling (Fixed July 2025)
+
+**Issue**: LOADNIL was setting B+1 registers to nil instead of B registers.
+
+**Root Cause**: Loop condition in the opcode implementation used an inclusive range instead of exclusive:
+
+```rust
+// Incorrect implementation
+for i in 0..=b {
+    tx.set_register(self.current_thread, base + a + i, Value::Nil)?;
+}
+```
+
+**Impact**:
+- One extra register being set to nil beyond what's expected
+- Potential unwanted register overwriting
+- Deviation from Lua 5.1 specification
+
+**Solution**:
+- Modified the loop to use exclusive range to match Lua 5.1 spec:
+```rust
+// Fixed implementation
+for i in 0..b {
+    tx.set_register(self.current_thread, base + a + i, Value::Nil)?;
+}
+```
+
 ## Pending Architectural Issues
 
 ### 1. Memory Management (Unimplemented)
@@ -146,6 +190,23 @@ self.used = level;  // This completely reset allocation state!
 - Complete pcall/xpcall implementation
 - Ensure error propagation is consistent
 
+### 6. Closure and Upvalue Handling (Partial)
+
+**Issue**: Complex closure scenarios and upvalue management have limitations.
+
+**Root Cause**: The upvalue handling logic isn't fully handling complex closure nesting and lifecycle management.
+
+**Impact**:
+- Simple closures work but complex patterns fail
+- Upvalue capture may not work correctly across multiple closure levels
+- Upvalue closing needs improvement
+
+**Required Solution**:
+- Complete the upvalue management system
+- Ensure proper upvalue sharing between closures
+- Fix upvalue closing mechanism
+- Test with complex closure patterns
+
 ## Architectural Principles Compliance
 
 Despite the pending issues, the implementation follows these core architectural principles:
@@ -176,6 +237,6 @@ Despite the pending issues, the implementation follows these core architectural 
 
 ## Conclusion
 
-While the core VM architecture issues have been fixed, there are still significant architectural gaps in memory management, transaction patterns, and error handling. These should be addressed systematically while completing the standard library and before moving to Redis integration.
+The core VM architecture issues have been fixed, making the VM capable of executing basic to moderately complex Lua scripts. Tables can now be properly returned from scripts, and opcodes are correctly implemented according to the Lua 5.1 specification. However, there are still significant architectural gaps in memory management, upvalue handling, transaction patterns, and error handling. These should be addressed systematically while completing the standard library and before moving to Redis integration.
 
-The most critical issue to address is the memory management system, as unbounded memory growth will make the VM unsuitable for long-running or production applications.
+The most critical issues to address are the upvalue/closure system and memory management, as these limitations will prevent the VM from running many real-world Lua scripts.
