@@ -12,6 +12,7 @@ use crate::storage::StorageEngine;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use super::register_window::RegisterWindowSystem;
 
 /// Bytecode instruction format (simplified for now)
 pub struct Instruction(pub u32);
@@ -60,6 +61,7 @@ impl Instruction {
             36 => OpCode::Closure,
             37 => OpCode::Close,
             38 => OpCode::ExtraArg,
+            39 => OpCode::Eval,
             _ => OpCode::Move, // Default
         }
     }
@@ -278,6 +280,105 @@ pub enum OpCode {
 
     /// EXTRAARG: Extra argument for previous instruction
     ExtraArg,   // Extra argument for previous instruction
+    
+    /// EVAL: Evaluate Lua code dynamically
+    /// A: Target register for first result
+    /// B: Source register containing code string
+    /// C: Expected result count (0 = all results)
+    Eval,
+}
+
+/// Convert opcode to u8
+pub fn opcode_to_u8(op: OpCode) -> u8 {
+    match op {
+        OpCode::Move => 0,
+        OpCode::LoadK => 1,
+        OpCode::LoadBool => 2,
+        OpCode::LoadNil => 3,
+        OpCode::GetUpval => 4,
+        OpCode::GetGlobal => 5,
+        OpCode::SetGlobal => 6,
+        OpCode::SetUpval => 7,
+        OpCode::GetTable => 8,
+        OpCode::SetTable => 9,
+        OpCode::NewTable => 10,
+        OpCode::Self_ => 11,
+        OpCode::Add => 12,
+        OpCode::Sub => 13,
+        OpCode::Mul => 14,
+        OpCode::Div => 15,
+        OpCode::Mod => 16,
+        OpCode::Pow => 17,
+        OpCode::Unm => 18,
+        OpCode::Not => 19,
+        OpCode::Len => 20,
+        OpCode::Concat => 21,
+        OpCode::Jmp => 22,
+        OpCode::Eq => 23,
+        OpCode::Lt => 24,
+        OpCode::Le => 25,
+        OpCode::Test => 26,
+        OpCode::TestSet => 27,
+        OpCode::Call => 28,
+        OpCode::TailCall => 29,
+        OpCode::Return => 30,
+        OpCode::ForPrep => 31,
+        OpCode::ForLoop => 32,
+        OpCode::TForLoop => 33,
+        OpCode::SetList => 34,
+        OpCode::VarArg => 35,
+        OpCode::Closure => 36,
+        OpCode::Close => 37,
+        OpCode::ExtraArg => 38,
+        OpCode::Eval => 39,
+    }
+}
+
+/// Convert u8 to opcode
+pub fn u8_to_opcode(value: u8) -> OpCode {
+    match value {
+        0 => OpCode::Move,
+        1 => OpCode::LoadK,
+        2 => OpCode::LoadBool,
+        3 => OpCode::LoadNil,
+        4 => OpCode::GetUpval,
+        5 => OpCode::GetGlobal,
+        6 => OpCode::SetGlobal,
+        7 => OpCode::SetUpval,
+        8 => OpCode::GetTable,
+        9 => OpCode::SetTable,
+        10 => OpCode::NewTable,
+        11 => OpCode::Self_,
+        12 => OpCode::Add,
+        13 => OpCode::Sub,
+        14 => OpCode::Mul,
+        15 => OpCode::Div,
+        16 => OpCode::Mod,
+        17 => OpCode::Pow,
+        18 => OpCode::Unm,
+        19 => OpCode::Not,
+        20 => OpCode::Len,
+        21 => OpCode::Concat,
+        22 => OpCode::Jmp,
+        23 => OpCode::Eq,
+        24 => OpCode::Lt,
+        25 => OpCode::Le,
+        26 => OpCode::Test,
+        27 => OpCode::TestSet,
+        28 => OpCode::Call,
+        29 => OpCode::TailCall,
+        30 => OpCode::Return,
+        31 => OpCode::ForPrep,
+        32 => OpCode::ForLoop,
+        33 => OpCode::TForLoop,
+        34 => OpCode::SetList,
+        35 => OpCode::VarArg,
+        36 => OpCode::Closure,
+        37 => OpCode::Close,
+        38 => OpCode::ExtraArg,
+        39 => OpCode::Eval,
+        _ => OpCode::Move, // Default
+    }
 }
 
 /// Pending operation to be processed by the VM
@@ -364,6 +465,20 @@ pub enum PendingOperation {
         next_pc: usize,
     },
 
+    /// Eval code execution
+    EvalExecution {
+        /// Source code to evaluate
+        source: String,
+        
+        /// Target window for results
+        target_window: usize,
+        
+        /// Result register in target window
+        result_register: usize,
+        
+        /// Expected result count
+        expected_results: usize,
+    },
 
 }
 
@@ -404,6 +519,18 @@ pub enum ReturnContext {
         c: usize,       // C value (number of loop variables)
         pc: usize,      // Original PC for loop continuation
         sbx: i32        // Jump offset for loop continuation
+    },
+    
+    /// Results from eval
+    EvalReturn {
+        /// Target window for results
+        target_window: usize,
+        
+        /// Result register in target window
+        result_register: usize,
+        
+        /// Expected result count
+        expected_results: usize,
     },
 }
 
@@ -815,6 +942,9 @@ pub struct LuaVM {
     
     /// Script context (Redis integration)
     script_context: Option<crate::lua::ScriptContext>,
+    
+    /// Register window system for frame isolation
+    register_windows: RegisterWindowSystem,
 }
 
 impl LuaVM {
@@ -991,10 +1121,13 @@ impl LuaVM {
         Ok(result)
     }
     
-    /// Create a new VM instance
+    /// Create a new VM instance with register windows
     pub fn new() -> LuaResult<Self> {
         let heap = LuaHeap::new()?;
         let main_thread = heap.main_thread()?;
+        
+        // Initialize register window system with a reasonable initial size
+        let register_windows = RegisterWindowSystem::new(1024);
         
         Ok(LuaVM {
             heap,
@@ -1007,6 +1140,7 @@ impl LuaVM {
             start_time: None,
             timeout: None,
             script_context: None,
+            register_windows,
         })
     }
     
@@ -1137,6 +1271,7 @@ impl LuaVM {
         Ok(final_result)
     }
     
+    /// Execute a single step
     fn step(&mut self) -> LuaResult<StepResult> {
         // Increment instruction count
         self.instruction_count += 1;
@@ -1160,330 +1295,191 @@ impl LuaVM {
         // Default: increment PC unless instruction handles it
         let mut should_increment_pc = true;
         
+        // Get the window index from the frame
+        // In our architecture, base_register stores the window INDEX, not a memory address
+        let window_idx = frame.base_register as usize;  
+        
+        // Print debug info about window access
+        println!("DEBUG STEP: Accessing window {} for execution at PC {}", window_idx, frame.pc);
+        
+        // Make sure window exists by checking if it's within the window stack bounds
+        if let Some(current_window) = self.register_windows.current_window() {
+            if window_idx > current_window {
+                println!("DEBUG STEP: Invalid window index {} (current: {})",  
+                         window_idx, current_window);
+                return Err(LuaError::InternalError(format!(
+                    "Invalid window index {} (current: {})",
+                    window_idx, current_window
+                )));
+            }
+        } else {
+            println!("DEBUG STEP: No active window");
+            return Err(LuaError::InternalError("No active window".to_string()));
+        }
+        
+        // Setup frame base for transaction-based register access
+        let frame_base = frame.base_register as usize;
+        
         let result = match opcode {
+            // Handle instructions using window-based register access
             OpCode::Move => {
-                // R(A) := R(B)
-                let base = frame.base_register as usize;
-                let value = tx.read_register(self.current_thread, base + b)?;
-                tx.set_register(self.current_thread, base + a, value)?;
+                println!("DEBUG STEP: MOVE - from R({}) to R({})", b, a);
+                let value = self.register_windows.get_register(window_idx, b)?.clone();
+                self.register_windows.set_register(window_idx, a, value)?;
                 StepResult::Continue
-            }
-            
-            OpCode::LoadK => {
-                // R(A) := Kst(Bx)
-                let base = frame.base_register as usize;
-                
-                // Inline get_constant to avoid self-borrowing
-                let closure_obj = tx.get_closure(frame.closure)?;
-                let bx = instruction.bx() as usize;
-                let constant = closure_obj.proto.constants.get(bx)
-                    .cloned()
-                    .ok_or_else(|| LuaError::RuntimeError(format!(
-                        "Constant index {} out of bounds",
-                        bx
-                    )))?;
-                
-                tx.set_register(self.current_thread, base + a, constant)?;
-                StepResult::Continue
-            }
+            },
             
             OpCode::LoadBool => {
                 // R(A) := (Bool)B; if (C) pc++
-                let base = frame.base_register as usize;
+                println!("DEBUG STEP: LOADBOOL - value {} to R({})", b != 0, a);
                 let value = Value::Boolean(b != 0);
-                tx.set_register(self.current_thread, base + a, value)?;
+                self.register_windows.set_register(window_idx, a, value)?;
                 
                 if c != 0 {
                     // Skip next instruction
                     tx.increment_pc(self.current_thread)?;
+                    // Don't increment PC again since we already did
+                    should_increment_pc = false;
                 }
                 
                 StepResult::Continue
-            }
+            },
             
-            OpCode::LoadNil => {
-                // R(A), R(A+1), ..., R(A+B-1) := nil
-                // Note: Lua 5.1 spec specifies this sets B registers to nil (not B+1)
-                let base = frame.base_register as usize;
-                for i in 0..b {
-                    tx.set_register(self.current_thread, base + a + i, Value::Nil)?;
-                }
-                StepResult::Continue
-            }
-            
-            OpCode::GetUpval => {
-                // R(A) := UpValue[B]
-                let base = frame.base_register as usize;
-                
-                // Phase 1: Extract all needed information
-                // Get the upvalue handle and check if it's valid
-                let upvalue_info = {
+            OpCode::LoadK => {
+                println!("DEBUG STEP: LOADK - constant index {} to R({})", instruction.bx(), a);
+                // Get constant from heap
+                let bx = instruction.bx() as usize;
+                let constant = {
                     let closure_obj = tx.get_closure(frame.closure)?;
-                    
-                    // Check upvalue bounds
-                    if b >= closure_obj.upvalues.len() {
+                    if bx >= closure_obj.proto.constants.len() {
+                        tx.commit()?;
                         return Err(LuaError::RuntimeError(format!(
-                            "Upvalue index {} out of bounds (upvalues: {})",
-                            b, closure_obj.upvalues.len()
+                            "Constant index {} out of bounds", bx
+                        )));
+                    }
+                    closure_obj.proto.constants[bx].clone()
+                };
+                
+                // Store constant in register window
+                self.register_windows.set_register(window_idx, a, constant)?;
+                StepResult::Continue
+            },
+            
+            OpCode::Closure => {
+                // R(A) := closure(KPROTO[Bx])
+                println!("DEBUG STEP: CLOSURE - creating closure from proto {} in R({})", instruction.bx(), a);
+                
+                // Get the function prototype
+                let bx = instruction.bx() as usize;
+                let proto_handle = {
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    if bx >= closure_obj.proto.constants.len() {
+                        tx.commit()?;
+                        return Err(LuaError::RuntimeError(format!(
+                            "Function prototype index {} out of bounds", bx
                         )));
                     }
                     
-                    // Get the upvalue handle
-                    let upvalue_handle = closure_obj.upvalues[b];
-                    
-                    // Get the upvalue
-                    let upvalue = tx.get_upvalue(upvalue_handle)?;
-                    
-                    // Extract the info we need
-                    match upvalue {
-                        crate::lua::value::Upvalue { stack_index: Some(idx), value: None } => {
-                            // Open upvalue
-                            (true, *idx, None)
-                        },
-                        crate::lua::value::Upvalue { stack_index: None, value: Some(val) } => {
-                            // Closed upvalue
-                            (false, 0, Some(val.clone()))
-                        },
+                    // Get the constant
+                    match &closure_obj.proto.constants[bx] {
+                        Value::FunctionProto(handle) => *handle,
                         _ => {
-                            // Invalid state
-                            return Err(LuaError::RuntimeError("Invalid upvalue state".to_string()));
+                            tx.commit()?;
+                            return Err(LuaError::RuntimeError(format!(
+                                "Expected function prototype at constant {}", bx
+                            )));
                         }
                     }
                 };
                 
-                // Phase 2: Process the information
-                let value = match upvalue_info {
-                    (true, idx, _) => {
-                        // Open upvalue - read from thread stack
-                        tx.read_register(self.current_thread, idx)?
-                    },
-                    (false, _, Some(val)) => {
-                        // Closed upvalue - use stored value
-                        val
-                    },
-                    _ => {
-                        // Invalid state (shouldn't happen due to pattern match above)
-                        return Err(LuaError::InternalError("Invalid upvalue state in phase 2".to_string()));
-                    }
+                // Create upvalues for the closure
+                let proto = tx.get_function_proto_copy(proto_handle)?;
+                let mut upvalues = Vec::with_capacity(proto.upvalues.len());
+
+                // Process upvalues
+                for upvalue_info in &proto.upvalues {
+                    let upvalue_handle = if upvalue_info.in_stack {
+                        // Create upvalues for local variables in the stack
+                        tx.find_or_create_upvalue(self.current_thread, frame_base + upvalue_info.index as usize)?
+                    } else {
+                        // Copy upvalue from parent closure
+                        let parent_closure = tx.get_closure(frame.closure)?;
+                        if upvalue_info.index as usize >= parent_closure.upvalues.len() {
+                            tx.commit()?;
+                            return Err(LuaError::RuntimeError(format!(
+                                "Upvalue index {} out of bounds", upvalue_info.index
+                            )));
+                        }
+                        parent_closure.upvalues[upvalue_info.index as usize]
+                    };
+                    
+                    upvalues.push(upvalue_handle);
+                }
+                
+                // Create the new closure
+                let closure = Closure {
+                    proto,
+                    upvalues,
                 };
                 
-                // Set register A to upvalue value
-                tx.set_register(self.current_thread, base + a, value)?;
+                let closure_handle = tx.create_closure(closure)?;
+                
+                // Set in register
+                self.register_windows.set_register(window_idx, a, Value::Closure(closure_handle))?;
                 
                 StepResult::Continue
             },
-            
-            OpCode::GetGlobal => {
-                // R(A) := Gbl[Kst(Bx)]
-                let base = frame.base_register as usize;
-                
-                // Get the global name from the constant pool
-                let bx = instruction.bx() as usize;
-                let closure_obj = tx.get_closure(frame.closure)?;
-                
-                let name_value = closure_obj.proto.constants.get(bx)
-                    .cloned()
-                    .ok_or_else(|| LuaError::RuntimeError(format!(
-                        "Constant index {} out of bounds", bx
-                    )))?;
-                
-                // The name must be a string
-                let name_handle = match name_value {
-                    Value::String(handle) => handle,
-                    _ => {
-                        tx.commit()?;
-                        return Err(LuaError::RuntimeError("Global name must be a string".to_string()));
-                    }
-                };
-                
-                // Add diagnostics for important lookups
-                let name_str = tx.get_string_value(name_handle)?;
-                if name_str == "print" || name_str == "type" || name_str == "tostring" || name_str == "pairs" {
-                    println!("DEBUG LOOKUP: Looking up global '{}' with handle {:?}", name_str, name_handle);
-                }
-                
-                // Get the globals table
-                let globals_table = tx.get_globals_table()?;
-                
-                // Get the value from the globals table
-                let value = tx.read_table_field(globals_table, &Value::String(name_handle))?;
-                
-                // Add diagnostics for result
-                if name_str == "print" || name_str == "type" || name_str == "tostring" || name_str == "pairs" {
-                    println!("DEBUG LOOKUP: Result for '{}': {:?} ({})", 
-                             name_str, value, value.type_name());
-                }
-                
-                // Store the value in register A
-                tx.set_register(self.current_thread, base + a, value)?;
-                
-                StepResult::Continue
-            }
-            
-            OpCode::SetGlobal => {
-                // Gbl[Kst(Bx)] := R(A)
-                let base = frame.base_register as usize;
-                
-                // Get the global name from the constant pool
-                let bx = instruction.bx() as usize;
-                let closure_obj = tx.get_closure(frame.closure)?;
-                
-                let name_value = closure_obj.proto.constants.get(bx)
-                    .cloned()
-                    .ok_or_else(|| LuaError::RuntimeError(format!(
-                        "Constant index {} out of bounds", bx
-                    )))?;
-                
-                // The name must be a string
-                let name_handle = match name_value {
-                    Value::String(handle) => handle,
-                    _ => {
-                        tx.commit()?;
-                        return Err(LuaError::RuntimeError("Global name must be a string".to_string()));
-                    }
-                };
-                
-                // Get the value to store
-                let value = tx.read_register(self.current_thread, base + a)?;
-                
-                // Get the globals table
-                let globals_table = tx.get_globals_table()?;
-                
-                // Set the value in the globals table
-                tx.set_table_field(globals_table, Value::String(name_handle), value)?;
-                
-                StepResult::Continue
-            }
-            
-            OpCode::SetUpval => {
-                // UpValue[B] := R(A)
-                let base = frame.base_register as usize;
-                
-                // Phase 1: Extract all needed information
-                // Get the value and upvalue details
-                let (upvalue_handle, is_open, stack_idx, value) = {
-                    // Get the value to store
-                    let value = tx.read_register(self.current_thread, base + a)?;
-                    
-                    // Get the closure
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    
-                    // Check upvalue bounds
-                    if b >= closure_obj.upvalues.len() {
-                        return Err(LuaError::RuntimeError(format!(
-                            "Upvalue index {} out of bounds (upvalues: {})",
-                            b, closure_obj.upvalues.len()
-                        )));
-                    }
-                    
-                    // Get the upvalue handle
-                    let upvalue_handle = closure_obj.upvalues[b];
-                    
-                    // Get the upvalue state
-                    let upvalue = tx.get_upvalue(upvalue_handle)?;
-                    let is_open = upvalue.stack_index.is_some();
-                    let stack_idx = upvalue.stack_index;
-                    
-                    (upvalue_handle, is_open, stack_idx, value)
-                };
-                
-                // Phase 2: Update the upvalue
-                if is_open {
-                    if let Some(idx) = stack_idx {
-                        // Open upvalue - write to thread stack
-                        tx.set_register(self.current_thread, idx, value)?;
-                    }
-                } else {
-                    // Closed upvalue - update stored value
-                    tx.set_upvalue(upvalue_handle, value)?;
-                }
-                
-                StepResult::Continue
-            },
-            
-            OpCode::Return => {
-                // return R(A), ..., R(A+B-2)
-                let base = frame.base_register as usize;
-                let mut values = Vec::new();
-                
-                println!("DEBUG RETURN: Processing Return opcode with A={}, B={}", a, b);
-                
-                if b == 0 {
-                    // Return all values from R(A) to top
-                    let top = tx.get_stack_top(self.current_thread)?;
-                    println!("DEBUG RETURN: B=0, returning all values from R({}) to top ({})", base + a, top);
-                    for i in a..=(top - base) {
-                        let val = tx.read_register(self.current_thread, base + i)?;
-                        println!("DEBUG RETURN: Adding return value [{}]: {:?} ({})", i, val, val.type_name());
-                        values.push(val);
-                    }
-                } else {
-                    // Return B-1 values
-                    println!("DEBUG RETURN: B={}, returning {} values", b, b - 1);
-                    for i in 0..(b - 1) {
-                        let val = tx.read_register(self.current_thread, base + a + i)?;
-                        println!("DEBUG RETURN: Adding return value [{}]: {:?} ({})", i, val, val.type_name());
-                        values.push(val);
-                    }
-                }
-                
-                println!("DEBUG RETURN: Collected {} return values", values.len());
-                if !values.is_empty() {
-                    println!("DEBUG RETURN: First return value type: {}", values[0].type_name());
-                    
-                    if let Value::Table(handle) = &values[0] {
-                        println!("DEBUG RETURN: Returning table with handle: {:?}", handle);
-                    }
-                }
-                
-                // Pop call frame
-                tx.pop_call_frame(self.current_thread)?;
-                
-                // Don't increment PC - we're returning
-                should_increment_pc = false;
-                
-                StepResult::Return(values)
-            }
             
             OpCode::Call => {
                 // R(A), ..., R(A+C-2) := R(A)(R(A+1), ..., R(A+B-1))
-                let base = frame.base_register as usize;
+                println!("DEBUG STEP: CALL - function in R({}), {} args, {} results", a, b, c);
                 
-                // CRITICAL: Safely copy the function and arguments to avoid register conflicts
-                // This is necessary because registers can be overwritten during execution
-                let func = tx.read_register(self.current_thread, base + a)?;
+                // Get function object from register window
+                let func = self.register_windows.get_register(window_idx, a)?.clone();
                 
-                println!("DEBUG CALL: Processing CALL instruction A={}, B={}, C={}", a, b, c);
-                println!("DEBUG CALL: Function in register {}: {:?}", base + a, func);
+                // Protect the function register during argument evaluation
+                self.register_windows.protect_register(window_idx, a)?;
                 
                 // Calculate argument count
-                let arg_count = if b == 0 {
-                    // Use all values from R(A+1) to top
-                    let top = tx.get_stack_top(self.current_thread)?;
-                    top - base - a - 1
+                let arg_count;
+                if b == 0 {
+                    // All values from R(A+1) to top
+                    let max_args = 10; // Reasonable limit for safety
+                    let mut count = 0;
+                    for i in 1..max_args {
+                        // Check if register exists by trying to access it
+                        if let Ok(val) = self.register_windows.get_register(window_idx, a + i) {
+                            if !val.is_nil() {
+                                count += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    arg_count = count;
                 } else {
-                    b - 1
-                };
-                
-                println!("DEBUG CALL: Gathering {} arguments", arg_count);
-                
-                // Copy all arguments to a separate array to ensure they're not modified
-                let mut args = Vec::with_capacity(arg_count);
-                for i in 0..arg_count {
-                    let arg_idx = base + a + 1 + i;
-                    let arg = tx.read_register(self.current_thread, arg_idx)?;
-                    println!("DEBUG CALL: Arg {}: {:?}", i, arg);
-                    args.push(arg);
+                    arg_count = b - 1;
                 }
                 
-                // Process based on function type - using our safely copied values
+                // Gather arguments from register window
+                let mut args = Vec::with_capacity(arg_count);
+                for i in 0..arg_count {
+                    // Use proper error handling for register access
+                    match self.register_windows.get_register(window_idx, a + 1 + i) {
+                        Ok(value) => args.push(value.clone()),
+                        Err(_) => args.push(Value::Nil), // Out of bounds registers are nil
+                    }
+                }
+                
+                // Process based on function type
                 match func {
                     Value::Closure(closure) => {
                         // Queue function call for later execution
-                        println!("DEBUG CALL: Queueing closure call with {} args", args.len());
                         tx.queue_operation(PendingOperation::FunctionCall {
                             closure,
-                            args,  // This is our safe copy
+                            args,
                             context: ReturnContext::Register {
                                 base: frame.base_register,
                                 offset: a,
@@ -1493,122 +1489,20 @@ impl LuaVM {
                         StepResult::Continue
                     },
                     Value::CFunction(cfunc) => {
-                        println!("DEBUG CALL: Executing C function with {} args", args.len());
-                        // For C functions, we need special handling
-                        // First increment the PC
-                        tx.increment_pc(self.current_thread)?;
-                        
-                        // Commit the transaction
+                        // For C functions, we need to set up and call directly
                         tx.commit()?;
                         
-                        // Extract arguments we need to avoid self-borrowing conflicts
-                        let func_copy = cfunc;
-                        let args_copy = args;
-                        let base_register = frame.base_register;
-                        let register_a = a;
-                        let thread_handle = self.current_thread;
-                        
-                        // Call the handler with clean borrows
-                        return self.handle_c_function_call(
-                            func_copy,
-                            args_copy,
-                            base_register,
-                            register_a,
-                            thread_handle
+                        // Call C function with proper context
+                        return self.handle_c_function_call_with_windows(
+                            cfunc,
+                            args,
+                            window_idx,
+                            a,
+                            self.current_thread
                         );
                     },
                     _ => {
-                        println!("ERROR: Expected function in register {} but got {:?}", base + a, func);
-                        // Not a function - return error after committing
-                        tx.commit()?;
-                        return Err(LuaError::TypeError { 
-                            expected: "function".to_string(), 
-                            got: func.type_name().to_string(),
-                        });
-                    },
-                }
-            }
-            
-            OpCode::TailCall => {
-                // return R(A)(R(A+1), ..., R(A+B-1))
-                // Tail calls are used to optimize tail recursion
-                let base = frame.base_register as usize;
-                let func = tx.read_register(self.current_thread, base + a)?;
-                
-                // Gather arguments
-                let arg_count = if b == 0 {
-                    // Use all values from R(A+1) to top
-                    let top = tx.get_stack_top(self.current_thread)?;
-                    top - base - a
-                } else {
-                    b - 1
-                };
-                
-                let mut args = Vec::with_capacity(arg_count);
-                for i in 0..arg_count {
-                    args.push(tx.read_register(self.current_thread, base + a + 1 + i)?);
-                }
-                
-                // Process based on function type
-                match func {
-                    Value::Closure(closure) => {
-                        // Pop the current frame before pushing a new one
-                        tx.pop_call_frame(self.current_thread)?;
-                        
-                        // Queue function call
-                        tx.queue_operation(PendingOperation::FunctionCall {
-                            closure,
-                            args,
-                            context: ReturnContext::FinalResult,
-                        })?;
-                        
-                        // Don't increment PC - we're returning
-                        should_increment_pc = false;
-                        
-                        StepResult::Continue
-                    },
-                    Value::CFunction(cfunc) => {
-                        // For C functions, we could implement a similar optimization,
-                        // but for simplicity, just handle it like a normal call followed by return
-                        // This isn't completely correct from a tail call optimization standpoint,
-                        // but it's adequate for initial implementation
-                        
-                        // Pop the current frame
-                        tx.pop_call_frame(self.current_thread)?;
-                        
-                        // Commit the transaction
-                        tx.commit()?;
-                        
-                        // Extract arguments we need to avoid self-borrowing conflicts
-                        let func_copy = cfunc; // CFunction implements Copy
-                        let args_copy = args; // Clone the args
-                        let thread_handle = self.current_thread;
-                        
-                        // Call the C function directly - result will be returned as final result
-                        let mut ctx = ExecutionContext::new(self, 0, args_copy.len(), thread_handle);
-                        
-                        match func_copy(&mut ctx) {
-                            Ok(count) => {
-                                // For tail calls, we just return the values directly
-                                let mut results = Vec::new();
-                                let mut tx = HeapTransaction::new(&mut self.heap);
-                                
-                                for i in 0..count as usize {
-                                    if let Ok(value) = tx.read_register(thread_handle, i) {
-                                        results.push(value);
-                                    }
-                                }
-                                
-                                tx.commit()?;
-                                
-                                // Return the results directly
-                                return Ok(StepResult::Return(results));
-                            },
-                            Err(e) => return Ok(StepResult::Error(e)),
-                        }
-                    },
-                    _ => {
-                        // Not a function - return error after committing
+                        // Not a function - return error
                         tx.commit()?;
                         return Err(LuaError::TypeError { 
                             expected: "function".to_string(), 
@@ -1617,1814 +1511,215 @@ impl LuaVM {
                     },
                 }
             },
-
+            
+            OpCode::Return => {
+                // return R(A), ..., R(A+B-2)
+                println!("DEBUG STEP: RETURN - from R({}), {} values", a, b);
+                let mut values = Vec::new();
+                
+                if b == 0 {
+                    // Return all values from R(A) to top
+                    // Instead of accessing window.size directly, try registers until we get an error
+                    let max_regs = 50; // Safety limit
+                    for i in 0..max_regs {
+                        if a + i >= max_regs {
+                            break;
+                        }
+                        
+                        match self.register_windows.get_register(window_idx, a + i) {
+                            Ok(val) => {
+                                if !val.is_nil() { // Stop at first nil
+                                    values.push(val.clone());
+                                } else {
+                                    break;
+                                }
+                            },
+                            Err(_) => break, // Stop at invalid register
+                        }
+                    }
+                } else {
+                    // Return B-1 values
+                    for i in 0..(b - 1) {
+                        match self.register_windows.get_register(window_idx, a + i) {
+                            Ok(val) => values.push(val.clone()),
+                            Err(_) => values.push(Value::Nil), // Invalid registers return nil
+                        }
+                    }
+                }
+                
+                println!("DEBUG STEP: Returning {} values", values.len());
+                
+                // IMPORTANT: Deallocate the register window for this function call
+                self.register_windows.deallocate_window()?;
+                
+                // Pop call frame
+                tx.pop_call_frame(self.current_thread)?;
+                
+                // Don't increment PC - we're returning
+                should_increment_pc = false;
+                
+                StepResult::Return(values)
+            },
+            
+            OpCode::LoadNil => {
+                // R(A), R(A+1), ..., R(A+B-1) := nil
+                for i in 0..b {
+                    self.register_windows.set_register(window_idx, a + i, Value::Nil)?;
+                }
+                StepResult::Continue
+            },
+            
             OpCode::GetTable => {
                 // R(A) := R(B)[RK(C)]
-                let base = frame.base_register as usize;
-                let table_val = tx.read_register(self.current_thread, base + b)?;
-                let key_val = if c & 0x100 != 0 {
-                    // RK(C) is constant
-                    let const_idx = c & 0xFF;
+                // Get the table from register B
+                let table = self.register_windows.get_register(window_idx, b)?.clone();
+                
+                // Get the key from register C or constant
+                let key = if c & 0x100 != 0 {
+                    // Key is a constant
+                    let constant_idx = c & 0xFF;
                     let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
+                    closure_obj.proto.constants.get(constant_idx as usize)
                         .cloned()
                         .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
+                            "Constant index {} out of bounds", constant_idx
                         )))?
                 } else {
-                    // RK(C) is register
-                    tx.read_register(self.current_thread, base + c)?
+                    // Key is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
                 };
                 
-                match table_val {
-                    Value::Table(table) => {
-                        // Try direct table access first
-                        let result = tx.read_table_field(table, &key_val)?;
+                // Table access
+                match table {
+                    Value::Table(table_handle) => {
+                        // Create a transaction to read the table field
+                        let value = tx.read_table_field(table_handle, &key)?;
                         
-                        if !result.is_nil() {
-                            // Found value, store it
-                            tx.set_register(self.current_thread, base + a, result)?;
-                            StepResult::Continue
-                        } else {
-                            // Need to check for __index metamethod
-                            if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
-                                &mut tx, &Value::Table(table), crate::lua::metamethod::MetamethodType::Index
-                            )? {
-                                match mm {
-                                    Value::Table(index_table) => {
-                                        // __index is a table, look up the key in it
-                                        let mm_result = tx.read_table_field(index_table, &key_val)?;
-                                        tx.set_register(self.current_thread, base + a, mm_result)?;
-                                        StepResult::Continue
-                                    }
-                                    Value::Closure(_) | Value::CFunction(_) => {
-                                        // __index is a function, queue metamethod call
-                                        let method_name = tx.create_string("__index")?;
-                                        tx.queue_operation(PendingOperation::MetamethodCall {
-                                            method: method_name,
-                                            target: Value::Table(table),
-                                            args: vec![Value::Table(table), key_val],
-                                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                                        })?;
-                                        StepResult::Continue
-                                    }
-                                    _ => {
-                                        // Invalid __index metamethod
-                                        tx.set_register(self.current_thread, base + a, Value::Nil)?;
-                                        StepResult::Continue
-                                    }
-                                }
-                            } else {
-                                // No metamethod, result is nil
-                                tx.set_register(self.current_thread, base + a, Value::Nil)?;
-                                StepResult::Continue
-                            }
-                        }
-                    }
-                    _ => {
-                        // Not a table - check for metamethod
-                        if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
-                            &mut tx, &table_val, crate::lua::metamethod::MetamethodType::Index
-                        )? {
-                            // Queue metamethod call
-                            let method_name = tx.create_string("__index")?;
-                            let table_val_clone = table_val.clone();
-                            tx.queue_operation(PendingOperation::MetamethodCall {
-                                method: method_name,
-                                target: table_val_clone.clone(),
-                                args: vec![table_val_clone, key_val],
-                                context: ReturnContext::Register { base: frame.base_register, offset: a },
-                            })?;
-                            StepResult::Continue
-                        } else {
-                            // No metamethod, error
-                            tx.commit()?;
-                            return Err(LuaError::TypeError { 
-                                expected: "table".to_string(), 
-                                got: table_val.type_name().to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            
-            OpCode::SetTable => {
-                // R(A)[RK(B)] := RK(C)
-                let base = frame.base_register as usize;
-                let table_val = tx.read_register(self.current_thread, base + a)?;
-                
-                let key_val = if b & 0x100 != 0 {
-                    // RK(B) is constant
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(B) is register
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let value = if c & 0x100 != 0 {
-                    // RK(C) is constant
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(C) is register
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                match table_val {
-                    Value::Table(table) => {
-                        // Check if field already exists
-                        let existing = tx.read_table_field(table, &key_val)?;
-                        
-                        if !existing.is_nil() || value.is_nil() {
-                            // Field exists or we're setting nil, do direct assignment
-                            tx.set_table_field(table, key_val, value)?;
-                            StepResult::Continue
-                        } else {
-                            // Field doesn't exist, check for __newindex
-                            if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
-                                &mut tx, &Value::Table(table), crate::lua::metamethod::MetamethodType::NewIndex
-                            )? {
-                                match mm {
-                                    Value::Table(newindex_table) => {
-                                        // __newindex is a table, set the field there
-                                        tx.set_table_field(newindex_table, key_val, value)?;
-                                        StepResult::Continue
-                                    }
-                                    Value::Closure(_) | Value::CFunction(_) => {
-                                        // __newindex is a function, queue metamethod call
-                                        let method_name = tx.create_string("__newindex")?;
-                                        tx.queue_operation(PendingOperation::MetamethodCall {
-                                            method: method_name,
-                                            target: Value::Table(table),
-                                            args: vec![Value::Table(table), key_val, value],
-                                            context: ReturnContext::Stack, // __newindex doesn't return values
-                                        })?;
-                                        StepResult::Continue
-                                    }
-                                    _ => {
-                                        // Invalid __newindex, do normal assignment
-                                        tx.set_table_field(table, key_val, value)?;
-                                        StepResult::Continue
-                                    }
-                                }
-                            } else {
-                                // No metamethod, do normal assignment
-                                tx.set_table_field(table, key_val, value)?;
-                                StepResult::Continue
-                            }
-                        }
-                    }
-                    _ => {
-                        // Not a table - error (no metamethod for non-tables in Lua 5.1)
-                        tx.commit()?;
-                        return Err(LuaError::TypeError { 
-                            expected: "table".to_string(), 
-                            got: table_val.type_name().to_string(),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Add => {
-                // R(A) := RK(B) + RK(C)
-                let base = frame.base_register as usize;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    // RK(B) is constant
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(B) is register
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    // RK(C) is constant
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(C) is register
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try numeric addition first
-                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
-                    // Direct numeric addition
-                    tx.set_register(self.current_thread, base + a, Value::Number(l + r))?;
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some((mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Add
-                    )? {
-                        // Queue metamethod call
-                        let method_name = tx.create_string("__add")?;
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                        })?;
-                        StepResult::Continue
-                    } else {
-                        // Error - cannot add
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: format!("{} and {}", left.type_name(), right.type_name()),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Sub => {
-                // R(A) := RK(B) - RK(C)
-                let base = frame.base_register as usize;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try numeric subtraction first
-                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
-                    tx.set_register(self.current_thread, base + a, Value::Number(l - r))?;
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Sub
-                    )? {
-                        // Queue metamethod call
-                        let method_name = tx.create_string("__sub")?;
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                        })?;
-                        StepResult::Continue
-                    } else {
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: format!("{} and {}", left.type_name(), right.type_name()),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Mul => {
-                // R(A) := RK(B) * RK(C)
-                let base = frame.base_register as usize;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try numeric multiplication first
-                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
-                    tx.set_register(self.current_thread, base + a, Value::Number(l * r))?;
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Mul
-                    )? {
-                        let method_name = tx.create_string("__mul")?;
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                        })?;
-                        StepResult::Continue
-                    } else {
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: format!("{} and {}", left.type_name(), right.type_name()),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Div => {
-                // R(A) := RK(B) / RK(C)
-                let base = frame.base_register as usize;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try numeric division first
-                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
-                    tx.set_register(self.current_thread, base + a, Value::Number(l / r))?;
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Div
-                    )? {
-                        let method_name = tx.create_string("__div")?;
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                        })?;
-                        StepResult::Continue
-                    } else {
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: format!("{} and {}", left.type_name(), right.type_name()),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::NewTable => {
-                // R(A) := {} (size hints = B,C)
-                let base = frame.base_register as usize;
-                
-                // B and C are size hints for array and hash parts respectively
-                // B is the size hint for the array part (0-8 logarithmic)
-                // C is the size hint for the hash part (0-8 logarithmic)
-                
-                // Create a new table
-                let table = tx.create_table()?;
-                
-                // Store in register A
-                tx.set_register(self.current_thread, base + a, Value::Table(table))?;
-                
-                StepResult::Continue
-            }
-            
-            OpCode::Mod => {
-                // R(A) := RK(B) % RK(C)
-                let base = frame.base_register as usize;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try numeric modulo first
-                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
-                    // Lua mod is defined as: a % b == a - math.floor(a/b)*b
-                    let quotient = (l / r).floor();
-                    let result = l - quotient * r;
-                    tx.set_register(self.current_thread, base + a, Value::Number(result))?;
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Mod
-                    )? {
-                        let method_name = tx.create_string("__mod")?;
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                        })?;
-                        StepResult::Continue
-                    } else {
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: format!("{} and {}", left.type_name(), right.type_name()),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Pow => {
-                // R(A) := RK(B) ^ RK(C)
-                let base = frame.base_register as usize;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try numeric power first
-                if let Some((l, r)) = crate::lua::metamethod::can_coerce_arithmetic(&mut tx, &left, &right)? {
-                    tx.set_register(self.current_thread, base + a, Value::Number(l.powf(r)))?;
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some((_mm, _swapped)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Pow
-                    )? {
-                        let method_name = tx.create_string("__pow")?;
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                        })?;
-                        StepResult::Continue
-                    } else {
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: format!("{} and {}", left.type_name(), right.type_name()),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Unm => {
-                // R(A) := -R(B)
-                let base = frame.base_register as usize;
-                let operand = tx.read_register(self.current_thread, base + b)?;
-                
-                // Try numeric negation first
-                if let Some(n) = crate::lua::metamethod::coerce_to_number(&mut tx, &operand)? {
-                    tx.set_register(self.current_thread, base + a, Value::Number(-n))?;
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some(_mm) = crate::lua::metamethod::resolve_metamethod(
-                        &mut tx, &operand, crate::lua::metamethod::MetamethodType::Unm
-                    )? {
-                        let method_name = tx.create_string("__unm")?;
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: operand.clone(),
-                            args: vec![operand],
-                            context: ReturnContext::Register { base: frame.base_register, offset: a },
-                        })?;
-                        StepResult::Continue
-                    } else {
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: operand.type_name().to_string(),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Not => {
-                // R(A) := not R(B)
-                let base = frame.base_register as usize;
-                let operand = tx.read_register(self.current_thread, base + b)?;
-                
-                // Logical not - no metamethods in Lua 5.1
-                let result = Value::Boolean(operand.is_falsey());
-                tx.set_register(self.current_thread, base + a, result)?;
-                
-                StepResult::Continue
-            }
-            
-            OpCode::Len => {
-                // R(A) := length of R(B)
-                let base = frame.base_register as usize;
-                let operand = tx.read_register(self.current_thread, base + b)?;
-                
-                match operand {
-                    Value::String(handle) => {
-                        // Direct string length
-                        let s = tx.get_string_value(handle)?;
-                        let len = s.len() as f64;
-                        tx.set_register(self.current_thread, base + a, Value::Number(len))?;
-                        StepResult::Continue
-                    }
-                    Value::Table(table) => {
-                        // Check for __len metamethod first
-                        if let Some(_mm) = crate::lua::metamethod::resolve_metamethod(
-                            &mut tx, &Value::Table(table), crate::lua::metamethod::MetamethodType::Len
-                        )? {
-                            let method_name = tx.create_string("__len")?;
-                            tx.queue_operation(PendingOperation::MetamethodCall {
-                                method: method_name,
-                                target: Value::Table(table),
-                                args: vec![Value::Table(table)],
-                                context: ReturnContext::Register { base: frame.base_register, offset: a },
-                            })?;
-                            StepResult::Continue
-                        } else {
-                            // No metamethod, calculate table length
-                            // In Lua 5.1, #t returns the size of the array part
-                            // (highest numeric index n such that t[n] is not nil)
-                            let table_obj = tx.get_table(table)?;
-                            let len = table_obj.array.len() as f64;
-                            tx.set_register(self.current_thread, base + a, Value::Number(len))?;
-                            StepResult::Continue
-                        }
-                    }
-                    _ => {
-                        // Check for __len metamethod
-                        if let Some(_mm) = crate::lua::metamethod::resolve_metamethod(
-                            &mut tx, &operand, crate::lua::metamethod::MetamethodType::Len
-                        )? {
-                            let method_name = tx.create_string("__len")?;
-                            tx.queue_operation(PendingOperation::MetamethodCall {
-                                method: method_name,
-                                target: operand.clone(),
-                                args: vec![operand],
-                                context: ReturnContext::Register { base: frame.base_register, offset: a },
-                            })?;
-                            StepResult::Continue
-                        } else {
-                            tx.commit()?;
-                            return Err(LuaError::TypeError {
-                                expected: "string or table".to_string(),
-                                got: operand.type_name().to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-            
-OpCode::Concat => {
-    // R(A) := R(B).. ... ..R(C)
-    let base = frame.base_register as usize;
-    
-    println!("DEBUG CONCAT: Processing CONCAT instruction A={}, B={}, C={}", a, b, c);
-    
-    // Create a vector of all operand register values first
-    // This ensures we don't modify any registers until after reading them all
-    let mut operand_values = Vec::with_capacity((c - b + 1) as usize);
-    for i in b..=c {
-        let value = tx.read_register(self.current_thread, base + i)?;
-        operand_values.push(value);
-    }
-    
-    println!("DEBUG CONCAT: Collected {} operand values", operand_values.len());
-    
-    // Determine if we need metamethod handling
-    let mut needs_metamethod = false;
-    let mut mm_index = 0;
-    
-    for (i, value) in operand_values.iter().enumerate() {
-        // Only defer for actual metamethods, not just any non-string value
-        if let Some(_) = crate::lua::metamethod::resolve_metamethod(
-            &mut tx, value, crate::lua::metamethod::MetamethodType::Concat
-        )? {
-            println!("DEBUG CONCAT: Found __concat metamethod, will defer operation");
-            needs_metamethod = true;
-            mm_index = i;
-            break;
-        }
-        
-        if let Some(_) = crate::lua::metamethod::resolve_metamethod(
-            &mut tx, value, crate::lua::metamethod::MetamethodType::ToString
-        )? {
-            println!("DEBUG CONCAT: Found __tostring metamethod, will defer operation");
-            needs_metamethod = true;
-            mm_index = i;
-            break;
-        }
-    }
-    
-    if needs_metamethod {
-        println!("DEBUG CONCAT: Using deferred processing for metamethod at index {}", mm_index);
-        // Use the Pending Operation system for metamethod handling
-        tx.queue_operation(PendingOperation::Concatenation {
-            values: operand_values,
-            current_index: mm_index,
-            dest_register: frame.base_register + a as u16,
-            accumulated: Vec::new(),
-        })?;
-    } else {
-        println!("DEBUG CONCAT: All values can be processed immediately");
-        // We can concatenate immediately 
-        let mut result = String::new();
-        
-        // Process all values
-        for (i, value) in operand_values.iter().enumerate() {
-            match value {
-                Value::String(handle) => {
-                    let s = tx.get_string_value(*handle)?;
-                    println!("DEBUG CONCAT: Adding string: '{}'", s);
-                    result.push_str(&s);
-                },
-                Value::Number(n) => {
-                    println!("DEBUG CONCAT: Adding number: {}", n);
-                    result.push_str(&n.to_string());
-                },
-                Value::Boolean(b) => {
-                    println!("DEBUG CONCAT: Adding boolean: {}", b);
-                    result.push_str(if *b { "true" } else { "false" });
-                },
-                Value::Nil => {
-                    println!("DEBUG CONCAT: Adding nil");
-                    result.push_str("nil");
-                },
-                Value::CFunction(_) => {
-                    println!("DEBUG CONCAT: Adding function reference");
-                    result.push_str("function");
-                },
-                Value::Closure(_) => {
-                    println!("DEBUG CONCAT: Adding closure reference");
-                    result.push_str("function");
-                },
-                Value::Table(_) => {
-                    println!("DEBUG CONCAT: Adding table reference");
-                    result.push_str("table");
-                },
-                Value::Thread(_) => {
-                    println!("DEBUG CONCAT: Adding thread reference");
-                    result.push_str("thread");
-                },
-                Value::UserData(_) => {
-                    println!("DEBUG CONCAT: Adding userdata reference");
-                    result.push_str("userdata");
-                },
-                Value::FunctionProto(_) => {
-                    println!("DEBUG CONCAT: Adding function proto reference");
-                    result.push_str("function");
-                },
-            }
-        }
-        
-        // Create the final string
-        println!("DEBUG CONCAT: Created concatenated string: '{}'", result);
-        let string_handle = tx.create_string(&result)?;
-        
-        // Store result in target register
-        tx.set_register(self.current_thread, base + a, Value::String(string_handle))?;
-        println!("DEBUG CONCAT: Result stored in register {}", base + a);
-    }
-    
-    StepResult::Continue
-},
-            
-            OpCode::Close => {
-                // Close all upvalues >= R(A)
-                let base = frame.base_register as usize;
-                let close_threshold = base + a;
-                
-                // Close all upvalues at or above the threshold
-                tx.close_thread_upvalues(self.current_thread, close_threshold)?;
-                
-                StepResult::Continue
-            },
-
-OpCode::Closure => {
-    // R(A) := closure(KPROTO[Bx])
-    let base = frame.base_register as usize;
-    let bx = instruction.bx() as usize;
-    
-    // Phase 1: Extract needed information without holding a long-lived borrow
-    let proto_result = {
-        // Get the closure
-        let closure_obj = tx.get_closure(frame.closure)?;
-        
-        // Check constant index bounds
-        if bx >= closure_obj.proto.constants.len() {
-            return Err(LuaError::RuntimeError(format!(
-                "Prototype index {} out of bounds (constants: {})",
-                bx, closure_obj.proto.constants.len()
-            )));
-        }
-        
-        // Get the function prototype from constants
-        let proto_value = &closure_obj.proto.constants[bx];
-        
-        // Match the prototype and extract what we need
-        match proto_value {
-            Value::FunctionProto(proto_handle) => {
-                // We have a function prototype
-                Ok(*proto_handle)
-            },
-            _ => {
-                // Not a function prototype
-                Err(LuaError::TypeError {
-                    expected: "function prototype".to_string(),
-                    got: proto_value.type_name().to_string(),
-                })
-            }
-        }
-    };
-    
-    // Handle error cases early
-    let proto_handle = proto_result?;
-    
-    // Phase 2: Validate and extract the function prototype (separate transaction)
-    let proto = tx.get_function_proto_copy(proto_handle)?;
-    
-    // Phase 3: Process upvalue instructions
-    let num_upvalues = proto.upvalues.len();
-    let mut upvalues = Vec::with_capacity(num_upvalues);
-    
-    for i in 0..num_upvalues {
-        // Create a separate scope for each upvalue to avoid borrow conflicts
-        let upvalue_handle = {
-            // Read the instruction that follows the CLOSURE instruction
-            let upval_pc = frame.pc + 1 + i;
-            
-            // Validate PC bounds
-            let bytecode_len = {
-                let closure_obj = tx.get_closure(frame.closure)?;
-                closure_obj.proto.bytecode.len()
-            };
-            
-            if upval_pc >= bytecode_len {
-                tx.commit()?;
-                return Err(LuaError::RuntimeError(format!(
-                    "Upvalue instruction PC {} out of bounds",
-                    upval_pc
-                )));
-            }
-            
-            // Process based on upvalue info
-            let upvalue_info = proto.upvalues[i];
-            
-            if upvalue_info.in_stack {
-                // Creating an upvalue that points to the stack
-                let stack_idx = base + upvalue_info.index as usize;
-                tx.find_or_create_upvalue(self.current_thread, stack_idx)?
-            } else {
-                // Getting an upvalue from parent closure
-                let idx = upvalue_info.index as usize;
-                
-                // Get parent's upvalues
-                let parent_upvalues = {
-                    let parent_closure = tx.get_closure(frame.closure)?;
-                    
-                    if idx >= parent_closure.upvalues.len() {
-                        tx.commit()?;
-                        return Err(LuaError::RuntimeError(format!(
-                            "Parent upvalue index {} out of bounds",
-                            idx
-                        )));
-                    }
-                    
-                    // Clone the parent's upvalues to avoid borrow issues
-                    parent_closure.upvalues.clone()
-                };
-                
-                // Validate the upvalue handle outside of closure borrow
-                let upval_handle = parent_upvalues[idx];
-                tx.validate_handle(&upval_handle)?;
-                
-                upval_handle
-            }
-        };
-        
-        upvalues.push(upvalue_handle);
-    }
-    
-    // Phase 4: Create the closure with upvalues
-    let new_closure = Closure {
-        proto,
-        upvalues,
-    };
-    
-    let new_closure_handle = tx.create_closure(new_closure)?;
-    tx.set_register(self.current_thread, base + a, Value::Closure(new_closure_handle))?;
-    
-    // Skip the upvalue initialization instructions
-    for _ in 0..num_upvalues {
-        tx.increment_pc(self.current_thread)?;
-    }
-    
-    StepResult::Continue
-},
-
-            OpCode::Self_ => {
-                // R(A+1) := R(B); R(A) := R(B)[RK(C)]
-                let base = frame.base_register as usize;
-                
-                // Get the table
-                let table_val = tx.read_register(self.current_thread, base + b)?;
-                
-                // Set R(A+1) to the table (self)
-                tx.set_register(self.current_thread, base + a + 1, table_val.clone())?;
-                
-                // Get key from RK(C)
-                let key_val = if c & 0x100 != 0 {
-                    // RK(C) is constant
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    if const_idx >= closure_obj.proto.constants.len() {
-                        tx.commit()?;
-                        return Err(LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )));
-                    }
-                    closure_obj.proto.constants[const_idx].clone()
-                } else {
-                    // RK(C) is register
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Get method from table and store in R(A)
-                match table_val {
-                    Value::Table(table) => {
-                        // Try direct table lookup
-                        let method = tx.read_table_field(table, &key_val)?;
-                        
-                        // Check for __index metamethod if the method is nil
-                        if method.is_nil() {
-                            if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
-                                &mut tx, &Value::Table(table), crate::lua::metamethod::MetamethodType::Index
-                            )? {
-                                match mm {
-                                    Value::Table(index_table) => {
-                                        // Metatable __index is a table, look up the method there
-                                        let mm_method = tx.read_table_field(index_table, &key_val)?;
-                                        tx.set_register(self.current_thread, base + a, mm_method)?;
-                                    }
-                                    Value::Closure(_) | Value::CFunction(_) => {
-                                        // Metatable __index is a function, queue metamethod call
-                                        let method_name = tx.create_string("__index")?;
-                                        tx.queue_operation(PendingOperation::MetamethodCall {
-                                            method: method_name,
-                                            target: Value::Table(table),
-                                            args: vec![Value::Table(table), key_val],
-                                            context: ReturnContext::Register { 
-                                                base: frame.base_register, 
-                                                offset: a 
-                                            },
-                                        })?;
-                                    }
-                                    _ => {
-                                        // No valid metamethod, result is nil
-                                        tx.set_register(self.current_thread, base + a, Value::Nil)?;
-                                    }
-                                }
-                            } else {
-                                // No __index metamethod, result is nil
-                                tx.set_register(self.current_thread, base + a, Value::Nil)?;
-                            }
-                        } else {
-                            // Method found directly in the table
-                            tx.set_register(self.current_thread, base + a, method)?;
-                        }
-                        
-                        StepResult::Continue
+                        // Set the result in register A
+                        self.register_windows.set_register(window_idx, a, value)?;
                     },
                     _ => {
-                        // Only tables can have methods
+                        // Not a table - try metamethods
                         tx.commit()?;
                         return Err(LuaError::TypeError {
                             expected: "table".to_string(),
-                            got: table_val.type_name().to_string(),
+                            got: table.type_name().to_string(),
                         });
                     }
                 }
+                
+                StepResult::Continue
             },
-
-            OpCode::SetList => {
-                // R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
-                // FPF (Fields Per Flush) is typically 50 in Lua
-                const FPF: usize = 50;
+            
+            OpCode::SetTable => {
+                // R(A)[RK(B)] := RK(C)
+                // Get the table from register A
+                let table = self.register_windows.get_register(window_idx, a)?.clone();
                 
-                let base = frame.base_register as usize;
-                let table_val = tx.read_register(self.current_thread, base + a)?;
+                // Get the key from register B or constant
+                let key = if b & 0x100 != 0 {
+                    // Key is a constant
+                    let constant_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Key is a register
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
                 
-                match table_val {
-                    Value::Table(table) => {
-                        // Calculate the starting index for assignment
-                        let start_index = if c > 0 {
-                            (c - 1) * FPF
-                        } else {
-                            // If C == 0, the actual C value is in the next instruction
-                            // Get the next instruction
-                            let next_pc = frame.pc + 1;
-                            
-                            // Validate that the next instruction exists
-                            let closure_obj = tx.get_closure(frame.closure)?;
-                            if next_pc >= closure_obj.proto.bytecode.len() {
-                                tx.commit()?;
-                                return Err(LuaError::RuntimeError(format!(
-                                    "Missing next instruction for SetList C=0 case at PC {}",
-                                    frame.pc
-                                )));
-                            }
-                            
-                            // Read the next instruction as a raw value
-                            // In Lua 5.1, the next instruction is the actual C value, not an encoded instruction
-                            let extra_c = closure_obj.proto.bytecode[next_pc] as usize;
-                            
-                            // Increment PC to skip the extra instruction
-                            tx.increment_pc(self.current_thread)?;
-                            
-                            // Use the extra C value directly
-                            (extra_c - 1) * FPF
-                        };
-                        
-                        // B is the number of elements to set
-                        let num_elements = if b == 0 {
-                            // If B == 0, set all elements on the stack from R(A+1) to top
-                            let top = tx.get_stack_top(self.current_thread)?;
-                            top - base - a - 1
-                        } else {
-                            b
-                        };
-                        
-                        // Set each element
-                        for i in 0..num_elements {
-                            let value = tx.read_register(self.current_thread, base + a + 1 + i)?;
-                            let index = start_index + i + 1; // Lua arrays are 1-indexed
-                            
-                            // Convert index to Value::Number for table indexing
-                            let index_val = Value::Number(index as f64);
-                            tx.set_table_field(table, index_val, value)?;
-                        }
-                        
-                        StepResult::Continue
-                    }
+                // Get the value from register C or constant
+                let value = if c & 0x100 != 0 {
+                    // Value is a constant
+                    let constant_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Value is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                // Table access
+                match table {
+                    Value::Table(table_handle) => {
+                        // Set the table field
+                        tx.set_table_field(table_handle, key, value)?;
+                    },
                     _ => {
-                        tx.commit()?;
-                        return Err(LuaError::TypeError { 
-                            expected: "table".to_string(), 
-                            got: table_val.type_name().to_string(),
-                        });
-                    }
-                }
-            }
-            
-            OpCode::Eq => {
-                // if ((RK(B) == RK(C)) ~= A) then pc++
-                // Note: A=0 means "expected false", A=1 means "expected true"
-                let base = frame.base_register as usize;
-                let expected = a != 0;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    // RK(B) is constant
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(B) is register
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    // RK(C) is constant
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(C) is register
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try direct comparison first
-                let need_metamethod = match (&left, &right) {
-                    // Different types are never equal without metamethods
-                    (l, r) if std::mem::discriminant(l) != std::mem::discriminant(r) => false,
-
-                    // For tables, userdata - always use metamethods if available
-                    (Value::Table(_), Value::Table(_)) | 
-                    (Value::UserData(_), Value::UserData(_)) => true,
-
-                    // For other types, direct comparison is sufficient
-                    _ => false,
-                };
-
-                // Perform direct comparison if we don't need metamethods
-                if !need_metamethod {
-                    let direct_result = match (&left, &right) {
-                        // Compare primitive types directly
-                        (Value::Nil, Value::Nil) => true,
-                        (Value::Boolean(l), Value::Boolean(r)) => l == r,
-                        (Value::Number(l), Value::Number(r)) => {
-                            // NaN != NaN in Lua
-                            if l.is_nan() || r.is_nan() {
-                                false
-                            } else {
-                                l == r
-                            }
-                        },
-                        (Value::String(l), Value::String(r)) => {
-                            if l == r {
-                                // Same handle means same string
-                                true
-                            } else {
-                                // Different handles, compare content
-                                let l_str = tx.get_string_value(*l)?;
-                                let r_str = tx.get_string_value(*r)?;
-                                l_str == r_str
-                            }
-                        },
-                        // Other types compared by identity
-                        (Value::Closure(l), Value::Closure(r)) => l == r,
-                        (Value::Thread(l), Value::Thread(r)) => l == r,
-                        (Value::CFunction(l), Value::CFunction(r)) => {
-                            // Function pointers are compared by identity
-                            std::ptr::eq((*l) as *const (), (*r) as *const ())
-                        },
-                        // Different types are never equal
-                        _ => false,
-                    };
-                    
-                    // Skip next instruction if comparison result doesn't match expected
-                    if direct_result != expected {
-                        tx.increment_pc(self.current_thread)?;
-                    }
-                    
-                    StepResult::Continue
-                } else {
-                    // Try metamethod for table/userdata types
-                    // Note: For Eq, both operands must have the same metamethod (unlike Add, etc.)
-                    // Check for the __eq metamethod
-                    if let Some((_, _)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Eq
-                    )? {
-                        // Create metamethod name and context
-                        let method_name = tx.create_string("__eq")?;
-                        
-                        // Queue metamethod call
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(), 
-                            args: vec![left, right],
-                            context: ReturnContext::Metamethod { 
-                                context: crate::lua::metamethod::MetamethodContext {
-                                    mm_type: crate::lua::metamethod::MetamethodType::Eq,
-                                    continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
-                                        thread: self.current_thread,
-                                        expected,
-                                    },
-                                },
-                            },
-                        })?;
-                        
-                        // Don't increment PC - will be handled by metamethod result
-                        should_increment_pc = false;
-                    } else {
-                        // No metamethod, fall back to regular equality rules for tables/userdata
-                        // In Lua, objects of same type but no metamethod are equal only if they're the same object
-                        let direct_result = match (&left, &right) {
-                            (Value::Table(l), Value::Table(r)) => l == r,
-                            (Value::UserData(l), Value::UserData(r)) => l == r,
-                            _ => false, // Shouldn't happen due to earlier discriminant check
-                        };
-                        
-                        if direct_result != expected {
-                            tx.increment_pc(self.current_thread)?;
-                        }
-                    }
-                    
-                    StepResult::Continue
-                }
-            }
-            
-            OpCode::Lt => {
-                // if ((RK(B) < RK(C)) ~= A) then pc++
-                let base = frame.base_register as usize;
-                let expected = a != 0;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    // RK(B) is constant
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(B) is register
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    // RK(C) is constant
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(C) is register
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try direct comparison for numbers and strings
-                let direct_result_opt = match (&left, &right) {
-                    // Only number-number and string-string comparisons can be done directly
-                    (Value::Number(l), Value::Number(r)) => {
-                        // Direct numeric comparison
-                        // If either is NaN, the result is always false
-                        if l.is_nan() || r.is_nan() {
-                            Some(false)
-                        } else {
-                            Some(l < r)
-                        }
-                    },
-                    (Value::String(l_handle), Value::String(r_handle)) => {
-                        // For strings, we always compare lexicographically
-                        let l_str = tx.get_string_value(*l_handle)?;
-                        let r_str = tx.get_string_value(*r_handle)?;
-                        Some(l_str < r_str)
-                    },
-                    // Allow string-number or number-string coercion if the string is a valid number
-                    (Value::Number(n), Value::String(s_handle)) => {
-                        if let Ok(Some(s_num)) = crate::lua::metamethod::coerce_to_number(&mut tx, &Value::String(*s_handle)) {
-                            Some(*n < s_num)
-                        } else {
-                            None // String can't be coerced to number, use metamethod
-                        }
-                    },
-                    (Value::String(s_handle), Value::Number(n)) => {
-                        if let Ok(Some(s_num)) = crate::lua::metamethod::coerce_to_number(&mut tx, &Value::String(*s_handle)) {
-                            Some(s_num < *n)
-                        } else {
-                            None // String can't be coerced to number, use metamethod
-                        }
-                    },
-                    // All other type combinations require metamethods
-                    _ => None,
-                };
-                
-                if let Some(result) = direct_result_opt {
-                    // Direct comparison succeeded - skip if result doesn't match expected
-                    if result != expected {
-                        tx.increment_pc(self.current_thread)?;
-                    }
-                    StepResult::Continue
-                } else {
-                    // Try metamethod
-                    if let Some((_, _)) = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Lt
-                    )? {
-                        // Create metamethod name and context
-                        let method_name = tx.create_string("__lt")?;
-                        
-                        // Queue metamethod call
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Metamethod {
-                                context: crate::lua::metamethod::MetamethodContext {
-                                    mm_type: crate::lua::metamethod::MetamethodType::Lt,
-                                    continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
-                                        thread: self.current_thread,
-                                        expected,
-                                    },
-                                },
-                            },
-                        })?;
-                        
-                        // Don't increment PC - will be handled by metamethod result
-                        should_increment_pc = false;
-                        StepResult::Continue
-                    } else {
-                        // No metamethod and types don't support direct comparison - error
+                        // Not a table - try metamethods
                         tx.commit()?;
                         return Err(LuaError::TypeError {
-                            expected: "values comparable with the < operator".to_string(),
+                            expected: "table".to_string(),
+                            got: table.type_name().to_string(),
+                        });
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Add => {
+                // R(A) := RK(B) + RK(C)
+                // Get left operand from register B or constant
+                let left = if b & 0x100 != 0 {
+                    // Left is a constant
+                    let constant_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Left is a register
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from register C or constant
+                let right = if c & 0x100 != 0 {
+                    // Right is a constant
+                    let constant_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Right is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                // Perform addition
+                match (&left, &right) {
+                    (Value::Number(l), Value::Number(r)) => {
+                        let result = Value::Number(l + r);
+                        self.register_windows.set_register(window_idx, a, result)?;
+                    },
+                    _ => {
+                        // Non-numeric values - try metamethods
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
                             got: format!("{} and {}", left.type_name(), right.type_name()),
                         });
                     }
                 }
-            }
-            
-            OpCode::Le => {
-                // if ((RK(B) <= RK(C)) ~= A) then pc++
-                let base = frame.base_register as usize;
-                let expected = a != 0;
-                
-                // Get operands
-                let left = if b & 0x100 != 0 {
-                    // RK(B) is constant
-                    let const_idx = b & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(B) is register
-                    tx.read_register(self.current_thread, base + b)?
-                };
-                
-                let right = if c & 0x100 != 0 {
-                    // RK(C) is constant
-                    let const_idx = c & 0xFF;
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    closure_obj.proto.constants.get(const_idx)
-                        .cloned()
-                        .ok_or_else(|| LuaError::RuntimeError(format!(
-                            "Constant index {} out of bounds", const_idx
-                        )))?
-                } else {
-                    // RK(C) is register
-                    tx.read_register(self.current_thread, base + c)?
-                };
-                
-                // Try direct comparison for numbers and strings
-                let direct_result_opt = match (&left, &right) {
-                    // Only number-number and string-string comparisons can be done directly
-                    (Value::Number(l), Value::Number(r)) => {
-                        // Direct numeric comparison
-                        // If either is NaN, the result is always false
-                        if l.is_nan() || r.is_nan() {
-                            Some(false)
-                        } else {
-                            Some(l <= r)
-                        }
-                    },
-                    (Value::String(l_handle), Value::String(r_handle)) => {
-                        // For strings, we always compare lexicographically
-                        let l_str = tx.get_string_value(*l_handle)?;
-                        let r_str = tx.get_string_value(*r_handle)?;
-                        Some(l_str <= r_str)
-                    },
-                    // Allow string-number or number-string coercion if the string is a valid number
-                    (Value::Number(n), Value::String(s_handle)) => {
-                        if let Ok(Some(s_num)) = crate::lua::metamethod::coerce_to_number(&mut tx, &Value::String(*s_handle)) {
-                            Some(*n <= s_num)
-                        } else {
-                            None // String can't be coerced to number, use metamethod
-                        }
-                    },
-                    (Value::String(s_handle), Value::Number(n)) => {
-                        if let Ok(Some(s_num)) = crate::lua::metamethod::coerce_to_number(&mut tx, &Value::String(*s_handle)) {
-                            Some(s_num <= *n)
-                        } else {
-                            None // String can't be coerced to number, use metamethod
-                        }
-                    },
-                    // All other type combinations require metamethods
-                    _ => None,
-                };
-                
-                if let Some(result) = direct_result_opt {
-                    // Direct comparison succeeded - skip if result doesn't match expected
-                    if result != expected {
-                        tx.increment_pc(self.current_thread)?;
-                    }
-                    StepResult::Continue
-                } else {
-                    // Try metamethod - complex logic for Le
-                    // First try __le metamethod
-                    let found_le_metamethod = crate::lua::metamethod::resolve_binary_metamethod(
-                        &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Le
-                    )?.is_some();
-                    
-                    if found_le_metamethod {
-                        // Use __le metamethod
-                        let method_name = tx.create_string("__le")?;
-                        
-                        // Queue metamethod call
-                        tx.queue_operation(PendingOperation::MetamethodCall {
-                            method: method_name,
-                            target: left.clone(),
-                            args: vec![left, right],
-                            context: ReturnContext::Metamethod {
-                                context: crate::lua::metamethod::MetamethodContext {
-                                    mm_type: crate::lua::metamethod::MetamethodType::Le,
-                                    continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
-                                        thread: self.current_thread,
-                                        expected,
-                                    },
-                                },
-                            },
-                        })?;
-                        
-                        // Don't increment PC - will be handled by metamethod result
-                        should_increment_pc = false;
-                        StepResult::Continue
-                    } else {
-                        // Try __lt metamethod with reversed arguments
-                        // In Lua 5.1: a <= b is equivalent to not (b < a)
-                        let found_lt_metamethod = crate::lua::metamethod::resolve_binary_metamethod(
-                            &mut tx, &right, &left, crate::lua::metamethod::MetamethodType::Lt
-                        )?.is_some();
-                        
-                        if found_lt_metamethod {
-                            // Use __lt metamethod with reversed arguments and negated result
-                            let method_name = tx.create_string("__lt")?;
-                            
-                            // Queue metamethod call with swapped arguments - note the NOT in the expected value
-                            // Now the logic is: "if ((right < left) == expected) then pc++"
-                            // Since a <= b is equivalent to not (b < a), and we want to increment PC if result != expected,
-                            // we need to invert the expected value
-                            tx.queue_operation(PendingOperation::MetamethodCall {
-                                method: method_name,
-                                target: right.clone(),
-                                args: vec![right, left], // Arguments reversed!
-                                context: ReturnContext::Metamethod {
-                                    context: crate::lua::metamethod::MetamethodContext {
-                                        mm_type: crate::lua::metamethod::MetamethodType::Lt,
-                                        continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
-                                            thread: self.current_thread,
-                                            expected: !expected, // Note the inversion here!
-                                        },
-                                    },
-                                },
-                            })?;
-                            
-                            // Don't increment PC - will be handled by metamethod result
-                            should_increment_pc = false;
-                            StepResult::Continue
-                        } else {
-                            // No metamethod and types don't support direct comparison - error
-                            tx.commit()?;
-                            return Err(LuaError::TypeError {
-                                expected: "values comparable with the <= operator".to_string(),
-                                got: format!("{} and {}", left.type_name(), right.type_name()),
-                            });
-                        }
-                    }
-                }
-            }
-            
-            OpCode::Jmp => {
-                // pc += sBx (signed immediate offset)
-                let sbx = instruction.sbx();
-                
-                // Get current PC and add the signed offset
-                let current_pc = frame.pc;
-                let new_pc = (current_pc as i32 + sbx) as usize;
-                
-                // Set PC directly instead of incrementing
-                tx.set_pc(self.current_thread, new_pc)?;
-                
-                // Don't increment PC - we've already set it directly
-                should_increment_pc = false;
-                
-                StepResult::Continue
-            }
-            
-            OpCode::Test => {
-                // if not (R(A) <=> C) then pc++
-                // In Lua, C=0 means "test for false", C=1 means "test for true"
-                
-                let base = frame.base_register as usize;
-                let test_value = tx.read_register(self.current_thread, base + a)?;
-                let expected_true = c != 0;
-                
-                // Test truthiness against expected (using is_falsey method)
-                let is_truthy = !test_value.is_falsey();
-                
-                // Skip next instruction if not matching expected truthiness
-                if is_truthy != expected_true {
-                    tx.increment_pc(self.current_thread)?;
-                    should_increment_pc = false; // Don't increment PC again since we already did
-                }
-                
-                StepResult::Continue
-            }
-            
-            OpCode::TestSet => {
-                // if (R(B) <=> C) then R(A) := R(B) else pc++
-                // In Lua, C=0 means "test for false", C=1 means "test for true"
-                
-                let base = frame.base_register as usize;
-                let test_value = tx.read_register(self.current_thread, base + b)?;
-                let expected_true = c != 0;
-                
-                // Test truthiness against expected (using is_falsey method)
-                let is_truthy = !test_value.is_falsey();
-                
-                if is_truthy == expected_true {
-                    // Condition matches, set R(A) = R(B)
-                    tx.set_register(self.current_thread, base + a, test_value)?;
-                } else {
-                    // Condition doesn't match, skip next instruction
-                    tx.increment_pc(self.current_thread)?;
-                    should_increment_pc = false; // Don't increment PC again since we already did
-                }
-                
-                StepResult::Continue
-            }
-            
-            OpCode::ForPrep => {
-                // R(A) -= R(A+2); pc += sBx
-                // This initializes a numeric for loop
-                // R(A) = index, R(A+1) = limit, R(A+2) = step
-                
-                let base = frame.base_register as usize;
-                
-                // Get values from registers
-                let index_val = tx.read_register(self.current_thread, base + a)?;
-                let step_val = tx.read_register(self.current_thread, base + a + 2)?;
-                
-                // Implement numeric for loop initialization
-                // First try to coerce both to numbers
-                let (index_num, step_num) = match (index_val, step_val) {
-                    (Value::Number(i), Value::Number(s)) => {
-                        // Direct numeric calculation
-                        (i, s)
-                    },
-                    (index_v, step_v) => {
-                        // Try to convert both to numbers (Lua coercion rules)
-                        let index_opt = match &index_v {
-                            Value::Number(n) => Some(*n),
-                            Value::String(handle) => {
-                                // Try to parse the string as a number
-                                let s = tx.get_string_value(*handle)?;
-                                s.parse::<f64>().ok()
-                            },
-                            _ => None,
-                        };
-                        
-                        let step_opt = match &step_v {
-                            Value::Number(n) => Some(*n),
-                            Value::String(handle) => {
-                                // Try to parse the string as a number
-                                let s = tx.get_string_value(*handle)?;
-                                s.parse::<f64>().ok()
-                            },
-                            _ => None,
-                        };
-                        
-                        match (index_opt, step_opt) {
-                            (Some(i), Some(s)) => (i, s),
-                            _ => {
-                                tx.commit()?;
-                                return Err(LuaError::RuntimeError("'for' initial value and step must be numbers".to_string()));
-                            }
-                        }
-                    }
-                };
-                
-                // Subtract step from index (as initial step for the loop)
-                let new_index = index_num - step_num;
-                println!("ForPrep: setting the initial value from {} to {}", index_num, new_index);
-                
-                // Store the results back to R(A)
-                tx.set_register(self.current_thread, base + a, Value::Number(new_index))?;
-                
-                // Get sbx value for PC jump
-                let sbx = instruction.sbx();
-                
-                // Jump forward to the end of the loop body (ForLoop will jump back here)
-                println!("ForPrep: sbx offset = {}", sbx);
-
-                
-
-                let current_pc = frame.pc;
-                let new_pc = (current_pc as i32 + sbx) as usize;
-                
-                println!("ForPrep: jumping from PC {} to PC {}", current_pc, new_pc);
-
-                
-
-                tx.set_pc(self.current_thread, new_pc)?;
-                
-                // Don't increment PC - we've already set it directly
-                should_increment_pc = false;
-                
-                StepResult::Continue
-            }
-            
-            OpCode::ForLoop => {
-                // R(A) += R(A+2); if R(A) <?= R(A+1) then { pc+=sBx; R(A+3) = R(A) }
-                // Numeric for loop iteration
-                // R(A) = index, R(A+1) = limit, R(A+2) = step, R(A+3) = loop variable
-                
-                let base = frame.base_register as usize;
-                
-                // Get values from registers
-                let index_val = tx.read_register(self.current_thread, base + a)?;
-                let limit_val = tx.read_register(self.current_thread, base + a + 1)?;
-                let step_val = tx.read_register(self.current_thread, base + a + 2)?;
-                
-                // Convert to numbers (they should already be numbers from ForPrep)
-                let index_num = match index_val {
-                    Value::Number(n) => n,
-                    _ => {
-                        tx.commit()?;
-                        return Err(LuaError::RuntimeError("Invalid 'for' index (not a number)".to_string()));
-                    }
-                };
-                
-                let limit_num = match limit_val {
-                    Value::Number(n) => n,
-                    _ => {
-                        tx.commit()?;
-                        return Err(LuaError::RuntimeError("Invalid 'for' limit (not a number)".to_string()));
-                    }
-                };
-                
-                let step_num = match step_val {
-                    Value::Number(n) => n,
-                    _ => {
-                        tx.commit()?;
-                        return Err(LuaError::RuntimeError("Invalid 'for' step (not a number)".to_string()));
-                    }
-                };
-                
-                // Increment the index by step
-                let new_index = index_num + step_num;
-                
-                // Store updated index immediately
-                tx.set_register(self.current_thread, base + a, Value::Number(new_index))?;
-                
-                // Check if the loop should continue
-                let should_continue = if step_num > 0.0 {
-                    // Positive step: continue if index <= limit
-                    new_index <= limit_num
-                } else {
-                    // Negative step: continue if index >= limit
-                    new_index >= limit_num
-                };
-                
-                if should_continue {
-                    // Loop continues - set loop variable and jump back to loop body
-                    // Set Lua variable to the new index value (display value)
-                    tx.set_register(self.current_thread, base + a + 3, Value::Number(new_index))?;
-                    
-                    // Get sbx value for PC jump (jump back to loop body)
-                    let sbx = instruction.sbx();
-                    
-                    // Jump based on the sbx offset (which should be negative)
-                    let current_pc = frame.pc;
-                    let new_pc = (current_pc as i32 + sbx) as usize;
-                    println!("ForLoop: jumping from PC {} to PC {}", current_pc, new_pc);
-                    
-                    tx.set_pc(self.current_thread, new_pc)?;
-                    
-                    // Don't increment PC - we've already set it directly
-                    should_increment_pc = false;
-                } 
-                // else: Loop is done - just fall through to the next instruction
-                
-                StepResult::Continue
-            }
-            
-            OpCode::TForLoop => {
-                // R(A+3), ... , R(A+3+C) := R(A)(R(A+1), R(A+2)); 
-                // if R(A+3) ~= nil then R(A+2)=R(A+3) else pc++
-                // 
-                // In Lua 5.1, TForLoop just calls the iterator and sets up variables.
-                // A separate JMP instruction must follow to handle the loop back logic.
-                // If loop is done (iterator returns nil), it skips the JMP instruction.
-                
-                let base = frame.base_register as usize;
-                let num_returns = c as usize; // Number of expected return values
-                
-                // Get the iterator function, state, and control variable
-                let iterator = tx.read_register(self.current_thread, base + a)?;
-                let state = tx.read_register(self.current_thread, base + a + 1)?;
-                let control = tx.read_register(self.current_thread, base + a + 2)?;
-                
-                // Save current PC for context
-                let current_pc = frame.pc;
-                
-                // Process based on iterator function type
-                match iterator {
-                    Value::Closure(closure) => {
-                        // First increment the PC to the next instruction
-                        tx.increment_pc(self.current_thread)?;
-                        
-                        // Queue the iterator call as a function call
-                        tx.queue_operation(PendingOperation::FunctionCall {
-                            closure,
-                            args: vec![state, control],
-                            context: ReturnContext::ForLoop { 
-                                base: frame.base_register, 
-                                a, 
-                                c: num_returns,
-                                pc: current_pc,
-                                sbx: 0,
-                            },
-                        })?;
-                        
-                        // Since we already incremented PC, don't do it again
-                        should_increment_pc = false;
-                        
-                        StepResult::Continue
-                    },
-                    Value::CFunction(cfunc) => {
-                        // For C functions, we need special handling
-                        // First increment the PC
-                        tx.increment_pc(self.current_thread)?;
-                        
-                        // Commit the transaction
-                        tx.commit()?;
-                        
-                        // Extract arguments we need to avoid self-borrowing conflicts
-                        let func_copy = cfunc; // CFunction implements Copy
-                        let args = vec![state, control];
-                        let base_register = frame.base_register;
-                        let thread_handle = self.current_thread;
-                        
-                        // Call the special handler with clean borrows
-                        should_increment_pc = false; // We already incremented PC above
-                        
-                        return self.handle_tforloop_c_function(
-                            func_copy,
-                            args,
-                            base_register,
-                            a,
-                            num_returns,
-                            current_pc,
-                            0, // sbx is not used in Lua 5.1 TForLoop
-                            thread_handle
-                        );
-                    },
-                    _ => {
-                        // Not a function - return error after committing
-                        tx.commit()?;
-                        return Err(LuaError::TypeError { 
-                            expected: "function".to_string(), 
-                            got: iterator.type_name().to_string(),
-                        });
-                    },
-                }
-            }
-            
-            OpCode::VarArg => {
-                // R(A), R(A+1), ..., R(A+B-2) = vararg
-                let base = frame.base_register as usize;
-                
-                // Phase 1: Collect needed information
-                let (vararg_values, expected_results) = {
-                    // Get current call frame
-                    let frame = tx.get_current_frame(self.current_thread)?;
-                    
-                    // Get varargs from the frame
-                    let varargs = match &frame.varargs {
-                        Some(vars) => vars.clone(),
-                        None => {
-                            // No varargs available
-                            tx.commit()?;
-                            return Err(LuaError::RuntimeError("Function has no variable arguments".to_string()));
-                        }
-                    };
-                    
-                    // Determine number of results to return
-                    let expected = if b == 0 {
-                        // Use all available varargs
-                        varargs.len()
-                    } else {
-                        // Fixed number: B-1
-                        b - 1
-                    };
-                    
-                    (varargs, expected)
-                };
-                
-                // Phase 2: Store vararg values in registers
-                for i in 0..expected_results {
-                    let value = if i < vararg_values.len() {
-                        vararg_values[i].clone()
-                    } else {
-                        Value::Nil
-                    };
-                    
-                    tx.set_register(self.current_thread, base + a + i, value)?;
-                }
                 
                 StepResult::Continue
             },
-            
-            OpCode::ExtraArg => {
-                // ExtraArg is only used as data for previous instructions
-                // It is never executed directly - it contains extra bits for the argument
-                // of the previous instruction.
-                // Typically used to extend the argument range of certain opcodes (e.g., C in SetList)
-                
-                // In Lua 5.1, the ExtraArg instruction is simply skipped during normal execution
-                // We'll just increment the PC and continue
-                
-                StepResult::Continue
-            },
-            
+
             _ => {
+                // For unsupported opcodes during development
                 tx.commit()?;
-                return Err(LuaError::NotImplemented(format!("Opcode {:?}", opcode)));
+                return Err(LuaError::NotImplemented(format!("Opcode {:?} with register windows", opcode)));
             }
         };
         
@@ -3446,7 +1741,6 @@ OpCode::Closure => {
 }
 
 /// Helper function for handling metamethod continuations
-/// This is a free function to avoid borrowing self, making it usable from within other methods
 fn handle_metamethod_result(
     tx: &mut HeapTransaction,
     current_thread: ThreadHandle,
@@ -3489,7 +1783,7 @@ fn handle_metamethod_result(
 }
 
 impl LuaVM {
-    // Handle C function call without borrowing self more than once
+    /// Handle C function call without borrowing self more than once
     fn handle_c_function_call(
         &mut self,
         func: CFunction,
@@ -3517,9 +1811,9 @@ impl LuaVM {
         }
         
         // Call C function with isolated context - this is a new borrow
-        let (result_count, results_pushed) = {
+        let result_count = {
             let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
-            let count = match func(&mut ctx) {
+            match func(&mut ctx) {
                 Ok(count) => {
                     println!("DEBUG CFUNC: Function returned success with {} values", count);
                     count as usize
@@ -3528,14 +1822,27 @@ impl LuaVM {
                     println!("DEBUG CFUNC: Function returned error: {:?}", e);
                     return Ok(StepResult::Error(e));
                 },
-            };
-            (count, ctx.results_pushed)
+            }
         };
         
-        // Verify result count matches what the context pushed
-        if result_count != results_pushed {
-            println!("DEBUG CFUNC: Warning: returned {} but pushed {} values", result_count, results_pushed);
-        }
+        // Get the return context and depth in a separate scope
+        let (call_depth, context) = {
+            let depth = match self.get_call_depth() {
+                Ok(d) => d,
+                Err(_) => 0,
+            };
+            
+            let ctx = if let Some(existing_ctx) = self.return_contexts.get(&depth) {
+                existing_ctx.clone()
+            } else {
+                ReturnContext::Register {
+                    base: base_register,
+                    offset: register_a,
+                }
+            };
+            
+            (depth, ctx)
+        };
         
         // Collect results after function returns - new borrow of self
         let mut results = Vec::with_capacity(result_count);
@@ -3562,13 +1869,71 @@ impl LuaVM {
             println!("DEBUG CFUNC: Queueing CFunctionReturn with {} values", results.len());
             tx.queue_operation(PendingOperation::CFunctionReturn {
                 values: results,
-                context: ReturnContext::Register {
-                    base: base_register,
-                    offset: register_a,
-                },
+                context,
             })?;
             
             tx.commit()?;
+        }
+        
+        Ok(StepResult::Continue)
+    }
+
+    /// Handle C function call with register windows
+    fn handle_c_function_call_with_windows(
+        &mut self,
+        func: CFunction,
+        args: Vec<Value>,
+        window_idx: usize,
+        result_register: usize,
+        thread_handle: ThreadHandle,
+    ) -> LuaResult<StepResult> {
+        // Create a temporary window for C function execution
+        let c_window_size = args.len() + 10; // Args + some working space
+        let c_window_base = self.register_windows.allocate_window(c_window_size)?;
+        let c_window_idx = self.register_windows.current_window()
+            .ok_or_else(|| LuaError::InternalError("No C function window".to_string()))?;
+        
+        // Copy arguments to C function window
+        for (i, arg) in args.iter().enumerate() {
+            self.register_windows.set_register(c_window_idx, i, arg.clone())?;
+        }
+        
+        // Call C function with execution context
+        let mut ctx = ExecutionContext::new(self, c_window_base, args.len(), thread_handle);
+        
+        let result_count = match func(&mut ctx) {
+            Ok(count) => count as usize,
+            Err(e) => {
+                // Clean up window on error
+                self.register_windows.deallocate_window()?;
+                return Ok(StepResult::Error(e));
+            },
+        };
+        
+        // Copy results back to the calling window
+        let mut results = Vec::with_capacity(result_count);
+        for i in 0..result_count {
+            let value = self.register_windows.get_register(c_window_idx, i)?.clone();
+            results.push(value);
+        }
+        
+        // Deallocate C function window
+        self.register_windows.deallocate_window()?;
+        
+        // Store results in the caller's window
+        if !results.is_empty() {
+            for (i, value) in results.iter().enumerate() {
+                if i == 0 {
+                    // First result goes to the target register
+                    self.register_windows.set_register(window_idx, result_register, value.clone())?;
+                } else if result_register + i < 256 {
+                    // Additional results go to subsequent registers
+                    self.register_windows.set_register(window_idx, result_register + i, value.clone())?;
+                }
+            }
+        } else {
+            // No results - set target to nil
+            self.register_windows.set_register(window_idx, result_register, Value::Nil)?;
         }
         
         Ok(StepResult::Continue)
@@ -3650,6 +2015,37 @@ impl LuaVM {
                 }
                 // else: Loop is done, PC already incremented in TForLoop handler
             },
+            ReturnContext::EvalReturn { target_window, result_register, expected_results, .. } => {
+                println!("DEBUG CFUNC_RETURN: Processing eval results");
+                
+                // Store the eval result in the target window
+                if !values.is_empty() {
+                    // Get the first result (or more if specified by expected_results)
+                    let result_count = if expected_results == 0 {
+                        values.len()
+                    } else {
+                        expected_results.min(values.len())
+                    };
+                    
+                    // Store each result
+                    for i in 0..result_count {
+                        if i < values.len() {
+                            self.register_windows.set_register(
+                                target_window,
+                                result_register + i,
+                                values[i].clone()
+                            )?;
+                        }
+                    }
+                } else {
+                    // No results, store nil
+                    self.register_windows.set_register(
+                        target_window,
+                        result_register,
+                        Value::Nil
+                    )?;
+                }
+            }
         }
         
         tx.commit()?;
@@ -3815,6 +2211,24 @@ impl LuaVM {
                             }
                             // else: loop is done, PC already incremented in TForLoop handler
                         },
+                        ReturnContext::EvalReturn { target_window, result_register, expected_results } => {
+                            println!("DEBUG C FUNC: Processing eval return");
+                            
+                            // Store the result in the target window
+                            if !results.is_empty() {
+                                self.register_windows.set_register(
+                                    target_window,
+                                    result_register,
+                                    results[0].clone()
+                                )?;
+                            } else {
+                                self.register_windows.set_register(
+                                    target_window,
+                                    result_register,
+                                    Value::Nil
+                                )?;
+                            }
+                        },
                     }
                     
                     tx.commit()?;
@@ -3835,7 +2249,47 @@ impl LuaVM {
         }
     }
 
-
+    
+    /// Process an eval operation by compiling and executing Lua code
+    fn process_eval_operation(
+        &mut self, 
+        source: String,
+        target_window: usize,
+        result_register: usize,
+        expected_results: usize,
+    ) -> LuaResult<StepResult> {
+        println!("DEBUG EVAL: Processing eval operation for source: {}", source);
+        
+        // Compile the source
+        let compiled = match crate::lua::compiler::compile(&source) {
+            Ok(module) => {
+                println!("DEBUG EVAL: Source compiled successfully");
+                module
+            },
+            Err(e) => {
+                println!("DEBUG EVAL: Compilation error: {:?}", e);
+                // Set nil result on compilation error
+                self.register_windows.set_register(
+                    target_window, 
+                    result_register, 
+                    Value::Nil
+                )?;
+                return Err(e);
+            }
+        };
+        
+        // Set up the execution environment
+        let result = self.execute_module(&compiled, &[])?;
+        
+        // Store the result
+        self.register_windows.set_register(
+            target_window,
+            result_register,
+            result
+        )?;
+        
+        Ok(StepResult::Continue)
+    }
     
     fn process_pending_operation(&mut self, op: PendingOperation) -> LuaResult<StepResult> {
         match op {
@@ -3858,6 +2312,54 @@ impl LuaVM {
             PendingOperation::MetamethodCall { method, target, args, context } => {
                 println!("DEBUG PENDING_OP: Processing MetamethodCall operation");
                 self.process_metamethod_call(method, target, args, context)
+            },
+            PendingOperation::EvalExecution { 
+                source, 
+                target_window, 
+                result_register, 
+                expected_results 
+            } => {
+                println!("DEBUG EVAL: Processing eval execution for source: {}", source);
+                
+                // Compile the source code using a fresh transaction
+                let compiled = match crate::lua::compiler::compile(&source) {
+                    Ok(module) => {
+                        println!("DEBUG EVAL: Source compiled successfully");
+                        module
+                    },
+                    Err(e) => {
+                        println!("DEBUG EVAL: Compilation error: {:?}", e);
+                        
+                        // Set nil result for compilation errors
+                        if let Err(set_err) = self.register_windows.set_register(
+                            target_window, 
+                            result_register, 
+                            Value::Nil
+                        ) {
+                            println!("DEBUG EVAL: Failed to set nil result: {:?}", set_err);
+                        }
+                        
+                        return Err(e);
+                    }
+                };
+                
+                println!("DEBUG EVAL: Executing compiled module");
+                
+                // Execute the compiled code
+                match self.execute_module(&compiled, &[]) {
+                    Ok(result) => {
+                        // Store the result in the target window/register
+                        println!("DEBUG EVAL: Execution successful, setting result: {:?}", result);
+                        self.register_windows.set_register(target_window, result_register, result)?;
+                        Ok(StepResult::Continue)
+                    },
+                    Err(e) => {
+                        // Execution failed - set nil and propagate error
+                        println!("DEBUG EVAL: Execution failed: {:?}", e);
+                        self.register_windows.set_register(target_window, result_register, Value::Nil)?;
+                        Err(e)
+                    }
+                }
             },
             PendingOperation::Concatenation { values, current_index, dest_register, mut accumulated } => {
                 println!("DEBUG PENDING_OP: Processing Concatenation operation at index {}/{}", 
@@ -4269,14 +2771,16 @@ impl LuaVM {
         }
     }
     
-    /// Process a function call
+    /// Process a function call with proper register window allocation
     fn process_function_call(
         &mut self,
         closure: ClosureHandle,
         args: Vec<Value>,
         context: ReturnContext,
     ) -> LuaResult<StepResult> {
-        // First transaction for function call setup
+        println!("DEBUG FUNC_CALL: Processing function call");
+        
+        // First transaction to get function info
         let mut tx = HeapTransaction::new(&mut self.heap);
         
         // Get closure info
@@ -4285,60 +2789,54 @@ impl LuaVM {
         let is_vararg = closure_obj.proto.is_vararg;
         let max_stack = closure_obj.proto.max_stack_size as usize;
         
-        // Determine stack base for new frame
-        let current_top = tx.get_stack_size(self.current_thread)?;
-        let new_base = current_top;
-        
-        // Collect varargs if needed
-        let varargs = if is_vararg && args.len() > num_params {
-            // Collect excess arguments as varargs
-            Some(args[num_params..].to_vec())
-        } else {
-            None
-        };
-        
-        // CRITICAL FIX: We need to ensure we have enough stack space before proceeding
-        // The total stack space needed is:
-        // 1. Base register (new_base)
-        // 2. All registers the function will use (max_stack)
-        // 3. Additional safety margin of 1 to prevent off-by-one errors
-        let total_stack_needed = new_base + max_stack + 1; // +1 safety margin
-        
-        // Get current stack size
-        let current_stack_size = tx.get_stack_size(self.current_thread)?;
-        
-        // Calculate additional space needed (if any)
-        if current_stack_size < total_stack_needed {
-            let additional_needed = total_stack_needed - current_stack_size;
-            
-            // Add Nil values to extend the stack
-            for _ in 0..additional_needed {
-                tx.push_stack(self.current_thread, Value::Nil)?;
-            }
+        // Make sure we have an active window - if not, create one
+        if self.register_windows.current_window().is_none() {
+            println!("DEBUG FUNC_CALL: No active window, creating root window");
+            self.register_windows.allocate_window(256)?; // Create a root window
         }
+
+        // Get current window index as the parent
+        let parent_window = self.register_windows.current_window()
+            .ok_or_else(|| LuaError::InternalError("Failed to get parent window".to_string()))?;
+            
+        // Allocate a new register window for this function call
+        println!("DEBUG FUNC_CALL: Allocating window with size {}", max_stack);
+        let func_window_idx = self.register_windows.allocate_window(max_stack + 10)?; // +10 for safety margin
         
-        // First, push parameters
+        println!("DEBUG FUNC_CALL: Created function window {} (parent: {})", func_window_idx, parent_window);
+        
+        // Initialize parameters in the new window
         for i in 0..num_params {
             let value = if i < args.len() {
                 args[i].clone()
             } else {
                 Value::Nil
             };
-            tx.set_register(self.current_thread, new_base + i, value)?;
+            println!("DEBUG FUNC_CALL: Setting parameter {} in window {}", i, func_window_idx);
+            self.register_windows.set_register(func_window_idx, i, value)?;
         }
         
-        // Initialize remaining registers for local variables and temporaries
+        // Initialize remaining registers to nil
         for i in num_params..max_stack {
-            tx.set_register(self.current_thread, new_base + i, Value::Nil)?;
+            self.register_windows.set_register(func_window_idx, i, Value::Nil)?;
         }
         
-        // Create new call frame
+        // Collect varargs if needed
+        let varargs = if is_vararg && args.len() > num_params {
+            Some(args[num_params..].to_vec())
+        } else {
+            None
+        };
+        
         let new_frame = CallFrame {
             closure,
             pc: 0,
-            base_register: new_base as u16,
+            base_register: func_window_idx as u16, // Use window INDEX as base
             expected_results: match &context {
                 ReturnContext::Register { .. } => Some(1),
+                ReturnContext::EvalReturn { expected_results, .. } => {
+                    if *expected_results == 0 { None } else { Some(*expected_results) }
+                },
                 _ => None,
             },
             varargs,
@@ -4350,19 +2848,11 @@ impl LuaVM {
         // Commit transaction
         tx.commit()?;
         
-        // Store return context in a separate scope to avoid borrow issues
-        let call_depth = {
-            // Second transaction just to get call depth
-            let mut tx2 = HeapTransaction::new(&mut self.heap);
-            
-            // Get current call depth (after we pushed the frame)
-            let frame_count = tx2.get_thread_call_depth(self.current_thread)?;
-            tx2.commit()?;
-            frame_count
-        };
-        
         // Store return context
+        let call_depth = self.get_call_depth()?;
         self.return_contexts.insert(call_depth, context);
+        
+        println!("DEBUG FUNC_CALL: Function call setup complete");
         
         Ok(StepResult::Continue)
     }
@@ -4421,8 +2911,6 @@ impl LuaVM {
         let proto = tx.get_function_proto_copy(proto_handle)?;
         println!("DEBUG: Main function - max_stack_size: {}", proto.max_stack_size);
         
-        // CRITICAL FIX: Ensure the stack has sufficient space for all registers
-        // the main function might access
         let thread_handle = self.current_thread;
         
         // Get current stack size
@@ -4440,7 +2928,7 @@ impl LuaVM {
         // Ensure stack has at least needed_stack_size elements
         if current_stack_size < needed_stack_size {
             println!("DEBUG: Growing stack to {}", needed_stack_size);
-            // Add Nil values to extend the stack to exactly needed_stack_size
+            // Add Nil values to extend the stack
             for i in current_stack_size..needed_stack_size {
                 println!("DEBUG: Pushing Nil to stack at position {}", i);
                 tx.push_stack(thread_handle, Value::Nil)?;
@@ -4470,11 +2958,15 @@ impl LuaVM {
         let closure_handle = tx.create_closure(closure)?;
         println!("DEBUG: Created main closure");
         
-        // Commit the transaction
+        // Commit the transaction to release borrow on heap before creating register window
         tx.commit()?;
-        println!("DEBUG: Transaction committed");
-        
-        // Execute the main closure
+
+        println!("DEBUG: Initializing root register window");
+        let root_window_size = 256; // Generous size for the root window
+        let root_window_idx = self.register_windows.allocate_window(root_window_size)?;
+        println!("DEBUG: Created root register window: {}", root_window_idx);
+
+        // Now execute the main closure
         println!("DEBUG: Calling execute_function");
         self.execute_function(closure_handle, args)
     }
@@ -4613,6 +3105,15 @@ impl LuaVM {
         
         let traceback = LuaTraceback { frames };
         LuaError::TypeErrorWithTrace { expected, got, traceback }
+    }
+    
+    /// Evaluate Lua source code and return the result
+    pub fn eval(&mut self, source: &str) -> LuaResult<Value> {
+        // Compile the source
+        let compiled = crate::lua::compiler::compile(source)?;
+        
+        // Execute the compiled module
+        self.execute_module(&compiled, &[])
     }
 }
 

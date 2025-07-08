@@ -822,6 +822,47 @@ pub fn lua_load(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     Ok(2)
 }
 
+/// Eval function - evaluates a string as Lua code
+/// Signature: eval(code)
+pub fn lua_eval(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    if ctx.arg_count() < 1 {
+        return Err(LuaError::ArgumentError {
+            expected: 1,
+            got: ctx.arg_count(),
+        });
+    }
+    
+    // Get the source code string
+    let source_code = match ctx.get_arg(0)? {
+        Value::String(_) => ctx.get_string_arg(0)?,
+        Value::Number(n) => n.to_string(),
+        _ => return Err(LuaError::TypeError {
+            expected: "string".to_string(),
+            got: ctx.get_arg(0)?.type_name().to_string(),
+        }),
+    };
+    
+    println!("DEBUG EVAL: Evaluating code: {}", source_code);
+    
+    // Use the VM's eval_script method to evaluate the code
+    match ctx.vm_access.eval_script(&source_code) {
+        Ok(result) => {
+            // Successfully evaluated, push the result
+            println!("DEBUG EVAL: Evaluation successful, result type: {}", result.type_name());
+            ctx.push_result(result)?;
+            Ok(1)
+        },
+        Err(e) => {
+            // Error during evaluation
+            println!("DEBUG EVAL: Evaluation failed: {:?}", e);
+            
+            // In a pcall-like manner, we could return nil + error message,
+            // but for now we'll propagate the error
+            Err(e)
+        }
+    }
+}
+
 /// Lua pcall function - runs a function in protected mode and captures errors
 /// Signature: pcall(f, ...)
 pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
@@ -974,6 +1015,7 @@ pub fn create_base_lib() -> HashMap<&'static str, CFunction> {
     
     // Loading functions
     base_lib.insert("load", lua_load as CFunction);
+    base_lib.insert("eval", lua_eval as CFunction);
     
     // Error handling
     base_lib.insert("pcall", lua_pcall as CFunction);

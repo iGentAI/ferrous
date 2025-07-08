@@ -175,11 +175,61 @@ impl RegisterAllocator {
         self.free_registers.sort_unstable();
     }
     
-    /// The problematic function causing register conflicts
-    /// NOTE: This method is preserved for backwards compatibility but
-    /// now delegates to restore_state() for better scoping
+    /// The fixed free_to function that respects register lifetimes
     fn free_to(&mut self, level: usize) {
-        self.restore_state(level);
+        // Instead of blindly resetting, only free registers that are:
+        // 1. Above the target level
+        // 2. Not preserved
+        // 3. Not currently live
+        
+        // Collect registers to potentially free
+        let mut to_free = Vec::new();
+        
+        for reg in level..self.used {
+            // Check if this register is preserved
+            if !self.preserved_registers.contains(&reg) {
+                // Check if it's bound to a variable that's still live
+                let is_live = self.register_to_variable.get(&reg)
+                    .map(|var_name| {
+                        // A variable is live if it has recent usage
+                        // This is a simple heuristic - in practice we'd use proper liveness analysis
+                        self.current_instruction > 0
+                    })
+                    .unwrap_or(false);
+                
+                if !is_live {
+                    to_free.push(reg);
+                }
+            }
+        }
+        
+        // Add freed registers to the free list
+        for reg in to_free {
+            if !self.free_registers.contains(&reg) {
+                self.free_registers.push(reg);
+                self.register_to_variable.remove(&reg);
+            }
+        }
+        
+        // Only update 'used' if we can safely lower it
+        // This happens when all registers from 'level' to 'used' are free
+        let mut can_lower = true;
+        for reg in level..self.used {
+            if !self.free_registers.contains(&reg) && !self.preserved_registers.contains(&reg) {
+                can_lower = false;
+                break;
+            }
+        }
+        
+        if can_lower {
+            self.used = level;
+        }
+        
+        // Sort free registers for better allocation patterns
+        self.free_registers.sort_unstable();
+        
+        // Remove any free registers that are below the new 'used' level
+        self.free_registers.retain(|&reg| reg >= self.used);
     }
     
     /// Allocate a register, preferring to reuse a free register if possible

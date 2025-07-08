@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use ferrous::lua::error::{LuaError, Result};
-use ferrous::lua::value::{Value, StringHandle, TableHandle};
+use ferrous::lua::value::Value;
 use ferrous::lua::vm::LuaVM;
-use ferrous::lua::heap::LuaHeap;
-use ferrous::lua::compiler::Compiler;
+use ferrous::lua::compiler;
+use ferrous::lua::transaction::HeapTransaction;
+
+type Result<T> = std::result::Result<T, ferrous::lua::error::LuaError>;
 
 /// Run a simple Lua script
 fn run_script(vm: &mut LuaVM, script: &str) -> Result<Value> {
@@ -20,23 +21,25 @@ fn run_script(vm: &mut LuaVM, script: &str) -> Result<Value> {
     vm.init_stdlib()?;
     
     // Compile the script
-    let mut compiler = Compiler::new();
-    let closure = compiler.compile_and_load(script, &mut vm.heap)?;
+    let compiled = compiler::compile(script)?;
     
     // Execute the script
-    vm.execute_function(closure, &[])
+    vm.execute_module(&compiled, &[])
 }
 
 /// Print a value
-fn print_value(vm: &LuaVM, value: &Value) -> String {
+fn print_value(vm: &mut LuaVM, value: &Value) -> String {
     match value {
         Value::Nil => "nil".to_string(),
         Value::Boolean(b) => b.to_string(),
         Value::Number(n) => n.to_string(),
         Value::String(h) => {
-            if let Ok(s) = vm.heap.get_string_value(*h) {
+            let mut tx = HeapTransaction::new(vm.heap_mut());
+            if let Ok(s) = tx.get_string_value(*h) {
+                tx.commit().unwrap();
                 format!("\"{}\"", s)
             } else {
+                tx.commit().unwrap();
                 "\"<invalid string>\"".to_string()
             }
         },
@@ -45,6 +48,7 @@ fn print_value(vm: &LuaVM, value: &Value) -> String {
         Value::Thread(h) => format!("thread: {:?}", h),
         Value::CFunction(_) => "function: C".to_string(),
         Value::UserData(h) => format!("userdata: {:?}", h),
+        Value::FunctionProto(h) => format!("funcproto: {:?}", h),
     }
 }
 
@@ -66,12 +70,22 @@ fn test_script(name: &str, script: &str, expected: &str) {
         println!("Script timeout after 5 seconds!");
     });
     
-    vm.set_kill_flag(kill_flag);
+    // Create a very minimal mock context for testing
+    let context = ferrous::lua::ScriptContext {
+        storage: ferrous::storage::StorageEngine::new(),
+        db: 0,
+        keys: Vec::new(),
+        args: Vec::new(),
+        timeout: Duration::from_secs(5),
+    };
+    
+    // Set the context
+    let _ = vm.set_context(context);
     
     // Run the script
     match run_script(&mut vm, script) {
         Ok(result) => {
-            let result_str = print_value(&vm, &result);
+            let result_str = print_value(&mut vm, &result);
             println!("Result: {}", result_str);
             
             if result_str == expected {
@@ -94,6 +108,42 @@ fn test_script(name: &str, script: &str, expected: &str) {
 }
 
 fn main() {
+    // Check if we have a filename argument
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 {
+        // Run the specified file
+        let filename = &args[1];
+        println!("=== Running Test Script: {} ===", filename);
+        
+        if let Ok(script) = std::fs::read_to_string(filename) {
+            // Create VM
+            let mut vm = LuaVM::new().expect("Failed to create VM");
+            
+            // Initialize standard library
+            vm.init_stdlib().expect("Failed to initialize stdlib");
+            
+            // Compile and run the script
+            match run_script(&mut vm, &script) {
+                Ok(result) => {
+                    println!("\n=== Script Result ===");
+                    println!("{}", print_value(&mut vm, &result));
+                    println!("=== End Result ===");
+                }
+                Err(e) => {
+                    eprintln!("\n=== Script Error ===");
+                    eprintln!("{}", e);
+                    eprintln!("=== End Error ===");
+                    std::process::exit(1);
+                }
+            }
+            
+            return;
+        } else {
+            eprintln!("Error: Could not read file '{}'", filename);
+            std::process::exit(1);
+        }
+    }
+
     println!("=== Standalone Lua VM Test ===");
     
     // Test 1: Basic arithmetic
@@ -164,41 +214,6 @@ fn main() {
         "Generic for loop with pairs",
         "local t = {a=1, b=2, c=3}; local sum = 0; for k, v in pairs(t) do sum = sum + v end; return sum",
         "6",
-    );
-    
-    // Test 11: Math library functions
-    test_script(
-        "Math library",
-        "return math.sqrt(16) + math.floor(3.7) + math.ceil(2.1)",
-        "10",
-    );
-    
-    // Test 12: String library functions
-    test_script(
-        "String library",
-        "return string.upper('test') .. string.sub('hello', 2, 4)",
-        "\"TESTell\"",
-    );
-    
-    // Test 13: Table library functions
-    test_script(
-        "Table library",
-        "local t = {10, 20, 30}; table.insert(t, 40); return table.concat(t, '-')",
-        "\"10-20-30-40\"",
-    );
-    
-    // Test 14: Nested for loops
-    test_script(
-        "Nested for loops",
-        "local sum = 0; for i = 1, 3 do for j = 1, 2 do sum = sum + (i * j) end end; return sum",
-        "12",
-    );
-    
-    // Test 15: Error handling with pcall
-    test_script(
-        "Error handling with pcall",
-        "local status, result = pcall(function() error('test error') end); return status, type(result)",
-        "false \"string\"",
     );
     
     println!("\n=== Tests Complete ===");

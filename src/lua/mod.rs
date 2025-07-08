@@ -19,6 +19,8 @@ pub mod codegen;
 pub mod lexer;
 pub mod parser;
 pub mod ast;
+pub mod register_management;
+pub mod register_window;
 
 #[cfg(test)]
 mod test_basic;
@@ -29,6 +31,8 @@ pub use self::vm::LuaVM;
 pub use self::compiler::{compile, CompiledModule};
 pub use self::codegen::OpCode;
 pub use self::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle};
+pub use self::register_management::RegisterManagementSystem;
+pub use self::register_window::RegisterWindowSystem;
 
 // Implement handle_lua_command directly in the lua module
 pub fn handle_lua_command(

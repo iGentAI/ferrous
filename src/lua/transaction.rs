@@ -241,7 +241,65 @@ impl ValidationScope {
     }
 }
 
-/// Transaction for atomic heap operations
+/// Who owns a protection
+#[derive(Debug, Clone, PartialEq)]
+enum ProtectionOwner {
+    /// Manual protection (explicit call)
+    Manual,
+    /// Scope-based protection (RAII)
+    Scope,
+}
+
+/// Protected register tracking
+#[derive(Debug, Clone)]
+struct ProtectedRegisters {
+    /// Protected ranges by thread
+    ranges: HashMap<ThreadHandle, Vec<ProtectedRange>>,
+}
+
+/// A protected register range
+#[derive(Debug, Clone)]
+struct ProtectedRange {
+    /// Start index (inclusive)
+    start: usize,
+    
+    /// End index (exclusive)
+    end: usize,
+    
+    /// Protection reason (for debugging)
+    reason: String,
+    
+    /// Who owns this protection
+    owner: ProtectionOwner,
+}
+
+impl ProtectedRegisters {
+    fn new() -> Self {
+        ProtectedRegisters {
+            ranges: HashMap::new(),
+        }
+    }
+    
+    /// Check if a register is protected
+    fn is_protected(&self, thread: ThreadHandle, index: usize) -> Option<&str> {
+        if let Some(ranges) = self.ranges.get(&thread) {
+            for range in ranges {
+                if index >= range.start && index < range.end {
+                    return Some(&range.reason);
+                }
+            }
+        }
+        None
+    }
+    
+    /// Protect a register range
+    fn protect_range(&mut self, thread: ThreadHandle, start: usize, end: usize, reason: String, owner: ProtectionOwner) {
+        let range = ProtectedRange { start, end, reason, owner };
+        self.ranges.entry(thread).or_insert_with(Vec::new).push(range);
+    }
+}
+
+/// Enhanced transaction with register protection
 pub struct HeapTransaction<'a> {
     /// Reference to the heap
     heap: &'a mut LuaHeap,
@@ -257,10 +315,13 @@ pub struct HeapTransaction<'a> {
     
     /// Validation scope
     validation_scope: ValidationScope,
+    
+    /// Protected registers (can't be modified during this transaction)
+    protected_registers: ProtectedRegisters,
 }
 
 impl<'a> HeapTransaction<'a> {
-    /// Create a new transaction
+    /// Create a new transaction with register protection
     pub fn new(heap: &'a mut LuaHeap) -> Self {
         HeapTransaction {
             heap,
@@ -268,7 +329,34 @@ impl<'a> HeapTransaction<'a> {
             pending_operations: VecDeque::new(),
             state: TransactionState::Active,
             validation_scope: ValidationScope::new(),
+            protected_registers: ProtectedRegisters::new(),
         }
+    }
+    
+    /// Protect a register range
+    pub fn protect_registers(&mut self, thread: ThreadHandle, start: usize, end: usize, reason: &str) -> LuaResult<()> {
+        self.ensure_active()?;
+        self.validate_with_context(&thread, "protect_registers")?;
+        
+        // Store the protection
+        let range = ProtectedRange {
+            start,
+            end,
+            reason: reason.to_string(),
+            owner: ProtectionOwner::Manual,
+        };
+        
+        self.protected_registers.ranges
+            .entry(thread)
+            .or_insert_with(Vec::new)
+            .push(range);
+        
+        Ok(())
+    }
+    
+    /// Create a register protection scope with proper lifetime
+    pub fn register_protection_scope(&'a mut self, thread: ThreadHandle) -> RegisterProtectionScope<'a> {
+        RegisterProtectionScope::new(self, thread)
     }
     
     /// Ensure the transaction is active
@@ -569,6 +657,14 @@ impl<'a> HeapTransaction<'a> {
     /// Set a register value (queued)
     pub fn set_register(&mut self, thread: ThreadHandle, index: usize, value: Value) -> LuaResult<()> {
         self.ensure_active()?;
+        
+        // Check if register is protected
+        if let Some(reason) = self.protected_registers.is_protected(thread, index) {
+            return Err(LuaError::RuntimeError(format!(
+                "Cannot modify protected register {} (protected for: {})",
+                index, reason
+            )));
+        }
         
         // Validate handles
         self.validate_with_context(&thread, "set_register")?;
@@ -1107,6 +1203,7 @@ impl<'a> HeapTransaction<'a> {
         self.changes.clear();
         self.pending_operations.clear();
         self.validation_scope = ValidationScope::new();
+        self.protected_registers = ProtectedRegisters::new();
         self.state = TransactionState::Active;
         
         Ok(())
@@ -1551,7 +1648,73 @@ impl<'a, 'tx> Drop for ValidScope<'a, 'tx> {
     }
 }
 
+/// RAII scope for register protection
+pub struct RegisterProtectionScope<'tx> {
+    /// The transaction (raw pointer to avoid lifetime issues)
+    transaction: std::ptr::NonNull<HeapTransaction<'tx>>,
+    
+    /// Thread being protected
+    thread: ThreadHandle,
+    
+    /// Registers protected in this scope
+    protected_in_scope: Vec<(usize, usize)>,
+    
+    /// Marker for lifetime tracking
+    _phantom: std::marker::PhantomData<&'tx ()>,
+}
 
+// Unsafe Send + Sync impls required for raw pointers
+unsafe impl<'tx> Send for RegisterProtectionScope<'tx> {}
+unsafe impl<'tx> Sync for RegisterProtectionScope<'tx> {}
+
+impl<'tx> RegisterProtectionScope<'tx> {
+    /// Create a new protection scope with a transaction reference
+    fn new(transaction: &mut HeapTransaction<'tx>, thread: ThreadHandle) -> Self {
+        RegisterProtectionScope {
+            transaction: std::ptr::NonNull::from(transaction),
+            thread,
+            protected_in_scope: Vec::new(),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+    
+    /// Protect a single register
+    pub fn protect(&mut self, register: usize, reason: &str) -> LuaResult<()> {
+        self.protect_range(register, register + 1, reason)
+    }
+    
+    /// Protect a register range
+    pub fn protect_range(&mut self, start: usize, end: usize, reason: &str) -> LuaResult<()> {
+        // Safety: transaction pointer is valid for the lifetime of this scope
+        unsafe {
+            self.transaction.as_mut().protect_registers(self.thread, start, end, reason)?;
+        }
+        self.protected_in_scope.push((start, end));
+        Ok(())
+    }
+    
+    /// Execute a closure with registers protected
+    pub fn with_protected<F, R>(&mut self, registers: &[usize], reason: &str, f: F) -> LuaResult<R>
+    where
+        F: FnOnce(&mut Self) -> LuaResult<R>,
+    {
+        // Protect all specified registers
+        for &reg in registers {
+            self.protect(reg, reason)?;
+        }
+        
+        // Execute the closure
+        f(self)
+    }
+}
+
+impl<'tx> Drop for RegisterProtectionScope<'tx> {
+    fn drop(&mut self) {
+        // Remove protections when scope ends
+        // In a real implementation, we'd track and remove only our protections
+        // For now, we'll rely on transaction boundaries for cleanup
+    }
+}
 
 #[cfg(test)]
 mod tests {
