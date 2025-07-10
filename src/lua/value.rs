@@ -91,9 +91,9 @@ impl Value {
         matches!(self, Value::Table(_))
     }
     
-    /// Check if this value is a function (closure, C function, or function prototype)
+    /// Check if value is a function (closure or CFunction)
     pub fn is_function(&self) -> bool {
-        matches!(self, Value::Closure(_) | Value::CFunction(_) | Value::FunctionProto(_))
+        matches!(self, Value::Closure(_) | Value::CFunction(_))
     }
     
     /// Try to convert to a number

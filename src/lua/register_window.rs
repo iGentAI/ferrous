@@ -8,6 +8,12 @@ use super::error::{LuaError, LuaResult};
 use super::value::Value;
 use std::collections::{HashMap, HashSet};
 
+/// Default maximum size for register windows
+pub const DEFAULT_WINDOW_SIZE: usize = 256;
+
+/// Maximum registers that can be addressed within a single window
+pub const MAX_REGISTERS_PER_WINDOW: usize = 256;
+
 /// Register window system for proper frame isolation
 #[derive(Debug)]
 pub struct RegisterWindowSystem {
@@ -30,8 +36,8 @@ pub struct RegisterWindow {
     /// Base offset in global pool
     base: usize,
     
-    /// Window size
-    size: usize,
+    /// Window size (made public for debugging)
+    pub size: usize,
     
     /// Register protection map (registers that can't be modified)
     protected: HashSet<usize>,
@@ -68,7 +74,7 @@ impl RegisterWindowSystem {
         RegisterWindowSystem {
             window_stack: Vec::new(),
             global_pool: vec![Value::Nil; initial_capacity],
-            max_registers: 256, // Lua typically uses 8-bit register addressing
+            max_registers: MAX_REGISTERS_PER_WINDOW,
             stats: WindowStats::default(),
         }
     }
@@ -396,6 +402,26 @@ impl RegisterWindowSystem {
         result.push_str(&format!("- Max nesting depth: {}\n", self.stats.max_nesting_depth));
         
         result
+    }
+    
+    /// Calculate the absolute stack position for a register in a window
+    pub fn calculate_stack_position(&self, window_idx: usize, register: usize) -> usize {
+        window_idx * MAX_REGISTERS_PER_WINDOW + register
+    }
+    
+    /// Check if a register is within bounds for a window
+    pub fn is_register_in_bounds(&self, window_idx: usize, register: usize) -> bool {
+        if window_idx >= self.window_stack.len() {
+            return false;
+        }
+        
+        let window = &self.window_stack[window_idx];
+        register < window.size
+    }
+    
+    /// Get the size of a window
+    pub fn get_window_size(&self, window_idx: usize) -> Option<usize> {
+        self.window_stack.get(window_idx).map(|w| w.size)
     }
 }
 

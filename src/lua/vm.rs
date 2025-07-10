@@ -14,7 +14,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use super::register_window::RegisterWindowSystem;
-
+// Register layout constants for TForLoop
+// In a generic for loop: for vars... in iter_func, state, control do
+// The registers are laid out as:
+const TFORLOOP_ITER_OFFSET: usize = 0;    // R(A) = iterator function
+const TFORLOOP_STATE_OFFSET: usize = 1;   // R(A+1) = state value
+const TFORLOOP_CONTROL_OFFSET: usize = 2; // R(A+2) = control variable (current value)
+const TFORLOOP_VAR_OFFSET: usize = 3;     // R(A+3) = first loop variable
 /// Bytecode instruction format (simplified for now)
 pub struct Instruction(pub u32);
 
@@ -522,11 +528,12 @@ pub enum ReturnContext {
     
     /// Return from generic for loop iterator
     ForLoop { 
-        base: u16,      // Base register of the frame
-        a: usize,       // A value from TForLoop instruction
-        c: usize,       // C value (number of loop variables)
-        pc: usize,      // Original PC for loop continuation
-        sbx: i32        // Jump offset for loop continuation
+        window_idx: usize,    // Window containing the registers (base)
+        a: usize,             // Base register of TForLoop instruction
+        c: usize,             // Number of loop variables
+        pc: usize,            // Original PC for loop continuation
+        sbx: i32,             // Jump offset for loop continuation
+        storage_reg: usize,   // Register where iterator function is stored
     },
     
     /// Results from eval
@@ -1561,49 +1568,65 @@ impl LuaVM {
                 
                 // Get function object from register window
                 let func = self.register_windows.get_register(window_idx, a)?.clone();
+                println!("DEBUG STEP: CALL - function value is: {:?} (type: {})", func, func.type_name());
                 
-                // Calculate argument count
-                let arg_count;
-                if b == 0 {
-                    // All values from R(A+1) to top
-                    let max_args = 10; // Reasonable limit for safety
+                // Calculate argument count and collect arguments
+                let mut args = Vec::new();
+                let arg_count = if b == 0 {
+                    // Use all available registers after A
+                    let max_check = 10; // Safety limit
                     let mut count = 0;
-                    for i in 1..max_args {
-                        // Check if register exists by trying to access it
+                    for i in 1..max_check {
                         if let Ok(val) = self.register_windows.get_register(window_idx, a + i) {
                             if !val.is_nil() {
                                 count += 1;
+                                args.push(val.clone());
+                                println!("DEBUG STEP: CALL - Using arg {} from R({}): {:?}", 
+                                     count, a + i, val);
                             } else {
-                                break;
+                                break; // Stop at first nil
                             }
                         } else {
-                            break;
+                            break; // Stop at invalid register
                         }
                     }
-                    arg_count = count;
+                    count
                 } else {
-                    arg_count = b - 1;
-                }
-                
-                // Gather arguments from register window
-                let mut args = Vec::with_capacity(arg_count);
-                for i in 0..arg_count {
-                    // Use proper error handling for register access
-                    match self.register_windows.get_register(window_idx, a + 1 + i) {
-                        Ok(value) => args.push(value.clone()),
-                        Err(_) => args.push(Value::Nil), // Out of bounds registers are nil
+                    // B-1 arguments
+                    for i in 0..(b-1) {
+                        // Since Register B in the opcode is 1-indexed for args, but we use 0-indexed
+                        // we need to add 1 to the register index to get the first argument
+                        let reg_idx = a + i + 1;
+                        match self.register_windows.get_register(window_idx, reg_idx) {
+                            Ok(val) => {
+                                args.push(val.clone());
+                                println!("DEBUG STEP: CALL - Using arg {} from R({}): {:?}", 
+                                    i + 1, reg_idx, val);
+                            }
+                            Err(e) => {
+                                println!("DEBUG STEP: CALL - Error accessing argument register R({}): {:?}", 
+                                    reg_idx, e);
+                                args.push(Value::Nil); // Use nil for missing args
+                            }
+                        }
                     }
+                    b - 1
+                };
+                
+                // Debug print args for verification
+                for (i, arg) in args.iter().enumerate() {
+                    println!("DEBUG STEP: CALL - arg {} is: {:?}", i + 1, arg);
                 }
                 
-                // Process based on function type
+                // Unprotect registers in the current window
+                let _ = self.register_windows.unprotect_all(window_idx);
+                
+                // Handle function call based on type
                 match func {
                     Value::Closure(closure) => {
-                        // Unprotect registers in the current window since we're leaving it
-                        // and will need to write to it when the function returns
-                        let _ = self.register_windows.unprotect_all(window_idx);
-                        println!("DEBUG STEP: CALL - unprotected all registers in current window {}", window_idx);
+                        println!("DEBUG STEP: CALL - calling Lua closure with {} args", args.len());
                         
-                        // Queue function call for later execution
+                        // Queue function call as pending operation
                         tx.queue_operation(PendingOperation::FunctionCall {
                             closure,
                             args,
@@ -1616,17 +1639,9 @@ impl LuaVM {
                         StepResult::Continue
                     },
                     Value::CFunction(cfunc) => {
-                        // NOTE: C functions are queued as pending operations to maintain
-                        // the non-recursive state machine architecture. This ensures:
-                        // 1. No direct recursion into C code from the VM execution loop
-                        // 2. Proper state persistence across C function calls
-                        // 3. Consistent handling of all function types through pending operations
+                        println!("DEBUG STEP: CALL - calling C function with {} args", args.len());
                         
-                        // Unprotect the current window's registers
-                        let _ = self.register_windows.unprotect_all(window_idx);
-                        println!("DEBUG STEP: CALL - unprotected all registers in current window {}", window_idx);
-                        
-                        // Queue the C function call as a pending operation
+                        // Queue C function call as pending operation
                         tx.queue_operation(PendingOperation::CFunctionCall {
                             function: cfunc,
                             args,
@@ -1637,14 +1652,12 @@ impl LuaVM {
                         })?;
                         
                         println!("DEBUG STEP: CALL - queued C function call as pending operation");
-                        
                         StepResult::Continue
                     },
                     _ => {
-                        // Not a function - return error
                         tx.commit()?;
-                        return Err(LuaError::TypeError { 
-                            expected: "function".to_string(), 
+                        return Err(LuaError::TypeError {
+                            expected: "function".to_string(),
                             got: func.type_name().to_string(),
                         });
                     },
@@ -3932,87 +3945,99 @@ impl LuaVM {
             },
 
             OpCode::TForLoop => {
-                // R(A+3), ..., R(A+3+C) := R(A)(R(A+1), R(A+2)); 
-                // if R(A+3) ~= nil then R(A+2) = R(A+3) else pc++
+                // R(A+3), ... , R(A+3+C) := R(A)(R(A+1), R(A+2)); 
+                // if R(A+3) ~= nil then { R(A+2) = R(A+3); pc += sbx }
                 println!("DEBUG STEP: TFORLOOP - iterator in R({}), {} loop variables", a, c);
                 
-                // Get the iterator function from R(A)
-                let iterator = self.register_windows.get_register(window_idx, a)?.clone();
+                // Check if iterator is a function (on first iteration) or an index (on subsequent iterations)
+                let r_a = self.register_windows.get_register(window_idx, a)?.clone();
+                println!("DEBUG STEP: TFORLOOP - R(A) contains: {:?}", r_a);
                 
-                // Get state from R(A+1) and control from R(A+2)
-                let state = self.register_windows.get_register(window_idx, a + 1)?.clone();
-                let control = self.register_windows.get_register(window_idx, a + 2)?.clone();
-                
-                println!("DEBUG STEP: TFORLOOP - iterator: {:?}, state: {:?}, control: {:?}", 
-                         iterator, state, control);
-                
-                // Prepare arguments for the iterator call
-                let args = vec![state, control];
-                
-                // Get the sbx value for the next instruction (should be a JMP)
-                let next_pc = frame.pc + 1;
-                let next_instr = tx.get_instruction(frame.closure, next_pc)?;
-                let next_instruction = Instruction(next_instr);
-                let sbx = if next_instruction.opcode() == OpCode::Jmp {
-                    next_instruction.sbx()
+                if r_a.is_function() {
+                    // First iteration - we need to call the iterator with (state, control)
+                    let state = self.register_windows.get_register(window_idx, a + 1)?.clone();
+                    let control = self.register_windows.get_register(window_idx, a + 2)?.clone();
+                    
+                    // Unprotect all registers before making the call
+                    let _ = self.register_windows.unprotect_all(window_idx);
+                    
+                    // Now dispatch to the appropriate function type
+                    match r_a {
+                        Value::Closure(closure) => {
+                            // Get JMP instruction offset for ForLoop handler
+                            let next_pc = frame.pc + 1;
+                            let next_instr = tx.get_instruction(frame.closure, next_pc).unwrap_or(0);
+                            let next_instruction = Instruction(next_instr);
+                            let sbx = if next_instruction.opcode() == OpCode::Jmp {
+                                next_instruction.sbx()
+                            } else {
+                                println!("DEBUG STEP: TFORLOOP - Warning: Next instruction is not JMP");
+                                0
+                            };
+                            
+                            // We don't need to save any iterator since it's already in r_a
+                            
+                            // Queue function call with args (state, control)
+                            tx.queue_operation(PendingOperation::FunctionCall {
+                                closure,
+                                args: vec![state, control],
+                                context: ReturnContext::ForLoop { 
+                                    window_idx, 
+                                    a, 
+                                    c, 
+                                    pc: frame.pc,
+                                    sbx,
+                                    storage_reg: 0, // Don't need storage
+                                },
+                            })?;
+                        },
+                        Value::CFunction(cfunc) => {
+                            // Get JMP instruction offset for ForLoop handler
+                            let next_pc = frame.pc + 1;
+                            let next_instr = tx.get_instruction(frame.closure, next_pc).unwrap_or(0);
+                            let next_instruction = Instruction(next_instr);
+                            let sbx = if next_instruction.opcode() == OpCode::Jmp {
+                                next_instruction.sbx()
+                            } else {
+                                println!("DEBUG STEP: TFORLOOP - Warning: Next instruction is not JMP");
+                                0
+                            };
+                            
+                            // Queue C function call with args (state, control)
+                            tx.queue_operation(PendingOperation::CFunctionCall {
+                                function: cfunc,
+                                args: vec![state, control],
+                                context: ReturnContext::ForLoop { 
+                                    window_idx, 
+                                    a, 
+                                    c, 
+                                    pc: frame.pc,
+                                    sbx,
+                                    storage_reg: 0, // Don't need storage
+                                },
+                            })?;
+                        },
+                        _ => unreachable!(), // Already checked is_function() above
+                    }
                 } else {
-                    // If next instruction isn't JMP, assume we stay at current position
-                    0
-                };
-                
-                // Process based on iterator type
-                match iterator {
-                    Value::Closure(closure) => {
-                        println!("DEBUG STEP: TFORLOOP - calling Lua closure iterator");
+                    // Subsequent iteration - check if we should continue
+                    if r_a.is_nil() {
+                        // End of iteration - nil result
+                        println!("DEBUG STEP: TFORLOOP - nil result, ending loop");
+                        // Just advance PC normally - will skip the JMP instruction
+                    } else {
+                        // Continue iteration - set control to the index
+                        self.register_windows.set_register(window_idx, a + 2, r_a.clone())?;
+                        println!("DEBUG STEP: TFORLOOP - continuing loop, setting control var to {:?}", r_a);
                         
-                        // Unprotect registers in the current window for the function call
-                        let _ = self.register_windows.unprotect_all(window_idx);
-                        
-                        // Queue function call with special ForLoop return context
-                        tx.queue_operation(PendingOperation::FunctionCall {
-                            closure,
-                            args,
-                            context: ReturnContext::ForLoop {
-                                base: frame.base_register,
-                                a,
-                                c,
-                                pc: frame.pc,
-                                sbx,
-                            },
-                        })?;
-                        
-                        StepResult::Continue
-                    },
-                    Value::CFunction(cfunc) => {
-                        println!("DEBUG STEP: TFORLOOP - calling C function iterator");
-                        
-                        // Unprotect the current window's registers
-                        let _ = self.register_windows.unprotect_all(window_idx);
-                        
-                        // Queue C function call with special ForLoop return context
-                        tx.queue_operation(PendingOperation::CFunctionCall {
-                            function: cfunc,
-                            args,
-                            context: ReturnContext::ForLoop {
-                                base: frame.base_register,
-                                a,
-                                c,
-                                pc: frame.pc,
-                                sbx,
-                            },
-                        })?;
-                        
-                        StepResult::Continue
-                    },
-                    _ => {
-                        // Not a function - return error
-                        tx.commit()?;
-                        return Err(LuaError::TypeError { 
-                            expected: "function".to_string(), 
-                            got: iterator.type_name().to_string(),
-                        });
-                    },
+                        // Jump to PC+2 (skip the JMP instruction)
+                        // Actually, let the JMP instruction handle the jump
+                        tx.increment_pc(self.current_thread)?;
+                        should_increment_pc = false;
+                    }
                 }
+                
+                StepResult::Continue
             },
 
             OpCode::Concat => {
@@ -4425,15 +4450,11 @@ impl LuaVM {
         Ok(StepResult::Continue)
     }
 
-    fn process_c_function_return(
-        &mut self, 
-        values: Vec<Value>, 
-        context: ReturnContext
-    ) -> LuaResult<StepResult> {
-        println!("DEBUG CFUNC_RETURN: Processing {} return values", values.len());
-        
+    fn process_c_function_return(&mut self, values: Vec<Value>, context: ReturnContext) -> LuaResult<StepResult> {
+        // Create transaction for processing the result
         let mut tx = HeapTransaction::new(&mut self.heap);
         
+        // Process based on context
         match &context {
             ReturnContext::Register { base, offset } => {
                 println!("DEBUG CFUNC_RETURN: Storing to registers starting at base={}, offset={}", base, offset);
@@ -4460,10 +4481,15 @@ impl LuaVM {
                     // No return values - set the register to nil
                     tx.set_register(self.current_thread, *base as usize + *offset, Value::Nil)?;
                 }
+                
+                tx.commit()?;
+                return Ok(StepResult::Continue);
             },
             ReturnContext::FinalResult => {
                 println!("DEBUG CFUNC_RETURN: Final result context - will be handled by execute_function");
                 // Final result will be handled by execute_function
+                tx.commit()?;
+                return Ok(StepResult::Continue);
             },
             ReturnContext::TableField { table, key } => {
                 println!("DEBUG CFUNC_RETURN: Storing to table field, table={:?}, key={:?}", table, key);
@@ -4473,6 +4499,9 @@ impl LuaVM {
                 } else {
                     tx.set_table_field(*table, key.clone(), Value::Nil)?;
                 }
+                
+                tx.commit()?;
+                return Ok(StepResult::Continue);
             },
             ReturnContext::Stack => {
                 println!("DEBUG CFUNC_RETURN: Pushing to stack, {} values", values.len());
@@ -4480,47 +4509,83 @@ impl LuaVM {
                 for value in &values {
                     tx.push_stack(self.current_thread, value.clone())?;
                 }
+                
+                tx.commit()?;
+                return Ok(StepResult::Continue);
             },
             ReturnContext::Metamethod { context: mm_context } => {
                 println!("DEBUG CFUNC_RETURN: Processing metamethod continuation");
                 let result_value = values.get(0).cloned().unwrap_or(Value::Nil);
                 
                 // Use the free function to avoid borrowing self
-                // We need to clone mm_context since it's a reference
                 handle_metamethod_result(&mut tx, self.current_thread, result_value, mm_context.clone())?;
-            },
-
-            ReturnContext::ForLoop { base, a, c, pc, sbx } => {
-                println!("DEBUG CFUNC_RETURN: Processing for-loop results");
-                let first_value = values.get(0).cloned().unwrap_or(Value::Nil);
                 
-                if !first_value.is_nil() {
-                    // Loop continues
-                    println!("DEBUG CFUNC_RETURN: ForLoop continues with first value: {:?}", first_value);
+                tx.commit()?;
+                return Ok(StepResult::Continue);
+            },
+            // Here we handle just the ForLoop case directly
+            ReturnContext::ForLoop { window_idx, a, c, pc, sbx, storage_reg } => {
+                println!("DEBUG FORLOOP RETURN: Processing for-loop results with {} values", values.len());
+                
+                // First, get the saved iterator function from the storage register
+                let saved_iterator = match self.register_windows.get_register(*window_idx, *storage_reg) {
+                    Ok(value) => {
+                        println!("DEBUG FORLOOP RETURN: Retrieved saved iterator from R({}): {:?}", 
+                                 *storage_reg, value);
+                        value.clone()
+                    },
+                    Err(e) => {
+                        println!("DEBUG FORLOOP RETURN: Failed to retrieve saved iterator: {:?}", e);
+                        // Continue without iterator restoration - this is suboptimal but better than failing
+                        Value::Nil
+                    }
+                };
+                
+                // Check if there are any results (empty results means nil was returned)
+                let first_result = values.first().cloned().unwrap_or(Value::Nil);
+                println!("DEBUG FORLOOP RETURN: First result is: {:?}", first_result);
+                
+                if !first_result.is_nil() {
+                    // Process the ForLoop return with at least one non-nil value
+                    // This means the iterator wants to continue
                     
-                    // Get the window index from base
-                    let window_idx = *base as usize;
-                    
-                    // Update control variable R(A+2) with first result
-                    self.register_windows.set_register(window_idx, *a + 2, first_value.clone())?;
-                    
-                    // Store loop variables in R(A+3) ... R(A+3+C-1)
-                    for i in 0..*c {
-                        let value = if i < values.len() {
-                            values[i].clone()
-                        } else {
-                            Value::Nil
-                        };
-                        self.register_windows.set_register(window_idx, *a + 3 + i, value)?;
+                    // Step 1: Restore the original iterator function to R(A)
+                    if saved_iterator.is_function() {
+                        self.register_windows.set_register(*window_idx, *a, saved_iterator)?;
+                        println!("DEBUG FORLOOP RETURN: Restored iterator to R({})", *a);
+                    } else {
+                        println!("DEBUG FORLOOP RETURN: WARNING - Saved iterator is not a function: {:?}", 
+                                 saved_iterator.type_name());
                     }
                     
-                    // Don't modify PC - let the next instruction (JMP) execute normally
-                    println!("DEBUG CFUNC_RETURN: ForLoop variables set, continuing to next instruction");
+                    // Step 2: Copy the first result (the index) to the control variable (A+2)
+                    self.register_windows.set_register(*window_idx, *a + TFORLOOP_CONTROL_OFFSET, first_result.clone())?;
+                    println!("DEBUG FORLOOP RETURN: Set control variable R({}) to {:?}", 
+                             *a + TFORLOOP_CONTROL_OFFSET, first_result);
+                    
+                    // Step 3: Copy all result values to the loop variables (starting at A+3)
+                    // The first value is the index, second value is the first loop variable
+                    if values.len() > 1 {
+                        for (i, value) in values.iter().skip(1).enumerate() {
+                            if i < *c {  // Make sure we don't set more loop vars than C allows
+                                let target_reg = *a + TFORLOOP_VAR_OFFSET + i;
+                                self.register_windows.set_register(*window_idx, target_reg, value.clone())?;
+                                println!("DEBUG FORLOOP RETURN: Set loop var R({}) to {:?}", target_reg, value);
+                            }
+                        }
+                    }
+                    
+                    // Step 4: Jump back to the loop body
+                    // Don't modify PC here - let the current instruction (TForLoop) finish
+                    // and the subsequent JMP instruction handle the actual jump
                 } else {
-                    // Loop is done - skip the next instruction (usually a JMP)
-                    println!("DEBUG CFUNC_RETURN: ForLoop done, skipping next instruction");
+                    // End of iteration - nil result
+                    println!("DEBUG FORLOOP RETURN: nil result, ending loop iteration");
+                    // Skip the next instruction (the JMP) to exit the loop
                     tx.increment_pc(self.current_thread)?;
                 }
+                
+                Ok(StepResult::Continue)
             },
             ReturnContext::EvalReturn { target_window, result_register, expected_results } => {
                 println!("DEBUG CFUNC_RETURN: Processing eval results");
@@ -4552,11 +4617,11 @@ impl LuaVM {
                         Value::Nil
                     )?;
                 }
+                
+                tx.commit()?;
+                return Ok(StepResult::Continue);
             }
         }
-        
-        tx.commit()?;
-        Ok(StepResult::Continue)
     }
 
     /// Process a metamethod call
@@ -4693,7 +4758,7 @@ impl LuaVM {
                 
                 // Special handling for ForLoop context to ensure proper result handling
                 match &context {
-                    ReturnContext::ForLoop { base, a, c, pc, sbx } => {
+                    ReturnContext::ForLoop { window_idx, a, c, pc, sbx, storage_reg } => {
                         println!("DEBUG PENDING_OP: FunctionCall with ForLoop context");
                         // Process the function call which will eventually return through
                         // the regular return handling mechanism
@@ -4715,6 +4780,7 @@ impl LuaVM {
                     // Extract window index and register offset from context
                     match &context {
                         ReturnContext::Register { base, offset } => (*base as usize, *offset),
+                        ReturnContext::ForLoop { window_idx, a, .. } => (*window_idx, *a),
                         _ => (frame.base_register as usize, 0),
                     }
                 };

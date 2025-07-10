@@ -956,20 +956,47 @@ impl CodeGenerator {
                 self.leave_scope();
                 self.inside_loop = false;
                 
-                // Emit jump back to the start
-                self.emit(Self::encode_AsBx(
-                    OpCode::Jmp, 
-                    0, 
-                    loop_start as i32 - self.current_pc() as i32 - 1 // Relative offset
-                ));
+                // Emit jump back to the start with safe offset calculation
+                let current = self.current_pc();
+                let offset = match (loop_start as i64).checked_sub(current as i64) {
+                    Some(diff) => {
+                        let final_offset = diff.checked_sub(1).unwrap_or(-1);
+                        if final_offset < -131071 || final_offset > 131070 {
+                            return Err(LuaError::CompileError(
+                                format!("Jump offset {} out of range for while loop", final_offset)
+                            ));
+                        }
+                        final_offset as i32
+                    },
+                    None => {
+                        return Err(LuaError::CompileError(
+                            "While loop jump offset calculation overflow".to_string()
+                        ));
+                    }
+                };
                 
-                // Patch the jump out
+                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, offset));
+                
+                // Patch the jump out with safe calculation
                 let after_loop = self.current_pc();
-                self.code[jump_out] = Self::encode_AsBx(
-                    OpCode::Jmp,
-                    0,
-                    after_loop as i32 - jump_out as i32 - 1 // Relative offset
-                );
+                let jump_offset = match (after_loop as i64).checked_sub(jump_out as i64) {
+                    Some(diff) => {
+                        let final_offset = diff.checked_sub(1).unwrap_or(0);
+                        if final_offset < -131071 || final_offset > 131070 {
+                            return Err(LuaError::CompileError(
+                                format!("Jump out offset {} out of range for while loop", final_offset)
+                            ));
+                        }
+                        final_offset as i32
+                    },
+                    None => {
+                        return Err(LuaError::CompileError(
+                            "While loop jump out offset calculation overflow".to_string()
+                        ));
+                    }
+                };
+                
+                self.code[jump_out] = Self::encode_AsBx(OpCode::Jmp, 0, jump_offset);
                 
                 // Patch any break statements
                 self.patch_breaks(breaks_before);
@@ -988,13 +1015,28 @@ impl CodeGenerator {
                 let cond_reg = self.registers.allocate();
                 self.expression(condition, cond_reg, 1)?;
                 
-                // Emit test and jump (with inverted condition)
+                // Emit test and jump (with inverted condition) - safe calculation
                 self.emit(Self::encode_ABC(OpCode::Test, cond_reg as u8, 0, 0));
-                self.emit(Self::encode_AsBx(
-                    OpCode::Jmp, 
-                    0, 
-                    loop_start as i32 - self.current_pc() as i32 - 1 // Jump back to start if false
-                ));
+                
+                let current = self.current_pc();
+                let offset = match (loop_start as i64).checked_sub(current as i64) {
+                    Some(diff) => {
+                        let final_offset = diff.checked_sub(1).unwrap_or(-1);
+                        if final_offset < -131071 || final_offset > 131070 {
+                            return Err(LuaError::CompileError(
+                                format!("Jump offset {} out of range for repeat loop", final_offset)
+                            ));
+                        }
+                        final_offset as i32
+                    },
+                    None => {
+                        return Err(LuaError::CompileError(
+                            "Repeat loop jump offset calculation overflow".to_string()
+                        ));
+                    }
+                };
+                
+                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, offset));
                 
                 self.registers.free_to(cond_reg);
                 
@@ -1039,13 +1081,26 @@ impl CodeGenerator {
                 let jump_to_end = self.current_pc();
                 self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder
                 
-                // Patch jump to else part
+                // Patch jump to else part with safe calculation
                 let else_start = self.current_pc();
-                self.code[jump_to_else] = Self::encode_AsBx(
-                    OpCode::Jmp,
-                    0,
-                    else_start as i32 - jump_to_else as i32 - 1 // Relative offset
-                );
+                let if_jump_offset = match (else_start as i64).checked_sub(jump_to_else as i64) {
+                    Some(diff) => {
+                        let final_offset = diff.checked_sub(1).unwrap_or(0);
+                        if final_offset < -131071 || final_offset > 131070 {
+                            return Err(LuaError::CompileError(
+                                format!("If statement jump offset {} out of range", final_offset)
+                            ));
+                        }
+                        final_offset as i32
+                    },
+                    None => {
+                        return Err(LuaError::CompileError(
+                            "If statement jump offset calculation overflow".to_string()
+                        ));
+                    }
+                };
+
+                self.code[jump_to_else] = Self::encode_AsBx(OpCode::Jmp, 0, if_jump_offset);
                 
                 // Compile else-if parts
                 let mut jumps_to_end = vec![jump_to_end];
@@ -1071,13 +1126,26 @@ impl CodeGenerator {
                     jumps_to_end.push(self.current_pc());
                     self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder
                     
-                    // Patch jump to next
+                    // Patch jump to next with safe calculation
                     let next_start = self.current_pc();
-                    self.code[jump_to_next] = Self::encode_AsBx(
-                        OpCode::Jmp,
-                        0,
-                        next_start as i32 - jump_to_next as i32 - 1 // Relative offset
-                    );
+                    let next_jump_offset = match (next_start as i64).checked_sub(jump_to_next as i64) {
+                        Some(diff) => {
+                            let final_offset = diff.checked_sub(1).unwrap_or(0);
+                            if final_offset < -131071 || final_offset > 131070 {
+                                return Err(LuaError::CompileError(
+                                    format!("Else-if jump offset {} out of range", final_offset)
+                                ));
+                            }
+                            final_offset as i32
+                        },
+                        None => {
+                            return Err(LuaError::CompileError(
+                                "Else-if jump offset calculation overflow".to_string()
+                            ));
+                        }
+                    };
+
+                    self.code[jump_to_next] = Self::encode_AsBx(OpCode::Jmp, 0, next_jump_offset);
                 }
                 
                 // Compile else part if any
@@ -1087,14 +1155,27 @@ impl CodeGenerator {
                     self.leave_scope();
                 }
                 
-                // Patch all jumps to end
+                // Patch all jumps to end with safe calculation
                 let end = self.current_pc();
                 for jump in jumps_to_end {
-                    self.code[jump] = Self::encode_AsBx(
-                        OpCode::Jmp,
-                        0,
-                        end as i32 - jump as i32 - 1 // Relative offset
-                    );
+                    let end_jump_offset = match (end as i64).checked_sub(jump as i64) {
+                        Some(diff) => {
+                            let final_offset = diff.checked_sub(1).unwrap_or(0);
+                            if final_offset < -131071 || final_offset > 131070 {
+                                return Err(LuaError::CompileError(
+                                    format!("End jump offset {} out of range", final_offset)
+                                ));
+                            }
+                            final_offset as i32
+                        },
+                        None => {
+                            return Err(LuaError::CompileError(
+                                "End jump offset calculation overflow".to_string()
+                            ));
+                        }
+                    };
+                    
+                    self.code[jump] = Self::encode_AsBx(OpCode::Jmp, 0, end_jump_offset);
                 }
             }
             
@@ -1145,22 +1226,49 @@ impl CodeGenerator {
                 let forloop = self.current_pc();
                 self.emit(Self::encode_AsBx(OpCode::ForLoop, var_reg as u8, 0)); // Placeholder
                 
-                // Patch jumps
+                // Patch jumps with safe calculations
                 let _end = self.current_pc();
                 
                 // Patch FORPREP to jump to FORLOOP
-                self.code[forprep] = Self::encode_AsBx(
-                    OpCode::ForPrep,
-                    var_reg as u8,
-                    forloop as i32 - forprep as i32 - 1 // Jump to FORLOOP
-                );
+                let forprep_offset = match (forloop as i64).checked_sub(forprep as i64) {
+                    Some(diff) => {
+                        let final_offset = diff.checked_sub(1).unwrap_or(0);
+                        if final_offset < -131071 || final_offset > 131070 {
+                            return Err(LuaError::CompileError(
+                                format!("FORPREP jump offset {} out of range", final_offset)
+                            ));
+                        }
+                        final_offset as i32
+                    },
+                    None => {
+                        return Err(LuaError::CompileError(
+                            "FORPREP jump offset calculation overflow".to_string()
+                        ));
+                    }
+                };
+                
+                self.code[forprep] = Self::encode_AsBx(OpCode::ForPrep, var_reg as u8, forprep_offset);
                 
                 // Patch FORLOOP to jump back to end of FORPREP
-                self.code[forloop] = Self::encode_AsBx(
-                    OpCode::ForLoop,
-                    var_reg as u8,
-                    forprep as i32 + 1 - forloop as i32 - 1 // Jump to instruction after FORPREP
-                );
+                let forloop_target = forprep + 1;
+                let forloop_offset = match (forloop_target as i64).checked_sub(forloop as i64) {
+                    Some(diff) => {
+                        let final_offset = diff.checked_sub(1).unwrap_or(-1);
+                        if final_offset < -131071 || final_offset > 131070 {
+                            return Err(LuaError::CompileError(
+                                format!("FORLOOP jump offset {} out of range", final_offset)
+                            ));
+                        }
+                        final_offset as i32
+                    },
+                    None => {
+                        return Err(LuaError::CompileError(
+                            "FORLOOP jump offset calculation overflow".to_string()
+                        ));
+                    }
+                };
+                
+                self.code[forloop] = Self::encode_AsBx(OpCode::ForLoop, var_reg as u8, forloop_offset);
                 
                 // Patch any break statements
                 self.patch_breaks(breaks_before);
@@ -1190,7 +1298,10 @@ impl CodeGenerator {
                     let reg = if self.registers.level() > var_base {
                         self.registers.level()
                     } else {
-                        var_base + (self.registers.level() - var_base)
+                        match self.registers.level().checked_sub(var_base) {
+                            Some(diff) => var_base + diff,
+                            None => var_base // If underflow, just use var_base
+                        }
                     };
                     
                     if reg >= self.registers.level() {
@@ -1243,12 +1354,27 @@ impl CodeGenerator {
                 self.block(body)?;
                 self.inside_loop = false;
                 
-                // Jump back to the call
-                self.emit(Self::encode_AsBx(
-                    OpCode::Jmp,
-                    0,
-                    loop_start as i32 - self.current_pc() as i32 - 1 // Jump to loop start
-                ));
+                // Jump back to the call with safe calculation
+                let current = self.current_pc();
+                
+                let jump_back_offset = match (loop_start as i64).checked_sub(current as i64) {
+                    Some(diff) => {
+                        let final_offset = diff.checked_sub(1).unwrap_or(-1);
+                        if final_offset < -131071 || final_offset > 131070 {
+                            return Err(LuaError::CompileError(
+                                format!("For-in loop jump back offset {} out of range", final_offset)
+                            ));
+                        }
+                        final_offset as i32
+                    },
+                    None => {
+                        return Err(LuaError::CompileError(
+                            "For-in loop jump offset calculation overflow".to_string()
+                        ));
+                    }
+                };
+
+                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, jump_back_offset));
                 
                 // Patch any break statements
                 self.patch_breaks(breaks_before);
