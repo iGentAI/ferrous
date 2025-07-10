@@ -88,6 +88,22 @@ impl Default for CompilerConfig {
     }
 }
 
+/// Helper function to recursively collect all nested prototypes
+fn collect_all_prototypes_recursive(func: &CompiledFunction) -> Vec<CompiledFunction> {
+    let mut result = Vec::new();
+    
+    // Process each nested prototype
+    for proto in &func.prototypes {
+        // Add the prototype itself
+        result.push(proto.clone());
+        // Then recursively collect its nested prototypes
+        let nested = collect_all_prototypes_recursive(proto);
+        result.extend(nested);
+    }
+    
+    result
+}
+
 /// Compile Lua source code into a module
 pub fn compile(source: &str) -> LuaResult<CompiledModule> {
     compile_with_config(source, &CompilerConfig::default())
@@ -101,8 +117,11 @@ pub fn compile_with_config(source: &str, config: &CompilerConfig) -> LuaResult<C
     // Generate bytecode
     let output = generate_bytecode(&ast)?;
     
-    println!("DEBUG COMPILER: Compilation complete - main bytecode: {}, prototypes: {}, strings: {}", 
-             output.main.bytecode.len(), output.main.prototypes.len(), output.strings.len());
+    // Recursively collect ALL nested prototypes, not just immediate children
+    let all_prototypes = collect_all_prototypes_recursive(&output.main);
+    
+    println!("DEBUG COMPILER: Compilation complete - main bytecode: {}, total prototypes: {}, strings: {}", 
+             output.main.bytecode.len(), all_prototypes.len(), output.strings.len());
     
     // Convert the compilation output to a compiled module
     Ok(CompiledModule {
@@ -113,7 +132,7 @@ pub fn compile_with_config(source: &str, config: &CompilerConfig) -> LuaResult<C
         max_stack_size: output.main.max_stack_size,
         upvalues: output.main.upvalues,
         strings: output.strings,
-        prototypes: output.main.prototypes,
+        prototypes: all_prototypes,
         source_name: config.source_name.clone(),
     })
 }
@@ -176,12 +195,14 @@ pub mod loader {
         let mut proto_constants = Vec::with_capacity(module.prototypes.len());
         
         for (proto_idx, proto) in module.prototypes.iter().enumerate() {
-            println!("DEBUG LOADER: Processing prototype {} - {} constants, {} bytecode", 
-                    proto_idx, proto.constants.len(), proto.bytecode.len());
+            println!("DEBUG LOADER: Processing prototype {} - {} constants, {} bytecode, {} nested prototypes", 
+                    proto_idx, proto.constants.len(), proto.bytecode.len(), proto.prototypes.len());
             
             // Convert upvalues
             let mut vm_upvalues = Vec::with_capacity(proto.upvalues.len());
-            for upvalue in &proto.upvalues {
+            for (upval_idx, upvalue) in proto.upvalues.iter().enumerate() {
+                println!("DEBUG LOADER:   Proto {} upvalue {}: in_stack={}, index={}", 
+                         proto_idx, upval_idx, upvalue.in_stack, upvalue.index);
                 vm_upvalues.push(VMUpvalueInfo {
                     in_stack: upvalue.in_stack,
                     index: upvalue.index,
@@ -192,9 +213,9 @@ pub mod loader {
             let mut temp_constants = Vec::with_capacity(proto.constants.len());
             for (const_idx, constant) in proto.constants.iter().enumerate() {
                 match constant {
-                    CompilationConstant::FunctionProto(proto_idx) => {
+                    CompilationConstant::FunctionProto(idx) => {
                         println!("DEBUG LOADER:   Proto {} has FunctionProto const {} = proto index {}", 
-                                proto_idx, const_idx, proto_idx);
+                                proto_idx, const_idx, idx);
                         // Use Nil as placeholder for function prototypes
                         temp_constants.push(Value::Nil);
                     },
@@ -310,7 +331,9 @@ pub mod loader {
         
         // Convert upvalues
         let mut vm_upvalues = Vec::with_capacity(module.upvalues.len());
-        for upvalue in &module.upvalues {
+        for (upval_idx, upvalue) in module.upvalues.iter().enumerate() {
+            println!("DEBUG LOADER:   Main function upvalue {}: in_stack={}, index={}", 
+                     upval_idx, upvalue.in_stack, upvalue.index);
             vm_upvalues.push(VMUpvalueInfo {
                 in_stack: upvalue.in_stack,
                 index: upvalue.index,

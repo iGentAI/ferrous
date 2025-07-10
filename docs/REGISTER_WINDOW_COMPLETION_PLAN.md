@@ -1,6 +1,6 @@
 # Register Window Implementation Completion Plan
 
-This document outlines the tasks required to complete the register window implementation for the Ferrous Lua VM. This implementation will provide proper register isolation between function calls and solve the register conflict issues.
+This document outlines the tasks required to complete the register window implementation for the Ferrous Lua VM. This implementation provides proper register isolation between function calls and solves the register conflict issues.
 
 ## Core Infrastructure Tasks
 
@@ -8,11 +8,11 @@ This document outlines the tasks required to complete the register window implem
 - [x] Remove duplicate RegisterWindowSystem implementation in vm.rs
 - [x] Implement basic window access and manipulation methods
 - [x] Fix bracket matching issues in VM implementation
-- [ ] Add proper window index validation throughout the codebase
+- [x] Add proper window index validation throughout the codebase
 - [ ] Implement complete window deallocation/cleanup during error handling
 - [ ] Add window debugging and inspection tools
 - [ ] Implement window state visualization for complex debugging scenarios
-- [ ] Create comprehensive tests for window boundary conditions
+- [x] Create comprehensive tests for window boundary conditions
 
 ## Opcode Implementation Tasks
 
@@ -24,69 +24,69 @@ This document outlines the tasks required to complete the register window implem
 - [x] Implement Call opcode
 - [x] Implement Return opcode
 - [x] Implement Add opcode
-- [ ] Implement GetGlobal opcode (currently blocking)
-- [ ] Implement SetGlobal opcode
-- [ ] Implement GetUpval opcode
-- [ ] Implement SetUpval opcode
-- [ ] Implement GetTable opcode 
-- [ ] Implement SetTable opcode
-- [ ] Implement NewTable opcode
-- [ ] Implement Self_ opcode
-- [ ] Implement arithmetic opcodes (Sub, Mul, Div, Mod, Pow)
-- [ ] Implement unary opcodes (Unm, Not, Len)
-- [ ] Implement Concat opcode
-- [ ] Implement comparison opcodes (Eq, Lt, Le)
-- [ ] Implement test opcodes (Test, TestSet)
-- [ ] Implement jump opcode (Jmp)
-- [ ] Implement loop opcodes (ForPrep, ForLoop, TForLoop)
-- [ ] Implement VarArg opcode
-- [ ] Implement Close opcode
-- [ ] Implement Eval opcode
+- [x] Implement GetGlobal opcode
+- [x] Implement SetGlobal opcode
+- [x] Implement GetUpval opcode
+- [x] Implement SetUpval opcode
+- [x] Implement GetTable opcode 
+- [x] Implement SetTable opcode
+- [x] Implement NewTable opcode
+- [x] Implement Self_ opcode
+- [x] Implement arithmetic opcodes (Sub, Mul, Div, Mod, Pow)
+- [x] Implement unary opcodes (Unm, Not, Len)
+- [x] Implement Concat opcode
+- [x] Implement comparison opcodes (Eq, Lt, Le)
+- [x] Implement test opcodes (Test, TestSet)
+- [x] Implement jump opcode (Jmp)
+- [x] Implement loop opcodes (ForPrep, ForLoop, TForLoop)
+- [x] Implement VarArg opcode
+- [x] Implement Close opcode
+- [x] Implement Eval opcode
 
 ## Integration Tasks
 
-- [ ] Update process_function_call to properly handle register windows
-- [ ] Update handle_c_function_call for full compatibility with register windows
-- [ ] Modify process_metamethod_call to work with window indices
-- [ ] Ensure all VM state operations respect window boundaries
+- [x] Update process_function_call to properly handle register windows
+- [x] Update handle_c_function_call for full compatibility with register windows
+- [x] Modify process_metamethod_call to work with window indices
+- [x] Ensure all VM state operations respect window boundaries
 - [ ] Refine ExecutionContext to work with register windows
-- [ ] Integrate TForLoop with register window-aware iterator handling
-- [ ] Enhance closure creation with proper upvalue binding in windowed environment
+- [x] Integrate TForLoop with register window-aware iterator handling
+- [x] Enhance closure creation with proper upvalue binding in windowed environment
 
 ## Transaction System Enhancements
 
 - [x] Update transaction system to respect register protection
 - [ ] Implement RegisterProtectionScope RAII guards
-- [ ] Add transaction validation for window index references
-- [ ] Create window-aware transaction batching for multi-register operations
+- [x] Add transaction validation for window index references
+- [x] Create window-aware transaction batching for multi-register operations
 - [ ] Implement failure recovery for aborted window operations
-- [ ] Enhance transaction commit process to maintain window consistency
+- [x] Enhance transaction commit process to maintain window consistency
 
 ## Compiler Integration
 
-- [ ] Update the compiler's RegisterAllocator to be aware of window boundaries
-- [ ] Modify register preservation mechanisms to use window protection
-- [ ] Ensure proper handling of upvalues across window boundaries
+- [x] Update the compiler's RegisterAllocator to be aware of window boundaries
+- [x] Modify register preservation mechanisms to use window protection
+- [x] Ensure proper handling of upvalues across window boundaries
 - [ ] Add window-specific hints in generated bytecode for optimal register usage
 - [ ] Implement better debug information linking source to windowed registers
 
 ## Testing Tasks
 
-- [ ] Create minimal test script for each opcode implementation
+- [x] Create minimal test script for each opcode implementation
 - [ ] Develop stress tests for window allocation/deallocation
-- [ ] Implement deep call stack tests to verify window isolation
-- [ ] Create closure tests that capture variables across multiple windows
+- [x] Implement deep call stack tests to verify window isolation
+- [x] Create closure tests that capture variables across multiple windows
 - [ ] Add performance benchmarks comparing windowed vs. non-windowed execution
 - [ ] Test edge cases for maximum windows/registers
 - [ ] Verify correct handling of errors during window allocation
 
 ## Documentation Tasks
 
-- [ ] Document window indexing conventions and practices
+- [x] Document window indexing conventions and practices
 - [ ] Create architectural diagrams showing window relationships
 - [ ] Add window debugging guide for VM troubleshooting
-- [ ] Document window safety patterns and best practices
-- [ ] Update transaction pattern documentation for window awareness
+- [x] Document window safety patterns and best practices
+- [x] Update transaction pattern documentation for window awareness
 - [ ] Create examples of correct window usage patterns
 
 ## Optimization Tasks
@@ -99,68 +99,39 @@ This document outlines the tasks required to complete the register window implem
 - [ ] Add window usage statistics for optimization analysis
 - [ ] Create window pressure monitoring for memory optimization
 
-## Critical Implementation Details
+## Key Implementation Learnings
 
-### GetGlobal Implementation (Currently Blocking)
+### Borrow Checker Challenges and Solutions
 
-The GetGlobal opcode is currently blocking progress and requires:
-- Access to the global table through the transaction system
-- Proper string constant handling for the global name
-- Setting the result in the appropriate window register
-- Error handling for non-existent globals
+1. **Extraction Before Usage**: Always extract all data you need from the transaction as owned values *before* any further transaction operations. This avoids borrow checker conflicts.
 
-```rust
-OpCode::GetGlobal => {
-    // R(A) := Gbl[Kst(Bx)]
-    println!("DEBUG STEP: GETGLOBAL - loading global from constant {} to R({})", instruction.bx(), a);
-    
-    // Get the global table
-    let globals = tx.get_globals_table()?;
-    
-    // Get the name of the global from the constant pool
-    let bx = instruction.bx() as usize;
-    let name_value = {
-        let closure_obj = tx.get_closure(frame.closure)?;
-        if bx >= closure_obj.proto.constants.len() {
-            tx.commit()?;
-            return Err(LuaError::RuntimeError(format!(
-                "Constant index {} out of bounds", bx
-            )));
-        }
-        closure_obj.proto.constants[bx].clone()
-    };
-    
-    // Get the string handle from the constant
-    let name_handle = match name_value {
-        Value::String(handle) => handle,
-        _ => {
-            tx.commit()?;
-            return Err(LuaError::RuntimeError(format!(
-                "Expected string constant at {}, got {}", 
-                bx, name_value.type_name()
-            )));
-        }
-    };
-    
-    // Get the value from the global table
-    let value = tx.read_table_field(globals, &Value::String(name_handle))?;
-    
-    // Set the result in register A
-    self.register_windows.set_register(window_idx, a, value)?;
-    
-    StepResult::Continue
-},
-```
+2. **Phase Separation**: Use complete phase separation when implementing opcodes, ensuring that borrows don't overlap. Extract data in phase 1, then operate on it in phase 2 without holding references.
 
-### Window Index Consistency
+3. **No Self-Reference**: Avoid calling methods that borrow `self` while already holding a borrow of `self.heap` through a transaction. Instead, use standalone helper functions.
 
-Throughout all implementations, consistently follow these rules:
-- Window indices are integers starting from 0 (root window)
-- `CallFrame.base_register` stores the window index, not a memory address
-- Use register_windows.get_register(window_idx, reg) instead of direct access
-- Check window bounds before accessing registers
-- Deallocate windows when function calls return
+4. **Transaction Lifecycle**: Do not commit transactions early in opcodes unless absolutely necessary. Let the `step()` method handle the transaction lifecycle.
 
-## Conclusion
+5. **Window-Stack Sync**: Register windows and thread stacks must be kept in sync for upvalue capture. Use `sync_window_to_stack_helper()` to ensure values are properly available.
 
-Completing this register window implementation requires significant work across all layers of the VM, from the transaction system to the compiler. The tasks above represent a comprehensive plan to achieve a fully functional, robust register window system that solves the original register conflict issues while maintaining the VM's architectural principles.
+### Upvalue Implementation
+
+Proper upvalue implementation requires:
+
+1. Calculating absolute stack positions from window indices (typically `window_idx * 256 + register_idx`)
+2. Syncing window values to the thread stack before upvalue creation 
+3. Creating open upvalues that point to the thread stack position
+4. Reading values from the thread stack when accessing upvalues
+
+### Transaction Commit Management
+
+For opcodes that need early transaction commits:
+1. Handle all error paths with `tx.commit()?` before returning errors
+2. Set `should_increment_pc = false` if you've already incremented the PC
+3. Ensure all borrows of transaction-provided data are dropped before committing
+
+### Register Window Invariants
+
+1. Windows are views into the thread's stack
+2. Base register in call frames stores the window INDEX (not a memory address)
+3. Always access registers through the window system, not directly
+4. Protect registers that must not be modified during complex operations

@@ -399,6 +399,13 @@ impl HashableValue {
             _ => false
         }
     }
+    
+    /// Create a HashableValue::String from a raw Handle<LuaString>
+    pub fn from_string_handle(handle: super::arena::Handle<LuaString>) -> Self {
+        // Convert Handle<LuaString> to StringHandle first
+        let string_handle = StringHandle::from(handle);
+        HashableValue::String(string_handle)
+    }
 
     /// Try to create a hashable value from a Lua value with context for better error messages
     pub fn from_value_with_context(value: &Value, context: &str) -> LuaResult<Self> {
@@ -465,22 +472,22 @@ impl std::hash::Hash for OrderedFloat {
     }
 }
 
-/// Function prototype
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Function prototype (compiled function code)
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct FunctionProto {
     /// Bytecode instructions
     pub bytecode: Vec<u32>,
     
-    /// Constant values
+    /// Constant values used by the function
     pub constants: Vec<Value>,
     
     /// Number of parameters
     pub num_params: u8,
     
-    /// Is variadic
+    /// Whether the function is variadic
     pub is_vararg: bool,
     
-    /// Maximum stack size
+    /// Maximum stack size needed
     pub max_stack_size: u8,
     
     /// Upvalue information

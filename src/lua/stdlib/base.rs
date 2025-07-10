@@ -983,6 +983,18 @@ impl<'vm> ExecutionContext<'vm> {
     // All implementations removed - they're defined in vm.rs
 }
 
+/// Helper function to register a function in the globals table
+fn register_function(
+    tx: &mut HeapTransaction,
+    globals: TableHandle,
+    name: &str,
+    func: CFunction,
+) -> LuaResult<()> {
+    let name_handle = tx.create_string(name)?;
+    tx.set_table_field(globals, Value::String(name_handle), Value::CFunction(func))?;
+    Ok(())
+}
+
 /// Create a table with all base library functions
 pub fn create_base_lib() -> HashMap<&'static str, CFunction> {
     let mut base_lib = HashMap::new();
@@ -1021,6 +1033,44 @@ pub fn create_base_lib() -> HashMap<&'static str, CFunction> {
     base_lib.insert("pcall", lua_pcall as CFunction);
     
     base_lib
+}
+
+/// Initialize the base library
+pub fn init(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
+    println!("DEBUG: Initializing base library");
+    
+    let mut tx = HeapTransaction::new(vm.heap_mut());
+    let globals = tx.get_globals_table()?;
+    
+    println!("DEBUG: Got globals table handle: {:?}", globals);
+    
+    // Register all base functions
+    register_function(&mut tx, globals, "print", lua_print)?;
+    println!("DEBUG: Registered print function");
+    
+    register_function(&mut tx, globals, "type", lua_type)?;
+    println!("DEBUG: Registered type function");
+    
+    register_function(&mut tx, globals, "tostring", lua_tostring)?;
+    register_function(&mut tx, globals, "tonumber", lua_tonumber)?;
+    register_function(&mut tx, globals, "pairs", lua_pairs)?;
+    register_function(&mut tx, globals, "ipairs", lua_ipairs)?;
+    register_function(&mut tx, globals, "next", lua_next)?;
+    register_function(&mut tx, globals, "rawget", lua_rawget)?;
+    register_function(&mut tx, globals, "rawset", lua_rawset)?;
+    register_function(&mut tx, globals, "getmetatable", lua_getmetatable)?;
+    register_function(&mut tx, globals, "setmetatable", lua_setmetatable)?;
+    
+    // Also register _G global table pointing to itself
+    let g_key = tx.create_string("_G")?;
+    tx.set_table_field(globals, Value::String(g_key), Value::Table(globals))?;
+    println!("DEBUG: Registered _G global");
+    
+    println!("DEBUG: Committing base library transaction...");
+    tx.commit()?;
+    println!("DEBUG: Base library initialization complete");
+    
+    Ok(())
 }
 
 /// Initialize the base library in a VM

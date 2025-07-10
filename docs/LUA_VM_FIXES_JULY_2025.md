@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document details the critical fixes made to the Lua VM implementation in July 2025. These fixes resolved fundamental issues that were preventing the VM from executing even basic Lua code. Thanks to these changes, the VM is now capable of executing scripts with arithmetic operations, function definitions, function calls, basic control flow, and string concatenation.
+This document details the critical fixes made to the Lua VM implementation in July 2025. These fixes resolved fundamental issues that were preventing the VM from executing even basic Lua code. Thanks to these changes, the VM is now capable of executing scripts with arithmetic operations, function definitions, function calls, basic control flow, closures with upvalues, and string concatenation.
 
 ## 1. Bytecode Encoding Fix
 
@@ -422,8 +422,117 @@ if needs_metamethod {
 
 This ensures that simple concatenations complete immediately, while complex ones that need metamethods still use the pending operation system.
 
+## 7. Register Window Synchronization for Upvalues
+
+### Problem
+Upvalues created in closures were not correctly capturing values, resulting in nil values being read instead of the expected captured values.
+
+#### Root Cause
+The core issue was that register windows and the thread's stack were not properly synchronized. Upvalues refer to positions in the thread's stack, but our register windows system operates separately from the stack.
+
+#### Impact
+- Upvalues would read nil values instead of the expected captured values
+- State was not maintained across function calls via upvalues
+- Closures could not properly access their parent's variables
+
+#### Solution
+Implemented proper synchronization between register windows and the thread's stack:
+
+1. Created a helper function to synchronize windows to stack:
+```rust
+fn sync_window_to_stack_helper(
+    tx: &mut HeapTransaction,
+    register_windows: &RegisterWindowSystem,
+    thread: ThreadHandle,
+    window_idx: usize,
+    register_count: usize
+) -> LuaResult<()> {
+    for i in 0..register_count {
+        // Get value from window
+        let value = match register_windows.get_register(window_idx, i) {
+            Ok(v) => v.clone(),
+            Err(_) => Value::Nil,
+        };
+        
+        // Calculate stack position using inline calculation
+        let stack_position = window_idx * 256 + i;
+        
+        // Set value in stack
+        tx.set_register(thread, stack_position, value)?;
+    }
+    
+    Ok(())
+}
+```
+
+2. Called this function before creating upvalues in the Closure opcode:
+```rust
+// Sync current window to stack before creating upvalues
+sync_window_to_stack_helper(&mut tx, &self.register_windows, 
+                          self.current_thread, window_idx, max_registers)?;
+```
+
+3. Used consistent stack position calculation for upvalues:
+```rust
+// Calculate stack position for upvalue
+let stack_position = window_idx * 256 + register_idx;
+
+// Create upvalue pointing to this position
+let open_upvalue = value::Upvalue {
+    stack_index: Some(stack_position),
+    value: None,
+};
+```
+
+This ensures that upvalues correctly capture variables from parent scopes and maintain state across function calls.
+
+## 8. Closure Opcode Borrow Checker Fix
+
+### Problem
+The Closure opcode implementation suffered from multiple borrow checker issues when trying to extract data from the heap while creating new objects.
+
+#### Root Cause
+The fundamental issue was overlapping borrows when trying to:
+1. Access parent closure's data via `tx` while still holding references to it
+2. Create a new transaction before the first one was fully dropped
+3. Borrow `self` in multiple ways simultaneously
+
+#### Impact
+- Compiler errors preventing the VM from building
+- E0499 and E0502 borrow checker errors in vm.rs
+- Unable to create closures or capture upvalues
+
+#### Solution
+Implemented a completely revised Closure opcode with extreme phase separation:
+
+1. Extract data in completely separate phases with no overlapping borrows
+2. Use standalone helper functions instead of methods that borrow `self`
+3. Use inline calculations for stack positions instead of helper methods
+4. Make sure all references are fully dropped before proceeding to the next phase
+
+Key implementation pattern:
+
+```rust
+// Phase 1: Extract only the proto handle
+let proto_handle = {
+    let parent_closure = tx.get_closure(frame.closure)?;
+    // Extract and return just the handle...
+}; // parent_closure reference fully dropped here
+
+// Phase 2: Extract proto copy
+let proto_copy = tx.get_function_proto_copy(proto_handle)?;
+
+// Phase 3: Extract parent upvalues separately
+let parent_upvalues = {
+    let parent_closure = tx.get_closure(frame.closure)?;
+    parent_closure.upvalues.clone()
+}; // parent_closure reference fully dropped again
+```
+
+This pattern of extreme phase separation is key to avoiding borrow checker issues in complex operations.
+
 ## Conclusion
 
-These fixes have resolved the critical blocking issues that were preventing the Lua VM from executing even moderately complex scripts. The implementation now correctly handles core language features including arithmetic operations, functions, control flow, and concatenation operations with nested expressions. 
+These fixes have addressed the critical issues that were preventing the Lua VM from executing proper script code. The implementation now correctly handles arithmetic operations, function calls, global variable access, upvalues, and closures. The register window system provides proper isolation between function calls while still allowing upvalue capture.
 
-With these architectural fixes in place, the focus can now shift to completing the standard library, improving error handling, implementing garbage collection, and eventually integrating with Redis. There are still placeholder implementations throughout the codebase that will need to be addressed, but the core VM architecture is now sound.
+By applying these patterns consistently to remaining areas of the codebase, we can complete the VM implementation while maintaining compatibility with Rust's ownership rules.

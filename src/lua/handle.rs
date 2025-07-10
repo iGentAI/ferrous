@@ -43,6 +43,48 @@ typed_handle!(UpvalueHandle, Upvalue);
 typed_handle!(UserDataHandle, UserData);
 typed_handle!(FunctionProtoHandle, FunctionProto);
 
+impl From<StringHandle> for Handle<LuaString> {
+    fn from(handle: StringHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<TableHandle> for Handle<Table> {
+    fn from(handle: TableHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<ClosureHandle> for Handle<Closure> {
+    fn from(handle: ClosureHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<ThreadHandle> for Handle<Thread> {
+    fn from(handle: ThreadHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<UpvalueHandle> for Handle<Upvalue> {
+    fn from(handle: UpvalueHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<UserDataHandle> for Handle<UserData> {
+    fn from(handle: UserDataHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<FunctionProtoHandle> for Handle<FunctionProto> {
+    fn from(handle: FunctionProtoHandle) -> Self {
+        handle.0
+    }
+}
+
 /// Resource trait for objects that can be stored in the heap
 pub trait Resource: Sized {
     /// The typed handle type for this resource

@@ -506,6 +506,27 @@ impl CodeGenerator {
         }
     }
     
+    /// Create a parent context for a child generator
+    /// This captures the necessary state for upvalue resolution without cloning
+    fn create_parent_context(&self) -> CodeGenerator {
+        // Create a new generator with just the necessary state for upvalue resolution
+        let mut parent = CodeGenerator::new();
+        
+        // Copy variables (we need a snapshot, modifications will happen in the original)
+        parent.variables = self.variables.clone();
+        
+        // Copy upvalues for recursive upvalue resolution
+        parent.upvalues = self.upvalues.clone();
+        
+        // Copy the parent reference for multi-level upvalue resolution
+        if let Some(ref grandparent) = self.parent {
+            // Recursively create parent contexts
+            parent.parent = Some(Box::new(grandparent.create_parent_context()));
+        }
+        
+        parent
+    }
+    
     /// Create a child code generator for a nested function
     pub fn child(&self) -> Self {
         CodeGenerator {
@@ -691,16 +712,23 @@ impl CodeGenerator {
     
     /// Find or create an upvalue
     fn find_or_create_upvalue(&mut self, name: &str) -> Option<usize> {
+        println!("DEBUG: find_or_create_upvalue - Looking for upvalue '{}'", name);
+        
         // First, check if we already have this upvalue
         for (i, upvalue) in self.upvalues.iter().enumerate() {
             if upvalue.name == name {
+                println!("DEBUG: find_or_create_upvalue - Found existing upvalue '{}' at index {}", name, i);
                 return Some(i);
             }
         }
         
         // If this is a local variable in a parent function, create an upvalue
         if let Some(ref mut parent) = self.parent {
+            println!("DEBUG: find_or_create_upvalue - Checking parent for variable '{}'", name);
+            
             if let Some(var) = parent.variables.get_mut(name) {
+                println!("DEBUG: find_or_create_upvalue - Found '{}' in parent at register {}", name, var.register);
+                
                 // Mark the variable as captured
                 var.captured = true;
                 
@@ -711,20 +739,32 @@ impl CodeGenerator {
                     index: var.register as u8,
                 });
                 
-                return Some(self.upvalues.len() - 1);
+                let idx = self.upvalues.len() - 1;
+                println!("DEBUG: find_or_create_upvalue - Created upvalue '{}' at index {} (in_stack=true, register={})", 
+                         name, idx, var.register);
+                
+                return Some(idx);
             }
             
             // If it's an upvalue in the parent, create an upvalue reference
             if let Some(upvalue_idx) = parent.find_or_create_upvalue(name) {
+                println!("DEBUG: find_or_create_upvalue - Found '{}' as upvalue in parent at index {}", name, upvalue_idx);
+                
                 self.upvalues.push(CompilationUpvalue {
                     name: name.to_string(),
                     in_stack: false,
                     index: upvalue_idx as u8,
                 });
                 
-                return Some(self.upvalues.len() - 1);
+                let idx = self.upvalues.len() - 1;
+                println!("DEBUG: find_or_create_upvalue - Created upvalue '{}' at index {} (in_stack=false, upvalue_index={})", 
+                         name, idx, upvalue_idx);
+                
+                return Some(idx);
             }
         }
+        
+        println!("DEBUG: find_or_create_upvalue - Variable '{}' not found as upvalue", name);
         
         // Not found
         None
@@ -2107,11 +2147,16 @@ impl CodeGenerator {
         is_vararg: bool,
         body: &Block,
     ) -> LuaResult<CompiledFunction> {
+        println!("DEBUG: compile_function - Creating child generator for nested function");
+        
         // Create a child generator
         let mut child = self.child();
         
-        // Set parent reference
-        child.parent = Some(Box::new(CodeGenerator::new()));
+        // Set parent reference using the new method
+        child.parent = Some(Box::new(self.create_parent_context()));
+        
+        println!("DEBUG: compile_function - Parent context set with {} variables", 
+                 self.variables.len());
         
         // Declare parameters
         for param in params {
@@ -2124,6 +2169,20 @@ impl CodeGenerator {
         // Add final return if not present
         if !child.has_return() {
             child.emit(Self::encode_ABC(OpCode::Return, 0, 1, 0));
+        }
+        
+        println!("DEBUG: compile_function - Child function compiled with {} upvalues", 
+                 child.upvalues.len());
+        
+        // After compilation, we need to update our variables to mark captured ones
+        for upvalue in &child.upvalues {
+            if upvalue.in_stack {
+                // This upvalue refers to a local variable in this scope
+                if let Some(var) = self.variables.get_mut(&upvalue.name) {
+                    println!("DEBUG: compile_function - Marking variable '{}' as captured", upvalue.name);
+                    var.captured = true;
+                }
+            }
         }
         
         Ok(CompiledFunction {

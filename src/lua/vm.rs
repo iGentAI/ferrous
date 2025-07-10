@@ -7,6 +7,7 @@ use super::error::{LuaError, LuaResult};
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle, FunctionProtoHandle};
 use super::heap::LuaHeap;
 use super::transaction::HeapTransaction;
+use super::value;
 use crate::lua::value::{Value, CallFrame, Closure, CFunction, FunctionProto, HashableValue};
 use crate::storage::StorageEngine;
 use std::collections::{HashMap, VecDeque};
@@ -387,6 +388,13 @@ pub enum PendingOperation {
     /// Function call
     FunctionCall {
         closure: ClosureHandle,
+        args: Vec<Value>,
+        context: ReturnContext,
+    },
+    
+    /// C function call
+    CFunctionCall {
+        function: CFunction,
         args: Vec<Value>,
         context: ReturnContext,
     },
@@ -911,6 +919,44 @@ impl<'vm> ExecutionContext<'vm> {
     }
 }
 
+/// Sync register window values to thread stack
+/// This ensures upvalues can properly capture values
+fn sync_window_to_stack_helper(
+    tx: &mut HeapTransaction,
+    register_windows: &RegisterWindowSystem,
+    thread: ThreadHandle,
+    window_idx: usize,
+    register_count: usize
+) -> LuaResult<()> {
+    println!("DEBUG: Syncing window {} to thread stack ({} registers)", window_idx, register_count);
+    
+    for i in 0..register_count {
+        // Get value from window
+        let value = match register_windows.get_register(window_idx, i) {
+            Ok(v) => v.clone(),
+            Err(_) => Value::Nil, // Register doesn't exist
+        };
+        
+        // Calculate stack position using inline calculation
+        // Simple calculation: each window gets up to 256 slots
+        let stack_position = window_idx * 256 + i;
+        
+        // Ensure stack is large enough
+        let stack_size = tx.get_stack_size(thread)?;
+        if stack_position >= stack_size {
+            // Extend stack with nils
+            for _ in stack_size..=stack_position {
+                tx.push_stack(thread, Value::Nil)?;
+            }
+        }
+        
+        // Set value in stack
+        tx.set_register(thread, stack_position, value)?;
+    }
+    
+    Ok(())
+}
+
 /// Main Lua Virtual Machine
 pub struct LuaVM {
     /// Lua heap
@@ -951,6 +997,105 @@ impl LuaVM {
     /// Get mutable access to the heap for transaction creation
     pub fn heap_mut(&mut self) -> &mut LuaHeap {
         &mut self.heap
+    }
+    
+    /// Debug method to check if a global exists and return its value
+    pub fn debug_get_global(&mut self, name: &str) -> LuaResult<(bool, Value)> {
+        // Phase 1: Collect all the data we need
+        let (globals_handle, key_handle, value, array_len, map_len, string_handles) = {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            // Get the globals table
+            let globals = tx.get_globals_table()?;
+            println!("DEBUG: debug_get_global - globals table handle: {:?}", globals);
+            
+            // Create string key
+            let key_handle = tx.create_string(name)?;
+            let key = Value::String(key_handle);
+            
+            // Look up the value
+            let value = tx.read_table_field(globals, &key)?;
+            let exists = !value.is_nil();
+            
+            println!("DEBUG: debug_get_global - looking up '{}': exists={}, value={:?}", 
+                     name, exists, value);
+            
+            // Get table stats and collect string handles
+            let table_obj = tx.get_table(globals)?;
+            let array_len = table_obj.array.len();
+            let map_len = table_obj.map.len();
+            
+            // Collect string handles from the map
+            let mut handles = Vec::new();
+            for (k, v) in &table_obj.map {
+                if let HashableValue::String(s) = k {
+                    handles.push((*s, v.clone()));
+                }
+            }
+            
+            // Commit and return collected data
+            tx.commit()?;
+            (globals, key_handle, value, array_len, map_len, handles)
+        };
+        
+        println!("DEBUG: Globals table stats - array_len={}, map_len={}", array_len, map_len);
+        
+        // Phase 2: Process the string handles in a new transaction
+        if !string_handles.is_empty() {
+            println!("DEBUG: All globals:");
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            for (s, v) in string_handles {
+                let str_val = tx.get_string_value(StringHandle::from(s))?;
+                println!("  '{}' -> {:?} ({})", str_val, v, v.type_name());
+            }
+            
+            tx.commit()?;
+        }
+        
+        let exists = !value.is_nil();
+        Ok((exists, value))
+    }
+    
+    /// Debug method to list all globals
+    pub fn debug_list_globals(&mut self) -> LuaResult<Vec<String>> {
+        // Phase 1: Collect all string handles
+        let string_handles = {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            // Get the globals table
+            let globals = tx.get_globals_table()?;
+            
+            // Get the table object and collect handles
+            let table_obj = tx.get_table(globals)?;
+            let mut handles = Vec::new();
+            
+            for (k, _v) in &table_obj.map {
+                if let HashableValue::String(s) = k {
+                    handles.push(*s);
+                }
+            }
+            
+            // Commit and return handles
+            tx.commit()?;
+            handles
+        };
+        
+        // Phase 2: Convert handles to strings in a new transaction
+        let mut global_names = Vec::new();
+        
+        if !string_handles.is_empty() {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            for s in string_handles {
+                let str_val = tx.get_string_value(StringHandle::from(s))?;
+                global_names.push(str_val);
+            }
+            
+            tx.commit()?;
+        }
+        
+        Ok(global_names)
     }
 
     /// Load a function prototype into the heap
@@ -996,77 +1141,7 @@ impl LuaVM {
     
 
     
-    /// Handle C function call for TForLoop following the pattern from handle_c_function_call
-    fn handle_tforloop_c_function(
-        &mut self,
-        func: CFunction,
-        args: Vec<Value>,
-        base_register: u16,
-        a: usize,
-        c: usize,
-        original_pc: usize,
-        sbx: i32,
-        thread_handle: ThreadHandle,
-    ) -> LuaResult<StepResult> {
-        // TForLoop registers:
-        // R(A) = iterator function
-        // R(A+1) = state
-        // R(A+2) = control
-        // R(A+3)...R(A+3+C-1) = loop variables
-        
-        // Stack base is where the arguments start (R(A+1))
-        let stack_base = base_register as usize + a + 1;
-        
-        // Create execution context
-        let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
-        
-        // Call C function
-        let result_count = match func(&mut ctx) {
-            Ok(count) => count as usize,
-            Err(e) => return Err(e),
-        };
-        
-        // Process results with a new transaction
-        let mut tx = HeapTransaction::new(&mut self.heap);
-        
-        // Results are placed at stack_base, stack_base+1, etc.
-        // First result is where we placed state (R(A+1))
-        let result_start = stack_base;
-        
-        // Check if first result is nil (end of iteration)
-        let first_result = if result_count > 0 {
-            tx.read_register(thread_handle, result_start)?
-        } else {
-            Value::Nil
-        };
-        
-        if !first_result.is_nil() {
-            // Loop continues
-            
-            // Update control variable (R(A+2)) with first result
-            tx.set_register(thread_handle, base_register as usize + a + 2, first_result.clone())?;
-            
-            // Move results to loop variables (R(A+3)...R(A+3+C-1))
-            for i in 0..c {
-                let value = if i < result_count {
-                    tx.read_register(thread_handle, result_start + i)?
-                } else {
-                    Value::Nil
-                };
-                
-                tx.set_register(thread_handle, base_register as usize + a + 3 + i, value)?;
-            }
-            
-            // In Lua 5.1, we don't modify the PC further if iteration continues
-            // The next instruction (usually a JMP) will be executed normally
-        } else {
-            // Loop is done - skip the next instruction (usually a JMP back)
-            tx.increment_pc(thread_handle)?;
-        }
-        
-        tx.commit()?;
-        Ok(StepResult::Continue)
-    }
+
     
     /// Example method showing proper handle validation with ValidScope
     /// This demonstrates the recommended pattern for operations on multiple handles
@@ -1292,6 +1367,9 @@ impl LuaVM {
         let b = instruction.b() as usize;
         let c = instruction.c() as usize;
         
+        println!("DEBUG VM STEP: PC={}, Opcode={:?}, A={}, B={}, C={}", 
+                 frame.pc, opcode, a, b, c);
+        
         // Default: increment PC unless instruction handles it
         let mut should_increment_pc = true;
         
@@ -1367,66 +1445,113 @@ impl LuaVM {
             
             OpCode::Closure => {
                 // R(A) := closure(KPROTO[Bx])
-                println!("DEBUG STEP: CLOSURE - creating closure from proto {} in R({})", instruction.bx(), a);
-                
-                // Get the function prototype
+                // This creates a new closure from a function prototype stored in constants
                 let bx = instruction.bx() as usize;
+                
+                // Sync current window to stack before creating upvalues
+                // This ensures upvalues can capture the correct values
+                let max_registers = 256; // Sync a reasonable number of registers
+                sync_window_to_stack_helper(&mut tx, &self.register_windows, self.current_thread, window_idx, max_registers)?;
+                
+                // Phase 1: Extract ONLY the FunctionProto handle from parent closure
                 let proto_handle = {
-                    let closure_obj = tx.get_closure(frame.closure)?;
-                    if bx >= closure_obj.proto.constants.len() {
-                        tx.commit()?;
+                    // Get parent closure object
+                    let parent_closure = tx.get_closure(frame.closure)?;
+                    
+                    // Validate constant index
+                    if bx >= parent_closure.proto.constants.len() {
                         return Err(LuaError::RuntimeError(format!(
-                            "Function prototype index {} out of bounds", bx
+                            "Function prototype index {} out of bounds (constants len: {})", 
+                            bx, parent_closure.proto.constants.len()
                         )));
                     }
                     
-                    // Get the constant
-                    match &closure_obj.proto.constants[bx] {
-                        Value::FunctionProto(handle) => *handle,
-                        _ => {
+                    // Extract proto handle from constant
+                    match &parent_closure.proto.constants[bx] {
+                        Value::FunctionProto(proto_handle) => Ok(*proto_handle),
+                        other => Err(LuaError::RuntimeError(format!(
+                            "Expected function prototype at constant {}, got {:?}", 
+                            bx, other.type_name()
+                        )))
+                    }?
+                }; // Drop ALL references to parent_closure here
+                
+                // Phase 2: Clone the prototype in a separate step
+                let proto_copy = tx.get_function_proto_copy(proto_handle)?;
+                
+                // Phase 3: Extract parent upvalues in a separate step
+                let parent_upvalues = {
+                    let parent_closure = tx.get_closure(frame.closure)?;
+                    parent_closure.upvalues.clone()
+                }; // Drop reference to parent_closure
+                
+                println!("DEBUG CLOSURE: Creating closure with {} upvalues in window {}", 
+                         proto_copy.upvalues.len(), window_idx);
+                
+                // Phase 4: Validate upvalue references
+                for upval_info in &proto_copy.upvalues {
+                    if !upval_info.in_stack {
+                        let idx = upval_info.index as usize;
+                        if idx >= parent_upvalues.len() {
+                            // Always commit transaction before returning error
                             tx.commit()?;
                             return Err(LuaError::RuntimeError(format!(
-                                "Expected function prototype at constant {}", bx
+                                "Invalid parent upvalue index {} (parent has {} upvalues)",
+                                idx, parent_upvalues.len()
                             )));
                         }
                     }
-                };
-                
-                // Create upvalues for the closure
-                let proto = tx.get_function_proto_copy(proto_handle)?;
-                let mut upvalues = Vec::with_capacity(proto.upvalues.len());
-
-                // Process upvalues
-                for upvalue_info in &proto.upvalues {
-                    let upvalue_handle = if upvalue_info.in_stack {
-                        // Create upvalues for local variables in the stack
-                        tx.find_or_create_upvalue(self.current_thread, frame_base + upvalue_info.index as usize)?
-                    } else {
-                        // Copy upvalue from parent closure
-                        let parent_closure = tx.get_closure(frame.closure)?;
-                        if upvalue_info.index as usize >= parent_closure.upvalues.len() {
-                            tx.commit()?;
-                            return Err(LuaError::RuntimeError(format!(
-                                "Upvalue index {} out of bounds", upvalue_info.index
-                            )));
-                        }
-                        parent_closure.upvalues[upvalue_info.index as usize]
-                    };
-                    
-                    upvalues.push(upvalue_handle);
                 }
                 
-                // Create the new closure
-                let closure = Closure {
-                    proto,
-                    upvalues,
+                // Phase 5: Create upvalues
+                let mut new_upvalues = Vec::with_capacity(proto_copy.upvalues.len());
+                
+                for (i, upval_info) in proto_copy.upvalues.iter().enumerate() {
+                    let upvalue_handle = if upval_info.in_stack {
+                        // Create new open upvalue pointing to stack
+                        // The upval_info.index is the register index in the current frame
+                        let register_idx = upval_info.index as usize;
+                        
+                        // Calculate stack position using inline calculation  
+                        // Simple calculation: each window gets up to 256 slots
+                        let stack_position = window_idx * 256 + register_idx;
+                        
+                        println!("DEBUG CLOSURE: Upvalue {} captures register {} (stack position {})",
+                                 i, register_idx, stack_position);
+                        
+                        // Verify the value is there
+                        let captured_value = tx.read_register(self.current_thread, stack_position)?;
+                        println!("DEBUG CLOSURE: Captured value: {:?}", captured_value);
+                        
+                        let open_upvalue = value::Upvalue {
+                            stack_index: Some(stack_position),
+                            value: None,
+                        };
+                        tx.create_upvalue(open_upvalue)?
+                    } else {
+                        // Use parent's upvalue (already validated)
+                        let parent_idx = upval_info.index as usize;
+                        parent_upvalues[parent_idx]
+                    };
+                    
+                    new_upvalues.push(upvalue_handle);
+                }
+                
+                // Phase 6: Create the closure with our complete owned data
+                let new_closure = Closure {
+                    proto: proto_copy,
+                    upvalues: new_upvalues,
                 };
                 
-                let closure_handle = tx.create_closure(closure)?;
+                let closure_handle = tx.create_closure(new_closure)?;
                 
-                // Set in register
-                self.register_windows.set_register(window_idx, a, Value::Closure(closure_handle))?;
+                // Phase 7: Create the result value
+                let result_value = Value::Closure(closure_handle);
                 
+                // Phase 8: Update register window
+                self.register_windows.set_register(window_idx, a, result_value)?;
+                
+                // The transaction will be committed by step() after incrementing the PC
                 StepResult::Continue
             },
             
@@ -1436,9 +1561,6 @@ impl LuaVM {
                 
                 // Get function object from register window
                 let func = self.register_windows.get_register(window_idx, a)?.clone();
-                
-                // Protect the function register during argument evaluation
-                self.register_windows.protect_register(window_idx, a)?;
                 
                 // Calculate argument count
                 let arg_count;
@@ -1476,6 +1598,11 @@ impl LuaVM {
                 // Process based on function type
                 match func {
                     Value::Closure(closure) => {
+                        // Unprotect registers in the current window since we're leaving it
+                        // and will need to write to it when the function returns
+                        let _ = self.register_windows.unprotect_all(window_idx);
+                        println!("DEBUG STEP: CALL - unprotected all registers in current window {}", window_idx);
+                        
                         // Queue function call for later execution
                         tx.queue_operation(PendingOperation::FunctionCall {
                             closure,
@@ -1489,17 +1616,148 @@ impl LuaVM {
                         StepResult::Continue
                     },
                     Value::CFunction(cfunc) => {
-                        // For C functions, we need to set up and call directly
+                        // NOTE: C functions are queued as pending operations to maintain
+                        // the non-recursive state machine architecture. This ensures:
+                        // 1. No direct recursion into C code from the VM execution loop
+                        // 2. Proper state persistence across C function calls
+                        // 3. Consistent handling of all function types through pending operations
+                        
+                        // Unprotect the current window's registers
+                        let _ = self.register_windows.unprotect_all(window_idx);
+                        println!("DEBUG STEP: CALL - unprotected all registers in current window {}", window_idx);
+                        
+                        // Queue the C function call as a pending operation
+                        tx.queue_operation(PendingOperation::CFunctionCall {
+                            function: cfunc,
+                            args,
+                            context: ReturnContext::Register {
+                                base: frame.base_register,
+                                offset: a,
+                            },
+                        })?;
+                        
+                        println!("DEBUG STEP: CALL - queued C function call as pending operation");
+                        
+                        StepResult::Continue
+                    },
+                    _ => {
+                        // Not a function - return error
+                        tx.commit()?;
+                        return Err(LuaError::TypeError { 
+                            expected: "function".to_string(), 
+                            got: func.type_name().to_string(),
+                        });
+                    },
+                }
+            },
+            
+            OpCode::TailCall => {
+                // return R(A)(R(A+1), ..., R(A+B-1))
+                println!("DEBUG STEP: TAILCALL - function in R({}), {} args", a, b);
+                
+                // Extract all needed data before any mutable operations
+                let call_depth = Self::get_call_depth_with_tx(&mut tx, self.current_thread)?;
+                let caller_context = if call_depth > 1 {
+                    self.return_contexts.get(&(call_depth - 1)).cloned().unwrap_or(ReturnContext::FinalResult)
+                } else {
+                    ReturnContext::FinalResult
+                };
+                
+                // Get function object from register window
+                let func = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                // Calculate argument count
+                let arg_count = if b == 0 {
+                    // All values from R(A+1) to top
+                    let max_args = 10; // Reasonable limit for safety
+                    let mut count = 0;
+                    for i in 1..max_args {
+                        if let Ok(val) = self.register_windows.get_register(window_idx, a + i) {
+                            if !val.is_nil() {
+                                count += 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    count
+                } else {
+                    b - 1
+                };
+                
+                // Gather arguments from register window
+                let mut args = Vec::with_capacity(arg_count);
+                for i in 0..arg_count {
+                    match self.register_windows.get_register(window_idx, a + 1 + i) {
+                        Ok(value) => args.push(value.clone()),
+                        Err(_) => args.push(Value::Nil),
+                    }
+                }
+                
+                // Extract thread handle before any borrows
+                let thread_handle = self.current_thread;
+                
+                // For tail calls, we need to pop the current frame first
+                tx.pop_call_frame(thread_handle)?;
+                
+                // Don't increment PC - we're replacing the current frame
+                should_increment_pc = false;
+                
+                // Process based on function type
+                match func {
+                    Value::Closure(closure) => {
+                        println!("DEBUG STEP: TAILCALL - Lua closure, reusing window");
+                        
+                        // For tail calls, we can potentially reuse the current window
+                        // But first check if the new function needs more space
+                        let closure_obj = tx.get_closure(closure)?;
+                        let needed_size = closure_obj.proto.max_stack_size as usize;
+                        
+                        // Commit transaction before window operations
                         tx.commit()?;
                         
-                        // Call C function with proper context
-                        return self.handle_c_function_call_with_windows(
-                            cfunc,
+                        // Deallocate current window and allocate a new one
+                        // (This is safer than trying to resize/reuse)
+                        self.register_windows.deallocate_window()?;
+                        
+                        // Create a new transaction for queuing the operation
+                        let mut tx2 = HeapTransaction::new(&mut self.heap);
+                        
+                        // Queue function call with the caller's context
+                        tx2.queue_operation(PendingOperation::FunctionCall {
+                            closure,
                             args,
-                            window_idx,
-                            a,
-                            self.current_thread
-                        );
+                            context: caller_context,
+                        })?;
+                        
+                        tx2.commit()?;
+                        
+                        return Ok(StepResult::Continue);
+                    },
+                    Value::CFunction(cfunc) => {
+                        println!("DEBUG STEP: TAILCALL - C function");
+                        
+                        // Commit the current transaction first
+                        tx.commit()?;
+                        
+                        // Deallocate current window since we're replacing the frame
+                        self.register_windows.deallocate_window()?;
+                        
+                        // Create a new transaction for queuing the operation
+                        let mut tx2 = HeapTransaction::new(&mut self.heap);
+                        
+                        // Queue C function call with the caller's context
+                        tx2.queue_operation(PendingOperation::CFunctionCall {
+                            function: cfunc,
+                            args,
+                            context: caller_context,
+                        })?;
+                        
+                        tx2.commit()?;
+                        
+                        return Ok(StepResult::Continue);
                     },
                     _ => {
                         // Not a function - return error
@@ -1549,6 +1807,20 @@ impl LuaVM {
                 
                 println!("DEBUG STEP: Returning {} values", values.len());
                 
+                // Find the parent window if any (to unprotect its registers)
+                if let Some(parent_window) = {
+                    if window_idx > 0 {
+                        Some(window_idx - 1)
+                    } else {
+                        None
+                    }
+                } {
+                    // Unprotect all registers in the parent window to ensure we
+                    // can write to them after the function returns
+                    let _ = self.register_windows.unprotect_all(parent_window);
+                    println!("DEBUG STEP: Unprotected all registers in parent window {}", parent_window);
+                }
+                
                 // IMPORTANT: Deallocate the register window for this function call
                 self.register_windows.deallocate_window()?;
                 
@@ -1574,10 +1846,11 @@ impl LuaVM {
                 // Get the table from register B
                 let table = self.register_windows.get_register(window_idx, b)?.clone();
                 
-                // Get the key from register C or constant
+                // Get the key from register C or constant using RK(C) pattern
                 let key = if c & 0x100 != 0 {
-                    // Key is a constant
+                    // C >= 256, key is a constant at index (C & 0xFF)
                     let constant_idx = c & 0xFF;
+                    println!("DEBUG STEP: GETTABLE - key from constant index {}", constant_idx);
                     let closure_obj = tx.get_closure(frame.closure)?;
                     closure_obj.proto.constants.get(constant_idx as usize)
                         .cloned()
@@ -1585,26 +1858,118 @@ impl LuaVM {
                             "Constant index {} out of bounds", constant_idx
                         )))?
                 } else {
-                    // Key is a register
+                    // C < 256, key is in register C
+                    println!("DEBUG STEP: GETTABLE - key from register R({})", c);
                     self.register_windows.get_register(window_idx, c)?.clone()
                 };
                 
-                // Table access
-                match table {
+                println!("DEBUG STEP: GETTABLE - table in R({}), key: {:?}, result to R({})", 
+                         b, key, a);
+                
+                // Handle table access based on value type
+                match &table {
                     Value::Table(table_handle) => {
-                        // Create a transaction to read the table field
-                        let value = tx.read_table_field(table_handle, &key)?;
+                        // Direct table access
+                        let value = tx.read_table_field(*table_handle, &key)?;
                         
-                        // Set the result in register A
-                        self.register_windows.set_register(window_idx, a, value)?;
+                        // Check if we got nil (key not found)
+                        if value.is_nil() {
+                            // Check for __index metamethod
+                            let metatable_opt = tx.get_table_metatable(*table_handle)?;
+                            
+                            if let Some(metatable) = metatable_opt {
+                                // Look for __index in metatable
+                                let index_key = tx.create_string("__index")?;
+                                let index_mm = tx.read_table_field(metatable, &Value::String(index_key))?;
+                                
+                                if !index_mm.is_nil() {
+                                    println!("DEBUG STEP: GETTABLE - found __index metamethod");
+                                    
+                                    // Check if __index is a function or a table
+                                    match &index_mm {
+                                        Value::Closure(_) | Value::CFunction(_) => {
+                                            // __index is a function, queue metamethod call
+                                            let method_name = tx.create_string("__index")?;
+                                            tx.queue_operation(PendingOperation::MetamethodCall {
+                                                method: method_name,
+                                                target: table.clone(),
+                                                args: vec![table.clone(), key],
+                                                context: ReturnContext::Register {
+                                                    base: frame.base_register,
+                                                    offset: a,
+                                                },
+                                            })?;
+                                            
+                                            println!("DEBUG STEP: GETTABLE - queued __index metamethod call");
+                                            
+                                            // Don't set result yet - metamethod will handle it
+                                            tx.commit()?;
+                                            return Ok(StepResult::Continue);
+                                        },
+                                        Value::Table(index_table) => {
+                                            // __index is a table, look up the key in it
+                                            println!("DEBUG STEP: GETTABLE - __index is a table, looking up key");
+                                            let indexed_value = tx.read_table_field(*index_table, &key)?;
+                                            
+                                            // Set the result
+                                            self.register_windows.set_register(window_idx, a, indexed_value)?;
+                                        },
+                                        _ => {
+                                            // __index is neither function nor table, use nil
+                                            println!("DEBUG STEP: GETTABLE - __index is not function or table, using nil");
+                                            self.register_windows.set_register(window_idx, a, Value::Nil)?;
+                                        }
+                                    }
+                                } else {
+                                    // No __index metamethod, result is nil
+                                    println!("DEBUG STEP: GETTABLE - no __index metamethod, result is nil");
+                                    self.register_windows.set_register(window_idx, a, Value::Nil)?;
+                                }
+                            } else {
+                                // No metatable, result is nil
+                                println!("DEBUG STEP: GETTABLE - no metatable, result is nil");
+                                self.register_windows.set_register(window_idx, a, Value::Nil)?;
+                            }
+                        } else {
+                            // Found value in table
+                            println!("DEBUG STEP: GETTABLE - found value: {:?}", value);
+                            self.register_windows.set_register(window_idx, a, value)?;
+                        }
                     },
                     _ => {
-                        // Not a table - try metamethods
-                        tx.commit()?;
-                        return Err(LuaError::TypeError {
-                            expected: "table".to_string(),
-                            got: table.type_name().to_string(),
-                        });
+                        // Not a table - check for __index metamethod
+                        println!("DEBUG STEP: GETTABLE - not a table, checking for __index metamethod");
+                        
+                        // Check for metamethod using the metamethod resolution system
+                        if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
+                            &mut tx, &table, crate::lua::metamethod::MetamethodType::Index
+                        )? {
+                            println!("DEBUG STEP: GETTABLE - found __index metamethod on non-table");
+                            
+                            // Queue metamethod call
+                            let method_name = tx.create_string("__index")?;
+                            tx.queue_operation(PendingOperation::MetamethodCall {
+                                method: method_name,
+                                target: table.clone(),
+                                args: vec![table, key],
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Don't set result yet - metamethod will handle it
+                            tx.commit()?;
+                            return Ok(StepResult::Continue);
+                        } else {
+                            // No __index metamethod for non-table value
+                            println!("DEBUG STEP: GETTABLE - no __index metamethod for non-table");
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "table or value with __index metamethod".to_string(),
+                                got: table.type_name().to_string(),
+                            });
+                        }
                     }
                 }
                 
@@ -1664,6 +2029,151 @@ impl LuaVM {
                 
                 StepResult::Continue
             },
+            
+            OpCode::NewTable => {
+                // R(A) := {} (size = B,C)
+                // B and C are array/hash size hints (log2 encoded)
+                println!("DEBUG STEP: NEWTABLE - creating table in R({}), array_hint={}, hash_hint={}", a, b, c);
+                
+                // Create a new table
+                // Note: B and C are size hints where actual_size = 2^hint
+                // For now, we ignore these hints as our create_table doesn't support pre-allocation
+                let table_handle = tx.create_table()?;
+                
+                // Store the table in register A using the window system
+                self.register_windows.set_register(window_idx, a, Value::Table(table_handle))?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::Self_ => {
+                // R(A+1) := R(B); R(A) := R(B)[RK(C)]
+                // This prepares for a method call by:
+                // 1. Copying the table (object) from R(B) to R(A+1) - this becomes 'self'
+                // 2. Looking up the method RK(C) in the table and storing it in R(A)
+                
+                println!("DEBUG STEP: SELF - table in R({}), method key RK({}), to R({}) and R({})", 
+                         b, c, a, a + 1);
+                
+                // Get the table from register B
+                let table = self.register_windows.get_register(window_idx, b)?.clone();
+                println!("DEBUG STEP: SELF - got table: {:?} (type: {})", table, table.type_name());
+                
+                // Copy the table to R(A+1) first (this becomes the 'self' parameter)
+                self.register_windows.set_register(window_idx, a + 1, table.clone())?;
+                println!("DEBUG STEP: SELF - copied table to R({})", a + 1);
+                
+                // Get the key from RK(C) - either register or constant
+                let key = if c & 0x100 != 0 {
+                    // C >= 256, key is a constant at index (C & 0xFF)
+                    let constant_idx = c & 0xFF;
+                    println!("DEBUG STEP: SELF - key from constant index {}", constant_idx);
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // C < 256, key is in register C
+                    println!("DEBUG STEP: SELF - key from register R({})", c);
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: SELF - looking up key: {:?}", key);
+                
+                // Now look up the method in the table
+                match &table {
+                    Value::Table(table_handle) => {
+                        // Direct table access
+                        let method = tx.read_table_field(*table_handle, &key)?;
+                        
+                        // Check if we got nil (key not found)
+                        if method.is_nil() {
+                            println!("DEBUG STEP: SELF - key not found in table, checking for __index");
+                            
+                            // Check for __index metamethod
+                            let metatable_opt = tx.get_table_metatable(*table_handle)?;
+                            
+                            if let Some(metatable) = metatable_opt {
+                                // Look for __index in metatable
+                                let index_key = tx.create_string("__index")?;
+                                let index_mm = tx.read_table_field(metatable, &Value::String(index_key))?;
+                                
+                                if !index_mm.is_nil() {
+                                    println!("DEBUG STEP: SELF - found __index metamethod");
+                                    
+                                    // Check if __index is a function or a table
+                                    match &index_mm {
+                                        Value::Closure(_) | Value::CFunction(_) => {
+                                            // __index is a function, queue metamethod call
+                                            println!("DEBUG STEP: SELF - __index is a function, queuing metamethod call");
+                                            
+                                            let method_name = tx.create_string("__index")?;
+                                            tx.queue_operation(PendingOperation::MetamethodCall {
+                                                method: method_name,
+                                                target: table.clone(),
+                                                args: vec![table.clone(), key],
+                                                context: ReturnContext::Register {
+                                                    base: frame.base_register,
+                                                    offset: a,
+                                                },
+                                            })?;
+                                            
+                                            // Don't set result yet - metamethod will handle it
+                                            tx.commit()?;
+                                            return Ok(StepResult::Continue);
+                                        },
+                                        Value::Table(index_table) => {
+                                            // __index is a table, look up the key in it
+                                            println!("DEBUG STEP: SELF - __index is a table, looking up key");
+                                            let indexed_method = tx.read_table_field(*index_table, &key)?;
+                                            
+                                            // Print debug info before moving the value
+                                            println!("DEBUG STEP: SELF - found method via __index table: {:?}", indexed_method);
+                                            
+                                            // Set the result
+                                            self.register_windows.set_register(window_idx, a, indexed_method)?;
+                                        },
+                                        _ => {
+                                            // __index is neither function nor table, use nil
+                                            println!("DEBUG STEP: SELF - __index is not function or table, using nil");
+                                            self.register_windows.set_register(window_idx, a, Value::Nil)?;
+                                        }
+                                    }
+                                } else {
+                                    // No __index metamethod, result is nil
+                                    println!("DEBUG STEP: SELF - no __index metamethod, method is nil");
+                                    self.register_windows.set_register(window_idx, a, Value::Nil)?;
+                                }
+                            } else {
+                                // No metatable, result is nil
+                                println!("DEBUG STEP: SELF - no metatable, method is nil");
+                                self.register_windows.set_register(window_idx, a, Value::Nil)?;
+                            }
+                        } else {
+                            // Found method in table
+                            println!("DEBUG STEP: SELF - found method: {:?}", method);
+                            self.register_windows.set_register(window_idx, a, method)?;
+                        }
+                    },
+                    _ => {
+                        // Not a table - this is an error for Self_
+                        println!("DEBUG STEP: SELF - operand is not a table: {}", table.type_name());
+                        
+                        // For Self_, we specifically need a table
+                        // Unlike GetTable which can use __index on non-tables,
+                        // Self_ is specifically for method calls on objects (tables)
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "table".to_string(),
+                            got: table.type_name().to_string(),
+                        });
+                    }
+                }
+                
+                StepResult::Continue
+            },
 
             OpCode::Add => {
                 // R(A) := RK(B) + RK(C)
@@ -1697,6 +2207,8 @@ impl LuaVM {
                     self.register_windows.get_register(window_idx, c)?.clone()
                 };
                 
+                println!("DEBUG STEP: ADD - {:?} + {:?} to R({})", left, right, a);
+                
                 // Perform addition
                 match (&left, &right) {
                     (Value::Number(l), Value::Number(r)) => {
@@ -1704,14 +2216,1942 @@ impl LuaVM {
                         self.register_windows.set_register(window_idx, a, result)?;
                     },
                     _ => {
-                        // Non-numeric values - try metamethods
+                        // Non-numeric values - try __add metamethod
+                        // Check for __add metamethod
+                        let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Add
+                        )?;
+                        
+                        if let Some((mm_func, _)) = mm_opt {
+                            println!("DEBUG STEP: ADD - found __add metamethod");
+                            
+                            // Queue arithmetic operation for metamethod handling
+                            tx.queue_operation(PendingOperation::ArithmeticOp {
+                                op: ArithmeticOperation::Add,
+                                left,
+                                right,
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Unprotect registers for the operation
+                            let _ = self.register_windows.unprotect_all(window_idx);
+                        } else {
+                            // No metamethod available
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "number".to_string(),
+                                got: format!("{} and {}", left.type_name(), right.type_name()),
+                            });
+                        }
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Sub => {
+                // R(A) := RK(B) - RK(C)
+                // Get left operand from register B or constant
+                let left = if b & 0x100 != 0 {
+                    // Left is a constant
+                    let constant_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Left is a register
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from register C or constant
+                let right = if c & 0x100 != 0 {
+                    // Right is a constant
+                    let constant_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Right is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: SUB - {:?} - {:?} to R({})", left, right, a);
+                
+                // Perform subtraction
+                match (&left, &right) {
+                    (Value::Number(l), Value::Number(r)) => {
+                        let result = Value::Number(l - r);
+                        self.register_windows.set_register(window_idx, a, result)?;
+                    },
+                    _ => {
+                        // Non-numeric values - try __sub metamethod
+                        // Check for __sub metamethod
+                        let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Sub
+                        )?;
+                        
+                        if let Some((mm_func, _)) = mm_opt {
+                            println!("DEBUG STEP: SUB - found __sub metamethod");
+                            
+                            // Queue arithmetic operation for metamethod handling
+                            tx.queue_operation(PendingOperation::ArithmeticOp {
+                                op: ArithmeticOperation::Sub,
+                                left,
+                                right,
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Unprotect registers for the operation
+                            let _ = self.register_windows.unprotect_all(window_idx);
+                        } else {
+                            // No metamethod available
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "number".to_string(),
+                                got: format!("{} and {}", left.type_name(), right.type_name()),
+                            });
+                        }
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Mul => {
+                // R(A) := RK(B) * RK(C)
+                // Get left operand from register B or constant
+                let left = if b & 0x100 != 0 {
+                    // Left is a constant
+                    let constant_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Left is a register
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from register C or constant
+                let right = if c & 0x100 != 0 {
+                    // Right is a constant
+                    let constant_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Right is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: MUL - {:?} * {:?} to R({})", left, right, a);
+                
+                // Perform multiplication
+                match (&left, &right) {
+                    (Value::Number(l), Value::Number(r)) => {
+                        let result = Value::Number(l * r);
+                        self.register_windows.set_register(window_idx, a, result)?;
+                    },
+                    _ => {
+                        // Non-numeric values - try __mul metamethod
+                        // Check for __mul metamethod
+                        let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Mul
+                        )?;
+                        
+                        if let Some((mm_func, _)) = mm_opt {
+                            println!("DEBUG STEP: MUL - found __mul metamethod");
+                            
+                            // Queue arithmetic operation for metamethod handling
+                            tx.queue_operation(PendingOperation::ArithmeticOp {
+                                op: ArithmeticOperation::Mul,
+                                left,
+                                right,
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Unprotect registers for the operation
+                            let _ = self.register_windows.unprotect_all(window_idx);
+                        } else {
+                            // No metamethod available
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "number".to_string(),
+                                got: format!("{} and {}", left.type_name(), right.type_name()),
+                            });
+                        }
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Div => {
+                // R(A) := RK(B) / RK(C)
+                // Get left operand from register B or constant
+                let left = if b & 0x100 != 0 {
+                    // Left is a constant
+                    let constant_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Left is a register
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from register C or constant
+                let right = if c & 0x100 != 0 {
+                    // Right is a constant
+                    let constant_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Right is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: DIV - {:?} / {:?} to R({})", left, right, a);
+                
+                // Perform division
+                match (&left, &right) {
+                    (Value::Number(l), Value::Number(r)) => {
+                        // Note: In Lua, division by zero results in inf/-inf, not an error
+                        let result = Value::Number(l / r);
+                        self.register_windows.set_register(window_idx, a, result)?;
+                    },
+                    _ => {
+                        // Non-numeric values - try __div metamethod
+                        // Check for __div metamethod
+                        let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Div
+                        )?;
+                        
+                        if let Some((mm_func, _)) = mm_opt {
+                            println!("DEBUG STEP: DIV - found __div metamethod");
+                            
+                            // Queue arithmetic operation for metamethod handling
+                            tx.queue_operation(PendingOperation::ArithmeticOp {
+                                op: ArithmeticOperation::Div,
+                                left,
+                                right,
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Unprotect registers for the operation
+                            let _ = self.register_windows.unprotect_all(window_idx);
+                        } else {
+                            // No metamethod available
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "number".to_string(),
+                                got: format!("{} and {}", left.type_name(), right.type_name()),
+                            });
+                        }
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Mod => {
+                // R(A) := RK(B) % RK(C)
+                // Get left operand from register B or constant
+                let left = if b & 0x100 != 0 {
+                    // Left is a constant
+                    let constant_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Left is a register
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from register C or constant
+                let right = if c & 0x100 != 0 {
+                    // Right is a constant
+                    let constant_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Right is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: MOD - {:?} % {:?} to R({})", left, right, a);
+                
+                // Perform modulo operation
+                match (&left, &right) {
+                    (Value::Number(l), Value::Number(r)) => {
+                        // Lua uses floored division for modulo: a % b = a - floor(a/b)*b
+                        // This ensures the result has the same sign as the divisor
+                        let result = if *r != 0.0 {
+                            Value::Number(l - (l / r).floor() * r)
+                        } else {
+                            // In Lua, x % 0 results in nan
+                            Value::Number(f64::NAN)
+                        };
+                        self.register_windows.set_register(window_idx, a, result)?;
+                    },
+                    _ => {
+                        // Non-numeric values - try __mod metamethod
+                        // Check for __mod metamethod
+                        let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Mod
+                        )?;
+                        
+                        if let Some((mm_func, _)) = mm_opt {
+                            println!("DEBUG STEP: MOD - found __mod metamethod");
+                            
+                            // Queue arithmetic operation for metamethod handling
+                            tx.queue_operation(PendingOperation::ArithmeticOp {
+                                op: ArithmeticOperation::Mod,
+                                left,
+                                right,
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Unprotect registers for the operation
+                            let _ = self.register_windows.unprotect_all(window_idx);
+                        } else {
+                            // No metamethod available
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "number".to_string(),
+                                got: format!("{} and {}", left.type_name(), right.type_name()),
+                            });
+                        }
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Pow => {
+                // R(A) := RK(B) ^ RK(C)
+                // Get left operand from register B or constant
+                let left = if b & 0x100 != 0 {
+                    // Left is a constant
+                    let constant_idx = b & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Left is a register
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from register C or constant
+                let right = if c & 0x100 != 0 {
+                    // Right is a constant
+                    let constant_idx = c & 0xFF;
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx as usize)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // Right is a register
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: POW - {:?} ^ {:?} to R({})", left, right, a);
+                
+                // Perform power operation
+                match (&left, &right) {
+                    (Value::Number(l), Value::Number(r)) => {
+                        let result = Value::Number(l.powf(*r));
+                        self.register_windows.set_register(window_idx, a, result)?;
+                    },
+                    _ => {
+                        // Non-numeric values - try __pow metamethod
+                        // Check for __pow metamethod
+                        let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Pow
+                        )?;
+                        
+                        if let Some((mm_func, _)) = mm_opt {
+                            println!("DEBUG STEP: POW - found __pow metamethod");
+                            
+                            // Queue arithmetic operation for metamethod handling
+                            tx.queue_operation(PendingOperation::ArithmeticOp {
+                                op: ArithmeticOperation::Pow,
+                                left,
+                                right,
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Unprotect registers for the operation
+                            let _ = self.register_windows.unprotect_all(window_idx);
+                        } else {
+                            // No metamethod available
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "number".to_string(),
+                                got: format!("{} and {}", left.type_name(), right.type_name()),
+                            });
+                        }
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Unm => {
+                // R(A) := -R(B)
+                // Get the operand from register B
+                let operand = self.register_windows.get_register(window_idx, b)?.clone();
+                
+                println!("DEBUG STEP: UNM - negating {:?} from R({}) to R({})", operand, b, a);
+                
+                // Perform unary minus
+                match &operand {
+                    Value::Number(n) => {
+                        // Direct numeric negation
+                        let result = Value::Number(-n);
+                        self.register_windows.set_register(window_idx, a, result)?;
+                    },
+                    Value::String(handle) => {
+                        // Try to convert string to number first
+                        let str_val = tx.get_string_value(*handle)?;
+                        match str_val.trim().parse::<f64>() {
+                            Ok(n) => {
+                                // Successfully parsed as number, negate it
+                                let result = Value::Number(-n);
+                                self.register_windows.set_register(window_idx, a, result)?;
+                            },
+                            Err(_) => {
+                                // Not a numeric string, check for metamethod
+                                if let Some(_) = crate::lua::metamethod::resolve_metamethod(
+                                    &mut tx, &operand, crate::lua::metamethod::MetamethodType::Unm
+                                )? {
+                                    println!("DEBUG STEP: UNM - found __unm metamethod");
+                                    
+                                    // Queue arithmetic operation for metamethod handling
+                                    tx.queue_operation(PendingOperation::ArithmeticOp {
+                                        op: ArithmeticOperation::Unm,
+                                        left: operand,
+                                        right: Value::Nil, // Unary operation, no right operand
+                                        context: ReturnContext::Register {
+                                            base: frame.base_register,
+                                            offset: a,
+                                        },
+                                    })?;
+                                    
+                                    // Unprotect registers for the operation
+                                    let _ = self.register_windows.unprotect_all(window_idx);
+                                } else {
+                                    // No metamethod and can't convert to number
+                                    tx.commit()?;
+                                    return Err(LuaError::TypeError {
+                                        expected: "number or string convertible to number".to_string(),
+                                        got: operand.type_name().to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    },
+                    _ => {
+                        // For other types, check for __unm metamethod
+                        if let Some(_) = crate::lua::metamethod::resolve_metamethod(
+                            &mut tx, &operand, crate::lua::metamethod::MetamethodType::Unm
+                        )? {
+                            println!("DEBUG STEP: UNM - found __unm metamethod");
+                            
+                            // Queue arithmetic operation for metamethod handling
+                            tx.queue_operation(PendingOperation::ArithmeticOp {
+                                op: ArithmeticOperation::Unm,
+                                left: operand,
+                                right: Value::Nil, // Unary operation, no right operand
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Unprotect registers for the operation
+                            let _ = self.register_windows.unprotect_all(window_idx);
+                        } else {
+                            // No metamethod available
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "number or value with __unm metamethod".to_string(),
+                                got: operand.type_name().to_string(),
+                            });
+                        }
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Not => {
+                // R(A) := not R(B)
+                // Get the operand from register B
+                let operand = self.register_windows.get_register(window_idx, b)?.clone();
+                
+                println!("DEBUG STEP: NOT - applying logical not to {:?} from R({}) to R({})", operand, b, a);
+                
+                // Apply Lua's boolean conversion rules:
+                // Only nil and false are falsy, everything else is truthy
+                let result = match operand {
+                    Value::Nil => Value::Boolean(true),        // not nil = true
+                    Value::Boolean(b) => Value::Boolean(!b),   // not bool = !bool
+                    _ => Value::Boolean(false),                // not (any other value) = false
+                };
+                
+                println!("DEBUG STEP: NOT - result: {:?}", result);
+                
+                // Store the result in register A
+                self.register_windows.set_register(window_idx, a, result)?;
+                
+                StepResult::Continue
+            },
+            
+            OpCode::GetGlobal => {
+                // R(A) := Gbl[Kst(Bx)]
+                println!("DEBUG STEP: GETGLOBAL - loading global from constant {} to R({})", instruction.bx(), a);
+                
+                // Phase 1: Extract all needed values from the transaction
+                let value = {
+                    // Get the constant (should be a string) from the closure
+                    let bx = instruction.bx() as usize;
+                    let key_value = {
+                        let closure_obj = tx.get_closure(frame.closure)?;
+                        if bx >= closure_obj.proto.constants.len() {
+                            tx.commit()?;
+                            return Err(LuaError::RuntimeError(format!(
+                                "Constant index {} out of bounds", bx
+                            )));
+                        }
+                        closure_obj.proto.constants[bx].clone()
+                    };
+                    
+                    println!("DEBUG GETGLOBAL: Retrieved constant: {:?}", key_value);
+                    
+                    // Verify the constant is a string
+                    let string_handle = match key_value {
+                        Value::String(handle) => handle,
+                        _ => {
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "string".to_string(),
+                                got: key_value.type_name().to_string(),
+                            });
+                        }
+                    };
+                    
+                    // Get the actual string value for debugging
+                    let key_string = tx.get_string_value(string_handle)?;
+                    println!("DEBUG GETGLOBAL: Looking up global key: '{}'", key_string);
+                    
+                    // Get the globals table
+                    let globals = tx.get_globals_table()?;
+                    println!("DEBUG GETGLOBAL: Using globals table handle: {:?}", globals);
+                    
+                    // Look up the value in the globals table
+                    let value = tx.read_table_field(globals, &Value::String(string_handle))?;
+                    println!("DEBUG GETGLOBAL: Retrieved value: {:?} (type: {})", value, value.type_name());
+                    
+                    // If the value is nil, let's check if the globals table has any contents
+                    if value.is_nil() {
+                        println!("DEBUG GETGLOBAL: Value is nil, checking globals table contents...");
+                        
+                        // Phase 1: Collect string handles and metadata while we have table_obj
+                        let (array_len, map_len, string_entries) = {
+                            // Try to iterate through the globals table to see what's in it
+                            let table_obj = tx.get_table(globals)?;
+                            let array_len = table_obj.array.len();
+                            let map_len = table_obj.map.len();
+                            
+                            println!("DEBUG GETGLOBAL: Globals table has {} array elements and {} hash elements", 
+                                     array_len, map_len);
+                            
+                            // Collect first few string entries
+                            let mut entries = Vec::new();
+                            let mut count = 0;
+                            for (k, v) in &table_obj.map {
+                                if count < 5 {
+                                    match k {
+                                        HashableValue::String(s) => {
+                                            entries.push((*s, v.clone()));
+                                            count += 1;
+                                        },
+                                        _ => {
+                                            println!("DEBUG GETGLOBAL:   Global {:?} -> {:?}", k, v);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            (array_len, map_len, entries)
+                        }; // table_obj is dropped here
+                        
+                        // Phase 2: Process the collected string handles
+                        for (s, v) in string_entries {
+                            let string_handle = StringHandle::from(s);
+                            let str_val = tx.get_string_value(string_handle)?;
+                            println!("DEBUG GETGLOBAL:   Global '{}' -> {:?}", str_val, v);
+                        }
+                        
+                        if map_len > 5 {
+                            println!("DEBUG GETGLOBAL:   ... and {} more entries", map_len - 5);
+                        }
+                    }
+                    
+                    // Return the value to be used after transaction is committed
+                    value
+                };
+                
+                // Increment PC before committing the transaction
+                tx.increment_pc(self.current_thread)?;
+                
+                // Don't increment PC again in the main step() method
+                should_increment_pc = false;
+                
+                // Phase 2: Commit the transaction to release the borrow on self.heap
+                tx.commit()?;
+                
+                // Phase 3: Now we can safely access self.register_windows
+                self.register_windows.set_register(window_idx, a, value)?;
+                
+                StepResult::Continue
+            },
+            
+            OpCode::GetUpval => {
+                // R(A) := UpValue[B]
+                println!("DEBUG STEP: GETUPVAL - loading upvalue {} to R({})", b, a);
+                
+                // Get the upvalue from the closure
+                let upvalue_handle = {
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    println!("DEBUG GETUPVAL: Closure has {} upvalues", closure_obj.upvalues.len());
+                    
+                    if b >= closure_obj.upvalues.len() {
+                        tx.commit()?;
+                        return Err(LuaError::RuntimeError(format!(
+                            "Upvalue index {} out of bounds", b
+                        )));
+                    }
+                    let handle = closure_obj.upvalues[b];
+                    println!("DEBUG GETUPVAL: Getting upvalue handle: {:?}", handle);
+                    handle
+                };
+                
+                // Get the upvalue object
+                let upvalue_obj = tx.get_upvalue(upvalue_handle)?;
+                println!("DEBUG GETUPVAL: Upvalue object - stack_index: {:?}, value: {:?}", 
+                         upvalue_obj.stack_index, upvalue_obj.value);
+                
+                // Get the value from the upvalue
+                let value = if let Some(stack_idx) = upvalue_obj.stack_index {
+                    // Open upvalue - read from stack
+                    println!("DEBUG GETUPVAL: Reading from stack position {}", stack_idx);
+                    
+                    // Debug: print some context about the stack
+                    let thread = tx.get_thread(self.current_thread)?;
+                    println!("DEBUG GETUPVAL: Thread stack size: {}", thread.stack.len());
+                    if stack_idx < thread.stack.len() {
+                        println!("DEBUG GETUPVAL: Stack[{}] contains: {:?}", stack_idx, thread.stack[stack_idx]);
+                    } else {
+                        println!("DEBUG GETUPVAL: WARNING - stack_idx {} is out of bounds!", stack_idx);
+                    }
+                    
+                    let val = tx.read_register(self.current_thread, stack_idx)?;
+                    println!("DEBUG GETUPVAL: Read value: {:?}", val);
+                    val
+                } else if let Some(ref val) = upvalue_obj.value {
+                    // Closed upvalue - use stored value
+                    println!("DEBUG GETUPVAL: Using closed upvalue value: {:?}", val);
+                    val.clone()
+                } else {
+                    // Invalid upvalue state
+                    tx.commit()?;
+                    return Err(LuaError::InternalError("Invalid upvalue state".to_string()));
+                };
+                
+                println!("DEBUG GETUPVAL: Setting R({}) to value: {:?}", a, value);
+                
+                // Set the value in register A using the window system
+                self.register_windows.set_register(window_idx, a, value)?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::SetUpval => {
+                // UpValue[B] := R(A)
+                println!("DEBUG STEP: SETUPVAL - setting upvalue {} from R({})", b, a);
+                
+                // Get the value from register A
+                let value = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                // Get the upvalue handle from the closure
+                let upvalue_handle = {
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    if b >= closure_obj.upvalues.len() {
+                        tx.commit()?;
+                        return Err(LuaError::RuntimeError(format!(
+                            "Upvalue index {} out of bounds", b
+                        )));
+                    }
+                    closure_obj.upvalues[b]
+                };
+                
+                // Extract thread handle before calling set_upvalue
+                let thread = self.current_thread;
+                
+                // Set the value in the upvalue through the transaction
+                tx.set_upvalue(upvalue_handle, value, thread)?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::SetGlobal => {
+                // Gbl[Kst(Bx)] := R(A)
+                println!("DEBUG STEP: SETGLOBAL - setting global from R({}) to constant {}", a, instruction.bx());
+                
+                // Get the value from register A
+                let value = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                // Get the constant (should be a string) from the closure
+                let bx = instruction.bx() as usize;
+                let key_value = {
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    if bx >= closure_obj.proto.constants.len() {
+                        tx.commit()?;
+                        return Err(LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", bx
+                        )));
+                    }
+                    closure_obj.proto.constants[bx].clone()
+                };
+                
+                // Verify the constant is a string
+                let string_handle = match key_value {
+                    Value::String(handle) => handle,
+                    _ => {
                         tx.commit()?;
                         return Err(LuaError::TypeError {
-                            expected: "number".to_string(),
-                            got: format!("{} and {}", left.type_name(), right.type_name()),
+                            expected: "string".to_string(),
+                            got: key_value.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                // Get the globals table
+                let globals = tx.get_globals_table()?;
+                
+                // Set the value in the globals table
+                tx.set_table_field(globals, Value::String(string_handle), value)?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::Jmp => {
+                // PC += sBx
+                // sBx: Signed offset (added to PC)
+                let sbx = instruction.sbx();
+                
+                println!("DEBUG STEP: JMP - jumping by offset {}", sbx);
+                
+                // Calculate new PC
+                let current_pc = frame.pc;
+                let new_pc = ((current_pc as i32) + sbx) as usize;
+                
+                // Set the new PC directly
+                tx.set_pc(self.current_thread, new_pc)?;
+                
+                // Don't increment PC since we set it directly
+                should_increment_pc = false;
+                
+                StepResult::Continue
+            },
+
+            OpCode::Test => {
+                // if not (R(A) <=> C) then pc++
+                // A: Value to test
+                // C: Expected result (0 = false, 1 = true)
+                println!("DEBUG STEP: TEST - register R({}) with expected result {}", a, c != 0);
+                
+                // Get the value to test
+                let value = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                // Convert value to boolean according to Lua rules
+                let is_true = match value {
+                    Value::Nil => false,
+                    Value::Boolean(b) => b,
+                    _ => true, // All other values are truthy in Lua
+                };
+                
+                // Compare with expected, skip next instruction if they don't match
+                // C=0 means expected=false, C=1 means expected=true
+                let expected = c != 0;
+                
+                // Skip next instruction if test fails (value truth != expected)
+                if is_true != expected {
+                    println!("DEBUG STEP: TEST - condition not met, skipping next instruction");
+                    tx.increment_pc(self.current_thread)?;
+                } else {
+                    println!("DEBUG STEP: TEST - condition met, continuing");
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::TestSet => {
+                // if (R(B) <=> C) then R(A) := R(B) else pc++
+                // A: Target register
+                // B: Value register to test
+                // C: Expected truthiness (0=false, 1=true)
+                println!("DEBUG STEP: TESTSET - register R({}) from R({}), expected result {}", a, b, c != 0);
+                
+                // Get the value from register B
+                let value = self.register_windows.get_register(window_idx, b)?.clone();
+                
+                // Convert value to boolean according to Lua rules
+                let is_true = match &value {
+                    Value::Nil => false,
+                    Value::Boolean(b) => *b,
+                    _ => true, // All other values are truthy in Lua
+                };
+                
+                // Compare with expected
+                let expected = c != 0;
+                
+                // If they match, set R(A) to the value from R(B)
+                if is_true == expected {
+                    println!("DEBUG STEP: TESTSET - condition met, setting R({}) = {:?}", a, value);
+                    self.register_windows.set_register(window_idx, a, value)?;
+                } else {
+                    // If they don't match, skip next instruction
+                    println!("DEBUG STEP: TESTSET - condition not met, skipping next instruction");
+                    tx.increment_pc(self.current_thread)?;
+                    // Don't increment PC again
+                    should_increment_pc = false;
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::SetList => {
+                // R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
+                // A: Table register
+                // B: Number of elements (0 = all from A+1 to top)
+                // C: Starting index (simplified - using directly instead of (C-1)*FPF+1)
+                
+                println!("DEBUG STEP: SETLIST - table in R({}), {} elements, starting at index {}", a, b, c);
+                
+                // Get the table from register A
+                let table = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                match table {
+                    Value::Table(table_handle) => {
+                        // For initial implementation, use C directly as starting index
+                        // In full Lua 5.1, this would be (C-1)*FPF + 1 where FPF=50
+                        let start_index = if c > 0 {
+                            c as f64
+                        } else {
+                            // C=0 means the next instruction contains the full index
+                            // For now, default to 1
+                            1.0
+                        };
+                        
+                        // Determine how many elements to set
+                        let element_count = if b == 0 {
+                            // B=0 means all values from A+1 to top
+                            // Find non-nil values
+                            let mut count = 0;
+                            let max_check = 50; // Safety limit
+                            for i in 1..=max_check {
+                                match self.register_windows.get_register(window_idx, a + i) {
+                                    Ok(val) => {
+                                        // In SetList, we include all values until we run out of registers
+                                        // not just until the first nil
+                                        count = i;
+                                    },
+                                    Err(_) => {
+                                        // Reached end of valid registers
+                                        count = i - 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            println!("DEBUG STEP: SETLIST - B=0, found {} elements to set", count);
+                            count
+                        } else {
+                            b
+                        };
+                        
+                        println!("DEBUG STEP: SETLIST - Setting {} elements starting at table index {}", element_count, start_index);
+                        
+                        // Set the table elements
+                        // Note: i goes from 1 to element_count (following Lua convention)
+                        for i in 1..=element_count {
+                            // Get value from R(A+i)
+                            let value = match self.register_windows.get_register(window_idx, a + i) {
+                                Ok(val) => val.clone(),
+                                Err(_) => Value::Nil, // Out of bounds registers are nil
+                            };
+                            
+                            // Calculate table index: start_index + (i-1)
+                            // Since i starts at 1, the first element goes to start_index
+                            let table_index = Value::Number(start_index + (i - 1) as f64);
+                            
+                            println!("DEBUG STEP: SETLIST - Setting table[{}] = R({}): {:?}", 
+                                     start_index + (i - 1) as f64, a + i, value);
+                            
+                            tx.set_table_field(table_handle, table_index, value)?;
+                        }
+                        
+                        StepResult::Continue
+                    },
+                    _ => {
+                        // Not a table - error
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "table".to_string(),
+                            got: table.type_name().to_string(),
                         });
                     }
                 }
+            },
+
+            OpCode::ForPrep => {
+                // R(A) -= R(A+2); pc += sBx
+                // A: Index register (contains initial value)
+                // sBx: Jump offset to loop body
+                println!("DEBUG STEP: FORPREP - initializing loop at R({})", a);
+                
+                // Get the index value from R(A)
+                let index = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                // Get the step value from R(A+2)
+                let step = self.register_windows.get_register(window_idx, a + 2)?.clone();
+                
+                // Verify both are numbers
+                let index_num = match index {
+                    Value::Number(n) => n,
+                    _ => {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: index.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                let step_num = match step {
+                    Value::Number(n) => n,
+                    _ => {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: step.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                // Also verify the limit is a number (for early error detection)
+                let limit = self.register_windows.get_register(window_idx, a + 1)?.clone();
+                match limit {
+                    Value::Number(_) => {},
+                    _ => {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: limit.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                // Subtract step from index: R(A) -= R(A+2)
+                let new_index = index_num - step_num;
+                
+                println!("DEBUG STEP: FORPREP - index={}, step={}, new_index={}", 
+                         index_num, step_num, new_index);
+                
+                // Store the new index back to R(A)
+                self.register_windows.set_register(window_idx, a, Value::Number(new_index))?;
+                
+                // Jump to the loop body
+                let sbx = instruction.sbx();
+                let current_pc = frame.pc;
+                let new_pc = ((current_pc as i32) + sbx) as usize;
+                
+                println!("DEBUG STEP: FORPREP - jumping from PC {} to PC {}", current_pc, new_pc);
+                
+                // Set the new PC directly
+                tx.set_pc(self.current_thread, new_pc)?;
+                
+                // Don't increment PC since we set it directly
+                should_increment_pc = false;
+                
+                StepResult::Continue
+            },
+
+            OpCode::ForLoop => {
+                // R(A) += R(A+2); if R(A) <?= R(A+1) then { pc+=sBx; R(A+3) = R(A) }
+                // A: Index register (current loop counter)
+                // sBx: Jump offset back to loop body
+                println!("DEBUG STEP: FORLOOP - checking loop continuation at R({})", a);
+                
+                // Get the current index from R(A)
+                let index = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                // Get the limit from R(A+1)
+                let limit = self.register_windows.get_register(window_idx, a + 1)?.clone();
+                
+                // Get the step from R(A+2)
+                let step = self.register_windows.get_register(window_idx, a + 2)?.clone();
+                
+                // Convert all to numbers with proper type checking
+                let index_num = match index {
+                    Value::Number(n) => n,
+                    _ => {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: index.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                let limit_num = match limit {
+                    Value::Number(n) => n,
+                    _ => {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: limit.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                let step_num = match step {
+                    Value::Number(n) => n,
+                    _ => {
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: step.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                // Add step to index: R(A) += R(A+2)
+                let new_index = index_num + step_num;
+                
+                println!("DEBUG STEP: FORLOOP - index={}, limit={}, step={}, new_index={}", 
+                         index_num, limit_num, step_num, new_index);
+                
+                // Check if we should continue the loop
+                // If step > 0, continue if new_index <= limit
+                // If step < 0, continue if new_index >= limit
+                // If step == 0, this would be an infinite loop (Lua handles this specially)
+                let should_continue = if step_num > 0.0 {
+                    new_index <= limit_num
+                } else if step_num < 0.0 {
+                    new_index >= limit_num
+                } else {
+                    // Step is zero - in Lua this results in an infinite loop
+                    // We'll continue the loop (this matches Lua behavior)
+                    true
+                };
+                
+                if should_continue {
+                    println!("DEBUG STEP: FORLOOP - continuing loop, new_index={}", new_index);
+                    
+                    // Store the new index back to R(A)
+                    self.register_windows.set_register(window_idx, a, Value::Number(new_index))?;
+                    
+                    // Set the loop variable: R(A+3) = R(A)
+                    self.register_windows.set_register(window_idx, a + 3, Value::Number(new_index))?;
+                    
+                    // Jump back to the loop body
+                    let sbx = instruction.sbx();
+                    let current_pc = frame.pc;
+                    let new_pc = ((current_pc as i32) + sbx) as usize;
+                    
+                    println!("DEBUG STEP: FORLOOP - jumping from PC {} to PC {}", current_pc, new_pc);
+                    
+                    // Set the new PC directly
+                    tx.set_pc(self.current_thread, new_pc)?;
+                    
+                    // Don't increment PC since we set it directly
+                    should_increment_pc = false;
+                } else {
+                    println!("DEBUG STEP: FORLOOP - exiting loop, index {} beyond limit {}", 
+                             new_index, limit_num);
+                    
+                    // Store the final index value (even though we're exiting)
+                    // This matches Lua behavior
+                    self.register_windows.set_register(window_idx, a, Value::Number(new_index))?;
+                    
+                    // We're done with the loop, just increment PC normally
+                    // (should_increment_pc remains true)
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Len => {
+                // R(A) := length of R(B)
+                println!("DEBUG STEP: LEN - length of R({}) to R({})", b, a);
+                
+                // Get the value from register B
+                let value = self.register_windows.get_register(window_idx, b)?.clone();
+                
+                // Calculate length based on type
+                let length = match &value {
+                    Value::String(handle) => {
+                        // For strings, get the byte length
+                        let str_value = tx.get_string_value(*handle)?;
+                        str_value.len() as f64
+                    },
+                    Value::Table(handle) => {
+                        // For tables, calculate the border according to Lua semantics
+                        // Phase 1: Collect all data we need in one pass
+                        let (initial_border, numeric_keys) = {
+                            let table_obj = tx.get_table(*handle)?;
+                            
+                            // Find the "border" - the last index i where t[i] is not nil
+                            // and t[i+1] is nil (or doesn't exist)
+                            let mut border = 0;
+                            
+                            // Check array part for consecutive non-nil values
+                            for i in 0..table_obj.array.len() {
+                                if table_obj.array[i].is_nil() {
+                                    break;
+                                }
+                                border = i + 1;
+                            }
+                            
+                            // Collect numeric keys from the hash part
+                            let mut numeric_keys = Vec::new();
+                            for (k, v) in &table_obj.map {
+                                if let HashableValue::Number(n) = k {
+                                    let idx = n.0;
+                                    // Check if it's a positive integer
+                                    if idx > 0.0 && idx.fract() == 0.0 && !v.is_nil() {
+                                        let idx_int = idx as usize;
+                                        numeric_keys.push(idx_int);
+                                    }
+                                }
+                            }
+                            
+                            (border, numeric_keys)
+                        }; // table_obj is dropped here, releasing the borrow
+                        
+                        // Phase 2: Determine if we need to search beyond the initial border
+                        let mut max_key = initial_border;
+                        for &key in &numeric_keys {
+                            if key > max_key {
+                                max_key = key;
+                            }
+                        }
+                        
+                        let final_border = if max_key > initial_border {
+                            // Binary search for the actual border
+                            let mut low = initial_border;
+                            let mut high = max_key;
+                            
+                            while low < high {
+                                let mid = low + (high - low + 1) / 2;
+                                
+                                // Check if t[mid] exists and is non-nil
+                                let mid_value = tx.read_table_field(*handle, &Value::Number(mid as f64))?;
+                                
+                                if mid_value.is_nil() {
+                                    // nil at mid, border is before mid
+                                    high = mid - 1;
+                                } else {
+                                    // non-nil at mid, border might be at or after mid
+                                    low = mid;
+                                }
+                            }
+                            
+                            low
+                        } else {
+                            initial_border
+                        };
+                        
+                        final_border as f64
+                    },
+                    _ => {
+                        // For other types, check for __len metamethod
+                        if let Some(_mm) = crate::lua::metamethod::resolve_metamethod(
+                            &mut tx, &value, crate::lua::metamethod::MetamethodType::Len
+                        )? {
+                            // Queue metamethod call
+                            let method_name = tx.create_string("__len")?;
+                            tx.queue_operation(PendingOperation::MetamethodCall {
+                                method: method_name,
+                                target: value.clone(),
+                                args: vec![value],
+                                context: ReturnContext::Register {
+                                    base: frame.base_register,
+                                    offset: a,
+                                },
+                            })?;
+                            
+                            // Don't store a result yet - metamethod will handle it
+                            tx.commit()?;
+                            return Ok(StepResult::Continue);
+                        } else {
+                            // No __len metamethod, error
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "table, string, or value with __len metamethod".to_string(),
+                                got: value.type_name().to_string(),
+                            });
+                        }
+                    }
+                };
+                
+                // Store the length in register A
+                self.register_windows.set_register(window_idx, a, Value::Number(length))?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::Eq => {
+                // if ((RK(B) == RK(C)) ~= A) then pc++
+                // A: Expected result (0=false, 1=true)
+                // B: First operand (register or constant)
+                // C: Second operand (register or constant)
+                
+                // Get left operand from RK(B)
+                let left = if b & 0x100 != 0 {
+                    // B >= 256, left is a constant at index (B & 0xFF)
+                    let constant_idx = b & 0xFF;
+                    println!("DEBUG STEP: EQ - left from constant index {}", constant_idx);
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // B < 256, left is in register B
+                    println!("DEBUG STEP: EQ - left from register R({})", b);
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from RK(C)
+                let right = if c & 0x100 != 0 {
+                    // C >= 256, right is a constant at index (C & 0xFF)
+                    let constant_idx = c & 0xFF;
+                    println!("DEBUG STEP: EQ - right from constant index {}", constant_idx);
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // C < 256, right is in register C
+                    println!("DEBUG STEP: EQ - right from register R({})", c);
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: EQ - comparing {:?} == {:?}, expected result: {}", 
+                         left, right, a != 0);
+                
+                // Perform equality comparison
+                let result = match (&left, &right) {
+                    // Simple type comparisons
+                    (Value::Nil, Value::Nil) => true,
+                    (Value::Boolean(b1), Value::Boolean(b2)) => b1 == b2,
+                    (Value::Number(n1), Value::Number(n2)) => n1 == n2,
+                    (Value::String(s1), Value::String(s2)) => s1 == s2,
+                    (Value::Closure(c1), Value::Closure(c2)) => c1 == c2,
+                    (Value::CFunction(f1), Value::CFunction(f2)) => {
+                        // Compare function pointers
+                        std::ptr::eq(f1 as *const _, f2 as *const _)
+                    },
+                    (Value::Table(t1), Value::Table(t2)) => {
+                        if t1 == t2 {
+                            // Same table
+                            true
+                        } else {
+                            // Different tables - check for __eq metamethod
+                            let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                                &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Eq
+                            )?;
+                            
+                            if let Some((mm_func, _)) = mm_opt {
+                                println!("DEBUG STEP: EQ - found __eq metamethod");
+                                
+                                // Create metamethod context
+                                let mm_context = crate::lua::metamethod::MetamethodContext {
+                                    mm_type: crate::lua::metamethod::MetamethodType::Eq,
+                                    continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
+                                        thread: self.current_thread,
+                                        expected: a != 0,
+                                    },
+                                };
+                                
+                                // Queue metamethod call
+                                match mm_func {
+                                    Value::Closure(closure) => {
+                                        tx.queue_operation(PendingOperation::FunctionCall {
+                                            closure,
+                                            args: vec![left, right],
+                                            context: ReturnContext::Metamethod {
+                                                context: mm_context,
+                                            },
+                                        })?;
+                                    },
+                                    Value::CFunction(_) => {
+                                        let method_name = tx.create_string("__eq")?;
+                                        tx.queue_operation(PendingOperation::MetamethodCall {
+                                            method: method_name,
+                                            target: left.clone(),
+                                            args: vec![left, right],
+                                            context: ReturnContext::Metamethod {
+                                                context: mm_context,
+                                            },
+                                        })?;
+                                    },
+                                    _ => {
+                                        tx.commit()?;
+                                        return Err(LuaError::InternalError("Invalid metamethod type".to_string()));
+                                    }
+                                }
+                                
+                                // Don't skip yet - metamethod will handle it
+                                should_increment_pc = true;
+                                tx.commit()?;
+                                return Ok(StepResult::Continue);
+                            } else {
+                                // No metamethod, tables are not equal
+                                false
+                            }
+                        }
+                    },
+                    // Different types are never equal
+                    _ => false,
+                };
+                
+                // Check if we should skip the next instruction
+                // Skip if (result != expected)
+                let expected = a != 0;
+                if result != expected {
+                    println!("DEBUG STEP: EQ - condition not met (result={}, expected={}), skipping next instruction", 
+                             result, expected);
+                    tx.increment_pc(self.current_thread)?;
+                    // Don't increment PC again
+                    should_increment_pc = false;
+                } else {
+                    println!("DEBUG STEP: EQ - condition met, continuing");
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Lt => {
+                // if ((RK(B) < RK(C)) ~= A) then pc++
+                // A: Expected result (0=false, 1=true)
+                // B: First operand (register or constant)
+                // C: Second operand (register or constant)
+                
+                // Get left operand from RK(B)
+                let left = if b & 0x100 != 0 {
+                    // B >= 256, left is a constant at index (B & 0xFF)
+                    let constant_idx = b & 0xFF;
+                    println!("DEBUG STEP: LT - left from constant index {}", constant_idx);
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // B < 256, left is in register B
+                    println!("DEBUG STEP: LT - left from register R({})", b);
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from RK(C)
+                let right = if c & 0x100 != 0 {
+                    // C >= 256, right is a constant at index (C & 0xFF)
+                    let constant_idx = c & 0xFF;
+                    println!("DEBUG STEP: LT - right from constant index {}", constant_idx);
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // C < 256, right is in register C
+                    println!("DEBUG STEP: LT - right from register R({})", c);
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: LT - comparing {:?} < {:?}, expected result: {}", 
+                         left, right, a != 0);
+                
+                // Perform less-than comparison
+                let mut handled_by_metamethod = false;
+                let result = match (&left, &right) {
+                    // Numeric comparison
+                    (Value::Number(n1), Value::Number(n2)) => n1 < n2,
+                    
+                    // String comparison (lexicographic)
+                    (Value::String(s1), Value::String(s2)) => {
+                        let str1 = tx.get_string_value(*s1)?;
+                        let str2 = tx.get_string_value(*s2)?;
+                        str1 < str2
+                    },
+                    
+                    // For other types, check for metamethod
+                    _ => {
+                        // Check for __lt metamethod
+                        let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Lt
+                        )?;
+                        
+                        if let Some((mm_func, _)) = mm_opt {
+                            println!("DEBUG STEP: LT - found __lt metamethod");
+                            handled_by_metamethod = true;
+                            
+                            // Create metamethod context
+                            let mm_context = crate::lua::metamethod::MetamethodContext {
+                                mm_type: crate::lua::metamethod::MetamethodType::Lt,
+                                continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
+                                    thread: self.current_thread,
+                                    expected: a != 0,
+                                },
+                            };
+                            
+                            // Queue metamethod call
+                            match mm_func {
+                                Value::Closure(closure) => {
+                                    tx.queue_operation(PendingOperation::FunctionCall {
+                                        closure,
+                                        args: vec![left, right],
+                                        context: ReturnContext::Metamethod {
+                                            context: mm_context,
+                                        },
+                                    })?;
+                                },
+                                Value::CFunction(cfunc) => {
+                                    let method_name = tx.create_string("__lt")?;
+                                    tx.queue_operation(PendingOperation::MetamethodCall {
+                                        method: method_name,
+                                        target: left.clone(),
+                                        args: vec![left, right],
+                                        context: ReturnContext::Metamethod {
+                                            context: mm_context,
+                                        },
+                                    })?;
+                                },
+                                _ => {
+                                    tx.commit()?;
+                                    return Err(LuaError::InternalError("Invalid metamethod type".to_string()));
+                                }
+                            }
+                            
+                            // Placeholder return value - metamethod will handle the actual comparison
+                            false
+                        } else {
+                            // No metamethod and incompatible types
+                            tx.commit()?;
+                            return Err(LuaError::TypeError {
+                                expected: "comparable values".to_string(),
+                                got: format!("{} and {}", left.type_name(), right.type_name()),
+                            });
+                        }
+                    }
+                };
+                
+                if handled_by_metamethod {
+                    // Don't skip yet - metamethod will handle it
+                    should_increment_pc = true;
+                    tx.commit()?;
+                    return Ok(StepResult::Continue);
+                }
+                
+                // Check if we should skip the next instruction
+                // Skip if (result != expected)
+                let expected = a != 0;
+                if result != expected {
+                    println!("DEBUG STEP: LT - condition not met (result={}, expected={}), skipping next instruction", 
+                             result, expected);
+                    tx.increment_pc(self.current_thread)?;
+                    // Don't increment PC again
+                    should_increment_pc = false;
+                } else {
+                    println!("DEBUG STEP: LT - condition met, continuing");
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Le => {
+                // if ((RK(B) <= RK(C)) ~= A) then pc++
+                // A: Expected result (0=false, 1=true)
+                // B: First operand (register or constant)
+                // C: Second operand (register or constant)
+                
+                // Get left operand from RK(B)
+                let left = if b & 0x100 != 0 {
+                    // B >= 256, left is a constant at index (B & 0xFF)
+                    let constant_idx = b & 0xFF;
+                    println!("DEBUG STEP: LE - left from constant index {}", constant_idx);
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // B < 256, left is in register B
+                    println!("DEBUG STEP: LE - left from register R({})", b);
+                    self.register_windows.get_register(window_idx, b)?.clone()
+                };
+                
+                // Get right operand from RK(C)
+                let right = if c & 0x100 != 0 {
+                    // C >= 256, right is a constant at index (C & 0xFF)
+                    let constant_idx = c & 0xFF;
+                    println!("DEBUG STEP: LE - right from constant index {}", constant_idx);
+                    let closure_obj = tx.get_closure(frame.closure)?;
+                    closure_obj.proto.constants.get(constant_idx)
+                        .cloned()
+                        .ok_or_else(|| LuaError::RuntimeError(format!(
+                            "Constant index {} out of bounds", constant_idx
+                        )))?
+                } else {
+                    // C < 256, right is in register C
+                    println!("DEBUG STEP: LE - right from register R({})", c);
+                    self.register_windows.get_register(window_idx, c)?.clone()
+                };
+                
+                println!("DEBUG STEP: LE - comparing {:?} <= {:?}, expected result: {}", 
+                         left, right, a != 0);
+                
+                // Perform less-than-or-equal comparison
+                let mut handled_by_metamethod = false;
+                let result = match (&left, &right) {
+                    // Numeric comparison
+                    (Value::Number(n1), Value::Number(n2)) => n1 <= n2,
+                    
+                    // String comparison (lexicographic)
+                    (Value::String(s1), Value::String(s2)) => {
+                        let str1 = tx.get_string_value(*s1)?;
+                        let str2 = tx.get_string_value(*s2)?;
+                        str1 <= str2
+                    },
+                    
+                    // For other types, check for metamethods
+                    _ => {
+                        // First try __le metamethod
+                        let le_mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                            &mut tx, &left, &right, crate::lua::metamethod::MetamethodType::Le
+                        )?;
+                        
+                        if let Some((mm_func, _)) = le_mm_opt {
+                            println!("DEBUG STEP: LE - found __le metamethod");
+                            handled_by_metamethod = true;
+                            
+                            // Create metamethod context
+                            let mm_context = crate::lua::metamethod::MetamethodContext {
+                                mm_type: crate::lua::metamethod::MetamethodType::Le,
+                                continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
+                                    thread: self.current_thread,
+                                    expected: a != 0,
+                                },
+                            };
+                            
+                            // Queue metamethod call
+                            match mm_func {
+                                Value::Closure(closure) => {
+                                    tx.queue_operation(PendingOperation::FunctionCall {
+                                        closure,
+                                        args: vec![left, right],
+                                        context: ReturnContext::Metamethod {
+                                            context: mm_context,
+                                        },
+                                    })?;
+                                },
+                                Value::CFunction(cfunc) => {
+                                    let method_name = tx.create_string("__le")?;
+                                    tx.queue_operation(PendingOperation::MetamethodCall {
+                                        method: method_name,
+                                        target: left.clone(),
+                                        args: vec![left, right],
+                                        context: ReturnContext::Metamethod {
+                                            context: mm_context,
+                                        },
+                                    })?;
+                                },
+                                _ => {
+                                    tx.commit()?;
+                                    return Err(LuaError::InternalError("Invalid metamethod type".to_string()));
+                                }
+                            }
+                            
+                            false // Placeholder - metamethod will handle
+                        } else {
+                            // No __le metamethod, try !(right < left) using __lt
+                            println!("DEBUG STEP: LE - no __le metamethod, trying !(right < left) with __lt");
+                            
+                            let lt_mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                                &mut tx, &right, &left, crate::lua::metamethod::MetamethodType::Lt
+                            )?;
+                            
+                            if let Some((mm_func, _)) = lt_mm_opt {
+                                println!("DEBUG STEP: LE - found __lt metamethod for inverted comparison");
+                                handled_by_metamethod = true;
+                                
+                                // Create metamethod context that will invert the result
+                                // We want !(right < left), so if __lt returns true, we want false
+                                // The expected result needs to be inverted too
+                                let inverted_expected = if a != 0 { false } else { true };
+                                
+                                let mm_context = crate::lua::metamethod::MetamethodContext {
+                                    mm_type: crate::lua::metamethod::MetamethodType::Lt,
+                                    continuation: crate::lua::metamethod::MetamethodContinuation::ComparisonSkip {
+                                        thread: self.current_thread,
+                                        expected: inverted_expected,
+                                    },
+                                };
+                                
+                                // Queue metamethod call with swapped arguments
+                                match mm_func {
+                                    Value::Closure(closure) => {
+                                        tx.queue_operation(PendingOperation::FunctionCall {
+                                            closure,
+                                            args: vec![right, left], // Note: swapped
+                                            context: ReturnContext::Metamethod {
+                                                context: mm_context,
+                                            },
+                                        })?;
+                                    },
+                                    Value::CFunction(cfunc) => {
+                                        let method_name = tx.create_string("__lt")?;
+                                        tx.queue_operation(PendingOperation::MetamethodCall {
+                                            method: method_name,
+                                            target: right.clone(),
+                                            args: vec![right, left], // Note: swapped
+                                            context: ReturnContext::Metamethod {
+                                                context: mm_context,
+                                            },
+                                        })?;
+                                    },
+                                    _ => {
+                                        tx.commit()?;
+                                        return Err(LuaError::InternalError("Invalid metamethod type".to_string()));
+                                    }
+                                }
+                                
+                                false // Placeholder - metamethod will handle
+                            } else {
+                                // No metamethod available
+                                tx.commit()?;
+                                return Err(LuaError::TypeError {
+                                    expected: "comparable values".to_string(),
+                                    got: format!("{} and {}", left.type_name(), right.type_name()),
+                                });
+                            }
+                        }
+                    }
+                };
+                
+                if handled_by_metamethod {
+                    // Don't skip yet - metamethod will handle it
+                    should_increment_pc = true;
+                    tx.commit()?;
+                    return Ok(StepResult::Continue);
+                }
+                
+                // Check if we should skip the next instruction
+                // Skip if (result != expected)
+                let expected = a != 0;
+                if result != expected {
+                    println!("DEBUG STEP: LE - condition not met (result={}, expected={}), skipping next instruction", 
+                             result, expected);
+                    tx.increment_pc(self.current_thread)?;
+                    // Don't increment PC again
+                    should_increment_pc = false;
+                } else {
+                    println!("DEBUG STEP: LE - condition met, continuing");
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::TForLoop => {
+                // R(A+3), ..., R(A+3+C) := R(A)(R(A+1), R(A+2)); 
+                // if R(A+3) ~= nil then R(A+2) = R(A+3) else pc++
+                println!("DEBUG STEP: TFORLOOP - iterator in R({}), {} loop variables", a, c);
+                
+                // Get the iterator function from R(A)
+                let iterator = self.register_windows.get_register(window_idx, a)?.clone();
+                
+                // Get state from R(A+1) and control from R(A+2)
+                let state = self.register_windows.get_register(window_idx, a + 1)?.clone();
+                let control = self.register_windows.get_register(window_idx, a + 2)?.clone();
+                
+                println!("DEBUG STEP: TFORLOOP - iterator: {:?}, state: {:?}, control: {:?}", 
+                         iterator, state, control);
+                
+                // Prepare arguments for the iterator call
+                let args = vec![state, control];
+                
+                // Get the sbx value for the next instruction (should be a JMP)
+                let next_pc = frame.pc + 1;
+                let next_instr = tx.get_instruction(frame.closure, next_pc)?;
+                let next_instruction = Instruction(next_instr);
+                let sbx = if next_instruction.opcode() == OpCode::Jmp {
+                    next_instruction.sbx()
+                } else {
+                    // If next instruction isn't JMP, assume we stay at current position
+                    0
+                };
+                
+                // Process based on iterator type
+                match iterator {
+                    Value::Closure(closure) => {
+                        println!("DEBUG STEP: TFORLOOP - calling Lua closure iterator");
+                        
+                        // Unprotect registers in the current window for the function call
+                        let _ = self.register_windows.unprotect_all(window_idx);
+                        
+                        // Queue function call with special ForLoop return context
+                        tx.queue_operation(PendingOperation::FunctionCall {
+                            closure,
+                            args,
+                            context: ReturnContext::ForLoop {
+                                base: frame.base_register,
+                                a,
+                                c,
+                                pc: frame.pc,
+                                sbx,
+                            },
+                        })?;
+                        
+                        StepResult::Continue
+                    },
+                    Value::CFunction(cfunc) => {
+                        println!("DEBUG STEP: TFORLOOP - calling C function iterator");
+                        
+                        // Unprotect the current window's registers
+                        let _ = self.register_windows.unprotect_all(window_idx);
+                        
+                        // Queue C function call with special ForLoop return context
+                        tx.queue_operation(PendingOperation::CFunctionCall {
+                            function: cfunc,
+                            args,
+                            context: ReturnContext::ForLoop {
+                                base: frame.base_register,
+                                a,
+                                c,
+                                pc: frame.pc,
+                                sbx,
+                            },
+                        })?;
+                        
+                        StepResult::Continue
+                    },
+                    _ => {
+                        // Not a function - return error
+                        tx.commit()?;
+                        return Err(LuaError::TypeError { 
+                            expected: "function".to_string(), 
+                            got: iterator.type_name().to_string(),
+                        });
+                    },
+                }
+            },
+
+            OpCode::Concat => {
+                // R(A) := R(B).. ... ..R(C)
+                println!("DEBUG STEP: CONCAT - concatenating R({}) to R({}) into R({})", b, c, a);
+                
+                // Collect values from B to C (inclusive)
+                let mut values = Vec::new();
+                for i in b..=c {
+                    let value = self.register_windows.get_register(window_idx, i)?.clone();
+                    println!("DEBUG STEP: CONCAT - value from R({}): {:?}", i, value);
+                    values.push(value);
+                }
+                
+                println!("DEBUG STEP: CONCAT - collected {} values for concatenation", values.len());
+                
+                // Calculate the absolute destination register
+                // Following the pattern from return context handling where base + offset is used
+                let dest_register = (window_idx + a) as u16;
+                
+                // Unprotect registers in the current window to allow writing from pending operation
+                let _ = self.register_windows.unprotect_all(window_idx);
+                println!("DEBUG STEP: CONCAT - unprotected registers in window {}", window_idx);
+                
+                // Queue concatenation operation
+                tx.queue_operation(PendingOperation::Concatenation {
+                    values,
+                    current_index: 0,
+                    dest_register,
+                    accumulated: Vec::new(),
+                })?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::VarArg => {
+                // R(A), R(A+1), ..., R(A+B-2) = vararg
+                println!("DEBUG STEP: VARARG - loading varargs starting at R({}), count parameter: {}", a, b);
+                
+                // Get varargs from current frame (clone to avoid borrow issues)
+                let varargs = frame.varargs.clone().unwrap_or_default();
+                println!("DEBUG STEP: VARARG - available varargs: {}", varargs.len());
+                
+                // Determine how many values to load
+                let num_to_load = if b == 0 {
+                    // B=0 means load all available varargs
+                    println!("DEBUG STEP: VARARG - B=0, loading all {} varargs", varargs.len());
+                    varargs.len()
+                } else {
+                    // B > 0 means load B-1 values (B is one more than the count)
+                    let requested = b - 1;
+                    println!("DEBUG STEP: VARARG - B={}, loading {} values", b, requested);
+                    requested
+                };
+                
+                // Load vararg values into consecutive registers
+                for i in 0..num_to_load {
+                    let value = if i < varargs.len() {
+                        // Use actual vararg value
+                        println!("DEBUG STEP: VARARG - Setting R({}) to vararg[{}]: {:?}", 
+                                 a + i, i, varargs[i]);
+                        varargs[i].clone()
+                    } else {
+                        // Pad with nil if not enough varargs
+                        println!("DEBUG STEP: VARARG - Setting R({}) to nil (padding)", a + i);
+                        Value::Nil
+                    };
+                    
+                    self.register_windows.set_register(window_idx, a + i, value)?;
+                }
+                
+                // If B > 1 but we have no varargs at all, we still need to set registers to nil
+                if varargs.is_empty() && b > 0 {
+                    let nil_count = b - 1;
+                    println!("DEBUG STEP: VARARG - No varargs available, setting {} registers to nil", nil_count);
+                    for i in 0..nil_count {
+                        self.register_windows.set_register(window_idx, a + i, Value::Nil)?;
+                    }
+                }
+                
+                StepResult::Continue
+            },
+
+            OpCode::Close => {
+                // close all upvalues >= R(A)
+                println!("DEBUG STEP: CLOSE - closing upvalues at or above R({})", a);
+                
+                // Calculate the absolute stack position threshold
+                // Window index is the base, and 'a' is the register offset within that window
+                let threshold_position = window_idx + a;
+                
+                println!("DEBUG STEP: CLOSE - threshold position: {} (window {} + register {})", 
+                         threshold_position, window_idx, a);
+                
+                // Close upvalues using the transaction method
+                tx.close_thread_upvalues(self.current_thread, threshold_position)?;
+                
+                StepResult::Continue
+            },
+
+            OpCode::Eval => {
+                // R(A), ..., R(A+C-1) := eval(R(B))
+                // A: Target register for first result
+                // B: Source register containing code string
+                // C: Expected result count (0 = all results)
+                println!("DEBUG STEP: EVAL - source from R({}), results to R({}), expected count: {}", b, a, c);
+                
+                // Get the source code from register B
+                let source_val = self.register_windows.get_register(window_idx, b)?.clone();
+                
+                // Verify it's a string
+                let source_string = match source_val {
+                    Value::String(handle) => {
+                        // Get the actual string value
+                        let str_val = tx.get_string_value(handle)?;
+                        println!("DEBUG STEP: EVAL - source code: {}", str_val);
+                        str_val
+                    },
+                    _ => {
+                        // Not a string - error
+                        tx.commit()?;
+                        return Err(LuaError::TypeError {
+                            expected: "string".to_string(),
+                            got: source_val.type_name().to_string(),
+                        });
+                    }
+                };
+                
+                // Unprotect registers in the current window to allow writing results
+                let _ = self.register_windows.unprotect_all(window_idx);
+                println!("DEBUG STEP: EVAL - unprotected registers in current window {}", window_idx);
+                
+                // Queue the eval execution operation
+                tx.queue_operation(PendingOperation::EvalExecution {
+                    source: source_string,
+                    target_window: window_idx,
+                    result_register: a,
+                    expected_results: c,
+                })?;
                 
                 StepResult::Continue
             },
@@ -1728,8 +4168,16 @@ impl LuaVM {
             tx.increment_pc(self.current_thread)?;
         }
         
-        // Commit transaction and get pending operations
-        let pending_ops = tx.commit()?;
+        // Commit the transaction only if it is still active.  Individual
+        // opcode handlers are allowed to commit early (e.g. before calling
+        // into C-functions).  With the commit() method now being idempotent
+        // this is technically harmless, but skipping the extra call avoids
+        // pointless work.
+        let pending_ops = if tx.is_active() {
+            tx.commit()?
+        } else {
+            Vec::new()
+        };
         
         // Queue any new pending operations
         for op in pending_ops {
@@ -1887,59 +4335,96 @@ impl LuaVM {
         result_register: usize,
         thread_handle: ThreadHandle,
     ) -> LuaResult<StepResult> {
-        // Create a temporary window for C function execution
-        let c_window_size = args.len() + 10; // Args + some working space
-        let c_window_base = self.register_windows.allocate_window(c_window_size)?;
-        let c_window_idx = self.register_windows.current_window()
-            .ok_or_else(|| LuaError::InternalError("No C function window".to_string()))?;
+        // First, we need to push arguments to the thread's stack so the C function can read them
+        let stack_base = {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            // Get current stack size to determine stack_base
+            let current_stack_size = tx.get_stack_size(thread_handle)?;
+            let stack_base = current_stack_size;
+            
+            println!("DEBUG CFUNC_WINDOWS: Current stack size: {}, pushing {} args at base {}", 
+                     current_stack_size, args.len(), stack_base);
+            
+            // Push arguments to the thread's stack
+            for (i, arg) in args.iter().enumerate() {
+                println!("DEBUG CFUNC_WINDOWS: Pushing arg {} to stack at position {}: {:?}", 
+                         i, stack_base + i, arg);
+                tx.push_stack(thread_handle, arg.clone())?;
+            }
+            
+            tx.commit()?;
+            stack_base
+        };
         
-        // Copy arguments to C function window
-        for (i, arg) in args.iter().enumerate() {
-            self.register_windows.set_register(c_window_idx, i, arg.clone())?;
-        }
+        println!("DEBUG CFUNC_WINDOWS: Calling C function with stack_base={}, arg_count={}", 
+                 stack_base, args.len());
         
-        // Call C function with execution context
-        let mut ctx = ExecutionContext::new(self, c_window_base, args.len(), thread_handle);
+        // Call C function with execution context pointing to the thread's stack
+        let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
         
         let result_count = match func(&mut ctx) {
-            Ok(count) => count as usize,
+            Ok(count) => {
+                println!("DEBUG CFUNC_WINDOWS: C function returned {} results", count);
+                count as usize
+            },
             Err(e) => {
-                // Clean up window on error
-                self.register_windows.deallocate_window()?;
+                println!("DEBUG CFUNC_WINDOWS: C function returned error: {:?}", e);
+                
+                // Clean up stack on error
+                let mut tx = HeapTransaction::new(&mut self.heap);
+                tx.pop_stack(thread_handle, args.len())?;
+                tx.commit()?;
+                
                 return Ok(StepResult::Error(e));
             },
         };
         
         // Copy results back to the calling window
         let mut results = Vec::with_capacity(result_count);
-        for i in 0..result_count {
-            let value = self.register_windows.get_register(c_window_idx, i)?.clone();
-            results.push(value);
+        {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            
+            // Read results from the stack
+            for i in 0..result_count {
+                let value = tx.read_register(thread_handle, stack_base + i)?;
+                println!("DEBUG CFUNC_WINDOWS: Reading result {} from stack: {:?}", i, value);
+                results.push(value);
+            }
+            
+            // Clean up the stack - remove both arguments and results
+            // We need to remove whichever is larger
+            let total_to_pop = args.len().max(result_count);
+            println!("DEBUG CFUNC_WINDOWS: Cleaning up stack, popping {} values", total_to_pop);
+            tx.pop_stack(thread_handle, total_to_pop)?;
+            
+            tx.commit()?;
         }
-        
-        // Deallocate C function window
-        self.register_windows.deallocate_window()?;
         
         // Store results in the caller's window
         if !results.is_empty() {
             for (i, value) in results.iter().enumerate() {
                 if i == 0 {
                     // First result goes to the target register
+                    println!("DEBUG CFUNC_WINDOWS: Storing result 0 in window {} register {}", 
+                             window_idx, result_register);
                     self.register_windows.set_register(window_idx, result_register, value.clone())?;
                 } else if result_register + i < 256 {
                     // Additional results go to subsequent registers
+                    println!("DEBUG CFUNC_WINDOWS: Storing result {} in window {} register {}", 
+                             i, window_idx, result_register + i);
                     self.register_windows.set_register(window_idx, result_register + i, value.clone())?;
                 }
             }
         } else {
             // No results - set target to nil
+            println!("DEBUG CFUNC_WINDOWS: No results, setting register {} to nil", result_register);
             self.register_windows.set_register(window_idx, result_register, Value::Nil)?;
         }
         
         Ok(StepResult::Continue)
     }
 
-    // Update process_c_function_return to use the static helper
     fn process_c_function_return(
         &mut self, 
         values: Vec<Value>, 
@@ -1949,23 +4434,33 @@ impl LuaVM {
         
         let mut tx = HeapTransaction::new(&mut self.heap);
         
-        match context {
+        match &context {
             ReturnContext::Register { base, offset } => {
                 println!("DEBUG CFUNC_RETURN: Storing to registers starting at base={}, offset={}", base, offset);
+                
+                // Unprotect all registers in the target window instead of just the target register
+                // This handles cases where multiple sequential registers need to be written
+                if let Some(current_window) = self.register_windows.current_window() {
+                    if *base as usize <= current_window {
+                        // Unprotect all registers in the target window
+                        let target_window = *base as usize;
+                        let _ = self.register_windows.unprotect_all(target_window);
+                        println!("DEBUG CFUNC_RETURN: Unprotected all registers in window {}", target_window);
+                    }
+                }
                 
                 // Store the return values
                 if !values.is_empty() {
                     // Store each return value in its target register
                     for (i, value) in values.iter().enumerate() {
-                        let reg_idx = base as usize + offset + i;
+                        let reg_idx = *base as usize + *offset + i;
                         tx.set_register(self.current_thread, reg_idx, value.clone())?;
                     }
                 } else {
                     // No return values - set the register to nil
-                    tx.set_register(self.current_thread, base as usize + offset, Value::Nil)?;
+                    tx.set_register(self.current_thread, *base as usize + *offset, Value::Nil)?;
                 }
             },
-            // Handle other context types
             ReturnContext::FinalResult => {
                 println!("DEBUG CFUNC_RETURN: Final result context - will be handled by execute_function");
                 // Final result will be handled by execute_function
@@ -1974,16 +4469,16 @@ impl LuaVM {
                 println!("DEBUG CFUNC_RETURN: Storing to table field, table={:?}, key={:?}", table, key);
                 // Store in table
                 if !values.is_empty() {
-                    tx.set_table_field(table, key, values[0].clone())?;
+                    tx.set_table_field(*table, key.clone(), values[0].clone())?;
                 } else {
-                    tx.set_table_field(table, key, Value::Nil)?;
+                    tx.set_table_field(*table, key.clone(), Value::Nil)?;
                 }
             },
             ReturnContext::Stack => {
                 println!("DEBUG CFUNC_RETURN: Pushing to stack, {} values", values.len());
                 // Push to stack
-                for value in values {
-                    tx.push_stack(self.current_thread, value)?;
+                for value in &values {
+                    tx.push_stack(self.current_thread, value.clone())?;
                 }
             },
             ReturnContext::Metamethod { context: mm_context } => {
@@ -1991,48 +4486,60 @@ impl LuaVM {
                 let result_value = values.get(0).cloned().unwrap_or(Value::Nil);
                 
                 // Use the free function to avoid borrowing self
-                handle_metamethod_result(&mut tx, self.current_thread, result_value, mm_context)?;
+                // We need to clone mm_context since it's a reference
+                handle_metamethod_result(&mut tx, self.current_thread, result_value, mm_context.clone())?;
             },
+
             ReturnContext::ForLoop { base, a, c, pc, sbx } => {
                 println!("DEBUG CFUNC_RETURN: Processing for-loop results");
                 let first_value = values.get(0).cloned().unwrap_or(Value::Nil);
                 
                 if !first_value.is_nil() {
                     // Loop continues
-                    // Update control variable R(A+2)
-                    tx.set_register(self.current_thread, base as usize + a + 2, first_value.clone())?;
+                    println!("DEBUG CFUNC_RETURN: ForLoop continues with first value: {:?}", first_value);
+                    
+                    // Get the window index from base
+                    let window_idx = *base as usize;
+                    
+                    // Update control variable R(A+2) with first result
+                    self.register_windows.set_register(window_idx, *a + 2, first_value.clone())?;
                     
                     // Store loop variables in R(A+3) ... R(A+3+C-1)
-                    for (i, value) in values.iter().enumerate() {
-                        if i < c {
-                            tx.set_register(self.current_thread, base as usize + a + 3 + i, value.clone())?;
-                        }
+                    for i in 0..*c {
+                        let value = if i < values.len() {
+                            values[i].clone()
+                        } else {
+                            Value::Nil
+                        };
+                        self.register_windows.set_register(window_idx, *a + 3 + i, value)?;
                     }
                     
-                    // Jump to loop body
-                    let jump_pc = (pc as i32 + sbx) as usize;
-                    tx.set_pc(self.current_thread, jump_pc)?;
+                    // Don't modify PC - let the next instruction (JMP) execute normally
+                    println!("DEBUG CFUNC_RETURN: ForLoop variables set, continuing to next instruction");
+                } else {
+                    // Loop is done - skip the next instruction (usually a JMP)
+                    println!("DEBUG CFUNC_RETURN: ForLoop done, skipping next instruction");
+                    tx.increment_pc(self.current_thread)?;
                 }
-                // else: Loop is done, PC already incremented in TForLoop handler
             },
-            ReturnContext::EvalReturn { target_window, result_register, expected_results, .. } => {
+            ReturnContext::EvalReturn { target_window, result_register, expected_results } => {
                 println!("DEBUG CFUNC_RETURN: Processing eval results");
                 
                 // Store the eval result in the target window
                 if !values.is_empty() {
                     // Get the first result (or more if specified by expected_results)
-                    let result_count = if expected_results == 0 {
+                    let result_count = if *expected_results == 0 {
                         values.len()
                     } else {
-                        expected_results.min(values.len())
+                        (*expected_results).min(values.len())
                     };
                     
                     // Store each result
                     for i in 0..result_count {
                         if i < values.len() {
                             self.register_windows.set_register(
-                                target_window,
-                                result_register + i,
+                                *target_window,
+                                *result_register + i,
                                 values[i].clone()
                             )?;
                         }
@@ -2040,8 +4547,8 @@ impl LuaVM {
                 } else {
                     // No results, store nil
                     self.register_windows.set_register(
-                        target_window,
-                        result_register,
+                        *target_window,
+                        *result_register,
                         Value::Nil
                     )?;
                 }
@@ -2107,129 +4614,17 @@ impl LuaVM {
                     self.process_function_call(closure, args, context)
                 },
                 Value::CFunction(cfunc) => {
-                    // For C functions, we need to set up and call directly
+                    println!("DEBUG METAMETHOD: Queueing C function metamethod call");
+                    
+                    // Create a transaction just to queue the operation
                     let mut tx = HeapTransaction::new(&mut self.heap);
                     
-                    // Get current frame for register base
-                    let frame = tx.get_current_frame(self.current_thread)?;
-                    let base = frame.base_register as usize;
-                    
-                    // Calculate where to place arguments
-                    let stack_top = tx.get_stack_size(self.current_thread)?;
-                    
-                    // Push arguments onto stack
-                    for arg in &args {
-                        tx.push_stack(self.current_thread, arg.clone())?;
-                    }
-                    
-                    tx.commit()?;
-                    
-                    // Extract what we need for clean borrows
-                    let func_copy = cfunc;
-                    let args_copy = args.clone();
-                    let args_len = args.len();
-                    let thread_handle = self.current_thread;
-                    
-                    // Call C function
-                    let mut ctx = ExecutionContext::new(self, stack_top, args_copy.len(), thread_handle);
-                    
-                    let result_count = match func_copy(&mut ctx) {
-                        Ok(count) => count as usize,
-                        Err(e) => {
-                            // Clean up stack
-                            let mut tx = HeapTransaction::new(&mut self.heap);
-                            tx.pop_stack(thread_handle, args_len)?;
-                            tx.commit()?;
-                            return Err(e);
-                        }
-                    };
-                    
-                    // Collect results
-                    let mut results = Vec::with_capacity(result_count);
-                    let mut tx = HeapTransaction::new(&mut self.heap);
-                    
-                    for i in 0..result_count {
-                        if let Ok(value) = tx.read_register(thread_handle, stack_top + i) {
-                            results.push(value);
-                        }
-                    }
-                    
-                    // Clean up stack - remove args and results
-                    tx.pop_stack(thread_handle, args_len + result_count)?;
-                    
-                    // Process results based on context
-                    match context {
-                        ReturnContext::Register { base, offset } => {
-                            if !results.is_empty() {
-                                tx.set_register(thread_handle, base as usize + offset, results[0].clone())?;
-                            } else {
-                                tx.set_register(thread_handle, base as usize + offset, Value::Nil)?;
-                            }
-                        },
-                        ReturnContext::TableField { table, key } => {
-                            let value = results.get(0).cloned().unwrap_or(Value::Nil);
-                            tx.set_table_field(table, key, value)?;
-                        },
-                        ReturnContext::Stack => {
-                            for result in results {
-                                tx.push_stack(thread_handle, result)?;
-                            }
-                        },
-                        ReturnContext::FinalResult => {
-                            // Final result handled by execute_function
-                        },
-                        ReturnContext::Metamethod { context: mm_context } => {
-                            let result_value = results.get(0).cloned().unwrap_or(Value::Nil);
-                            
-                            // Use the free function to avoid borrowing self
-                            handle_metamethod_result(&mut tx, self.current_thread, result_value, mm_context)?;
-                        },
-                        ReturnContext::ForLoop { base, a, c, pc, sbx } => {
-                            // Get first return value - if nil, the iteration is done
-                            let first_result = results.get(0).cloned().unwrap_or(Value::Nil);
-                            if !first_result.is_nil() {
-                                // Iteration continues
-                                
-                                // Update control variable: R(A+2) = first result
-                                tx.set_register(self.current_thread, base as usize + a + 2, first_result.clone())?;
-                                
-                                // Store all returned values as loop variables
-                                for (i, value) in results.iter().enumerate() {
-                                    if i < c {
-                                        tx.set_register(self.current_thread, base as usize + a + 3 + i, value.clone())?;
-                                    }
-                                }
-                                
-                                // Pad with nil values if fewer than c values were returned
-                                for i in results.len()..c {
-                                    tx.set_register(self.current_thread, base as usize + a + 3 + i, Value::Nil)?;
-                                }
-                                
-                                // Jump to loop body
-                                let jump_pc = (pc as i32 + sbx) as usize;
-                                tx.set_pc(self.current_thread, jump_pc)?;
-                            }
-                            // else: loop is done, PC already incremented in TForLoop handler
-                        },
-                        ReturnContext::EvalReturn { target_window, result_register, expected_results } => {
-                            println!("DEBUG C FUNC: Processing eval return");
-                            
-                            // Store the result in the target window
-                            if !results.is_empty() {
-                                self.register_windows.set_register(
-                                    target_window,
-                                    result_register,
-                                    results[0].clone()
-                                )?;
-                            } else {
-                                self.register_windows.set_register(
-                                    target_window,
-                                    result_register,
-                                    Value::Nil
-                                )?;
-                            }
-                        },
-                    }
+                    // Queue the C function call as a pending operation
+                    tx.queue_operation(PendingOperation::CFunctionCall {
+                        function: cfunc,
+                        args,
+                        context,
+                    })?;
                     
                     tx.commit()?;
                     
@@ -2295,7 +4690,43 @@ impl LuaVM {
         match op {
             PendingOperation::FunctionCall { closure, args, context } => {
                 println!("DEBUG PENDING_OP: Processing FunctionCall operation");
+                
+                // Special handling for ForLoop context to ensure proper result handling
+                match &context {
+                    ReturnContext::ForLoop { base, a, c, pc, sbx } => {
+                        println!("DEBUG PENDING_OP: FunctionCall with ForLoop context");
+                        // Process the function call which will eventually return through
+                        // the regular return handling mechanism
+                    },
+                    _ => {}
+                }
+                
                 self.process_function_call(closure, args, context)
+            },
+            PendingOperation::CFunctionCall { function, args, context } => {
+                println!("DEBUG PENDING_OP: Processing CFunctionCall operation");
+                
+                // Get the current frame info
+                let (window_idx, register_offset) = {
+                    let mut tx = HeapTransaction::new(&mut self.heap);
+                    let frame = tx.get_current_frame(self.current_thread)?;
+                    tx.commit()?;
+                    
+                    // Extract window index and register offset from context
+                    match &context {
+                        ReturnContext::Register { base, offset } => (*base as usize, *offset),
+                        _ => (frame.base_register as usize, 0),
+                    }
+                };
+                
+                // Now handle the C function call
+                self.handle_c_function_call_with_windows(
+                    function,
+                    args,
+                    window_idx,
+                    register_offset,
+                    self.current_thread
+                )
             },
             PendingOperation::CFunctionReturn { values, context } => {
                 println!("DEBUG PENDING_OP: Processing CFunctionReturn operation with {} values", values.len());
@@ -2763,6 +5194,109 @@ impl LuaVM {
             },
 
 
+            PendingOperation::ArithmeticOp { op, left, right, context } => {
+                println!("DEBUG PENDING_OP: Processing ArithmeticOp {:?}", op);
+                
+                // Try to resolve the appropriate metamethod
+                let mm_type = match op {
+                    ArithmeticOperation::Add => crate::lua::metamethod::MetamethodType::Add,
+                    ArithmeticOperation::Sub => crate::lua::metamethod::MetamethodType::Sub,
+                    ArithmeticOperation::Mul => crate::lua::metamethod::MetamethodType::Mul,
+                    ArithmeticOperation::Div => crate::lua::metamethod::MetamethodType::Div,
+                    ArithmeticOperation::Mod => crate::lua::metamethod::MetamethodType::Mod,
+                    ArithmeticOperation::Pow => crate::lua::metamethod::MetamethodType::Pow,
+                    ArithmeticOperation::Unm => crate::lua::metamethod::MetamethodType::Unm,
+                };
+                
+                let mut tx = HeapTransaction::new(&mut self.heap);
+                
+                // For unary minus, we only have one operand
+                if matches!(op, ArithmeticOperation::Unm) {
+                    // Unary operation - only check left operand
+                    if let Some(mm) = crate::lua::metamethod::resolve_metamethod(
+                        &mut tx, &left, mm_type
+                    )? {
+                        match mm {
+                            Value::Closure(closure) => {
+                                tx.queue_operation(PendingOperation::FunctionCall {
+                                    closure,
+                                    args: vec![left],
+                                    context,
+                                })?;
+                            },
+                            Value::CFunction(_) => {
+                                let method_name = tx.create_string("__unm")?;
+                                tx.queue_operation(PendingOperation::MetamethodCall {
+                                    method: method_name,
+                                    target: left.clone(),
+                                    args: vec![left],
+                                    context,
+                                })?;
+                            },
+                            _ => {
+                                tx.commit()?;
+                                return Err(LuaError::InternalError("Invalid metamethod type".to_string()));
+                            }
+                        }
+                        tx.commit()?;
+                        Ok(StepResult::Continue)
+                    } else {
+                        tx.commit()?;
+                        Err(LuaError::TypeError {
+                            expected: "number or value with __unm metamethod".to_string(),
+                            got: left.type_name().to_string(),
+                        })
+                    }
+                } else {
+                    // Binary operation
+                    let mm_opt = crate::lua::metamethod::resolve_binary_metamethod(
+                        &mut tx, &left, &right, mm_type
+                    )?;
+                    
+                    if let Some((mm_func, _)) = mm_opt {
+                        match mm_func {
+                            Value::Closure(closure) => {
+                                tx.queue_operation(PendingOperation::FunctionCall {
+                                    closure,
+                                    args: vec![left, right],
+                                    context,
+                                })?;
+                            },
+                            Value::CFunction(_) => {
+                                let method_name = match op {
+                                    ArithmeticOperation::Add => "__add",
+                                    ArithmeticOperation::Sub => "__sub",
+                                    ArithmeticOperation::Mul => "__mul",
+                                    ArithmeticOperation::Div => "__div",
+                                    ArithmeticOperation::Mod => "__mod",
+                                    ArithmeticOperation::Pow => "__pow",
+                                    ArithmeticOperation::Unm => "__unm",
+                                };
+                                let method_str = tx.create_string(method_name)?;
+                                tx.queue_operation(PendingOperation::MetamethodCall {
+                                    method: method_str,
+                                    target: left.clone(),
+                                    args: vec![left, right],
+                                    context,
+                                })?;
+                            },
+                            _ => {
+                                tx.commit()?;
+                                return Err(LuaError::InternalError("Invalid metamethod type".to_string()));
+                            }
+                        }
+                        tx.commit()?;
+                        Ok(StepResult::Continue)
+                    } else {
+                        tx.commit()?;
+                        Err(LuaError::TypeError {
+                            expected: "number".to_string(),
+                            got: format!("{} and {}", left.type_name(), right.type_name()),
+                        })
+                    }
+                }
+            },
+
             _ => {
                 println!("DEBUG PENDING_OP: Unimplemented operation type: {:?}", 
                          std::mem::discriminant(&op));
@@ -2779,6 +5313,8 @@ impl LuaVM {
         context: ReturnContext,
     ) -> LuaResult<StepResult> {
         println!("DEBUG FUNC_CALL: Processing function call");
+        println!("DEBUG FUNC_CALL: Args: {:?}", args);
+        println!("DEBUG FUNC_CALL: Context: {:?}", context);
         
         // First transaction to get function info
         let mut tx = HeapTransaction::new(&mut self.heap);
@@ -2788,6 +5324,11 @@ impl LuaVM {
         let num_params = closure_obj.proto.num_params as usize;
         let is_vararg = closure_obj.proto.is_vararg;
         let max_stack = closure_obj.proto.max_stack_size as usize;
+        
+        println!("DEBUG FUNC_CALL: Function has {} upvalues", closure_obj.upvalues.len());
+        for (i, upval) in closure_obj.upvalues.iter().enumerate() {
+            println!("DEBUG FUNC_CALL: Upvalue {}: {:?}", i, upval);
+        }
         
         // Make sure we have an active window - if not, create one
         if self.register_windows.current_window().is_none() {
@@ -2813,12 +5354,21 @@ impl LuaVM {
                 Value::Nil
             };
             println!("DEBUG FUNC_CALL: Setting parameter {} in window {}", i, func_window_idx);
-            self.register_windows.set_register(func_window_idx, i, value)?;
+            self.register_windows.set_register(func_window_idx, i, value.clone())?;
+            
+            // IMPORTANT: Also sync to thread stack for upvalue capture
+            // Calculate stack position using inline calculation
+            let stack_position = func_window_idx * 256 + i;
+            tx.set_register(self.current_thread, stack_position, value)?;
         }
         
         // Initialize remaining registers to nil
         for i in num_params..max_stack {
             self.register_windows.set_register(func_window_idx, i, Value::Nil)?;
+            
+            // Sync to thread stack
+            let stack_position = func_window_idx * 256 + i;
+            tx.set_register(self.current_thread, stack_position, Value::Nil)?;
         }
         
         // Collect varargs if needed
@@ -2877,6 +5427,11 @@ impl LuaVM {
         Ok(depth)
     }
     
+    /// Get call depth using an existing transaction
+    fn get_call_depth_with_tx(tx: &mut HeapTransaction, thread: ThreadHandle) -> LuaResult<usize> {
+        tx.get_thread_call_depth(thread)
+    }
+    
     /// Check if we should kill the script
     fn should_kill(&self) -> bool {
         // TODO: Check kill flag
@@ -2891,6 +5446,8 @@ impl LuaVM {
             false
         }
     }
+    
+
     
     /// Initialize the standard library
     pub fn init_stdlib(&mut self) -> LuaResult<()> {
@@ -3114,6 +5671,71 @@ impl LuaVM {
         
         // Execute the compiled module
         self.execute_module(&compiled, &[])
+    }
+    
+    /// Calculate the length of a table according to Lua semantics
+    /// The length operator returns the largest positive integer key n in the table 
+    /// such that t[n] is not nil and t[n+1] is nil
+    pub fn calculate_table_length(&mut self, table: TableHandle) -> LuaResult<usize> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        let table_obj = tx.get_table(table)?;
+        
+        // Find the "border" - the last index i where t[i] is not nil
+        // and t[i+1] is nil (or doesn't exist)
+        let mut border = 0;
+        
+        // Check array part for consecutive non-nil values
+        for i in 0..table_obj.array.len() {
+            if table_obj.array[i].is_nil() {
+                break;
+            }
+            border = i + 1;
+        }
+        
+        // Check hash part for numeric indices that might extend the border
+        let mut has_keys_beyond = false;
+        let mut max_key = border;
+        
+        for (k, v) in &table_obj.map {
+            if let HashableValue::Number(n) = k {
+                let idx = n.0;
+                // Check if it's a positive integer and non-nil
+                if idx > 0.0 && idx == idx.floor() && !v.is_nil() {
+                    let idx_int = idx as usize;
+                    if idx_int > max_key {
+                        max_key = idx_int;
+                        has_keys_beyond = true;
+                    }
+                }
+            }
+        }
+        
+        // If we have keys beyond the current border, we need to find the actual border
+        if has_keys_beyond {
+            // Binary search for the actual border
+            let mut low = border;
+            let mut high = max_key;
+            
+            while low < high {
+                let mid = low + (high - low + 1) / 2;
+                
+                // Check if t[mid] exists and is non-nil
+                let mid_value = tx.read_table_field(table, &Value::Number(mid as f64))?;
+                
+                if mid_value.is_nil() {
+                    // nil at mid, border is before mid
+                    high = mid - 1;
+                } else {
+                    // non-nil at mid, border might be at or after mid
+                    low = mid;
+                }
+            }
+            
+            border = low;
+        }
+        
+        tx.commit()?;
+        Ok(border)
     }
 }
 
@@ -3787,46 +6409,40 @@ mod tests {
     }
 
     #[test]
-    fn test_upvalue_operations() {
+    fn test_upvalue_operations_execution() {
         let mut vm = LuaVM::new().unwrap();
         
-        // Create a transaction to set up the test
-        let (_closure_handle, _upvalue_handle) = {
+        // Initialize the register window system
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        // Create upvalues and bytecode
+        let (closure_handle, upvalue_handle) = {
             let mut tx = HeapTransaction::new(&mut vm.heap);
             
-            // Create an upvalue
+            // Create an upvalue with initial value
             let upvalue = value::Upvalue {
                 stack_index: None,
                 value: Some(Value::Number(42.0)),
             };
             let upvalue_handle = tx.create_upvalue(upvalue).unwrap();
             
-            // Create a function proto with GetUpval and SetUpval instructions
+            // Create bytecode:
+            // 0: LOADK R(1), K(0)    ; Load 99.0 into R(1)
+            // 1: GETUPVAL R(0), 0    ; Load upvalue[0] into R(0)
+            // 2: SETUPVAL R(1), 0    ; Store R(1) into upvalue[0]
+            // 3: GETUPVAL R(2), 0    ; Load upvalue[0] into R(2) to verify
+            // 4: RETURN R(2), 1      ; Return R(2)
             
-            // Encoding for GetUpval:
-            // opcode = 4 (GetUpval)
-            // A = 0 (store in R(0))
-            // B = 0 (first upvalue)
-            // Format: opcode | A << 6 | B << 23
-            let get_upval_instr = 4 | (0 << 6) | (0 << 23);
-            
-            // Encoding for SetUpval:
-            // opcode = 7 (SetUpval)
-            // A = 1 (load from R(1))
-            // B = 0 (first upvalue)
-            // Format: opcode | A << 6 | B << 23
-            let set_upval_instr = 7 | (1 << 6) | (0 << 23);
-            
-            // Create a return instruction
-            // opcode = 30 (Return)
-            // A = 0 (return from R(0))
-            // B = 2 (return 1 value)
-            let return_instr = 30 | (0 << 6) | (2 << 23);
+            let loadk_instr = 1 | (1 << 6) | (0 << 14);         // LOADK R(1), K(0)
+            let get_upval_instr1 = 4 | (0 << 6) | (0 << 23);   // GETUPVAL R(0), 0
+            let set_upval_instr = 7 | (1 << 6) | (0 << 23);    // SETUPVAL R(1), 0
+            let get_upval_instr2 = 4 | (2 << 6) | (0 << 23);   // GETUPVAL R(2), 0
+            let return_instr = 30 | (2 << 6) | (2 << 23);      // RETURN R(2), 1
             
             // Create function proto
             let proto = value::FunctionProto {
-                bytecode: vec![get_upval_instr, set_upval_instr, return_instr],
-                constants: vec![],
+                bytecode: vec![loadk_instr, get_upval_instr1, set_upval_instr, get_upval_instr2, return_instr],
+                constants: vec![Value::Number(99.0)],
                 num_params: 0,
                 is_vararg: false,
                 max_stack_size: 10,
@@ -3845,15 +6461,1578 @@ mod tests {
             // Create closure handle
             let closure_handle = tx.create_closure(closure).unwrap();
             
+            // Set up call frame
+            let frame = value::CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: Some(1),
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
             tx.commit().unwrap();
             
             (closure_handle, upvalue_handle)
         };
         
-        // This test will verify our upvalue implementation
-        // but we won't actually execute it for now, as we need to complete
-        // the VM implementation for function execution
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
         
-        println!("Created closure with upvalue for verification");
+        // Helper to get upvalue value
+        let get_upvalue_value = |vm: &mut LuaVM, handle: UpvalueHandle| -> Value {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            let upvalue_obj = tx.get_upvalue(handle).unwrap();
+            let value = upvalue_obj.value.unwrap_or(Value::Nil);
+            tx.commit().unwrap();
+            value
+        };
+        
+        println!("Testing upvalue operations");
+        
+        // Step 1: LOADK R(1), K(0) - Load 99.0 into R(1)
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 1), Value::Number(99.0), "R(1) should contain 99.0");
+        
+        // Step 2: GETUPVAL R(0), 0 - Load upvalue[0] into R(0)
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 0), Value::Number(42.0), "R(0) should contain upvalue value 42.0");
+        
+        // Step 3: SETUPVAL R(1), 0 - Store R(1) into upvalue[0]
+        vm.step().unwrap();
+        assert_eq!(get_upvalue_value(&mut vm, upvalue_handle), Value::Number(99.0), 
+                   "Upvalue should now contain 99.0");
+        
+        // Step 4: GETUPVAL R(2), 0 - Load upvalue[0] into R(2) to verify
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 2), Value::Number(99.0), 
+                   "R(2) should contain the updated upvalue value 99.0");
+        
+        println!("Upvalue operations test completed successfully");
+    }
+    
+    #[test]
+    fn test_upvalue_stack_reference() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize the register window system
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        // Create a test with an open upvalue (referencing the stack)
+        let upvalue_handle = {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Set up a value in register 5
+            tx.set_register(vm.current_thread, 5, Value::Number(123.0)).unwrap();
+            
+            // Create an upvalue that references stack position 5
+            let upvalue = value::Upvalue {
+                stack_index: Some(5),
+                value: None,
+            };
+            let upvalue_handle = tx.create_upvalue(upvalue).unwrap();
+            
+            // Create bytecode:
+            // 0: GETUPVAL R(0), 0    ; Load upvalue[0] into R(0)
+            // 1: RETURN R(0), 2      ; Return R(0)
+            
+            let get_upval_instr = 4 | (0 << 6) | (0 << 23);    // GETUPVAL R(0), 0
+            let return_instr = 30 | (0 << 6) | (2 << 23);      // RETURN R(0), 1
+            
+            // Create function proto
+            let proto = value::FunctionProto {
+                bytecode: vec![get_upval_instr, return_instr],
+                constants: vec![],
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![value::UpvalueInfo {
+                    in_stack: true,
+                    index: 0,
+                }],
+            };
+            
+            // Create closure with the upvalue
+            let closure = value::Closure {
+                proto,
+                upvalues: vec![upvalue_handle],
+            };
+            
+            // Create closure handle
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            // Set up call frame
+            let frame = value::CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: Some(1),
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+            
+            upvalue_handle
+        };
+        
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
+        
+        println!("Testing upvalue with stack reference");
+        
+        // Execute GETUPVAL R(0), 0 - should read from stack position 5
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 0), Value::Number(123.0), 
+                   "R(0) should contain value from stack position 5");
+        
+        println!("Stack reference upvalue test completed successfully");
+    }
+    
+    #[test]
+    fn test_newtable_opcode() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize the register window system
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode:
+            // 0: NEWTABLE R(1), 0, 0   ; Create empty table in R(1)
+            // 1: NEWTABLE R(2), 3, 2   ; Create table with size hints in R(2)
+            // 2: RETURN R(1), 2        ; Return R(1)
+            
+            // NewTable encoding: opcode=10, A=register, B=array hint, C=hash hint
+            let newtable_instr1 = 10 | (1 << 6) | (0 << 23) | (0 << 14);  // NEWTABLE R(1), 0, 0
+            let newtable_instr2 = 10 | (2 << 6) | (3 << 23) | (2 << 14);  // NEWTABLE R(2), 3, 2 
+            let return_instr = 30 | (1 << 6) | (2 << 23);                  // RETURN R(1), 1
+            
+            // Create function proto
+            let proto = value::FunctionProto {
+                bytecode: vec![newtable_instr1, newtable_instr2, return_instr],
+                constants: vec![],
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![],
+            };
+            
+            // Create closure
+            let closure = value::Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            // Create closure handle and setup
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = value::CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: Some(1),
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
+        
+        println!("Testing NEWTABLE opcode");
+        
+        // Step 1: NEWTABLE R(1), 0, 0 - Create empty table
+        vm.step().unwrap();
+        let table1 = get_register(&mut vm, 1);
+        match table1 {
+            Value::Table(handle) => {
+                println!("Successfully created table in R(1): {:?}", handle);
+                
+                // Verify it's an empty table
+                let mut tx = HeapTransaction::new(&mut vm.heap);
+                let table_obj = tx.get_table(handle).unwrap();
+                assert!(table_obj.array.is_empty(), "Array part should be empty");
+                assert!(table_obj.map.is_empty(), "Hash part should be empty");
+                tx.commit().unwrap();
+            },
+            _ => panic!("Expected table in R(1), got {:?}", table1),
+        }
+        
+        // Step 2: NEWTABLE R(2), 3, 2 - Create table with size hints
+        vm.step().unwrap();
+        let table2 = get_register(&mut vm, 2);
+        match table2 {
+            Value::Table(handle) => {
+                println!("Successfully created table in R(2) with size hints: {:?}", handle);
+                
+                // The table should still be empty, size hints are just optimization
+                let mut tx = HeapTransaction::new(&mut vm.heap);
+                let table_obj = tx.get_table(handle).unwrap();
+                assert!(table_obj.array.is_empty(), "Array part should be empty");
+                assert!(table_obj.map.is_empty(), "Hash part should be empty");
+                tx.commit().unwrap();
+            },
+            _ => panic!("Expected table in R(2), got {:?}", table2),
+        }
+        
+        // Verify that the two tables are different
+        match (table1, table2) {
+            (Value::Table(h1), Value::Table(h2)) => {
+                assert_ne!(h1, h2, "Tables should have different handles");
+            },
+            _ => panic!("Both values should be tables"),
+        }
+        
+        println!("NEWTABLE opcode test completed successfully");
+    }
+
+    #[test]
+    fn test_setlist_opcode() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize the register window system
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode:
+            // 0: NEWTABLE R(0), 0, 0     ; Create empty table in R(0)
+            // 1: LOADK R(1), K(0)        ; Load 10.0 into R(1)
+            // 2: LOADK R(2), K(1)        ; Load 20.0 into R(2)
+            // 3: LOADK R(3), K(2)        ; Load 30.0 into R(3)
+            // 4: SETLIST R(0), 3, 1      ; Set table[1]=R(1), table[2]=R(2), table[3]=R(3)
+            // 5: RETURN R(0), 2          ; Return R(0)
+            
+            // Instruction encoding
+            let newtable_instr = 10 | (0 << 6) | (0 << 23) | (0 << 14);   // NEWTABLE R(0), 0, 0
+            let loadk_instr1 = 1 | (1 << 6) | (0 << 14);                  // LOADK R(1), K(0)
+            let loadk_instr2 = 1 | (2 << 6) | (1 << 14);                  // LOADK R(2), K(1)
+            let loadk_instr3 = 1 | (3 << 6) | (2 << 14);                  // LOADK R(3), K(2)
+            let setlist_instr = 34 | (0 << 6) | (3 << 23) | (1 << 14);    // SETLIST R(0), 3, 1
+            let return_instr = 30 | (0 << 6) | (2 << 23);                 // RETURN R(0), 1
+            
+            // Create function proto with constants
+            let proto = value::FunctionProto {
+                bytecode: vec![
+                    newtable_instr,
+                    loadk_instr1,
+                    loadk_instr2,
+                    loadk_instr3,
+                    setlist_instr,
+                    return_instr
+                ],
+                constants: vec![
+                    Value::Number(10.0),
+                    Value::Number(20.0),
+                    Value::Number(30.0),
+                ],
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![],
+            };
+            
+            // Create closure
+            let closure = value::Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            // Create closure handle and setup
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = value::CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: Some(1),
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
+        
+        println!("Testing SETLIST opcode");
+        
+        // Step 1: NEWTABLE R(0), 0, 0
+        vm.step().unwrap();
+        let table = get_register(&mut vm, 0);
+        let table_handle = match table {
+            Value::Table(handle) => handle,
+            _ => panic!("Expected table in R(0), got {:?}", table),
+        };
+        
+        // Step 2-4: Load values into R(1), R(2), R(3)
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 1), Value::Number(10.0));
+        
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 2), Value::Number(20.0));
+        
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 3), Value::Number(30.0));
+        
+        // Step 5: SETLIST R(0), 3, 1
+        vm.step().unwrap();
+        
+        // Verify table contents
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Check table[1] = 10.0
+            let val1 = tx.read_table_field(table_handle, &Value::Number(1.0)).unwrap();
+            assert_eq!(val1, Value::Number(10.0), "table[1] should be 10.0");
+            
+            // Check table[2] = 20.0
+            let val2 = tx.read_table_field(table_handle, &Value::Number(2.0)).unwrap();
+            assert_eq!(val2, Value::Number(20.0), "table[2] should be 20.0");
+            
+            // Check table[3] = 30.0
+            let val3 = tx.read_table_field(table_handle, &Value::Number(3.0)).unwrap();
+            assert_eq!(val3, Value::Number(30.0), "table[3] should be 30.0");
+            
+            // Check table[4] is nil (not set)
+            let val4 = tx.read_table_field(table_handle, &Value::Number(4.0)).unwrap();
+            assert_eq!(val4, Value::Nil, "table[4] should be nil");
+            
+            tx.commit().unwrap();
+        }
+        
+        println!("SETLIST opcode test completed successfully");
+    }
+    
+    #[test]
+    fn test_setlist_with_b_zero() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize the register window system
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode:
+            // 0: NEWTABLE R(0), 0, 0     ; Create empty table in R(0)
+            // 1: LOADK R(1), K(0)        ; Load 100.0 into R(1)
+            // 2: LOADK R(2), K(1)        ; Load 200.0 into R(2)
+            // 3: SETLIST R(0), 0, 10     ; Set all values from R(1) onward, starting at index 10
+            // 4: RETURN R(0), 2          ; Return R(0)
+            
+            let newtable_instr = 10 | (0 << 6) | (0 << 23) | (0 << 14);   // NEWTABLE R(0), 0, 0
+            let loadk_instr1 = 1 | (1 << 6) | (0 << 14);                  // LOADK R(1), K(0)
+            let loadk_instr2 = 1 | (2 << 6) | (1 << 14);                  // LOADK R(2), K(1)
+            let setlist_instr = 34 | (0 << 6) | (0 << 23) | (10 << 14);   // SETLIST R(0), 0, 10
+            let return_instr = 30 | (0 << 6) | (2 << 23);                 // RETURN R(0), 1
+            
+            // Create function proto
+            let proto = value::FunctionProto {
+                bytecode: vec![
+                    newtable_instr,
+                    loadk_instr1,
+                    loadk_instr2,
+                    setlist_instr,
+                    return_instr
+                ],
+                constants: vec![
+                    Value::Number(100.0),
+                    Value::Number(200.0),
+                ],
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![],
+            };
+            
+            // Create closure
+            let closure = value::Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = value::CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: Some(1),
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack with extra nils
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        println!("Testing SETLIST with B=0 (all values)");
+        
+        // Execute: NEWTABLE
+        vm.step().unwrap();
+        let table_handle = match vm.register_windows.get_register(0, 0).unwrap() {
+            Value::Table(handle) => *handle,
+            other => panic!("Expected table, got {:?}", other),
+        };
+        
+        // Execute: LOADK R(1) and R(2)
+        vm.step().unwrap();
+        vm.step().unwrap();
+        
+        // Execute: SETLIST with B=0
+        vm.step().unwrap();
+        
+        // Verify table contents
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Check table[10] = 100.0
+            let val10 = tx.read_table_field(table_handle, &Value::Number(10.0)).unwrap();
+            assert_eq!(val10, Value::Number(100.0), "table[10] should be 100.0");
+            
+            // Check table[11] = 200.0
+            let val11 = tx.read_table_field(table_handle, &Value::Number(11.0)).unwrap();
+            assert_eq!(val11, Value::Number(200.0), "table[11] should be 200.0");
+            
+            // Check that other indices are not set
+            let val1 = tx.read_table_field(table_handle, &Value::Number(1.0)).unwrap();
+            assert_eq!(val1, Value::Nil, "table[1] should be nil");
+            
+            tx.commit().unwrap();
+        }
+        
+        println!("SETLIST with B=0 test completed successfully");
+    }
+    
+    #[test]
+    fn test_comparison_opcodes() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize register window
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode for testing comparisons
+            // Register layout:
+            // R(0) = 10.0
+            // R(1) = 20.0
+            // R(2) = "hello"
+            // R(3) = "world"
+            // R(4) = true
+            // R(5) = false
+            
+            // Load values into registers
+            let loadk_num1 = 1 | (0 << 6) | (0 << 14);    // LOADK R(0), K(0) = 10.0
+            let loadk_num2 = 1 | (1 << 6) | (1 << 14);    // LOADK R(1), K(1) = 20.0
+            let loadk_str1 = 1 | (2 << 6) | (2 << 14);    // LOADK R(2), K(2) = "hello"
+            let loadk_str2 = 1 | (3 << 6) | (3 << 14);    // LOADK R(3), K(3) = "world"
+            let loadbool_t = 2 | (4 << 6) | (1 << 23);    // LOADBOOL R(4), true, 0
+            let loadbool_f = 2 | (5 << 6) | (0 << 23);    // LOADBOOL R(5), false, 0
+            
+            // Test instructions with different comparisons
+            // Eq tests
+            let eq_num_true = 23 | (1 << 6) | (0 << 23) | (1 << 14);   // EQ 1, R(0), R(1) - expect true (10 == 20 is false, but A=1 inverts)
+            let eq_num_false = 23 | (0 << 6) | (0 << 23) | (1 << 14);  // EQ 0, R(0), R(1) - expect false, should skip
+            let eq_str_true = 23 | (0 << 6) | (2 << 23) | (2 << 14);   // EQ 0, R(2), R(2) - expect false (hello == hello is true, but A=0 inverts)
+            
+            // Lt tests
+            let lt_num_true = 24 | (1 << 6) | (0 << 23) | (1 << 14);   // LT 1, R(0), R(1) - expect true (10 < 20)
+            let lt_num_false = 24 | (0 << 6) | (0 << 23) | (1 << 14);  // LT 0, R(0), R(1) - expect false, should skip
+            let lt_str = 24 | (1 << 6) | (2 << 23) | (3 << 14);        // LT 1, R(2), R(3) - expect true ("hello" < "world")
+            
+            // Le tests
+            let le_num_true = 25 | (1 << 6) | (0 << 23) | (1 << 14);   // LE 1, R(0), R(1) - expect true (10 <= 20)
+            let le_num_eq = 25 | (1 << 6) | (0 << 23) | (0 << 14);     // LE 1, R(0), R(0) - expect true (10 <= 10)
+            let le_str = 25 | (1 << 6) | (2 << 23) | (3 << 14);        // LE 1, R(2), R(3) - expect true ("hello" <= "world")
+            
+            // Add some MOVE instructions as markers
+            let move_marker = 0 | (6 << 6) | (0 << 23);  // MOVE R(6), R(0) - marker instruction
+            
+            let test_bytecode = vec![
+                // Setup
+                loadk_num1,      // 0
+                loadk_num2,      // 1
+                loadk_str1,      // 2
+                loadk_str2,      // 3
+                loadbool_t,      // 4
+                loadbool_f,      // 5
+                
+                // Eq tests
+                eq_num_true,     // 6 - should NOT skip (10 == 20 is false, A=1 expects true, mismatch)
+                move_marker,     // 7 - should be skipped
+                eq_num_false,    // 8 - should skip (10 == 20 is false, A=0 expects false, match)
+                move_marker,     // 9 - should be executed
+                eq_str_true,     // 10 - should skip (hello == hello is true, A=0 expects false, mismatch)
+                move_marker,     // 11 - should be executed
+                
+                // Lt tests
+                lt_num_true,     // 12 - should NOT skip (10 < 20 is true, A=1 expects true, match)
+                move_marker,     // 13 - should be executed
+                lt_num_false,    // 14 - should skip (10 < 20 is true, A=0 expects false, mismatch)
+                move_marker,     // 15 - should be skipped
+                lt_str,          // 16 - should NOT skip ("hello" < "world" is true, A=1 expects true, match)
+                move_marker,     // 17 - should be executed
+                
+                // Le tests
+                le_num_true,     // 18 - should NOT skip (10 <= 20 is true, A=1 expects true, match)
+                move_marker,     // 19 - should be executed
+                le_num_eq,       // 20 - should NOT skip (10 <= 10 is true, A=1 expects true, match)
+                move_marker,     // 21 - should be executed
+                le_str,          // 22 - should NOT skip ("hello" <= "world" is true, A=1 expects true, match)
+                0,               // 23 - end
+            ];
+            
+            // Create constants
+            let hello_str = tx.create_string("hello").unwrap();
+            let world_str = tx.create_string("world").unwrap();
+            
+            let constants = vec![
+                Value::Number(10.0),
+                Value::Number(20.0),
+                Value::String(hello_str),
+                Value::String(world_str),
+            ];
+            
+            // Create function prototype
+            let proto = FunctionProto {
+                bytecode: test_bytecode,
+                constants,
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![],
+            };
+            
+            // Create closure and setup
+            let closure = Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: None,
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get PC
+        let get_pc = |vm: &mut LuaVM| -> usize {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            let frame = tx.get_current_frame(vm.current_thread).unwrap();
+            let pc = frame.pc;
+            tx.commit().unwrap();
+            pc
+        };
+        
+        println!("Testing comparison opcodes");
+        
+        // Execute setup instructions (0-5)
+        for i in 0..6 {
+            println!("Setup step {}", i);
+            vm.step().unwrap();
+        }
+        assert_eq!(get_pc(&mut vm), 6);
+        
+        // Test EQ with numbers (should skip)
+        println!("\nTesting EQ with numbers (A=1)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 8, "EQ should have skipped instruction 7");
+        
+        // Test EQ with numbers (should not skip)
+        println!("\nTesting EQ with numbers (A=0)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 9, "EQ should not have skipped");
+        
+        // Execute marker
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 10);
+        
+        // Test EQ with strings (should skip)
+        println!("\nTesting EQ with equal strings (A=0)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 12, "EQ should have skipped instruction 11");
+        
+        // Test LT with numbers (should not skip)
+        println!("\nTesting LT with numbers (A=1, 10 < 20)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 13, "LT should not have skipped");
+        
+        // Execute marker
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 14);
+        
+        // Test LT with numbers (should skip)
+        println!("\nTesting LT with numbers (A=0, 10 < 20)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 16, "LT should have skipped instruction 15");
+        
+        // Test LT with strings (should not skip)
+        println!("\nTesting LT with strings");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 17, "LT should not have skipped");
+        
+        // Execute marker
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 18);
+        
+        // Test LE with numbers (should not skip)
+        println!("\nTesting LE with numbers (10 <= 20)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 19, "LE should not have skipped");
+        
+        // Execute marker
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 20);
+        
+        // Test LE with equal numbers (should not skip)
+        println!("\nTesting LE with equal numbers (10 <= 10)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 21, "LE should not have skipped");
+        
+        // Execute marker
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 22);
+        
+        // Test LE with strings (should not skip)
+        println!("\nTesting LE with strings");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 23, "LE should not have skipped");
+        
+        println!("All comparison tests passed!");
+    }
+    
+    #[test]
+    fn test_comparison_with_constants() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize register window
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Test RK encoding with constants (bit 0x100 set)
+            // Compare register with constant and constant with register
+            
+            let loadk_num = 1 | (0 << 6) | (0 << 14);     // LOADK R(0), K(0) = 42.0
+            
+            // EQ with constant: compare R(0) with K(1)
+            // B = R(0) = 0, C = K(1) = 1 | 0x100 = 257
+            let eq_reg_const = 23 | (1 << 6) | (0 << 23) | (257 << 14);  // EQ 1, R(0), K(1)
+            
+            // LT with constant: compare K(1) with R(0)
+            // B = K(1) = 257, C = R(0) = 0
+            let lt_const_reg = 24 | (0 << 6) | (257 << 23) | (0 << 14);  // LT 0, K(1), R(0)
+            
+            let test_bytecode = vec![
+                loadk_num,       // 0: Load 42.0 into R(0)
+                eq_reg_const,    // 1: Compare R(0) == K(1) (42 == 42), expect true
+                0,               // 2: Marker (should be executed)
+                lt_const_reg,    // 3: Compare K(1) < R(0) (42 < 42), expect false
+                0,               // 4: Marker (should be executed)
+            ];
+            
+            let constants = vec![
+                Value::Number(42.0),
+                Value::Number(42.0),
+            ];
+            
+            // Create function prototype
+            let proto = FunctionProto {
+                bytecode: test_bytecode,
+                constants,
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![],
+            };
+            
+            // Create closure and setup
+            let closure = Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: None,
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get PC
+        let get_pc = |vm: &mut LuaVM| -> usize {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            let frame = tx.get_current_frame(vm.current_thread).unwrap();
+            let pc = frame.pc;
+            tx.commit().unwrap();
+            pc
+        };
+        
+        println!("Testing comparison with constants (RK encoding)");
+        
+        // Load value
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 1);
+        
+        // Test EQ with constant (42 == 42 is true, A=1 expects true, match - no skip)
+        println!("Testing EQ R(0) vs K(1)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 2, "EQ should not have skipped");
+        
+        // Execute marker
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 3);
+        
+        // Test LT with constant (42 < 42 is false, A=0 expects false, match - no skip)
+        println!("Testing LT K(1) vs R(0)");
+        vm.step().unwrap();
+        assert_eq!(get_pc(&mut vm), 4, "LT should not have skipped");
+        
+        println!("RK encoding test passed!");
+    }
+
+    #[test]
+    fn test_unm_and_not_opcodes() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize register window
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode to test Unm and Not operations
+            // Register setup:
+            // R(0) = 42.0
+            // R(1) = -5.0
+            // R(2) = "123"  (numeric string)
+            // R(3) = "abc"  (non-numeric string)
+            // R(4) = true
+            // R(5) = false
+            // R(6) = nil
+            
+            // Load test values
+            let loadk_pos = 1 | (0 << 6) | (0 << 14);      // LOADK R(0), K(0) = 42.0
+            let loadk_neg = 1 | (1 << 6) | (1 << 14);      // LOADK R(1), K(1) = -5.0
+            let loadk_numstr = 1 | (2 << 6) | (2 << 14);   // LOADK R(2), K(2) = "123"
+            let loadk_str = 1 | (3 << 6) | (3 << 14);      // LOADK R(3), K(3) = "abc"
+            let loadbool_t = 2 | (4 << 6) | (1 << 23);     // LOADBOOL R(4), true, 0
+            let loadbool_f = 2 | (5 << 6) | (0 << 23);     // LOADBOOL R(5), false, 0
+            let loadnil = 3 | (6 << 6) | (1 << 23);        // LOADNIL R(6), 1
+            
+            // Unm tests
+            let unm_pos = 18 | (7 << 6) | (0 << 23);       // UNM R(7), R(0)  ; -42.0
+            let unm_neg = 18 | (8 << 6) | (1 << 23);       // UNM R(8), R(1)  ; -(-5.0) = 5.0
+            let unm_numstr = 18 | (9 << 6) | (2 << 23);    // UNM R(9), R(2)  ; -"123" = -123.0
+            
+            // Not tests
+            let not_num = 19 | (10 << 6) | (0 << 23);      // NOT R(10), R(0) ; not 42.0 = false
+            let not_true = 19 | (11 << 6) | (4 << 23);     // NOT R(11), R(4) ; not true = false
+            let not_false = 19 | (12 << 6) | (5 << 23);    // NOT R(12), R(5) ; not false = true
+            let not_nil = 19 | (13 << 6) | (6 << 23);      // NOT R(13), R(6) ; not nil = true
+            let not_str = 19 | (14 << 6) | (3 << 23);      // NOT R(14), R(3) ; not "abc" = false
+            
+            let test_bytecode = vec![
+                // Setup
+                loadk_pos,      // 0
+                loadk_neg,      // 1
+                loadk_numstr,   // 2
+                loadk_str,      // 3
+                loadbool_t,     // 4
+                loadbool_f,     // 5
+                loadnil,        // 6
+                
+                // Unm tests
+                unm_pos,        // 7
+                unm_neg,        // 8
+                unm_numstr,     // 9
+                
+                // Not tests
+                not_num,        // 10
+                not_true,       // 11
+                not_false,      // 12
+                not_nil,        // 13
+                not_str,        // 14
+            ];
+            
+            // Create constants
+            let numstr = tx.create_string("123").unwrap();
+            let str = tx.create_string("abc").unwrap();
+            
+            let constants = vec![
+                Value::Number(42.0),
+                Value::Number(-5.0),
+                Value::String(numstr),
+                Value::String(str),
+            ];
+            
+            // Create function prototype
+            let proto = FunctionProto {
+                bytecode: test_bytecode,
+                constants,
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 20,
+                upvalues: vec![],
+            };
+            
+            // Create closure and setup
+            let closure = Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: None,
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..20 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
+        
+        println!("Testing Unm and Not opcodes");
+        
+        // Execute setup instructions (0-6)
+        for i in 0..7 {
+            println!("Setup step {}", i);
+            vm.step().unwrap();
+        }
+        
+        // Verify setup
+        assert_eq!(get_register(&mut vm, 0), Value::Number(42.0));
+        assert_eq!(get_register(&mut vm, 1), Value::Number(-5.0));
+        assert_eq!(get_register(&mut vm, 4), Value::Boolean(true));
+        assert_eq!(get_register(&mut vm, 5), Value::Boolean(false));
+        assert_eq!(get_register(&mut vm, 6), Value::Nil);
+        
+        // Test UNM on positive number
+        println!("\nTesting UNM on positive number");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 7), Value::Number(-42.0), "UNM of 42.0 should be -42.0");
+        
+        // Test UNM on negative number
+        println!("\nTesting UNM on negative number");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 8), Value::Number(5.0), "UNM of -5.0 should be 5.0");
+        
+        // Test UNM on numeric string
+        println!("\nTesting UNM on numeric string");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 9), Value::Number(-123.0), "UNM of '123' should be -123.0");
+        
+        // Test NOT on number
+        println!("\nTesting NOT on number");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 10), Value::Boolean(false), "NOT of 42.0 should be false");
+        
+        // Test NOT on true
+        println!("\nTesting NOT on true");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 11), Value::Boolean(false), "NOT of true should be false");
+        
+        // Test NOT on false
+        println!("\nTesting NOT on false");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 12), Value::Boolean(true), "NOT of false should be true");
+        
+        // Test NOT on nil
+        println!("\nTesting NOT on nil");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 13), Value::Boolean(true), "NOT of nil should be true");
+        
+        // Test NOT on string
+        println!("\nTesting NOT on string");
+        vm.step().unwrap();
+        assert_eq!(get_register(&mut vm, 14), Value::Boolean(false), "NOT of string should be false");
+        
+        println!("All Unm and Not tests passed!");
+    }
+
+    #[test]
+    fn test_self_opcode() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize register window
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create a table with a method
+            let obj_table = tx.create_table().unwrap();
+            let method_name = tx.create_string("greet").unwrap();
+            
+            // Create a simple C function as the method
+            let greet_func: CFunction = |ctx| {
+                // Get self (first argument)
+                if let Ok(Value::Table(_)) = ctx.get_arg(0) {
+                    println!("DEBUG TEST: greet called with self as table");
+                    // Return a greeting
+                    let greeting = ctx.create_string("Hello from method!").unwrap();
+                    ctx.push_result(Value::String(greeting)).unwrap();
+                    Ok(1)
+                } else {
+                    Err(LuaError::RuntimeError("Expected table as self".to_string()))
+                }
+            };
+            
+            // Set the method in the table
+            tx.set_table_field(obj_table, Value::String(method_name), Value::CFunction(greet_func)).unwrap();
+            
+            // Also test __index metamethod handling
+            let mt_table = tx.create_table().unwrap();
+            let index_table = tx.create_table().unwrap();
+            let hidden_method_name = tx.create_string("hidden").unwrap();
+            
+            // Create another method that will be accessed through __index
+            let hidden_func: CFunction = |ctx| {
+                let msg = ctx.create_string("Hidden method called!").unwrap();
+                ctx.push_result(Value::String(msg)).unwrap();
+                Ok(1)
+            };
+            
+            tx.set_table_field(index_table, Value::String(hidden_method_name), Value::CFunction(hidden_func)).unwrap();
+            
+            // Set __index in metatable
+            let index_key = tx.create_string("__index").unwrap();
+            tx.set_table_field(mt_table, Value::String(index_key), Value::Table(index_table)).unwrap();
+            
+            // Create bytecode:
+            // 0: LOADK R(0), K(0)       ; Load object table handle
+            // 1: LOADK R(1), K(1)       ; Load method name "greet"
+            // 2: SELF R(2), R(0), K(1)  ; Look up obj:greet - R(3) = obj, R(2) = obj.greet
+            // 3: LOADK R(4), K(2)       ; Load "hidden" method name
+            // 4: SELF R(5), R(0), R(4)  ; Look up obj:hidden using register key
+            // 5: LOADNIL R(7), 1        ; Load nil for error test
+            // 6: SELF R(8), R(7), K(1)  ; Try Self_ on nil (should error)
+            
+            // Note: We can't directly load table handles as constants, so we'll set them up differently
+            // Instead, we'll create the table in the test and use NEWTABLE
+            
+            let newtable_instr = 10 | (0 << 6);                           // NEWTABLE R(0)
+            let loadk_greet = 1 | (1 << 6) | (0 << 14);                  // LOADK R(1), K(0) = "greet"
+            let self_direct = 11 | (2 << 6) | (0 << 23) | ((256+0) << 14); // SELF R(2), R(0), K(0) - constant key
+            let loadk_hidden = 1 | (4 << 6) | (1 << 14);                 // LOADK R(4), K(1) = "hidden"
+            let self_reg_key = 11 | (5 << 6) | (0 << 23) | (4 << 14);    // SELF R(5), R(0), R(4) - register key
+            let loadnil = 3 | (7 << 6) | (1 << 23);                       // LOADNIL R(7), 1
+            let self_nil = 11 | (8 << 6) | (7 << 23) | ((256+0) << 14);  // SELF R(8), R(7), K(0) - will error
+            
+            let test_bytecode = vec![
+                newtable_instr,   // 0
+                loadk_greet,      // 1
+                self_direct,      // 2
+                loadk_hidden,     // 3
+                self_reg_key,     // 4
+                loadnil,          // 5
+                self_nil,         // 6 - This will error
+            ];
+            
+            // Create constants
+            let greet_str = tx.create_string("greet").unwrap();
+            let hidden_str = tx.create_string("hidden").unwrap();
+            
+            let constants = vec![
+                Value::String(greet_str),
+                Value::String(hidden_str),
+            ];
+            
+            // Create function prototype
+            let proto = FunctionProto {
+                bytecode: test_bytecode,
+                constants,
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 20,
+                upvalues: vec![],
+            };
+            
+            // Create closure and setup
+            let closure = Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: None,
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..20 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
+        
+        // Helper to set up the test table after NEWTABLE
+        let setup_test_table = |vm: &mut LuaVM| {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Get the table from R(0)
+            let table_val = vm.register_windows.get_register(0, 0).unwrap().clone();
+            if let Value::Table(table_handle) = table_val {
+                // Set up the greet method
+                let greet_name = tx.create_string("greet").unwrap();
+                let greet_func: CFunction = |ctx| {
+                    let greeting = ctx.create_string("Hello from method!").unwrap();
+                    ctx.push_result(Value::String(greeting)).unwrap();
+                    Ok(1)
+                };
+                tx.set_table_field(table_handle, Value::String(greet_name), Value::CFunction(greet_func)).unwrap();
+                
+                // Set up metatable with __index
+                let mt_table = tx.create_table().unwrap();
+                let index_table = tx.create_table().unwrap();
+                let hidden_name = tx.create_string("hidden").unwrap();
+                let hidden_func: CFunction = |ctx| {
+                    let msg = ctx.create_string("Hidden method called!").unwrap();
+                    ctx.push_result(Value::String(msg)).unwrap();
+                    Ok(1)
+                };
+                tx.set_table_field(index_table, Value::String(hidden_name), Value::CFunction(hidden_func)).unwrap();
+                
+                let index_key = tx.create_string("__index").unwrap();
+                tx.set_table_field(mt_table, Value::String(index_key), Value::Table(index_table)).unwrap();
+                tx.set_table_metatable(table_handle, Some(mt_table)).unwrap();
+                
+                tx.commit().unwrap();
+            }
+        };
+        
+        println!("Testing Self_ opcode");
+        
+        // Step 1: Create table
+        vm.step().unwrap();
+        
+        // Set up the table with methods and metatable
+        setup_test_table(&mut vm);
+        
+        // Step 2: Load "greet" string
+        vm.step().unwrap();
+        
+        // Step 3: SELF with constant key
+        println!("\nTesting SELF with direct method lookup");
+        vm.step().unwrap();
+        
+        // Check results: R(3) should have the table, R(2) should have the method
+        let self_param = get_register(&mut vm, 3);
+        let method = get_register(&mut vm, 2);
+        
+        match self_param {
+            Value::Table(_) => println!("Self parameter correctly set to table"),
+            _ => panic!("Expected table in R(3), got {:?}", self_param),
+        }
+        
+        match method {
+            Value::CFunction(_) => println!("Method correctly found and set"),
+            _ => panic!("Expected C function in R(2), got {:?}", method),
+        }
+        
+        // Step 4: Load "hidden" string
+        vm.step().unwrap();
+        
+        // Step 5: SELF with register key and __index lookup
+        println!("\nTesting SELF with __index metamethod lookup");
+        vm.step().unwrap();
+        
+        // Check results: R(6) should have the table, R(5) should have the hidden method
+        let self_param2 = get_register(&mut vm, 6);
+        let hidden_method = get_register(&mut vm, 5);
+        
+        match self_param2 {
+            Value::Table(_) => println!("Self parameter correctly set to table"),
+            _ => panic!("Expected table in R(6), got {:?}", self_param2),
+        }
+        
+        match hidden_method {
+            Value::CFunction(_) => println!("Hidden method correctly found via __index"),
+            _ => panic!("Expected C function in R(5), got {:?}", hidden_method),
+        }
+        
+        // Step 6: Load nil
+        vm.step().unwrap();
+        
+        // Step 7: SELF on non-table (should error)
+        println!("\nTesting SELF on non-table value");
+        let result = vm.step();
+        assert!(result.is_err(), "SELF on non-table should error");
+        
+        if let Err(e) = result {
+            match e {
+                LuaError::TypeError { expected, got } => {
+                    assert_eq!(expected, "table");
+                    assert_eq!(got, "nil");
+                    println!("Correctly errored with type error");
+                },
+                _ => panic!("Expected TypeError, got {:?}", e),
+            }
+        }
+        
+        println!("All Self_ opcode tests passed!");
+    }
+
+    #[test]
+    fn test_self_with_index_function() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize register window
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        // This test verifies that Self_ properly queues metamethod calls
+        // when __index is a function rather than a table
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode that tests __index function metamethod:
+            // 0: NEWTABLE R(0)           ; Create object table
+            // 1: SELF R(1), R(0), K(0)   ; Look up method via __index function
+            // 2: RETURN R(1), 2          ; Return the method
+            
+            let newtable_instr = 10 | (0 << 6);                           // NEWTABLE R(0)
+            let self_instr = 11 | (1 << 6) | (0 << 23) | ((256+0) << 14); // SELF R(1), R(0), K(0)
+            let return_instr = 30 | (1 << 6) | (2 << 23);                 // RETURN R(1), 1
+            
+            let test_bytecode = vec![
+                newtable_instr,
+                self_instr,
+                return_instr,
+            ];
+            
+            // Create constants
+            let method_name = tx.create_string("dynamic_method").unwrap();
+            
+            let constants = vec![
+                Value::String(method_name),
+            ];
+            
+            // Create function prototype
+            let proto = FunctionProto {
+                bytecode: test_bytecode,
+                constants,
+                num_params: 0,
+                is_vararg: false,
+                max_stack_size: 10,
+                upvalues: vec![],
+            };
+            
+            // Create closure
+            let closure = Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            let frame = CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: None,
+                varargs: None,
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to set up table with __index function
+        let setup_index_function = |vm: &mut LuaVM| {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Get the table from R(0)
+            let table_val = vm.register_windows.get_register(0, 0).unwrap().clone();
+            if let Value::Table(table_handle) = table_val {
+                // Create metatable
+                let mt = tx.create_table().unwrap();
+                
+                // Create __index function that generates methods dynamically
+                let index_func: CFunction = |ctx| {
+                    // Args: table, key
+                    if let Ok(key) = ctx.get_arg(1) {
+                        if let Value::String(key_handle) = key {
+                            let key_str = ctx.get_string_from_handle(key_handle).unwrap();
+                            if key_str == "dynamic_method" {
+                                // Return a dynamically created method
+                                let dynamic_method: CFunction = |ctx| {
+                                    let msg = ctx.create_string("Dynamically created method!").unwrap();
+                                    ctx.push_result(Value::String(msg)).unwrap();
+                                    Ok(1)
+                                };
+                                ctx.push_result(Value::CFunction(dynamic_method)).unwrap();
+                                return Ok(1);
+                            }
+                        }
+                    }
+                    // Not found
+                    ctx.push_result(Value::Nil).unwrap();
+                    Ok(1)
+                };
+                
+                let index_key = tx.create_string("__index").unwrap();
+                tx.set_table_field(mt, Value::String(index_key), Value::CFunction(index_func)).unwrap();
+                tx.set_table_metatable(table_handle, Some(mt)).unwrap();
+                
+                tx.commit().unwrap();
+            }
+        };
+        
+        println!("Testing Self_ with __index function metamethod");
+        
+        // Step 1: Create table
+        vm.step().unwrap();
+        
+        // Set up metatable with __index function
+        setup_index_function(&mut vm);
+        
+        // Check that pending operations queue is empty before Self_
+        assert_eq!(vm.pending_operations.len(), 0, "No pending operations before Self_");
+        
+        // Step 2: Execute SELF - should queue metamethod call
+        println!("\nExecuting SELF with __index function");
+        let result = vm.step();
+        assert!(result.is_ok(), "SELF should succeed");
+        
+        // Check that a metamethod call was queued
+        assert!(!vm.pending_operations.is_empty(), "Should have queued metamethod call");
+        
+        println!("Metamethod call successfully queued");
+        
+        // Process the pending metamethod call
+        if let Some(op) = vm.pending_operations.pop_front() {
+            match op {
+                PendingOperation::MetamethodCall { method, target, args, context } => {
+                    println!("Processing queued metamethod call");
+                    let step_result = vm.process_metamethod_call(method, target, args, context).unwrap();
+                    assert!(matches!(step_result, StepResult::Continue));
+                    
+                    // The metamethod should have set R(1) to the dynamic method
+                    let method_result = vm.register_windows.get_register(0, 1).unwrap().clone();
+                    match method_result {
+                        Value::CFunction(_) => println!("Dynamic method successfully retrieved via __index"),
+                        _ => panic!("Expected CFunction from __index, got {:?}", method_result),
+                    }
+                },
+                _ => panic!("Expected MetamethodCall operation, got {:?}", op),
+            }
+        }
+        
+        // Also verify R(2) has the table (self parameter)
+        let self_param = vm.register_windows.get_register(0, 2).unwrap().clone();
+        match self_param {
+            Value::Table(_) => println!("Self parameter correctly set"),
+            _ => panic!("Expected table in R(2), got {:?}", self_param),
+        }
+        
+        println!("Self_ with __index function test passed!");
+    }
+    
+    #[test]
+    fn test_vararg_opcode() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize register window
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        // Test 1: Function with some varargs
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode:
+            // 0: VARARG R(0), 3      ; Load 2 varargs (B-1) into R(0), R(1)
+            // 1: VARARG R(3), 0      ; Load all varargs starting at R(3)
+            // 2: VARARG R(10), 5     ; Load 4 varargs into R(10)-R(13), with padding
+            // 3: RETURN R(0), 2      ; Return R(0)
+            
+            let vararg_2vals = 35 | (0 << 6) | (3 << 23);     // VARARG R(0), 3
+            let vararg_all = 35 | (3 << 6) | (0 << 23);       // VARARG R(3), 0
+            let vararg_pad = 35 | (10 << 6) | (5 << 23);      // VARARG R(10), 5
+            let return_instr = 30 | (0 << 6) | (2 << 23);     // RETURN R(0), 1
+            
+            let test_bytecode = vec![
+                vararg_2vals,
+                vararg_all,
+                vararg_pad,
+                return_instr,
+            ];
+            
+            // Create function proto
+            let proto = FunctionProto {
+                bytecode: test_bytecode,
+                constants: vec![],
+                num_params: 0,
+                is_vararg: true,  // This function accepts varargs
+                max_stack_size: 20,
+                upvalues: vec![],
+            };
+            
+            // Create closure
+            let closure = Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            // Create varargs for testing
+            let test_varargs = vec![
+                Value::Number(100.0),
+                Value::Number(200.0),
+                Value::Number(300.0),
+            ];
+            
+            let frame = CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: None,
+                varargs: Some(test_varargs),
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..20 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
+        
+        println!("Testing VARARG opcode with 3 varargs");
+        
+        // Step 1: VARARG R(0), 3 - Load 2 values (B-1)
+        println!("\nTest 1: VARARG with B=3 (load 2 values)");
+        vm.step().unwrap();
+        
+        assert_eq!(get_register(&mut vm, 0), Value::Number(100.0), "R(0) should be first vararg");
+        assert_eq!(get_register(&mut vm, 1), Value::Number(200.0), "R(1) should be second vararg");
+        assert_eq!(get_register(&mut vm, 2), Value::Nil, "R(2) should be untouched (nil)");
+        
+        // Step 2: VARARG R(3), 0 - Load all varargs
+        println!("\nTest 2: VARARG with B=0 (load all values)");
+        vm.step().unwrap();
+        
+        assert_eq!(get_register(&mut vm, 3), Value::Number(100.0), "R(3) should be first vararg");
+        assert_eq!(get_register(&mut vm, 4), Value::Number(200.0), "R(4) should be second vararg");
+        assert_eq!(get_register(&mut vm, 5), Value::Number(300.0), "R(5) should be third vararg");
+        assert_eq!(get_register(&mut vm, 6), Value::Nil, "R(6) should be untouched");
+        
+        // Step 3: VARARG R(10), 5 - Load 4 values with padding
+        println!("\nTest 3: VARARG with B=5 (load 4 values, need padding)");
+        vm.step().unwrap();
+        
+        assert_eq!(get_register(&mut vm, 10), Value::Number(100.0), "R(10) should be first vararg");
+        assert_eq!(get_register(&mut vm, 11), Value::Number(200.0), "R(11) should be second vararg");
+        assert_eq!(get_register(&mut vm, 12), Value::Number(300.0), "R(12) should be third vararg");
+        assert_eq!(get_register(&mut vm, 13), Value::Nil, "R(13) should be nil (padding)");
+        assert_eq!(get_register(&mut vm, 14), Value::Nil, "R(14) should be untouched");
+        
+        println!("VARARG opcode test completed successfully!");
+    }
+    
+    #[test]
+    fn test_vararg_no_args() {
+        let mut vm = LuaVM::new().unwrap();
+        
+        // Initialize register window
+        vm.register_windows.allocate_window(256).unwrap();
+        
+        // Test with no varargs provided
+        {
+            let mut tx = HeapTransaction::new(&mut vm.heap);
+            
+            // Create bytecode:
+            // 0: VARARG R(0), 3      ; Try to load 2 varargs when none exist
+            // 1: VARARG R(5), 0      ; Try to load all varargs when none exist
+            // 2: RETURN
+            
+            let vararg_2vals = 35 | (0 << 6) | (3 << 23);     // VARARG R(0), 3
+            let vararg_all = 35 | (5 << 6) | (0 << 23);       // VARARG R(5), 0
+            let return_instr = 30 | (0 << 6) | (1 << 23);     // RETURN R(0), 0
+            
+            let test_bytecode = vec![
+                vararg_2vals,
+                vararg_all,
+                return_instr,
+            ];
+            
+            // Create function proto
+            let proto = FunctionProto {
+                bytecode: test_bytecode,
+                constants: vec![],
+                num_params: 0,
+                is_vararg: true,
+                max_stack_size: 10,
+                upvalues: vec![],
+            };
+            
+            // Create closure
+            let closure = Closure {
+                proto,
+                upvalues: vec![],
+            };
+            
+            let closure_handle = tx.create_closure(closure).unwrap();
+            
+            // Create frame with NO varargs
+            let frame = CallFrame {
+                closure: closure_handle,
+                pc: 0,
+                base_register: 0,
+                expected_results: None,
+                varargs: None,  // No varargs!
+            };
+            
+            tx.push_call_frame(vm.current_thread, frame).unwrap();
+            
+            // Initialize stack
+            for _ in 0..10 {
+                tx.push_stack(vm.current_thread, Value::Nil).unwrap();
+            }
+            
+            // Pre-fill some registers with non-nil values to verify they get overwritten
+            vm.register_windows.set_register(0, 0, Value::Number(999.0)).unwrap();
+            vm.register_windows.set_register(0, 1, Value::Number(999.0)).unwrap();
+            
+            tx.commit().unwrap();
+        }
+        
+        // Helper to get register value
+        let get_register = |vm: &mut LuaVM, reg: usize| -> Value {
+            vm.register_windows.get_register(0, reg).unwrap().clone()
+        };
+        
+        println!("Testing VARARG opcode with no varargs");
+        
+        // Step 1: VARARG R(0), 3 - Should set 2 registers to nil
+        println!("\nTest 1: VARARG with B=3 and no varargs");
+        vm.step().unwrap();
+        
+        assert_eq!(get_register(&mut vm, 0), Value::Nil, "R(0) should be nil");
+        assert_eq!(get_register(&mut vm, 1), Value::Nil, "R(1) should be nil");
+        
+        // Step 2: VARARG R(5), 0 - Should do nothing (no varargs to load)
+        println!("\nTest 2: VARARG with B=0 and no varargs");
+        vm.step().unwrap();
+        
+        // R(5) should still be nil (untouched)
+        assert_eq!(get_register(&mut vm, 5), Value::Nil, "R(5) should remain nil");
+        
+        println!("VARARG with no args test completed successfully!");
     }
 }

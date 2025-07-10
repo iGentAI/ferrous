@@ -198,6 +198,7 @@ pub enum HeapChange {
     SetUpvalue {
         upvalue: UpvalueHandle,
         value: Value,
+        thread: ThreadHandle,
     },
     
     /// Close upvalue
@@ -885,14 +886,15 @@ impl<'a> HeapTransaction<'a> {
     }
     
     /// Set upvalue (queued)
-    pub fn set_upvalue(&mut self, upvalue: UpvalueHandle, value: Value) -> LuaResult<()> {
+    pub fn set_upvalue(&mut self, upvalue: UpvalueHandle, value: Value, thread: ThreadHandle) -> LuaResult<()> {
         self.ensure_active()?;
         
         // Validate handles
         self.validate_with_context(&upvalue, "set_upvalue")?;
+        self.validate_with_context(&thread, "set_upvalue thread")?;
         self.validate_value(&value, "set_upvalue value")?;
         
-        self.changes.push(HeapChange::SetUpvalue { upvalue, value });
+        self.changes.push(HeapChange::SetUpvalue { upvalue, value, thread });
         Ok(())
     }
     
@@ -1081,7 +1083,23 @@ impl<'a> HeapTransaction<'a> {
     
     /// Commit all changes atomically - follows the pattern in LUA_TRANSACTION_PATTERNS.md
     pub fn commit(&mut self) -> LuaResult<Vec<PendingOperation>> {
-        self.ensure_active()?;
+        // If the transaction has already been committed we simply return an
+        // empty pending-operation list instead of treating it as an error.
+        // This turns commit() into an idempotent operation and removes the
+        // "double-commit" failure mode that surfaced when some VM op-codes
+        // committed early while LuaVM::step() tried to commit again.
+        if self.state == TransactionState::Committed {
+            return Ok(Vec::new());
+        }
+
+        // Abortions are still errors – committing an aborted transaction
+        // remains invalid logic.
+        if self.state == TransactionState::Aborted {
+            return Err(LuaError::InvalidTransactionState);
+        }
+
+        // The only remaining possibility is the normal Active case.
+        debug_assert_eq!(self.state, TransactionState::Active);
         
         // No handle validation here - all changes were validated when queued
         // This matches the design pattern specified in LUA_TRANSACTION_PATTERNS.md:
@@ -1172,9 +1190,15 @@ impl<'a> HeapTransaction<'a> {
                     frame.pc = pc;
                 }
             }
-            HeapChange::SetUpvalue { upvalue, value } => {
+            HeapChange::SetUpvalue { upvalue, value, thread } => {
                 let upvalue_obj = self.heap.get_upvalue_mut(upvalue)?;
-                if upvalue_obj.stack_index.is_none() {
+                if let Some(stack_index) = upvalue_obj.stack_index {
+                    // Open upvalue - update the value at the stack position
+                    println!("DEBUG: SetUpvalue - updating open upvalue at stack index {}", stack_index);
+                    self.heap.set_thread_register_internal(thread, stack_index, value)?;
+                } else {
+                    // Closed upvalue - update the stored value
+                    println!("DEBUG: SetUpvalue - updating closed upvalue");
                     upvalue_obj.value = Some(value);
                 }
             }
@@ -1536,6 +1560,16 @@ impl<'a> HeapTransaction<'a> {
         }
         
         Ok(())
+    }
+
+    /// True while the transaction is still active.
+    pub fn is_active(&self) -> bool {
+        self.state == TransactionState::Active
+    }
+
+    /// Current state accessor (used by VM for finer checks when needed).
+    pub fn state(&self) -> TransactionState {
+        self.state
     }
 }
 

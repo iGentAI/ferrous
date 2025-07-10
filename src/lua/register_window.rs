@@ -295,6 +295,20 @@ impl RegisterWindowSystem {
         Ok(())
     }
     
+    /// Unprotect all registers in a window
+    pub fn unprotect_all_registers(&mut self, window_idx: usize) -> LuaResult<()> {
+        if window_idx >= self.window_stack.len() {
+            return Err(LuaError::RuntimeError(format!(
+                "Invalid window index: {}", window_idx
+            )));
+        }
+        
+        let window = &mut self.window_stack[window_idx];
+        window.protected.clear();
+        
+        Ok(())
+    }
+    
     /// Use a window by name (create if not exists)
     pub fn use_named_window(&mut self, name: &str, size: usize) -> LuaResult<usize> {
         // Check if window already exists
