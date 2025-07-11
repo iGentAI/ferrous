@@ -613,7 +613,7 @@ impl<'vm> ExecutionContext<'vm> {
         self.arg_count
     }
     
-    // Get an argument by index
+    // Get an argument by index with improved validation
     pub fn get_arg(&mut self, index: usize) -> LuaResult<Value> {
         if index >= self.arg_count {
             return Err(LuaError::ArgumentError {
@@ -624,10 +624,28 @@ impl<'vm> ExecutionContext<'vm> {
         
         // Create a fresh transaction for each operation
         let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        
+        // Access the stack directly, not the register window
+        println!("DEBUG: get_register - index: {}, stack size: {}", self.stack_base + index, 
+                tx.get_stack_size(self.thread).unwrap_or(0));
+                
         let value = tx.read_register(self.thread, self.stack_base + index)?;
         tx.commit()?;
         
         Ok(value)
+    }
+    
+    // Get an argument as a table with type checking
+    pub fn get_table_arg(&mut self, index: usize) -> LuaResult<TableHandle> {
+        let value = self.get_arg(index)?;
+        
+        match value {
+            Value::Table(handle) => Ok(handle),
+            _ => Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: value.type_name().to_string(),
+            }),
+        }
     }
     
     // Get an argument as a string
@@ -642,10 +660,53 @@ impl<'vm> ExecutionContext<'vm> {
                 tx.commit()?;
                 Ok(result)
             },
+            Value::Number(n) => {
+                // Coerce number to string
+                Ok(n.to_string())
+            },
+            Value::Boolean(b) => {
+                // Coerce boolean to string
+                Ok(b.to_string())
+            },
             _ => Err(LuaError::TypeError {
-                expected: "string".to_string(),
+                expected: "string, number or boolean".to_string(),
                 got: value.type_name().to_string(),
             }),
+        }
+    }
+    
+    // Get an argument as a number with proper type checking and coercion
+    pub fn get_number_arg(&mut self, index: usize) -> LuaResult<f64> {
+        let value = self.get_arg(index)?;
+        
+        match value {
+            Value::Number(n) => Ok(n),
+            Value::String(handle) => {
+                // Try to parse string as number
+                let s = self.get_string_from_handle(handle)?;
+                match s.trim().parse::<f64>() {
+                    Ok(n) => Ok(n),
+                    Err(_) => Err(LuaError::TypeError {
+                        expected: "number".to_string(),
+                        got: "string (not convertible to number)".to_string(),
+                    }),
+                }
+            },
+            _ => Err(LuaError::TypeError {
+                expected: "number or string convertible to number".to_string(),
+                got: value.type_name().to_string(),
+            }),
+        }
+    }
+    
+    // Get an argument as a boolean, with proper type handling
+    pub fn get_bool_arg(&mut self, index: usize) -> LuaResult<bool> {
+        let value = self.get_arg(index)?;
+        
+        match value {
+            Value::Boolean(b) => Ok(b),
+            Value::Nil => Ok(false),
+            _ => Ok(true),
         }
     }
     
@@ -653,6 +714,13 @@ impl<'vm> ExecutionContext<'vm> {
     pub fn push_result(&mut self, value: Value) -> LuaResult<()> {
         // Create a fresh transaction
         let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+        
+        // Set directly on the stack, not in register window
+        println!("DEBUG: set_register - index: {}, stack size: {}, value: {:?}", 
+                self.stack_base + self.results_pushed, 
+                tx.get_stack_size(self.thread).unwrap_or(0), 
+                value);
+                
         tx.set_register(self.thread, self.stack_base + self.results_pushed, value)?;
         tx.commit()?;
         
@@ -697,71 +765,48 @@ impl<'vm> ExecutionContext<'vm> {
         Ok(value)
     }
     
-    // Get an argument as a number with proper type checking
-    pub fn get_number_arg(&mut self, index: usize) -> LuaResult<f64> {
-        let value = self.get_arg(index)?;
+    // Get a global function by name
+    pub fn get_global_function(&mut self, name: &str) -> LuaResult<Value> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
         
-        match value {
-            Value::Number(n) => Ok(n),
-            Value::String(handle) => {
-                // Try to parse string as number
-                let s = self.get_string_from_handle(handle)?;
-                match s.trim().parse::<f64>() {
-                    Ok(n) => Ok(n),
-                    Err(_) => Err(LuaError::TypeError {
-                        expected: "number".to_string(),
-                        got: "string (not convertible to number)".to_string(),
-                    }),
-                }
-            },
-            _ => Err(LuaError::TypeError {
-                expected: "number".to_string(),
-                got: value.type_name().to_string(),
-            }),
+        // Get the globals table
+        let globals = tx.get_globals_table()?;
+        
+        // Create string key
+        let key = tx.create_string(name)?;
+        
+        // Get function value
+        let value = tx.read_table_field(globals, &Value::String(key))?;
+        
+        tx.commit()?;
+        
+        // Verify it's a function
+        match &value {
+            Value::Closure(_) | Value::CFunction(_) => Ok(value),
+            _ => Err(LuaError::RuntimeError(format!(
+                "Expected function in global '{}', got {}", 
+                name, 
+                value.type_name()
+            )))
         }
     }
     
-    // Get an argument as a string, with proper type checking and coercion
-    pub fn get_string_arg(&mut self, index: usize) -> LuaResult<String> {
-        let value = self.get_arg(index)?;
+    // Get a global value by name
+    pub fn globals_get(&mut self, name: &str) -> LuaResult<Value> {
+        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
         
-        match value {
-            Value::String(handle) => {
-                self.get_string_from_handle(handle)
-            },
-            Value::Number(n) => {
-                // Convert number to string
-                Ok(n.to_string())
-            },
-            Value::Boolean(b) => {
-                // Convert boolean to string
-                Ok(b.to_string())
-            },
-            Value::Nil => {
-                // Nil not allowed for string operations
-                Err(LuaError::TypeError {
-                    expected: "string".to_string(),
-                    got: "nil".to_string(),
-                })
-            },
-            _ => Err(LuaError::TypeError {
-                expected: "string".to_string(),
-                got: value.type_name().to_string(),
-            }),
-        }
-    }
-    
-    // Get an argument as a boolean, with proper type handling
-    pub fn get_bool_arg(&mut self, index: usize) -> LuaResult<bool> {
-        let value = self.get_arg(index)?;
+        // Get the globals table
+        let globals = tx.get_globals_table()?;
         
-        match value {
-            Value::Boolean(b) => Ok(b),
-            Value::Nil => Ok(false),
-            _ => Ok(true),
-        }
+        // Create string key
+        let key = tx.create_string(name)?;
+        
+        // Get value
+        let value = tx.read_table_field(globals, &Value::String(key))?;
+        
+        tx.commit()?;
+        Ok(value)
     }
-    
     // Table operations
     pub fn table_next(&mut self, table: TableHandle, key: Value) -> LuaResult<Option<(Value, Value)>> {
         let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
@@ -4360,21 +4405,36 @@ impl LuaVM {
         result_register: usize,
         thread_handle: ThreadHandle,
     ) -> LuaResult<StepResult> {
-        // First, we need to push arguments to the thread's stack so the C function can read them
+        println!("DEBUG CFUNC_WINDOWS: Starting C function call - window_idx={}, result_register={}", 
+                 window_idx, result_register);
+        
+        // Step 1: Synchronize register window with thread stack
+        // This is CRITICAL for ensuring C functions can access current register state
+        {
+            let window_size = self.register_windows.get_window_size(window_idx)
+                .unwrap_or(256);
+            println!("DEBUG CFUNC_WINDOWS: Syncing window {} (size {}) to thread stack", 
+                     window_idx, window_size);
+            
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            sync_window_to_stack_helper(&mut tx, &self.register_windows, 
+                                      thread_handle, window_idx, window_size)?;
+            tx.commit()?;
+        }
+        
+        // Step 2: Push arguments to the thread stack
         let stack_base = {
             let mut tx = HeapTransaction::new(&mut self.heap);
             
-            // Get current stack size to determine stack_base
-            let current_stack_size = tx.get_stack_size(thread_handle)?;
-            let stack_base = current_stack_size;
+            // Get current stack size to determine where to push arguments
+            let stack_base = tx.get_stack_size(thread_handle)?;
+            println!("DEBUG CFUNC_WINDOWS: Pushing {} args to stack at base {}", 
+                     args.len(), stack_base);
             
-            println!("DEBUG CFUNC_WINDOWS: Current stack size: {}, pushing {} args at base {}", 
-                     current_stack_size, args.len(), stack_base);
-            
-            // Push arguments to the thread's stack
+            // Push each argument to the stack
             for (i, arg) in args.iter().enumerate() {
-                println!("DEBUG CFUNC_WINDOWS: Pushing arg {} to stack at position {}: {:?}", 
-                         i, stack_base + i, arg);
+                println!("DEBUG CFUNC_WINDOWS: Pushing arg[{}] = {:?} to stack position {}", 
+                         i, arg, stack_base + i);
                 tx.push_stack(thread_handle, arg.clone())?;
             }
             
@@ -4382,71 +4442,91 @@ impl LuaVM {
             stack_base
         };
         
+        // Step 3: Execute C function with proper ExecutionContext
         println!("DEBUG CFUNC_WINDOWS: Calling C function with stack_base={}, arg_count={}", 
                  stack_base, args.len());
         
-        // Call C function with execution context pointing to the thread's stack
-        let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
-        
-        let result_count = match func(&mut ctx) {
-            Ok(count) => {
-                println!("DEBUG CFUNC_WINDOWS: C function returned {} results", count);
-                count as usize
-            },
-            Err(e) => {
-                println!("DEBUG CFUNC_WINDOWS: C function returned error: {:?}", e);
-                
-                // Clean up stack on error
-                let mut tx = HeapTransaction::new(&mut self.heap);
-                tx.pop_stack(thread_handle, args.len())?;
-                tx.commit()?;
-                
-                return Ok(StepResult::Error(e));
-            },
+        let result_count = {
+            // Create execution context pointing to the thread's stack
+            let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
+            
+            // Call the C function
+            match func(&mut ctx) {
+                Ok(count) => {
+                    println!("DEBUG CFUNC_WINDOWS: C function returned {} results", count);
+                    count as usize
+                },
+                Err(e) => {
+                    println!("DEBUG CFUNC_WINDOWS: C function returned error: {:?}", e);
+                    
+                    // Clean up stack on error
+                    let mut tx = HeapTransaction::new(&mut self.heap);
+                    tx.pop_stack(thread_handle, args.len())?;
+                    tx.commit()?;
+                    
+                    return Ok(StepResult::Error(e));
+                },
+            }
         };
         
-        // Copy results back to the calling window
-        let mut results = Vec::with_capacity(result_count);
-        {
+        // Step 4: Collect results from stack
+        let results = {
             let mut tx = HeapTransaction::new(&mut self.heap);
+            let mut results = Vec::with_capacity(result_count);
             
-            // Read results from the stack
+            println!("DEBUG CFUNC_WINDOWS: Collecting {} results from stack", result_count);
+            
             for i in 0..result_count {
-                let value = tx.read_register(thread_handle, stack_base + i)?;
-                println!("DEBUG CFUNC_WINDOWS: Reading result {} from stack: {:?}", i, value);
-                results.push(value);
+                match tx.read_register(thread_handle, stack_base + i) {
+                    Ok(value) => {
+                        println!("DEBUG CFUNC_WINDOWS: Result[{}] = {:?} (type: {})", 
+                                 i, value, value.type_name());
+                        results.push(value);
+                    },
+                    Err(e) => {
+                        println!("DEBUG CFUNC_WINDOWS: Error reading result[{}]: {:?}", i, e);
+                        // Continue reading other results
+                    }
+                }
             }
             
-            // Clean up the stack - remove both arguments and results
-            // We need to remove whichever is larger
-            let total_to_pop = args.len().max(result_count);
-            println!("DEBUG CFUNC_WINDOWS: Cleaning up stack, popping {} values", total_to_pop);
-            tx.pop_stack(thread_handle, total_to_pop)?;
+            // Step 5: Clean up the stack
+            // Remove the larger of args or results
+            let cleanup_count = args.len().max(result_count);
+            println!("DEBUG CFUNC_WINDOWS: Cleaning up {} stack values", cleanup_count);
+            tx.pop_stack(thread_handle, cleanup_count)?;
             
             tx.commit()?;
-        }
+            results
+        };
         
-        // Store results in the caller's window
+        // Step 6: Copy results back to register window
+        // IMPORTANT: window_idx and result_register are still in scope here
+        println!("DEBUG CFUNC_WINDOWS: Storing {} results to window {} starting at register {}", 
+                 results.len(), window_idx, result_register);
+        
         if !results.is_empty() {
+            // Store each result in consecutive registers
             for (i, value) in results.iter().enumerate() {
-                if i == 0 {
-                    // First result goes to the target register
-                    println!("DEBUG CFUNC_WINDOWS: Storing result 0 in window {} register {}", 
-                             window_idx, result_register);
-                    self.register_windows.set_register(window_idx, result_register, value.clone())?;
-                } else if result_register + i < 256 {
-                    // Additional results go to subsequent registers
-                    println!("DEBUG CFUNC_WINDOWS: Storing result {} in window {} register {}", 
-                             i, window_idx, result_register + i);
-                    self.register_windows.set_register(window_idx, result_register + i, value.clone())?;
+                let target_register = result_register + i;
+                
+                if target_register < 256 {
+                    println!("DEBUG CFUNC_WINDOWS: Storing result[{}] to window {} register {}: {:?}", 
+                             i, window_idx, target_register, value);
+                    self.register_windows.set_register(window_idx, target_register, value.clone())?;
+                } else {
+                    println!("DEBUG CFUNC_WINDOWS: Warning: register {} out of bounds, skipping", 
+                             target_register);
                 }
             }
         } else {
-            // No results - set target to nil
-            println!("DEBUG CFUNC_WINDOWS: No results, setting register {} to nil", result_register);
+            // No results - set target register to nil
+            println!("DEBUG CFUNC_WINDOWS: No results, setting window {} register {} to nil", 
+                     window_idx, result_register);
             self.register_windows.set_register(window_idx, result_register, Value::Nil)?;
         }
         
+        println!("DEBUG CFUNC_WINDOWS: C function call completed successfully");
         Ok(StepResult::Continue)
     }
 
@@ -4527,19 +4607,25 @@ impl LuaVM {
             ReturnContext::ForLoop { window_idx, a, c, pc, sbx, storage_reg } => {
                 println!("DEBUG FORLOOP RETURN: Processing for-loop results with {} values", values.len());
                 
-                // First, get the saved iterator function from the storage register
-                let saved_iterator = match self.register_windows.get_register(*window_idx, *storage_reg) {
-                    Ok(value) => {
-                        println!("DEBUG FORLOOP RETURN: Retrieved saved iterator from R({}): {:?}", 
-                                 *storage_reg, value);
-                        value.clone()
-                    },
-                    Err(e) => {
-                        println!("DEBUG FORLOOP RETURN: Failed to retrieve saved iterator: {:?}", e);
-                        // Continue without iterator restoration - this is suboptimal but better than failing
-                        Value::Nil
+                // First, restore the saved iterator function from the storage register
+                if *storage_reg > 0 && *storage_reg < 256 { // Check if storage register is valid
+                    match self.register_windows.get_register(*window_idx, *storage_reg) {
+                        Ok(iterator) => {
+                            println!("DEBUG FORLOOP RETURN: Retrieved saved iterator from R({}): {:?}", 
+                                     storage_reg, iterator);
+                                
+                            // Restore iterator to R(A)
+                            self.register_windows.set_register(*window_idx, *a, iterator.clone())?;
+                            println!("DEBUG FORLOOP RETURN: Restored iterator to R({})", *a);
+                        },
+                        Err(e) => {
+                            println!("DEBUG FORLOOP RETURN: Failed to retrieve saved iterator: {:?}", e);
+                            // Continue without iterator restoration - this is suboptimal but better than failing
+                        }
                     }
-                };
+                } else {
+                    println!("DEBUG FORLOOP RETURN: Invalid storage register: {}, can't restore iterator", storage_reg);
+                }
                 
                 // Check if there are any results (empty results means nil was returned)
                 let first_result = values.first().cloned().unwrap_or(Value::Nil);
@@ -4549,21 +4635,12 @@ impl LuaVM {
                     // Process the ForLoop return with at least one non-nil value
                     // This means the iterator wants to continue
                     
-                    // Step 1: Restore the original iterator function to R(A)
-                    if saved_iterator.is_function() {
-                        self.register_windows.set_register(*window_idx, *a, saved_iterator)?;
-                        println!("DEBUG FORLOOP RETURN: Restored iterator to R({})", *a);
-                    } else {
-                        println!("DEBUG FORLOOP RETURN: WARNING - Saved iterator is not a function: {:?}", 
-                                 saved_iterator.type_name());
-                    }
-                    
-                    // Step 2: Copy the first result (the index) to the control variable (A+2)
+                    // Step 1: Copy the first result (the index) to the control variable (A+2)
                     self.register_windows.set_register(*window_idx, *a + TFORLOOP_CONTROL_OFFSET, first_result.clone())?;
                     println!("DEBUG FORLOOP RETURN: Set control variable R({}) to {:?}", 
                              *a + TFORLOOP_CONTROL_OFFSET, first_result);
                     
-                    // Step 3: Copy all result values to the loop variables (starting at A+3)
+                    // Step 2: Copy all result values to the loop variables (starting at A+3)
                     // The first value is the index, second value is the first loop variable
                     if values.len() > 1 {
                         for (i, value) in values.iter().skip(1).enumerate() {
@@ -4573,11 +4650,17 @@ impl LuaVM {
                                 println!("DEBUG FORLOOP RETURN: Set loop var R({}) to {:?}", target_reg, value);
                             }
                         }
+                    } else {
+                        // Iterator only returned a control variable, but no values
+                        // This is unusual but still valid - set first loop var to nil
+                        if *c > 0 {
+                            self.register_windows.set_register(*window_idx, *a + TFORLOOP_VAR_OFFSET, Value::Nil)?;
+                            println!("DEBUG FORLOOP RETURN: Iterator returned no values, setting R({}) to nil", 
+                                     *a + TFORLOOP_VAR_OFFSET);
+                        }
                     }
                     
-                    // Step 4: Jump back to the loop body
-                    // Don't modify PC here - let the current instruction (TForLoop) finish
-                    // and the subsequent JMP instruction handle the actual jump
+                    // Don't modify PC here - let the subsequent JMP instruction handle the loop back
                 } else {
                     // End of iteration - nil result
                     println!("DEBUG FORLOOP RETURN: nil result, ending loop iteration");
@@ -5802,6 +5885,45 @@ impl LuaVM {
         
         tx.commit()?;
         Ok(border)
+    }
+}
+
+pub fn lua_eval(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    if ctx.arg_count() < 1 {
+        return Err(LuaError::ArgumentError {
+            expected: 1,
+            got: ctx.arg_count(),
+        });
+    }
+    
+    // Get the source code string
+    let source_code = match ctx.get_arg(0)? {
+        Value::String(_) => ctx.get_arg_str(0)?,
+        Value::Number(n) => n.to_string(),
+        _ => return Err(LuaError::TypeError {
+            expected: "string".to_string(),
+            got: ctx.get_arg(0)?.type_name().to_string(),
+        }),
+    };
+    
+    println!("DEBUG EVAL: Evaluating code: {}", source_code);
+    
+    // Use the VM's eval_script method to evaluate the code
+    match ctx.vm_access.eval_script(&source_code) {
+        Ok(result) => {
+            // Successfully evaluated, push the result
+            println!("DEBUG EVAL: Evaluation successful, result type: {}", result.type_name());
+            ctx.push_result(result)?;
+            Ok(1)
+        },
+        Err(e) => {
+            // Error during evaluation
+            println!("DEBUG EVAL: Evaluation failed: {:?}", e);
+            
+            // In a pcall-like manner, we could return nil + error message,
+            // but for now we'll propagate the error
+            Err(e)
+        }
     }
 }
 

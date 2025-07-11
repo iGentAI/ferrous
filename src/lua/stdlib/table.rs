@@ -477,6 +477,142 @@ impl<'vm> ExecutionContext<'vm> {
     }
 }
 
+/// pairs(t) -> returns iterator function, t, nil
+pub fn pairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    println!("DEBUG PAIRS: pairs() called with {} arguments", ctx.arg_count());
+    
+    // Validate argument count
+    if ctx.arg_count() != 1 {
+        return Err(LuaError::ArgumentError {
+            expected: 1,
+            got: ctx.arg_count(),
+        });
+    }
+    
+    // Get table argument with strict type checking
+    let table = match ctx.get_arg(0)? {
+        Value::Table(handle) => handle,
+        other => {
+            println!("DEBUG PAIRS: Argument is not a table, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: other.type_name().to_string(),
+            });
+        }
+    };
+    
+    // Get the next function
+    let next = match ctx.globals_get("next")? {
+        Value::CFunction(f) => f,
+        other => {
+            println!("DEBUG PAIRS: Cannot find 'next' function, got: {}", other.type_name());
+            return Err(LuaError::RuntimeError("Could not find next function".to_string()));
+        }
+    };
+    
+    println!("DEBUG PAIRS: Returning next function, table, and nil");
+    
+    // Return the iterator triplet: next, table, nil
+    ctx.push_result(Value::CFunction(next))?;
+    ctx.push_result(Value::Table(table))?;
+    ctx.push_result(Value::Nil)?;
+    
+    Ok(3) // Return 3 values (iterator function, state, initial control value)
+}
+
+/// ipairs(t) -> returns iterator function, t, 0
+pub fn ipairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    println!("DEBUG IPAIRS: ipairs() called with {} arguments", ctx.arg_count());
+    
+    // Validate argument count
+    if ctx.arg_count() != 1 {
+        return Err(LuaError::ArgumentError {
+            expected: 1,
+            got: ctx.arg_count(),
+        });
+    }
+    
+    // Get table argument with strict type checking
+    let table = match ctx.get_arg(0)? {
+        Value::Table(handle) => handle,
+        other => {
+            println!("DEBUG IPAIRS: Argument is not a table, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: other.type_name().to_string(),
+            });
+        }
+    };
+    
+    println!("DEBUG IPAIRS: Returning ipairs_iter, table, and 0");
+    
+    // Return the iterator triplet: ipairs_iter, table, 0
+    ctx.push_result(Value::CFunction(ipairs_iter))?;
+    ctx.push_result(Value::Table(table))?;
+    ctx.push_result(Value::Number(0.0))?;
+    
+    Ok(3) // Return 3 values (iterator function, state, initial control value)
+}
+
+/// ipairs iterator function
+pub fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    println!("DEBUG IPAIRS_ITER: ipairs_iter() called with {} arguments", ctx.arg_count());
+    
+    // Validate argument count
+    if ctx.arg_count() != 2 {
+        return Err(LuaError::ArgumentError {
+            expected: 2,
+            got: ctx.arg_count(),
+        });
+    }
+    
+    // Get table argument
+    let table = match ctx.get_arg(0)? {
+        Value::Table(handle) => handle,
+        other => {
+            println!("DEBUG IPAIRS_ITER: First argument is not a table, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: other.type_name().to_string(),
+            });
+        }
+    };
+    
+    // Get index argument
+    let index = match ctx.get_arg(1)? {
+        Value::Number(n) => n as i64,
+        other => {
+            println!("DEBUG IPAIRS_ITER: Second argument is not a number, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "number".to_string(),
+                got: other.type_name().to_string(),
+            });
+        }
+    };
+    
+    // Calculate next index
+    let next_index = index + 1;
+    println!("DEBUG IPAIRS_ITER: Checking index {}", next_index);
+    
+    // Get value at next index
+    let value = ctx.table_get(table, Value::Number(next_index as f64))?;
+    
+    // Check if we should continue
+    if value.is_nil() {
+        println!("DEBUG IPAIRS_ITER: Index {} is nil, ending iteration", next_index);
+        ctx.push_result(Value::Nil)?;
+        return Ok(1);
+    }
+    
+    println!("DEBUG IPAIRS_ITER: Found value at index {}", next_index);
+    
+    // Return index and value
+    ctx.push_result(Value::Number(next_index as f64))?;
+    ctx.push_result(value)?;
+    
+    Ok(2) // Return 2 values: index and value
+}
+
 /// Create a table with all table functions
 pub fn create_table_lib() -> Vec<(&'static str, CFunction)> {
     let mut table_funcs = Vec::new();

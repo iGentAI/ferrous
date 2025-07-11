@@ -396,25 +396,17 @@ fn process_array_batch(
 ) -> LuaResult<()> {
     const FIELDS_PER_FLUSH: usize = 50;
     
-    let batch_state = codegen.registers.save_state();
-    
-    // Allocate registers for all fields in this batch
-    let mut field_regs = Vec::with_capacity(fields.len());
-    
-    for _ in 0..fields.len() {
-        field_regs.push(codegen.registers.allocate());
-    }
-    
-    // Evaluate each expression in its own scope
+    // Evaluate each expression directly into consecutive registers
     for (i, &expr) in fields.iter().enumerate() {
-        let expr_state = codegen.registers.save_state();
+        let dest_reg = target + 1 + i; // R(A+1), R(A+2), etc.
         
-        // Evaluate expression
-        codegen.expression(expr, field_regs[i], 1)?;
+        // Ensure we have enough registers allocated
+        while codegen.registers.level() <= dest_reg {
+            codegen.registers.allocate();
+        }
         
-        // Preserve the field register
-        codegen.registers.preserve_register(field_regs[i]);
-        codegen.registers.restore_state(expr_state);
+        // Evaluate expression directly to destination register
+        codegen.expression(expr, dest_reg, 1)?;
     }
     
     // Emit SETLIST instruction for this batch
@@ -425,12 +417,6 @@ fn process_array_batch(
         fields.len() as u16,
         batch_index as u16
     ));
-    
-    // Clear preserved registers for this batch and restore
-    for &reg in &field_regs {
-        codegen.registers.preserved_registers.remove(&reg);
-    }
-    codegen.registers.restore_state(batch_state);
     
     Ok(())
 }
