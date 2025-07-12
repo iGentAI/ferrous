@@ -592,6 +592,9 @@ pub struct ExecutionContext<'vm> {
     thread: ThreadHandle,
     results_pushed: usize,
     
+    // Window index for register window access
+    window_idx: Option<usize>,
+    
     // Public handle to VM for controlled access
     pub vm_access: &'vm mut LuaVM,
 }
@@ -604,6 +607,19 @@ impl<'vm> ExecutionContext<'vm> {
             arg_count,
             thread,
             results_pushed: 0,
+            window_idx: None,
+            vm_access: vm,
+        }
+    }
+    
+    // Create a new execution context with window index
+    fn new_with_window(vm: &'vm mut LuaVM, window_idx: usize, register_base: usize, arg_count: usize, thread: ThreadHandle) -> Self {
+        Self {
+            stack_base: register_base,
+            arg_count,
+            thread,
+            results_pushed: 0,
+            window_idx: Some(window_idx),
             vm_access: vm,
         }
     }
@@ -622,17 +638,26 @@ impl<'vm> ExecutionContext<'vm> {
             });
         }
         
-        // Create a fresh transaction for each operation
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        
-        // Access the stack directly, not the register window
-        println!("DEBUG: get_register - index: {}, stack size: {}", self.stack_base + index, 
-                tx.get_stack_size(self.thread).unwrap_or(0));
-                
-        let value = tx.read_register(self.thread, self.stack_base + index)?;
-        tx.commit()?;
-        
-        Ok(value)
+        // If we have a window index, use the register window system
+        if let Some(window_idx) = self.window_idx {
+            // Access through register window
+            let register_idx = self.stack_base + index;
+            let value = self.vm_access.register_windows.get_register(window_idx, register_idx)?.clone();
+            println!("DEBUG: get_arg via window - window_idx: {}, register: {}, value: {:?}", 
+                    window_idx, register_idx, value);
+            Ok(value)
+        } else {
+            // Fall back to direct stack access for compatibility
+            let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+            
+            println!("DEBUG: get_register - index: {}, stack size: {}", self.stack_base + index, 
+                    tx.get_stack_size(self.thread).unwrap_or(0));
+                    
+            let value = tx.read_register(self.thread, self.stack_base + index)?;
+            tx.commit()?;
+            
+            Ok(value)
+        }
     }
     
     // Get an argument as a table with type checking
@@ -712,21 +737,72 @@ impl<'vm> ExecutionContext<'vm> {
     
     // Push a result value
     pub fn push_result(&mut self, value: Value) -> LuaResult<()> {
-        // Create a fresh transaction
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        
-        // Set directly on the stack, not in register window
-        println!("DEBUG: set_register - index: {}, stack size: {}, value: {:?}", 
-                self.stack_base + self.results_pushed, 
-                tx.get_stack_size(self.thread).unwrap_or(0), 
-                value);
-                
-        tx.set_register(self.thread, self.stack_base + self.results_pushed, value)?;
-        tx.commit()?;
+        // If we have a window index, use the register window system
+        if let Some(window_idx) = self.window_idx {
+            // Write through register window
+            let register_idx = self.stack_base + self.results_pushed;
+            println!("DEBUG: push_result via window - window_idx: {}, register: {}, value: {:?}", 
+                    window_idx, register_idx, value);
+            self.vm_access.register_windows.set_register(window_idx, register_idx, value)?;
+        } else {
+            // Fall back to direct stack access for compatibility
+            let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+            
+            println!("DEBUG: set_register - index: {}, stack size: {}, value: {:?}", 
+                    self.stack_base + self.results_pushed, 
+                    tx.get_stack_size(self.thread).unwrap_or(0), 
+                    value);
+                    
+            tx.set_register(self.thread, self.stack_base + self.results_pushed, value)?;
+            tx.commit()?;
+        }
         
         self.results_pushed += 1;
         
         Ok(())
+    }
+    
+    // Get the window index if available
+    pub fn get_window_idx(&self) -> Option<usize> {
+        self.window_idx
+    }
+    
+    // Set the window index for this context
+    pub fn set_window_idx(&mut self, window_idx: usize) {
+        self.window_idx = Some(window_idx);
+    }
+    
+    // Create execution context with separate windows/locations for args and results
+    pub fn create_flexible_context(
+        &mut self, 
+        arg_location: ArgumentLocation,
+        result_location: ResultLocation,
+        arg_count: usize,
+        thread_handle: ThreadHandle,
+    ) -> ExecutionContext {
+        match (arg_location, result_location) {
+            (ArgumentLocation::Stack(stack_base), ResultLocation::Window(win_idx, reg_base)) => {
+                // Args from stack, results to window
+                let mut ctx = ExecutionContext::new(self.vm_access, stack_base, arg_count, thread_handle);
+                ctx.window_idx = Some(win_idx);
+                ctx.stack_base = reg_base; // For results
+                ctx
+            },
+            (ArgumentLocation::Window(win_idx, reg_base), ResultLocation::Window(_, result_base)) => {
+                // Both from window
+                ExecutionContext::new_with_window(self.vm_access, win_idx, reg_base, arg_count, thread_handle)
+            },
+            (ArgumentLocation::Stack(stack_base), ResultLocation::Stack(result_base)) => {
+                // Both from stack (legacy mode)
+                ExecutionContext::new(self.vm_access, stack_base, arg_count, thread_handle)
+            },
+            (ArgumentLocation::Window(win_idx, reg_base), ResultLocation::Stack(stack_base)) => {
+                // Args from window, results to stack
+                let mut ctx = ExecutionContext::new_with_window(self.vm_access, win_idx, reg_base, arg_count, thread_handle);
+                // This is a rare case, we'd need to handle it specially
+                ctx
+            },
+        }
     }
     
     // Get access to the heap for creating strings
@@ -933,35 +1009,74 @@ impl<'vm> ExecutionContext<'vm> {
                 Ok(vec![result])
             },
             Value::CFunction(cfunc) => {
-                // Call the C function directly with the current context
-                // No ownership issues with this branch
+                // Call the C function with proper window context
                 let arg_count = args.len();
                 
-                // First, move all the arguments to the stack at register positions
-                // that won't conflict with the results
-                let stack_base = self.stack_base + self.results_pushed;
+                // Get current window if available
+                let window_idx = self.window_idx;
                 
-                // Setup arguments
-                for (i, arg) in args.iter().enumerate() {
-                    // Create a new transaction for each operation to avoid aliasing
-                    let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-                    tx.set_register(self.thread, stack_base + i, arg.clone())?;
-                    tx.commit()?;
+                // First, setup arguments
+                if let Some(win_idx) = window_idx {
+                    // Use window-based approach
+                    let temp_base = self.stack_base + self.results_pushed + 10; // Offset to avoid conflicts
+                    
+                    // Set arguments in the window
+                    for (i, arg) in args.iter().enumerate() {
+                        self.vm_access.register_windows.set_register(win_idx, temp_base + i, arg.clone())?;
+                    }
+                    
+                    // Create a new context for the metamethod call
+                    let mut meta_ctx = ExecutionContext::new_with_window(
+                        self.vm_access,
+                        win_idx,
+                        temp_base,
+                        arg_count,
+                        self.thread
+                    );
+                    
+                    // Call the function
+                    let result_count = cfunc(&mut meta_ctx)?;
+                    
+                    // Collect results
+                    let mut results = Vec::with_capacity(result_count as usize);
+                    for i in 0..result_count as usize {
+                        let value = self.vm_access.register_windows.get_register(win_idx, temp_base + i)?.clone();
+                        results.push(value);
+                    }
+                    
+                    Ok(results)
+                } else {
+                    // Fall back to stack-based approach
+                    let stack_base = self.stack_base + self.results_pushed;
+                    
+                    // Setup arguments
+                    for (i, arg) in args.iter().enumerate() {
+                        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+                        tx.set_register(self.thread, stack_base + i, arg.clone())?;
+                        tx.commit()?;
+                    }
+                    
+                    // Now call the C function with a fresh context
+                    let mut meta_ctx = ExecutionContext::new(
+                        self.vm_access,
+                        stack_base,
+                        arg_count,
+                        self.thread
+                    );
+                    
+                    let result_count = cfunc(&mut meta_ctx)?;
+                    
+                    // Collect results
+                    let mut results = Vec::with_capacity(result_count as usize);
+                    for i in 0..result_count as usize {
+                        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
+                        let value = tx.read_register(self.thread, stack_base + i)?;
+                        tx.commit()?;
+                        results.push(value);
+                    }
+                    
+                    Ok(results)
                 }
-                
-                // Now call the C function with a fresh context
-                let result_count = cfunc(self)?;
-                
-                // Collect results
-                let mut results = Vec::with_capacity(result_count as usize);
-                for i in 0..result_count as usize {
-                    let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-                    let value = tx.read_register(self.thread, stack_base + i)?;
-                    tx.commit()?;
-                    results.push(value);
-                }
-                
-                Ok(results)
             },
             _ => Err(LuaError::TypeError {
                 expected: "function".to_string(),
@@ -969,6 +1084,22 @@ impl<'vm> ExecutionContext<'vm> {
             }),
         }
     }
+}
+
+/// Location for reading arguments
+pub enum ArgumentLocation {
+    /// Arguments are on the stack at the given base
+    Stack(usize),
+    /// Arguments are in a register window
+    Window(usize, usize), // (window_idx, register_base)
+}
+
+/// Location for writing results  
+pub enum ResultLocation {
+    /// Results go to the stack at the given base
+    Stack(usize),
+    /// Results go to a register window
+    Window(usize, usize), // (window_idx, register_base)
 }
 
 /// Sync register window values to thread stack
@@ -1008,6 +1139,8 @@ fn sync_window_to_stack_helper(
     
     Ok(())
 }
+
+
 
 /// Main Lua Virtual Machine
 pub struct LuaVM {
@@ -1049,6 +1182,52 @@ impl LuaVM {
     /// Get mutable access to the heap for transaction creation
     pub fn heap_mut(&mut self) -> &mut LuaHeap {
         &mut self.heap
+    }
+    
+    /// Clean up register windows down to a target depth
+    /// This is used for error recovery to ensure no windows are leaked
+    fn cleanup_windows_to_depth(&mut self, target_depth: usize) -> LuaResult<()> {
+        // Get current window depth
+        let current = self.register_windows.current_window();
+        
+        match current {
+            Some(depth) if depth > target_depth => {
+                // We need to clean up windows
+                println!("DEBUG: Cleaning up windows from {} to {}", depth, target_depth);
+                
+                // Deallocate windows until we reach target depth
+                while let Some(current_depth) = self.register_windows.current_window() {
+                    if current_depth <= target_depth {
+                        break;
+                    }
+                    
+                    // Deallocate the current window
+                    match self.register_windows.deallocate_window() {
+                        Ok(_) => {
+                            println!("DEBUG: Deallocated window at depth {}", current_depth);
+                        }
+                        Err(e) => {
+                            // Log the error but continue cleanup
+                            println!("WARNING: Error deallocating window at depth {}: {:?}", current_depth, e);
+                            // Still try to continue cleanup
+                        }
+                    }
+                }
+                
+                // Verify we reached the target depth
+                if let Some(final_depth) = self.register_windows.current_window() {
+                    if final_depth != target_depth {
+                        println!("WARNING: Target depth {} not reached, stopped at {}", target_depth, final_depth);
+                    }
+                }
+                
+                Ok(())
+            }
+            _ => {
+                // Nothing to clean up
+                Ok(())
+            }
+        }
     }
     
     /// Debug method to check if a global exists and return its value
@@ -1303,6 +1482,10 @@ impl LuaVM {
         // Record initial call depth
         let initial_depth = self.get_call_depth()?;
         
+        // Track initial window depth for cleanup on error
+        let initial_window_depth = self.register_windows.current_window().unwrap_or(0);
+        println!("DEBUG VM: Starting execution with window depth {}", initial_window_depth);
+        
         // Queue initial function call
         self.pending_operations.push_back(PendingOperation::FunctionCall {
             closure,
@@ -1321,23 +1504,29 @@ impl LuaVM {
         loop {
             // Check termination conditions
             if self.should_kill() {
+                // Clean up windows before returning error
+                self.cleanup_windows_to_depth(initial_window_depth)?;
                 return Err(LuaError::ScriptKilled);
             }
             
             if self.check_timeout() {
+                // Clean up windows before returning error
+                self.cleanup_windows_to_depth(initial_window_depth)?;
                 return Err(LuaError::Timeout);
             }
             
             if self.instruction_count > self.max_instructions {
+                // Clean up windows before returning error
+                self.cleanup_windows_to_depth(initial_window_depth)?;
                 return Err(LuaError::InstructionLimitExceeded);
             }
             
             // Process pending operations first
             if !self.pending_operations.is_empty() {
                 let op = self.pending_operations.pop_front().unwrap();
-                match self.process_pending_operation(op)? {
-                    StepResult::Continue => continue,
-                    StepResult::Return(values) => {
+                match self.process_pending_operation(op) {
+                    Ok(StepResult::Continue) => continue,
+                    Ok(StepResult::Return(values)) => {
                         if !values.is_empty() {
                             final_result = values[0].clone();
                             
@@ -1353,18 +1542,27 @@ impl LuaVM {
                             break;
                         }
                     }
-                    StepResult::Yield(_) => {
+                    Ok(StepResult::Yield(_)) => {
+                        // Clean up windows before returning error
+                        self.cleanup_windows_to_depth(initial_window_depth)?;
                         return Err(LuaError::NotImplemented("coroutines".to_string()));
                     }
-                    StepResult::Error(e) => {
+                    Ok(StepResult::Error(e)) => {
+                        // Clean up windows before returning error
+                        self.cleanup_windows_to_depth(initial_window_depth)?;
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        // Clean up windows before returning error
+                        self.cleanup_windows_to_depth(initial_window_depth)?;
                         return Err(e);
                     }
                 }
             } else {
                 // Execute next instruction
-                match self.step()? {
-                    StepResult::Continue => continue,
-                    StepResult::Return(values) => {
+                match self.step() {
+                    Ok(StepResult::Continue) => continue,
+                    Ok(StepResult::Return(values)) => {
                         if !values.is_empty() {
                             final_result = values[0].clone();
                             
@@ -1380,10 +1578,19 @@ impl LuaVM {
                             break;
                         }
                     }
-                    StepResult::Yield(_) => {
+                    Ok(StepResult::Yield(_)) => {
+                        // Clean up windows before returning error
+                        self.cleanup_windows_to_depth(initial_window_depth)?;
                         return Err(LuaError::NotImplemented("coroutines".to_string()));
                     }
-                    StepResult::Error(e) => {
+                    Ok(StepResult::Error(e)) => {
+                        // Clean up windows before returning error
+                        self.cleanup_windows_to_depth(initial_window_depth)?;
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        // Clean up windows before returning error
+                        self.cleanup_windows_to_depth(initial_window_depth)?;
                         return Err(e);
                     }
                 }
@@ -1393,6 +1600,15 @@ impl LuaVM {
         self.execution_state = ExecutionState::Completed;
         
         println!("DEBUG VM: Final result value type: {}", final_result.type_name());
+        
+        // Verify we've cleaned up properly on success path
+        let final_window_depth = self.register_windows.current_window().unwrap_or(0);
+        if final_window_depth != initial_window_depth {
+            println!("WARNING: Window depth mismatch after execution: initial={}, final={}", 
+                     initial_window_depth, final_window_depth);
+            // Clean up any remaining windows
+            self.cleanup_windows_to_depth(initial_window_depth)?;
+        }
         
         // Return the result directly without any additional processing or conversions
         Ok(final_result)
@@ -4330,7 +4546,24 @@ impl LuaVM {
         
         // Call C function with isolated context - this is a new borrow
         let result_count = {
-            let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
+            // Try to determine the window index from base_register
+            let window_idx = if let Some(current_window) = self.register_windows.current_window() {
+                // Check if base_register matches current window
+                if base_register as usize <= current_window {
+                    Some(base_register as usize)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            let mut ctx = if let Some(win_idx) = window_idx {
+                ExecutionContext::new_with_window(self, win_idx, register_a, args.len(), thread_handle)
+            } else {
+                ExecutionContext::new(self, stack_base, args.len(), thread_handle)
+            };
+            
             match func(&mut ctx) {
                 Ok(count) => {
                     println!("DEBUG CFUNC: Function returned success with {} values", count);
@@ -4447,11 +4680,30 @@ impl LuaVM {
                  stack_base, args.len());
         
         let result_count = {
-            // Create execution context pointing to the thread's stack
-            let mut ctx = ExecutionContext::new(self, stack_base, args.len(), thread_handle);
+            // Create execution context with window awareness
+            // We'll place results directly in the window at result_register
+            let mut ctx = ExecutionContext::new_with_window(
+                self, 
+                window_idx,
+                result_register,  // Use result_register as the base for results
+                args.len(), 
+                thread_handle
+            );
+            
+            // For argument access, we need to temporarily adjust the context
+            // to read from the stack positions where we pushed the args
+            let original_stack_base = ctx.stack_base;
+            ctx.stack_base = stack_base;
+            ctx.window_idx = None; // Temporarily disable window access for args
             
             // Call the C function
-            match func(&mut ctx) {
+            let result = func(&mut ctx);
+            
+            // Restore window-based result writing
+            ctx.stack_base = original_stack_base;
+            ctx.window_idx = Some(window_idx);
+            
+            match result {
                 Ok(count) => {
                     println!("DEBUG CFUNC_WINDOWS: C function returned {} results", count);
                     count as usize
@@ -4469,63 +4721,18 @@ impl LuaVM {
             }
         };
         
-        // Step 4: Collect results from stack
-        let results = {
+        // Step 4: Clean up the stack (remove arguments)
+        {
             let mut tx = HeapTransaction::new(&mut self.heap);
-            let mut results = Vec::with_capacity(result_count);
             
-            println!("DEBUG CFUNC_WINDOWS: Collecting {} results from stack", result_count);
-            
-            for i in 0..result_count {
-                match tx.read_register(thread_handle, stack_base + i) {
-                    Ok(value) => {
-                        println!("DEBUG CFUNC_WINDOWS: Result[{}] = {:?} (type: {})", 
-                                 i, value, value.type_name());
-                        results.push(value);
-                    },
-                    Err(e) => {
-                        println!("DEBUG CFUNC_WINDOWS: Error reading result[{}]: {:?}", i, e);
-                        // Continue reading other results
-                    }
-                }
-            }
-            
-            // Step 5: Clean up the stack
-            // Remove the larger of args or results
-            let cleanup_count = args.len().max(result_count);
-            println!("DEBUG CFUNC_WINDOWS: Cleaning up {} stack values", cleanup_count);
-            tx.pop_stack(thread_handle, cleanup_count)?;
+            // Remove arguments from stack
+            println!("DEBUG CFUNC_WINDOWS: Cleaning up {} stack values", args.len());
+            tx.pop_stack(thread_handle, args.len())?;
             
             tx.commit()?;
-            results
-        };
-        
-        // Step 6: Copy results back to register window
-        // IMPORTANT: window_idx and result_register are still in scope here
-        println!("DEBUG CFUNC_WINDOWS: Storing {} results to window {} starting at register {}", 
-                 results.len(), window_idx, result_register);
-        
-        if !results.is_empty() {
-            // Store each result in consecutive registers
-            for (i, value) in results.iter().enumerate() {
-                let target_register = result_register + i;
-                
-                if target_register < 256 {
-                    println!("DEBUG CFUNC_WINDOWS: Storing result[{}] to window {} register {}: {:?}", 
-                             i, window_idx, target_register, value);
-                    self.register_windows.set_register(window_idx, target_register, value.clone())?;
-                } else {
-                    println!("DEBUG CFUNC_WINDOWS: Warning: register {} out of bounds, skipping", 
-                             target_register);
-                }
-            }
-        } else {
-            // No results - set target register to nil
-            println!("DEBUG CFUNC_WINDOWS: No results, setting window {} register {} to nil", 
-                     window_idx, result_register);
-            self.register_windows.set_register(window_idx, result_register, Value::Nil)?;
         }
         
+        // Results are already written to the window by ExecutionContext
         println!("DEBUG CFUNC_WINDOWS: C function call completed successfully");
         Ok(StepResult::Continue)
     }
@@ -4835,7 +5042,12 @@ impl LuaVM {
     }
     
     fn process_pending_operation(&mut self, op: PendingOperation) -> LuaResult<StepResult> {
-        match op {
+        // Track initial window depth for cleanup on error
+        let initial_window_depth = self.register_windows.current_window().unwrap_or(0);
+        println!("DEBUG PENDING_OP: Starting with window depth {}", initial_window_depth);
+        
+        // Process the operation and capture any errors
+        let result = match op {
             PendingOperation::FunctionCall { closure, args, context } => {
                 println!("DEBUG PENDING_OP: Processing FunctionCall operation");
                 
@@ -4862,13 +5074,22 @@ impl LuaVM {
                     
                     // Extract window index and register offset from context
                     match &context {
-                        ReturnContext::Register { base, offset } => (*base as usize, *offset),
+                        ReturnContext::Register { base, offset } => {
+                            // The base_register in the frame stores the window index
+                            (frame.base_register as usize, *offset)
+                        },
                         ReturnContext::ForLoop { window_idx, a, .. } => (*window_idx, *a),
-                        _ => (frame.base_register as usize, 0),
+                        ReturnContext::EvalReturn { target_window, result_register, .. } => {
+                            (*target_window, *result_register)
+                        },
+                        _ => {
+                            // For other contexts, use the frame's window
+                            (frame.base_register as usize, 0)
+                        },
                     }
                 };
                 
-                // Now handle the C function call
+                // Now handle the C function call with windows
                 self.handle_c_function_call_with_windows(
                     function,
                     args,
@@ -5451,6 +5672,17 @@ impl LuaVM {
                          std::mem::discriminant(&op));
                 Err(LuaError::NotImplemented("Pending operation type".to_string()))
             },
+        };
+        
+        // If an error occurred, clean up windows before propagating the error
+        match result {
+            Err(e) => {
+                println!("DEBUG PENDING_OP: Error occurred, cleaning up windows to depth {}", initial_window_depth);
+                // Clean up windows - ignore cleanup errors in error path
+                let _ = self.cleanup_windows_to_depth(initial_window_depth);
+                Err(e)
+            },
+            Ok(step_result) => Ok(step_result),
         }
     }
     
@@ -5464,6 +5696,9 @@ impl LuaVM {
         println!("DEBUG FUNC_CALL: Processing function call");
         println!("DEBUG FUNC_CALL: Args: {:?}", args);
         println!("DEBUG FUNC_CALL: Context: {:?}", context);
+        
+        // Track the initial window depth for cleanup on error
+        let initial_window_depth = self.register_windows.current_window().unwrap_or(0);
         
         // First transaction to get function info
         let mut tx = HeapTransaction::new(&mut self.heap);
@@ -5488,72 +5723,95 @@ impl LuaVM {
         // Get current window index as the parent
         let parent_window = self.register_windows.current_window()
             .ok_or_else(|| LuaError::InternalError("Failed to get parent window".to_string()))?;
-            
+        
         // Allocate a new register window for this function call
         println!("DEBUG FUNC_CALL: Allocating window with size {}", max_stack);
-        let func_window_idx = self.register_windows.allocate_window(max_stack + 10)?; // +10 for safety margin
+        let func_window_idx = match self.register_windows.allocate_window(max_stack + 10) { // +10 for safety margin
+            Ok(idx) => idx,
+            Err(e) => {
+                // Window allocation failed - no cleanup needed since we didn't allocate anything
+                return Err(e);
+            }
+        };
         
         println!("DEBUG FUNC_CALL: Created function window {} (parent: {})", func_window_idx, parent_window);
         
-        // Initialize parameters in the new window
-        for i in 0..num_params {
-            let value = if i < args.len() {
-                args[i].clone()
+        // Try to initialize the window; if any error occurs, clean it up
+        let setup_result: LuaResult<()> = (|| {
+            // Initialize parameters in the new window
+            for i in 0..num_params {
+                let value = if i < args.len() {
+                    args[i].clone()
+                } else {
+                    Value::Nil
+                };
+                println!("DEBUG FUNC_CALL: Setting parameter {} in window {}", i, func_window_idx);
+                self.register_windows.set_register(func_window_idx, i, value.clone())?;
+                
+                // IMPORTANT: Also sync to thread stack for upvalue capture
+                // Calculate stack position using inline calculation
+                let stack_position = func_window_idx * 256 + i;
+                tx.set_register(self.current_thread, stack_position, value)?;
+            }
+            
+            // Initialize remaining registers to nil
+            for i in num_params..max_stack {
+                self.register_windows.set_register(func_window_idx, i, Value::Nil)?;
+                
+                // Sync to thread stack
+                let stack_position = func_window_idx * 256 + i;
+                tx.set_register(self.current_thread, stack_position, Value::Nil)?;
+            }
+            
+            // Collect varargs if needed
+            let varargs = if is_vararg && args.len() > num_params {
+                Some(args[num_params..].to_vec())
             } else {
-                Value::Nil
+                None
             };
-            println!("DEBUG FUNC_CALL: Setting parameter {} in window {}", i, func_window_idx);
-            self.register_windows.set_register(func_window_idx, i, value.clone())?;
             
-            // IMPORTANT: Also sync to thread stack for upvalue capture
-            // Calculate stack position using inline calculation
-            let stack_position = func_window_idx * 256 + i;
-            tx.set_register(self.current_thread, stack_position, value)?;
-        }
-        
-        // Initialize remaining registers to nil
-        for i in num_params..max_stack {
-            self.register_windows.set_register(func_window_idx, i, Value::Nil)?;
-            
-            // Sync to thread stack
-            let stack_position = func_window_idx * 256 + i;
-            tx.set_register(self.current_thread, stack_position, Value::Nil)?;
-        }
-        
-        // Collect varargs if needed
-        let varargs = if is_vararg && args.len() > num_params {
-            Some(args[num_params..].to_vec())
-        } else {
-            None
-        };
-        
-        let new_frame = CallFrame {
-            closure,
-            pc: 0,
-            base_register: func_window_idx as u16, // Use window INDEX as base
-            expected_results: match &context {
-                ReturnContext::Register { .. } => Some(1),
-                ReturnContext::EvalReturn { expected_results, .. } => {
-                    if *expected_results == 0 { None } else { Some(*expected_results) }
+            let new_frame = CallFrame {
+                closure,
+                pc: 0,
+                base_register: func_window_idx as u16, // Use window INDEX as base
+                expected_results: match &context {
+                    ReturnContext::Register { .. } => Some(1),
+                    ReturnContext::EvalReturn { expected_results, .. } => {
+                        if *expected_results == 0 { None } else { Some(*expected_results) }
+                    },
+                    _ => None,
                 },
-                _ => None,
+                varargs,
+            };
+            
+            // Push call frame
+            tx.push_call_frame(self.current_thread, new_frame)?;
+            
+            // Commit transaction
+            tx.commit()?;
+            
+            Ok(())
+        })();
+        
+        // Check if setup succeeded
+        match setup_result {
+            Ok(_) => {
+                // Success - store return context
+                let call_depth = self.get_call_depth()?;
+                self.return_contexts.insert(call_depth, context);
+                
+                println!("DEBUG FUNC_CALL: Function call setup complete");
+                
+                Ok(StepResult::Continue)
             },
-            varargs,
-        };
-        
-        // Push call frame
-        tx.push_call_frame(self.current_thread, new_frame)?;
-        
-        // Commit transaction
-        tx.commit()?;
-        
-        // Store return context
-        let call_depth = self.get_call_depth()?;
-        self.return_contexts.insert(call_depth, context);
-        
-        println!("DEBUG FUNC_CALL: Function call setup complete");
-        
-        Ok(StepResult::Continue)
+            Err(e) => {
+                // Error occurred during setup - clean up window
+                println!("DEBUG FUNC_CALL: Error during setup: {:?}", e);
+                // Clean up the window we allocated
+                self.cleanup_windows_to_depth(initial_window_depth)?;
+                Err(e)
+            }
+        }
     }
     
     /// Get a constant from a closure
@@ -5669,12 +5927,35 @@ impl LuaVM {
 
         println!("DEBUG: Initializing root register window");
         let root_window_size = 256; // Generous size for the root window
-        let root_window_idx = self.register_windows.allocate_window(root_window_size)?;
+        
+        // Track initial window depth for cleanup
+        let initial_window_depth = self.register_windows.current_window().unwrap_or(0);
+        
+        let root_window_idx = match self.register_windows.allocate_window(root_window_size) {
+            Ok(idx) => idx,
+            Err(e) => {
+                // Window allocation failed
+                return Err(e);
+            }
+        };
         println!("DEBUG: Created root register window: {}", root_window_idx);
 
         // Now execute the main closure
         println!("DEBUG: Calling execute_function");
-        self.execute_function(closure_handle, args)
+        let result = self.execute_function(closure_handle, args);
+        
+        // Check if execution succeeded
+        match result {
+            Ok(value) => {
+                Ok(value)
+            },
+            Err(e) => {
+                // Error occurred during execution - clean up window
+                println!("DEBUG: Error during module execution: {:?}", e);
+                self.cleanup_windows_to_depth(initial_window_depth)?;
+                Err(e)
+            }
+        }
     }
     
     /// Get the heap for direct access (used in test helpers)
