@@ -91,6 +91,24 @@ struct BreakJump {
 #[derive(Debug, Clone)]
 struct PendingGoto(String, usize, usize); // Label, PC, level
 
+/// Statistics for register allocation
+#[derive(Debug, Clone)]
+struct RegisterStats {
+    preserved_registers: usize,
+    releases: usize,
+    mass_releases: usize,
+}
+
+impl RegisterStats {
+    fn new() -> Self {
+        RegisterStats {
+            preserved_registers: 0,
+            releases: 0,
+            mass_releases: 0,
+        }
+    }
+}
+
 /// Helper for register allocation with proper lifetime tracking
 #[derive(Debug, Clone)]
 struct RegisterAllocator {
@@ -111,6 +129,9 @@ struct RegisterAllocator {
     
     /// Registers that need to be preserved during state restoration
     preserved_registers: HashSet<usize>,
+    
+    /// Statistics tracking
+    stats: RegisterStats,
 }
 
 impl RegisterAllocator {
@@ -123,6 +144,7 @@ impl RegisterAllocator {
             register_to_variable: HashMap::new(),
             current_instruction: 0,
             preserved_registers: HashSet::new(),
+            stats: RegisterStats::new(),
         }
     }
     
@@ -132,9 +154,52 @@ impl RegisterAllocator {
         self.used
     }
     
-    /// Mark a register to be preserved when restoring state
-    fn preserve_register(&mut self, reg: usize) {
+    /// Allocate a register, guaranteeing sequential allocation
+    /// This is critical for opcodes like TFORLOOP that require specific register layouts
+    pub fn allocate_sequential(&mut self) -> usize {
+        // For sequential allocation, we ignore the free list and always allocate new
+        let reg = self.used;
+        self.used += 1;
+        
+        // Update max_used
+        if self.used > self.max_used {
+            self.max_used = self.used;
+        }
+        
+        // Remove this register from free list if it was there
+        self.free_registers.retain(|&r| r != reg);
+        
+        reg
+    }
+    
+    /// Preserve a register to prevent reuse
+    /// 
+    /// According to the register allocation contract, registers must be preserved 
+    /// when they contain values that must survive nested operations.
+    /// Common cases: function registers during argument evaluation
+    pub fn preserve_register(&mut self, reg: usize) {
+        if self.preserved_registers.contains(&reg) {
+            // Already preserved, nothing to do
+            return;
+        }
+        
         self.preserved_registers.insert(reg);
+        
+        // Update stats
+        self.stats.preserved_registers += 1;
+    }
+    
+    /// Release a specific register's preservation
+    pub fn release_register(&mut self, reg: usize) {
+        if self.preserved_registers.remove(&reg) {
+            // Register was previously preserved, now released
+            self.stats.releases += 1;
+            
+            // If the register is above current allocation level, it can be freed
+            if reg >= self.used {
+                self.free_registers.push(reg);
+            }
+        }
     }
     
     /// Mark multiple registers to be preserved
@@ -144,9 +209,13 @@ impl RegisterAllocator {
         }
     }
     
-    /// Clear all preserved register markings
-    fn clear_preserved(&mut self) {
+    /// Clear all preserved registers
+    pub fn clear_preserved(&mut self) {
+        let count = self.preserved_registers.len();
         self.preserved_registers.clear();
+        
+        // Update stats
+        self.stats.mass_releases += count;
     }
     
     /// Restore state to a previously saved point, preserving registers
@@ -182,6 +251,10 @@ impl RegisterAllocator {
         // 2. Not preserved
         // 3. Not currently live
         
+        // First, clean up the free list to remove any registers below the target level
+        // This prevents allocate() from returning registers that should be active
+        self.free_registers.retain(|&reg| reg >= level);
+        
         // Collect registers to potentially free
         let mut to_free = Vec::new();
         
@@ -212,27 +285,37 @@ impl RegisterAllocator {
         }
         
         // Only update 'used' if we can safely lower it
-        // This happens when all registers from 'level' to 'used' are free
+        // This happens when all registers from 'level' to 'used' are free or preserved
         let mut can_lower = true;
+        let mut new_used = level;
+        
         for reg in level..self.used {
+            // If a register is not in the free list and not preserved, it's still in use
             if !self.free_registers.contains(&reg) && !self.preserved_registers.contains(&reg) {
                 can_lower = false;
-                break;
+                new_used = reg + 1;
             }
         }
         
         if can_lower {
             self.used = level;
+        } else {
+            // Set used to the highest non-free register + 1
+            self.used = new_used;
         }
         
-        // Sort free registers for better allocation patterns
+        // Sort free registers for better allocation patterns (prefer lower registers)
         self.free_registers.sort_unstable();
         
-        // Remove any free registers that are below the new 'used' level
-        self.free_registers.retain(|&reg| reg >= self.used);
+        // Final cleanup: remove any free registers that are below the new 'used' level
+        // to maintain consistency
+        self.free_registers.retain(|&reg| reg < self.used);
     }
     
     /// Allocate a register, preferring to reuse a free register if possible
+    /// 
+    /// Use this for general register allocation where the specific register number doesn't matter.
+    /// For cases requiring sequential registers (like TFORLOOP), use allocate_sequential() instead.
     fn allocate(&mut self) -> usize {
         // Try to reuse a free register first
         if let Some(reg) = self.free_registers.pop() {
@@ -680,6 +763,19 @@ impl CodeGenerator {
         self.registers.mark_register(register, name);
         
         Ok(())
+    }
+    
+    /// Add a local variable with a specific register
+    fn add_local(&mut self, name: &str, register: usize) {
+        self.variables.insert(name.to_string(), VarInfo {
+            register,
+            level: self.scope_level,
+            captured: false,
+            last_use: Some(self.registers.current_instruction),
+        });
+        
+        // Mark register as containing this variable
+        self.registers.mark_register(register, name.to_string());
     }
     
     /// Resolve a variable with proper usage tracking
@@ -1170,10 +1266,19 @@ impl CodeGenerator {
                 
                 // Allocate registers: R(base), R(base+1), R(base+2), R(base+3) = var, limit, step, loop var
                 let base_reg = self.registers.level();
-                let var_reg = self.registers.allocate(); // R(base) - internal counter
-                let limit_reg = self.registers.allocate(); // R(base+1) - limit
-                let step_reg = self.registers.allocate(); // R(base+2) - step
-                let loop_var_reg = self.registers.allocate(); // R(base+3) - Lua variable
+                
+                let var_reg = self.registers.allocate_sequential(); // R(base) - internal counter
+                let limit_reg = self.registers.allocate_sequential(); // R(base+1) - limit
+                let step_reg = self.registers.allocate_sequential(); // R(base+2) - step
+                let loop_var_reg = self.registers.allocate_sequential(); // R(base+3) - Lua variable
+                
+                // Verify sequential allocation
+                if var_reg != base_reg || limit_reg != base_reg + 1 || 
+                   step_reg != base_reg + 2 || loop_var_reg != base_reg + 3 {
+                    return Err(LuaError::InternalError(
+                        "Sequential register allocation failed for numeric for loop".to_string()
+                    ));
+                }
                 
                 // Declare the variable
                 self.variables.insert(variable.clone(), VarInfo {
@@ -1265,105 +1370,103 @@ impl CodeGenerator {
             Statement::ForInLoop { variables, iterators, body } => {
                 self.enter_scope();
                 
-                // Need at least 3 registers for the for-in loop
-                // R(base), R(base+1), R(base+2) = iterator, state, control
+                // Get the base register for the iterator triplet following the contract
                 let base_reg = self.registers.level();
                 
-                // Compile iterator expressions (usually pairs/ipairs)
-                for (i, expr) in iterators.iter().enumerate() {
-                    let reg = base_reg + i;
-                    if reg >= self.registers.level() {
-                        self.registers.allocate();
-                    }
-                    self.expression(expr, reg, 1)?;
+                // Allocate registers for the triplet: R(base), R(base+1), R(base+2)
+                let iterator_reg = self.registers.allocate_sequential();
+                let state_reg = self.registers.allocate_sequential();
+                let control_reg = self.registers.allocate_sequential();
+                
+                // Verify sequential allocation
+                if iterator_reg != base_reg || state_reg != base_reg + 1 || control_reg != base_reg + 2 {
+                    return Err(LuaError::InternalError(
+                        format!("Sequential register allocation failed for iterator triplet: expected {},{},{} got {},{},{}",
+                                base_reg, base_reg + 1, base_reg + 2,
+                                iterator_reg, state_reg, control_reg)
+                    ));
                 }
                 
-                // Allocate additional registers for loop variables
-                let var_base = base_reg + 3; // First variable is at R(base+3)
-                for var in variables {
-                    let reg = if self.registers.level() > var_base {
-                        self.registers.level()
-                    } else {
-                        match self.registers.level().checked_sub(var_base) {
-                            Some(diff) => var_base + diff,
-                            None => var_base // If underflow, just use var_base
+                // Mark the iterator register as preserved per contract
+                self.registers.preserve_register(iterator_reg);
+                
+                // Evaluate the iterator expression (typically pairs(t) or ipairs(t))
+                // which returns the triplet: iterator function, state, control value
+                match iterators.len() {
+                    0 => {
+                        return Err(LuaError::CompileError(
+                            "for-in loop requires at least one iterator expression".to_string()
+                        ));
+                    },
+                    1 => {
+                        // Single iterator expression - evaluate to get all 3 values
+                        self.expression(&iterators[0], base_reg, 3)?;
+                    },
+                    _ => {
+                        // Multiple expressions (rarely used)
+                        for (i, expr) in iterators.iter().enumerate() {
+                            if i < 3 {
+                                self.expression(expr, base_reg + i, 1)?;
+                            }
                         }
-                    };
-                    
-                    if reg >= self.registers.level() {
-                        self.registers.allocate();
                     }
-                    
-                    // Declare the variable with proper last_use tracking
-                    self.variables.insert(var.clone(), VarInfo {
-                        register: reg,
-                        level: self.scope_level,
-                        captured: false,
-                        last_use: Some(self.registers.current_instruction),
-                    });
-                    
-                    // Mark register as containing this variable
-                    self.registers.mark_register(reg, var.clone());
                 }
                 
-                // Emit JMP to the TFORCALL instruction
-                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 1)); // Skip to TFORCALL
+                // Allocate registers for each for-loop variable
+                // They go after the triplet: R(Base+3) onwards
+                for (i, var) in variables.iter().enumerate() {
+                    let reg = self.registers.allocate_sequential();
+                    if reg != base_reg + 3 + i {
+                        return Err(LuaError::InternalError(
+                            format!("Register allocation inconsistency in for-in loop: expected {} got {}",
+                                    base_reg + 3 + i, reg)
+                        ));
+                    }
+                    self.add_local(var, reg);
+                }
                 
-                // The TFORCALL instruction will be here (Lua 5.2+).
-                // In Lua 5.1, there's no TFORCALL instruction, so we simulate it with a CALL
-                let loop_start = self.current_pc();
+                // Following Lua 5.1 spec: We need to generate following pattern:
+                // 1. Jump to TFORLOOP
+                // 2. Loop body
+                // 3. TFORLOOP (single instruction)
+                // 4. Jump back to body
                 
-                // Call the iterator: R(a), R(a+1), R(a+2) = f(s, var)
-                self.emit(Self::encode_ABC(
-                    OpCode::Call,
-                    base_reg as u8,
-                    3, // 2 arguments
-                    variables.len() as u16 + 1 // N results + 1
-                ));
+                // Skip body first time, jump to TFORLOOP
+                let jmp_to_tforloop = self.current_pc();
+                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 0)); // Placeholder, fixed later
                 
-                // Check if iteration is done with TForLoop
-                // In Lua 5.1, TForLoop combines both the iterator call and the loop check
-                let _tforloop = self.current_pc();
+                // Mark start of loop body for breaks
+                let loop_body_start = self.current_pc();
+                self.inside_loop = true;
+                let breaks_before = self.break_jumps.len();
+                
+                // Compile loop body
+                self.block(body)?;
+                
+                self.inside_loop = false;
+
+                // Emit TFORLOOP instruction (no separate CALL needed per Lua 5.1 spec)
+                let tforloop_pc = self.current_pc();
                 self.emit(Self::encode_ABC(
                     OpCode::TForLoop,
                     base_reg as u8,
-                    0,
-                    variables.len() as u16
+                    0, // B unused in Lua 5.1
+                    variables.len() as u16  // C = number of variables
                 ));
                 
-                // Emit JMP to loop body
-                self.emit(Self::encode_AsBx(OpCode::Jmp, 0, 1)); // Skip to loop body
-                
-                // Compile loop body
-                self.inside_loop = true;
-                let breaks_before = self.break_jumps.len();
-                self.block(body)?;
-                self.inside_loop = false;
-                
-                // Jump back to the call with safe calculation
-                let current = self.current_pc();
-                
-                let jump_back_offset = match (loop_start as i64).checked_sub(current as i64) {
-                    Some(diff) => {
-                        let final_offset = diff.checked_sub(1).unwrap_or(-1);
-                        if final_offset < -131071 || final_offset > 131070 {
-                            return Err(LuaError::CompileError(
-                                format!("For-in loop jump back offset {} out of range", final_offset)
-                            ));
-                        }
-                        final_offset as i32
-                    },
-                    None => {
-                        return Err(LuaError::CompileError(
-                            "For-in loop jump offset calculation overflow".to_string()
-                        ));
-                    }
-                };
-
+                // Jump back to loop body
+                let jump_back_offset = loop_body_start as i32 - (tforloop_pc as i32 + 2);
                 self.emit(Self::encode_AsBx(OpCode::Jmp, 0, jump_back_offset));
                 
-                // Patch any break statements
+                // Fix the initial jump to skip the body and land on TFORLOOP
+                let skip_jump_offset = tforloop_pc as i32 - (jmp_to_tforloop as i32 + 1);
+                self.code[jmp_to_tforloop] = Self::encode_AsBx(OpCode::Jmp, 0, skip_jump_offset);
+                
+                // Patch break jumps
                 self.patch_breaks(breaks_before);
+                
+                // Release the preserved register
+                self.registers.release_register(iterator_reg);
                 
                 self.leave_scope();
             }
@@ -1936,123 +2039,39 @@ impl CodeGenerator {
         // Save the allocation state for later restoration
         let saved_state = self.registers.save_state();
         
-        // Allocate register for function and mark it preserved
+        // Allocate register for function and mark it preserved per contract
         let func_reg = self.registers.allocate();
         self.registers.preserve_register(func_reg);
         
-        // Handle method calls (:)
-        if let Some(method) = &call.method {
-            if let Expression::Variable(Variable::Name(obj_name)) = &call.function {
-                // Simple case: x:method(...)
-                // First resolve the variable without holding a borrow on self
-                let var_info = self.resolve_variable_and_clone(obj_name);
-                
-                if let Some(v) = var_info {
-                    // Get method from object
-                    let method_idx = self.add_string_constant(method)?;
-                    
-                    // Now emit the instruction
-                    self.emit(Self::encode_ABC(
-                        OpCode::Self_,
-                        func_reg as u8,
-                        v.register as u16,
-                        (method_idx | 0x100) as u16 // Mark as constant
-                    ));
-                } else {
-                    // Global
-                    let obj_reg = self.registers.allocate();
-                    let obj_idx = self.add_string_constant(obj_name)?;
-                    self.emit(Self::encode_ABx(OpCode::GetGlobal, obj_reg as u8, obj_idx as u32));
-                    
-                    let method_idx = self.add_string_constant(method)?;
-                    self.emit(Self::encode_ABC(
-                        OpCode::Self_,
-                        func_reg as u8,
-                        obj_reg as u16,
-                        (method_idx | 0x100) as u16 // Mark as constant
-                    ));
-                }
-            } else {
-                // Complex case: expr:method(...)
-                let obj_reg = self.registers.allocate();
-                
-                // Compile with proper scoping
-                let obj_state = self.registers.save_state();
-                self.expression(&call.function, obj_reg, 1)?;
-                
-                // Preserve the object register
-                self.registers.preserve_register(obj_reg);
-                self.registers.restore_state(obj_state);
-                
-                let method_idx = self.add_string_constant(method)?;
-                self.emit(Self::encode_ABC(
-                    OpCode::Self_,
-                    func_reg as u8,
-                    obj_reg as u16,
-                    (method_idx | 0x100) as u16 // Mark as constant
-                ));
-            }
-        } else {
-            // Regular function call
-            let func_state = self.registers.save_state();
-            self.expression(&call.function, func_reg, 1)?;
-            
-            // Preserve the function register
-            // This ensures it won't be overwritten during argument evaluation
-            self.registers.preserve_register(func_reg);
-            self.registers.restore_state(func_state);
-        }
+        // Generate code for the function itself
+        self.expression(&call.function, func_reg, 1)?;
         
-        // Process arguments
+        // Process arguments with careful register management
         let mut arg_regs = Vec::new();
         let num_args = match &call.args {
             CallArgs::Args(args) => {
                 for arg in args {
-                    // Allocate a NEW register for each argument
-                    // Don't reuse the function register
                     let arg_reg = self.registers.allocate();
-                    
-                    if arg_reg == func_reg {
-                        // This should never happen since func_reg is preserved,
-                        // but just to be extra safe
-                        println!("WARNING: Argument register {} conflicts with function register", arg_reg);
-                        continue;
-                    }
-                    
                     arg_regs.push(arg_reg);
                     
-                    // Save state before compiling expression
-                    let arg_state = self.registers.save_state();
-                    
-                    // Mark function register as preserved before any subexpression
+                    // Following the register contract
+                    // "When compiling func(arg1, arg2), preserve function register during arg evaluation"
                     self.registers.preserve_register(func_reg);
                     
-                    // Compile expression
+                    // Compile the argument expression
                     self.expression(arg, arg_reg, 1)?;
-                    
-                    // Restore state, preserving function and this argument register
-                    self.registers.preserve_register(arg_reg);
-                    self.registers.restore_state(arg_state);
                 }
-                
                 args.len()
             },
             CallArgs::Table(table) => {
                 let arg_reg = self.registers.allocate();
                 arg_regs.push(arg_reg);
                 
-                // Save state before compiling
-                let table_state = self.registers.save_state();
-                
-                // Ensure function register is preserved
+                // Preserve function register during table construction
                 self.registers.preserve_register(func_reg);
                 
                 // Compile table constructor
                 self.table_constructor(table, arg_reg)?;
-                
-                // Restore state, preserving both function and argument registers
-                self.registers.preserve_register(arg_reg);
-                self.registers.restore_state(table_state);
                 
                 1
             },
@@ -2080,9 +2099,8 @@ impl CodeGenerator {
             }
         }
         
-        // Now we can restore state without preserving registers
-        // The CALL and MOVE instructions have been emitted
-        self.registers.clear_preserved();  // Clear the preserved set
+        // Properly clear preserved registers before restoration
+        self.registers.release_register(func_reg);
         self.registers.restore_state(saved_state);
         
         Ok(())

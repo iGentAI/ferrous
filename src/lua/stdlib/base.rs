@@ -373,7 +373,7 @@ pub fn lua_select(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 pub fn lua_next(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     println!("DEBUG NEXT: next() called with {} arguments", ctx.arg_count());
     
-    // Validate argument count
+    // Validate argument count - must be 1 or 2
     let arg_count = ctx.arg_count();
     if arg_count < 1 || arg_count > 2 {
         return Err(LuaError::ArgumentError {
@@ -396,28 +396,27 @@ pub fn lua_next(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     };
     
     // Get the current key (nil means start from beginning)
-    let current_key = if arg_count >= 2 {
-        ctx.get_arg(1)?
-    } else {
-        Value::Nil
-    };
+    let current_key = ctx.get_arg(1)?;
     
     println!("DEBUG NEXT: Looking for next key after {:?}", current_key);
     
-    // Get next key-value pair
+    // According to the register allocation contract & Lua 5.1 spec,
+    // iterator functions must follow a strict return pattern:
+    // 1. Return nil to end iteration, OR
+    // 2. Return key, value pair to continue
     match ctx.table_next(table_handle, current_key)? {
         Some((key, value)) => {
             println!("DEBUG NEXT: Found next pair: {:?} -> {:?}", key, value);
-            // Return key-value pair
+            // Return key-value pair for next iteration
             ctx.push_result(key)?;
             ctx.push_result(value)?;
-            Ok(2)
+            Ok(2)  // Return 2 values: key and value
         },
         None => {
-            // No more elements
+            // No more elements - return nil to end iteration
             println!("DEBUG NEXT: No more pairs, returning nil");
             ctx.push_result(Value::Nil)?;
-            Ok(1)
+            Ok(1)  // Return 1 value: nil
         }
     }
 }

@@ -59,3 +59,11 @@ path = "src/bin/debug_globals.rs"
 [[bin]]
 name = "test_getglobal"
 path = "src/bin/test_getglobal.rs"
+
+[[bin]]
+name = "stdlib_test_runner"
+path = "src/bin/stdlib_test_runner.rs"
+
+[[bin]]
+name = "tforloop_test_runner"
+path = "tests/lua/tforloop_test_runner.rs"
