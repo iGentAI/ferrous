@@ -14,6 +14,7 @@ Ferrous is currently at Phase 4 implementation, with several key features comple
 - ✅ Pub/Sub messaging system
 - ✅ Transaction support (MULTI/EXEC/DISCARD/WATCH)
 - ✅ AOF persistence
+- ✅ Lua VM with unified stack architecture (in progress)
 
 ### Phase 4 Features Completed:
 - ✅ Pipelined command processing
@@ -22,19 +23,19 @@ Ferrous is currently at Phase 4 implementation, with several key features comple
 - ✅ Enhanced RESP protocol parsing
 - ✅ Master-slave replication
 - ✅ SCAN command family for safe iteration
-- ✅ Improved Lua VM with generational arena architecture
-- ✅ Table field concatenation and memory management in Lua
-- ✅ cjson.encode/decode support
+- ✅ Improved Lua VM with unified stack architecture
+- ✅ Basic Lua standard library implementation
+- ✅ Core Lua operations (tables, closures, etc.)
 
 ### Known Limitations:
-- ⚠️ Nested function calls in Lua scripts have stack overflow issues
-- ⚠️ Generic for loops (pairs/ipairs) in Lua have implementation issues
+- ⚠️ Lua VM: Some advanced features like generic for loops still in development
+- ⚠️ Lua VM: Metamethod handling partially implemented
 - ⚠️ Command renaming/disabling not implemented yet
 - ⚠️ Protected mode not implemented
 
 ### Coming Soon (Remaining Phase 4-6):
 - Production monitoring (INFO, SLOWLOG)
-- Advanced features (Lua scripting - register allocation fixed, full Redis API integration in progress, HyperLogLog)
+- Advanced features (Complete Lua scripting, full Redis API integration, HyperLogLog)
 - Cluster support
 
 ## Performance
@@ -129,3 +130,7 @@ Alternatively, you can use the REPLICAOF command to dynamically configure replic
 ```bash
 redis-cli -h 127.0.0.1 -p 6380 -a mysecretpassword REPLICAOF 127.0.0.1 6379
 ```
+
+## Lua VM Implementation Status
+
+The Lua VM is currently in active development with a unified stack architecture. See the [Lua Implementation Status](./docs/LUA_IMPLEMENTATION_STATUS.md) for details on what's currently working and upcoming features.

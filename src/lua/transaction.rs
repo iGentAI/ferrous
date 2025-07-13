@@ -546,6 +546,11 @@ impl<'a> HeapTransaction<'a> {
         Ok(globals)
     }
 
+    /// Get the globals table
+    pub fn globals(&mut self) -> LuaResult<TableHandle> {
+        self.heap.globals()
+    }
+
     /// Get metatable from a table using the two-phase pattern
     pub fn get_table_metatable_two_phase(&mut self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
         self.ensure_active()?;
@@ -832,6 +837,34 @@ impl<'a> HeapTransaction<'a> {
         self.validation_scope.mark_created(&handle);
         
         Ok(handle)
+    }
+    
+    /// Create a closure from a function prototype handle
+    pub fn create_closure_from_proto(
+        &mut self, 
+        proto_handle: FunctionProtoHandle, 
+        upvalues: Vec<UpvalueHandle>
+    ) -> LuaResult<ClosureHandle> {
+        self.ensure_active()?;
+        
+        // Validate the prototype handle
+        self.validate_with_context(&proto_handle, "create_closure_from_proto")?;
+        
+        // Validate all upvalue handles
+        for (i, upvalue) in upvalues.iter().enumerate() {
+            self.validate_with_context(upvalue, &format!("create_closure_from_proto upvalue[{}]", i))?;
+        }
+        
+        // Get a copy of the prototype
+        let proto = self.heap.get_function_proto(proto_handle)?.clone();
+        
+        // Create the closure
+        let closure = Closure {
+            proto,
+            upvalues,
+        };
+        
+        self.create_closure(closure)
     }
     
     /// Get closure

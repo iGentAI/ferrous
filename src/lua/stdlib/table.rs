@@ -148,7 +148,7 @@ pub fn table_insert(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         
         // Insert at len + 1
         let key = Value::Number((len + 1) as f64);
-        ctx.table_set(table_handle, key, value)?;
+        ctx.set_table_field(table_handle, key, value)?;
     } else {
         // Position and value insertion
         let pos_val = ctx.get_arg(1)?;
@@ -183,12 +183,12 @@ pub fn table_insert(ctx: &mut ExecutionContext) -> LuaResult<i32> {
             let dest_key = Value::Number((i + 1) as f64);
             
             let src_value = ctx.table_get(table_handle, src_key)?;
-            ctx.table_set(table_handle, dest_key, src_value)?;
+            ctx.set_table_field(table_handle, dest_key, src_value)?;
         }
         
         // Insert at pos
         let key = Value::Number(pos as f64);
-        ctx.table_set(table_handle, key, value)?;
+        ctx.set_table_field(table_handle, key, value)?;
     }
     
     // No return values
@@ -307,12 +307,12 @@ pub fn table_remove(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         let next_val = ctx.table_get(table_handle, next_key)?;
         
         let curr_key = Value::Number(i as f64);
-        ctx.table_set(table_handle, curr_key, next_val)?;
+        ctx.set_table_field(table_handle, curr_key, next_val)?;
     }
     
     // Remove the last element
     let last_key = Value::Number(len as f64);
-    ctx.table_set(table_handle, last_key, Value::Nil)?;
+    ctx.set_table_field(table_handle, last_key, Value::Nil)?;
     
     // Return the removed value
     ctx.push_result(removed_value)?;
@@ -372,32 +372,10 @@ pub fn table_sort(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     }
     
     // Sort items
-    if let Some(comp) = comp_func {
-        // Use custom comparator
-        
-        // This requires calling the comparison function
-        // Creating a bubble sort implementation for simplicity
-        // A real implementation would use a more efficient algorithm like quicksort
-        
-        for i in 0..items.len() {
-            for j in 0..items.len()-i-1 {
-                // Call comparator function
-                let a = items[j].clone();
-                let b = items[j+1].clone();
-                
-                // Call comparison function with a, b
-                let result = ctx.call_function(&comp, vec![a.clone(), b.clone()])?;
-                
-                let swap = match result {
-                    Value::Boolean(true) => false, // a < b, in order
-                    _ => true, // a >= b, swap
-                };
-                
-                if swap {
-                    items.swap(j, j+1);
-                }
-            }
-        }
+    if let Some(_comp) = comp_func {
+        // Custom comparator sorting is not yet implemented
+        // This would require the ability to call Lua functions from C functions
+        return Err(LuaError::NotImplemented("table.sort with custom comparator".to_string()));
     } else {
         // Use default less-than comparison
         
@@ -406,9 +384,32 @@ pub fn table_sort(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         
         for i in 0..items.len() {
             for j in 0..items.len()-i-1 {
-                let less_than = ctx.less_than(&items[j+1], &items[j])?;
+                // Compare using Lua's default comparison rules
+                let less_than = match (&items[j], &items[j+1]) {
+                    (Value::Number(a), Value::Number(b)) => {
+                        // NaN comparisons always return false
+                        if a.is_nan() || b.is_nan() {
+                            false
+                        } else {
+                            a < b
+                        }
+                    },
+                    (Value::String(a_handle), Value::String(b_handle)) => {
+                        let a_str = ctx.get_string_from_handle(*a_handle)?;
+                        let b_str = ctx.get_string_from_handle(*b_handle)?;
+                        a_str < b_str
+                    },
+                    _ => {
+                        // Different types - cannot compare
+                        return Err(LuaError::TypeError {
+                            expected: "comparable types".to_string(),
+                            got: format!("{} and {}", items[j].type_name(), items[j+1].type_name()),
+                        });
+                    }
+                };
                 
-                if less_than {
+                // If items[j] > items[j+1], swap them
+                if !less_than && items[j] != items[j+1] {
                     items.swap(j, j+1);
                 }
             }
@@ -418,200 +419,13 @@ pub fn table_sort(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     // Store the sorted items back in the table
     for i in 0..items.len() {
         let key = Value::Number((i+1) as f64);
-        ctx.table_set(table_handle, key, items[i].clone())?;
+        ctx.set_table_field(table_handle, key, items[i].clone())?;
     }
     
     // No return values
     Ok(0)
 }
 
-/// Helper to call a function from within ExecutionContext
-impl<'vm> ExecutionContext<'vm> {
-    /// Call a function with arguments
-    pub fn call_function(&mut self, func: &Value, args: Vec<Value>) -> LuaResult<Value> {
-        // This would be implemented to call a function
-        // For now, we'll return a default value for simplicity
-        Ok(Value::Boolean(false))
-    }
-    
-    /// Compare two values (less than)
-    pub fn less_than(&mut self, a: &Value, b: &Value) -> LuaResult<bool> {
-        // This would be implemented to compare values
-        // For now, we'll implement a simplified comparison for numbers and strings
-        match (a, b) {
-            (Value::Number(a), Value::Number(b)) => {
-                // NaN comparisons always return false
-                if a.is_nan() || b.is_nan() {
-                    return Ok(false);
-                }
-                Ok(a < b)
-            },
-            (Value::String(a_handle), Value::String(b_handle)) => {
-                let a_str = self.get_string_from_handle(*a_handle)?;
-                let b_str = self.get_string_from_handle(*b_handle)?;
-                Ok(a_str < b_str)
-            },
-            // In a full implementation, we'd handle metamethods here
-            _ => {
-                // Different types
-                Err(LuaError::TypeError {
-                    expected: "comparable types".to_string(),
-                    got: format!("{} and {}", a.type_name(), b.type_name()),
-                })
-            }
-        }
-    }
-    
-    /// Set a value in a table
-    pub fn table_set(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
-        // Create a transaction
-        let mut tx = HeapTransaction::new(&mut self.vm_access.heap);
-        
-        // Set the value
-        tx.set_table_field(table, key, value)?;
-        
-        // Commit the transaction
-        tx.commit()?;
-        
-        Ok(())
-    }
-}
-
-/// pairs(t) -> returns iterator function, t, nil
-pub fn pairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    println!("DEBUG PAIRS: pairs() called with {} arguments", ctx.arg_count());
-    
-    // Validate argument count
-    if ctx.arg_count() != 1 {
-        return Err(LuaError::ArgumentError {
-            expected: 1,
-            got: ctx.arg_count(),
-        });
-    }
-    
-    // Get table argument with strict type checking
-    let table = match ctx.get_arg(0)? {
-        Value::Table(handle) => handle,
-        other => {
-            println!("DEBUG PAIRS: Argument is not a table, got: {}", other.type_name());
-            return Err(LuaError::TypeError {
-                expected: "table".to_string(),
-                got: other.type_name().to_string(),
-            });
-        }
-    };
-    
-    // Get the next function
-    let next = match ctx.globals_get("next")? {
-        Value::CFunction(f) => f,
-        other => {
-            println!("DEBUG PAIRS: Cannot find 'next' function, got: {}", other.type_name());
-            return Err(LuaError::RuntimeError("Could not find next function".to_string()));
-        }
-    };
-    
-    println!("DEBUG PAIRS: Returning next function, table, and nil");
-    
-    // Return the iterator triplet: next, table, nil
-    ctx.push_result(Value::CFunction(next))?;
-    ctx.push_result(Value::Table(table))?;
-    ctx.push_result(Value::Nil)?;
-    
-    Ok(3) // Return 3 values (iterator function, state, initial control value)
-}
-
-/// ipairs(t) -> returns iterator function, t, 0
-pub fn ipairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    println!("DEBUG IPAIRS: ipairs() called with {} arguments", ctx.arg_count());
-    
-    // Validate argument count
-    if ctx.arg_count() != 1 {
-        return Err(LuaError::ArgumentError {
-            expected: 1,
-            got: ctx.arg_count(),
-        });
-    }
-    
-    // Get table argument with strict type checking
-    let table = match ctx.get_arg(0)? {
-        Value::Table(handle) => handle,
-        other => {
-            println!("DEBUG IPAIRS: Argument is not a table, got: {}", other.type_name());
-            return Err(LuaError::TypeError {
-                expected: "table".to_string(),
-                got: other.type_name().to_string(),
-            });
-        }
-    };
-    
-    println!("DEBUG IPAIRS: Returning ipairs_iter, table, and 0");
-    
-    // Return the iterator triplet: ipairs_iter, table, 0
-    ctx.push_result(Value::CFunction(ipairs_iter))?;
-    ctx.push_result(Value::Table(table))?;
-    ctx.push_result(Value::Number(0.0))?;
-    
-    Ok(3) // Return 3 values (iterator function, state, initial control value)
-}
-
-/// ipairs iterator function
-pub fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    println!("DEBUG IPAIRS_ITER: ipairs_iter() called with {} arguments", ctx.arg_count());
-    
-    // Validate argument count
-    if ctx.arg_count() != 2 {
-        return Err(LuaError::ArgumentError {
-            expected: 2,
-            got: ctx.arg_count(),
-        });
-    }
-    
-    // Get table argument
-    let table = match ctx.get_arg(0)? {
-        Value::Table(handle) => handle,
-        other => {
-            println!("DEBUG IPAIRS_ITER: First argument is not a table, got: {}", other.type_name());
-            return Err(LuaError::TypeError {
-                expected: "table".to_string(),
-                got: other.type_name().to_string(),
-            });
-        }
-    };
-    
-    // Get index argument
-    let index = match ctx.get_arg(1)? {
-        Value::Number(n) => n as i64,
-        other => {
-            println!("DEBUG IPAIRS_ITER: Second argument is not a number, got: {}", other.type_name());
-            return Err(LuaError::TypeError {
-                expected: "number".to_string(),
-                got: other.type_name().to_string(),
-            });
-        }
-    };
-    
-    // Calculate next index
-    let next_index = index + 1;
-    println!("DEBUG IPAIRS_ITER: Checking index {}", next_index);
-    
-    // Get value at next index
-    let value = ctx.table_get(table, Value::Number(next_index as f64))?;
-    
-    // Check if we should continue
-    if value.is_nil() {
-        println!("DEBUG IPAIRS_ITER: Index {} is nil, ending iteration", next_index);
-        ctx.push_result(Value::Nil)?;
-        return Ok(1);
-    }
-    
-    println!("DEBUG IPAIRS_ITER: Found value at index {}", next_index);
-    
-    // Return index and value
-    ctx.push_result(Value::Number(next_index as f64))?;
-    ctx.push_result(value)?;
-    
-    Ok(2) // Return 2 values: index and value
-}
 
 /// Create a table with all table functions
 pub fn create_table_lib() -> Vec<(&'static str, CFunction)> {

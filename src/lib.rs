@@ -24,7 +24,8 @@ pub use config::Config;
 pub use lua::LuaGIL;
 
 // Re-export VM types from the lua module
-pub use lua::vm::{LuaVM, Value};
+pub use lua::vm::LuaVM;
+pub use lua::value::Value;
 pub use lua::compile;
 pub use lua::handle::TableHandle;
 pub use lua::transaction::HeapTransaction;

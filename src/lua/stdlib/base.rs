@@ -116,7 +116,7 @@ pub fn lua_tostring(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     let value = ctx.get_arg(0)?;
     
     // Check for __tostring metamethod
-    let mt_result = ctx.check_metamethod(&value, "__tostring");
+    let mt_result = ctx.check_metamethod(&value, "__tostring")?;
     
     if let Some(func) = mt_result {
         // Call metamethod with the value
@@ -900,7 +900,7 @@ pub fn lua_eval(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     println!("DEBUG EVAL: Evaluating code: {}", source_code);
     
     // Use the VM's eval_script method to evaluate the code
-    match ctx.vm_access.eval_script(&source_code) {
+    match ctx.eval_script(&source_code) {
         Ok(result) => {
             // Successfully evaluated, push the result
             println!("DEBUG EVAL: Evaluation successful, result type: {}", result.type_name());
@@ -941,7 +941,7 @@ pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
             }
             
             // Execute the closure in protected mode
-            match ctx.vm_access.execute_function(closure, &args) {
+            match ctx.execute_function(closure, &args) {
                 Ok(value) => {
                     // Success - first push the success status
                     ctx.push_result(Value::Boolean(true))?;
@@ -1000,19 +1000,14 @@ pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
                         _ => format!("{}", e),
                     };
                     
-                    // Create a fresh transaction to update the status and add error message
-                    let mut tx = HeapTransaction::new(&mut ctx.vm_access.heap);
-                    
-                    // Create error message string
-                    let err_handle = tx.create_string(&error_msg)?;
+                    // Create error message string and update status using existing context
+                    let err_handle = ctx.create_string(&error_msg)?;
                     
                     // Replace the success status with false
-                    tx.set_register(thread_handle, base_index, Value::Boolean(false))?;
+                    ctx.set_return(0, Value::Boolean(false))?;
                     
                     // Add the error message as second return value
-                    tx.set_register(thread_handle, base_index + 1, Value::String(err_handle))?;
-                    
-                    tx.commit()?;
+                    ctx.set_return(1, Value::String(err_handle))?;
                     
                     // We've manually set exactly 2 return values
                     Ok(2)
