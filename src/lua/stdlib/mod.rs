@@ -86,7 +86,7 @@ fn verify_stdlib_functions(vm: &mut LuaVM, functions: &[&str]) -> LuaResult<()> 
         let mut count = 0;
         for (k, v) in &table_obj.map {
             if count < 25 {  // Limit to 25 entries to avoid flooding output
-                if let crate::lua::value::HashableValue::String(s) = k {
+                if let crate::lua::value::HashableValue::String(s, _) = k {
                     entries.push((*s, v.clone()));
                     count += 1;
                 }

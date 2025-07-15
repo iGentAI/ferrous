@@ -7,13 +7,13 @@ use super::ast::*;
 use super::error::{LuaError, LuaResult};
 use std::collections::HashMap;
 
-/// Compilation-time constant representation
+/// Constant value during compilation
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompilationConstant {
     /// Nil constant
     Nil,
     
-    /// Boolean constant
+    /// Boolean constant 
     Boolean(bool),
     
     /// Number constant
@@ -24,6 +24,9 @@ pub enum CompilationConstant {
     
     /// Function prototype constant (index into prototype table)
     FunctionProto(usize),
+    
+    /// Table constant (array of key-value pairs)
+    Table(Vec<(CompilationConstant, CompilationConstant)>),
 }
 
 /// Compilation-time upvalue information
@@ -454,6 +457,9 @@ fn compile_statement(ctx: &mut CodeGenContext, statement: &Statement) -> LuaResu
         Statement::ForLoop { variable, initial, limit, step, body } => {
             compile_for_loop(ctx, variable, initial, limit, step.as_ref(), body)
         }
+        Statement::LocalFunctionDefinition { name, parameters, is_vararg, body } => {
+            compile_local_function_definition(ctx, name, parameters, *is_vararg, body)
+        }
         _ => Err(LuaError::NotImplemented(format!("Statement type: {:?}", statement))),
     }
 }
@@ -602,6 +608,9 @@ fn compile_expression_to_register(ctx: &mut CodeGenContext, expr: &Expression, t
         }
         Expression::TableConstructor(tc) => {
             compile_table_constructor(ctx, tc, target)?;
+        }
+        Expression::FunctionDef { parameters, is_vararg, body } => {
+            compile_function_expression(ctx, parameters, *is_vararg, body, target)?;
         }
         _ => return Err(LuaError::NotImplemented(format!("Expression type: {:?}", expr))),
     }
@@ -1089,6 +1098,76 @@ fn compile_block(ctx: &mut CodeGenContext, block: &Block) -> LuaResult<()> {
     Ok(())
 }
 
+/// Compile a function expression
+fn compile_function_expression(
+    ctx: &mut CodeGenContext,
+    parameters: &[String],
+    is_vararg: bool,
+    body: &Block,
+    target: u8
+) -> LuaResult<()> {
+    // Create child context for the function
+    let mut child_ctx = ctx.child();
+    
+    // Set up function metadata
+    child_ctx.current_function.num_params = parameters.len() as u8;
+    child_ctx.current_function.is_vararg = is_vararg;
+    
+    // Register parameters as locals
+    for (i, param) in parameters.iter().enumerate() {
+        let reg = child_ctx.allocate_register()?;
+        child_ctx.add_local(param, reg);
+    }
+    
+    // Compile the function body
+    compile_block(&mut child_ctx, body)?;
+    
+    // Add implicit return if not present
+    if !ends_with_return(&body.statements) {
+        child_ctx.emit(Instruction::create_ABC(OpCode::Return, 0, 1, 0));
+    }
+    
+    // Add the compiled function as a prototype to the parent
+    let proto_idx = ctx.current_function.prototypes.len();
+    ctx.current_function.prototypes.push(child_ctx.current_function);
+    
+    // Merge string tables from child to parent
+    for string in child_ctx.strings {
+        ctx.add_string(&string);
+    }
+    
+    // Create a constant for this function prototype
+    let const_idx = ctx.add_constant(CompilationConstant::FunctionProto(proto_idx))?;
+    
+    // Emit CLOSURE instruction to create the function at runtime
+    ctx.emit(Instruction::create_ABx(OpCode::Closure, target as u32, const_idx));
+    
+    // TODO: Handle upvalues here when upvalue support is implemented
+    // For now, functions without upvalues work fine
+    
+    Ok(())
+}
+
+/// Compile a local function definition
+fn compile_local_function_definition(
+    ctx: &mut CodeGenContext,
+    name: &str,
+    parameters: &[String],
+    is_vararg: bool,
+    body: &Block
+) -> LuaResult<()> {
+    // Allocate a register for the function
+    let func_reg = ctx.allocate_register()?;
+    
+    // Compile the function expression to that register
+    compile_function_expression(ctx, parameters, is_vararg, body, func_reg)?;
+    
+    // Register the function name as a local variable
+    ctx.add_local(name, func_reg);
+    
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,5 +1210,41 @@ mod tests {
         assert_eq!(output.main.bytecode.len(), 1);
         let inst = Instruction(output.main.bytecode[0]);
         assert_eq!(inst.get_opcode(), OpCode::Return);
+    }
+    
+    #[test]
+    fn test_function_compilation() {
+        use super::ast::*;
+        
+        // Test local function definition
+        let mut chunk = Chunk::new();
+        chunk.statements.push(Statement::LocalFunctionDefinition {
+            name: "add".to_string(),
+            parameters: vec!["a".to_string(), "b".to_string()],
+            is_vararg: false,
+            body: Block {
+                statements: vec![Statement::Return {
+                    expressions: vec![Expression::BinaryOp {
+                        left: Box::new(Expression::Variable(Variable::Name("a".to_string()))),
+                        operator: BinaryOperator::Add,
+                        right: Box::new(Expression::Variable(Variable::Name("b".to_string()))),
+                    }],
+                }],
+            },
+        });
+        
+        let output = generate_bytecode(&chunk).unwrap();
+        
+        // Should have the main function with one prototype
+        assert_eq!(output.main.prototypes.len(), 1);
+        
+        // The nested function should have 2 parameters
+        assert_eq!(output.main.prototypes[0].num_params, 2);
+        
+        // Main function should have CLOSURE instruction
+        let closure_found = output.main.bytecode.iter().any(|&instr| {
+            Instruction(instr).get_opcode() == OpCode::Closure
+        });
+        assert!(closure_found);
     }
 }

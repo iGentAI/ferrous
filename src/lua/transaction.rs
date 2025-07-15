@@ -303,7 +303,7 @@ impl ProtectedRegisters {
 /// Enhanced transaction with register protection
 pub struct HeapTransaction<'a> {
     /// Reference to the heap
-    heap: &'a mut LuaHeap,
+    pub heap: &'a mut LuaHeap,
     
     /// Accumulated changes
     changes: Vec<HeapChange>,
@@ -366,6 +366,28 @@ impl<'a> HeapTransaction<'a> {
             TransactionState::Active => Ok(()),
             TransactionState::Committed => Err(LuaError::InvalidTransactionState),
             TransactionState::Aborted => Err(LuaError::InvalidTransactionState),
+        }
+    }
+    
+    /// Helper method to create HashableValue from Value with proper string content hash
+    fn value_to_hashable(&mut self, value: &Value, context: &str) -> LuaResult<HashableValue> {
+        match value {
+            Value::String(handle) => {
+                // Get the string to access its content hash
+                let string_ref = self.heap.get_string(*handle)?;
+                let content_hash = string_ref.content_hash;
+                
+                // Debug output
+                #[cfg(debug_assertions)]
+                if let Ok(s) = string_ref.to_str() {
+                    if s.len() < 50 {
+                        println!("DEBUG value_to_hashable: String '{}' -> hash {:#x}", s, content_hash);
+                    }
+                }
+                
+                Ok(HashableValue::String(*handle, content_hash))
+            },
+            _ => HashableValue::from_value_with_context(value, context)
         }
     }
     
@@ -496,6 +518,14 @@ impl<'a> HeapTransaction<'a> {
     pub fn set_table_field(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
         self.ensure_active()?;
         
+        println!("DEBUG TX set_table_field: Queueing change for table {:?}", table);
+        if let Value::String(s) = &key {
+            let key_str = self.get_string_value(*s)?;
+            println!("DEBUG TX set_table_field: Key: '{}', Value type: {}", key_str, value.type_name());
+        } else {
+            println!("DEBUG TX set_table_field: Key type: {}, Value type: {}", key.type_name(), value.type_name());
+        }
+        
         // Validate all handles
         self.validate_with_context(&table, "set_table_field")?;
         self.validate_value(&key, "set_table_field key")?;
@@ -504,6 +534,7 @@ impl<'a> HeapTransaction<'a> {
         // Queue the change without checking if key is hashable
         // The actual validation will happen when the change is applied
         self.changes.push(HeapChange::SetTableField { table, key, value });
+        println!("DEBUG TX set_table_field: Change queued, total changes: {}", self.changes.len());
         Ok(())
     }
     
@@ -583,7 +614,28 @@ impl<'a> HeapTransaction<'a> {
         self.validate_value(key, "get_table_with_metamethods key")?;
         
         // Phase 1: Try direct table access first
-        let direct_result = self.heap.get_table_field_internal(table, key)?;
+        // We need to convert the key to its hashable form with content hash
+        let direct_result = match key {
+            Value::String(handle) => {
+                // Get string content hash for proper lookup
+                let string_obj = self.heap.get_string(*handle)?;
+                let content_hash = string_obj.content_hash;
+                #[cfg(debug_assertions)]
+                if let Ok(s) = string_obj.to_str() {
+                    if s.len() < 50 {
+                        println!("DEBUG get_table_with_metamethods: Looking up key '{}' with hash {:#x}", s, content_hash);
+                    }
+                }
+                
+                // Create hashable key with content hash
+                let hashable_key = HashableValue::String(*handle, content_hash);
+                
+                // Do the lookup
+                let table_obj = self.heap.get_table(table)?;
+                table_obj.map.get(&hashable_key).cloned().unwrap_or(Value::Nil)
+            },
+            _ => self.heap.get_table_field_internal(table, key)?
+        };
         
         if !direct_result.is_nil() {
             // Direct lookup succeeded, return the result
@@ -1077,7 +1129,7 @@ impl<'a> HeapTransaction<'a> {
             HashableValue::Boolean(false) => 1,
             HashableValue::Boolean(true) => 2,
             HashableValue::Number(n) => 3,
-            HashableValue::String(_) => 4,
+            HashableValue::String(_, _) => 4,
         });
         
         // Find current key's position and return the next one
@@ -1180,18 +1232,39 @@ impl<'a> HeapTransaction<'a> {
     
     /// Apply a single change to the heap
     fn apply_change(&mut self, change: HeapChange) -> LuaResult<()> {
+        println!("DEBUG apply_change: Applying change: {:?}", 
+                 match &change {
+                     HeapChange::SetTableField { .. } => "SetTableField",
+                     HeapChange::SetTableMetatable { .. } => "SetTableMetatable",
+                     HeapChange::SetRegister { .. } => "SetRegister",
+                     _ => "Other"
+                 });
+        
         match change {
             HeapChange::SetTableField { table, key, value } => {
+                println!("DEBUG apply_change: SetTableField - table: {:?}", table);
+                
+                // Debug the key
+                if let Value::String(s) = &key {
+                    let key_str = self.heap.get_string_value(*s)?;
+                    println!("DEBUG apply_change: String key: '{}'", key_str);
+                } else {
+                    println!("DEBUG apply_change: Non-string key type: {}", key.type_name());
+                }
+                
                 // For table keys, we need to verify the key is hashable
                 // Using the is_hashable function from value.rs
                 if !super::value::HashableValue::is_hashable(&key) {
+                    println!("DEBUG apply_change: WARNING - Key is not hashable! Using nil instead");
                     // Non-hashable key (like a table) - use Nil instead to avoid errors
                     // This matches Lua behavior where tables can't be used as keys
                     self.heap.set_table_field_internal(table, Value::Nil, value)?;
                 } else {
+                    println!("DEBUG apply_change: Key is hashable, proceeding with normal set");
                     // Normal case - key is hashable
                     self.heap.set_table_field_internal(table, key, value)?;
                 }
+                println!("DEBUG apply_change: SetTableField completed");
             }
             HeapChange::SetTableMetatable { table, metatable } => {
                 self.heap.set_table_metatable_internal(table, metatable)?;

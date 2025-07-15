@@ -161,20 +161,38 @@ impl std::hash::Hash for Value {
 pub struct LuaString {
     /// UTF-8 bytes of the string
     pub bytes: Vec<u8>,
+    /// Cached hash of the content for efficient comparison
+    pub content_hash: u64,
 }
 
 impl LuaString {
     /// Create a new Lua string from a Rust string
     pub fn new(s: impl Into<String>) -> Self {
         let s = s.into();
+        let bytes = s.into_bytes();
+        let content_hash = Self::compute_content_hash(&bytes);
         LuaString {
-            bytes: s.into_bytes(),
+            bytes,
+            content_hash,
         }
     }
     
     /// Create a Lua string from raw bytes
     pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        LuaString { bytes }
+        let content_hash = Self::compute_content_hash(&bytes);
+        LuaString { 
+            bytes,
+            content_hash,
+        }
+    }
+    
+    /// Compute hash of bytes
+    fn compute_content_hash(bytes: &[u8]) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
     }
     
     /// Get the bytes of this string
@@ -285,11 +303,25 @@ impl Table {
             }
         }
         
-        // Otherwise use hash map
-        if let Ok(hashable) = HashableValue::from_value_with_context(key, "Table::get_field") {
-            self.map.get(&hashable)
-        } else {
-            None
+        // Convert to HashableValue - this won't work without string content hash
+        // The caller needs to provide the content hash for string keys
+        // This is why we use special methods in heap.rs that have access to string content
+        
+        // For now, return None for string keys - the heap methods will handle this properly
+        match key {
+            Value::String(_) => {
+                // String keys need special handling through heap methods
+                // that have access to string content for hashing
+                None
+            },
+            _ => {
+                // Non-string keys can be converted without content access
+                if let Ok(hashable) = HashableValue::from_value_with_context(key, "Table::get_field") {
+                    self.map.get(&hashable)
+                } else {
+                    None
+                }
+            }
         }
     }
     
@@ -382,12 +414,12 @@ impl std::hash::Hash for Table {
 }
 
 /// Wrapper for hashable values (used as table keys)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum HashableValue {
     Nil,
     Boolean(bool),
     Number(OrderedFloat),
-    String(StringHandle),
+    String(StringHandle, u64), // Handle and content hash for content-based comparison
 }
 
 impl HashableValue {
@@ -400,11 +432,27 @@ impl HashableValue {
         }
     }
     
-    /// Create a HashableValue::String from a raw Handle<LuaString>
-    pub fn from_string_handle(handle: super::arena::Handle<LuaString>) -> Self {
+    /// Create a HashableValue::String from a raw Handle<LuaString> with content hash
+    pub fn from_string_handle_with_hash(handle: super::arena::Handle<LuaString>, content_hash: u64) -> Self {
         // Convert Handle<LuaString> to StringHandle first
         let string_handle = StringHandle::from(handle);
-        HashableValue::String(string_handle)
+        HashableValue::String(string_handle, content_hash)
+    }
+
+    /// Try to create a hashable value from a reference to a Value
+    /// This is used for table lookups where we need the content hash
+    pub fn from_value_ref(value: &Value, provider: &impl StringContentProvider) -> Option<Self> {
+        match value {
+            Value::Nil => Some(HashableValue::Nil),
+            Value::Boolean(b) => Some(HashableValue::Boolean(*b)),
+            Value::Number(n) => Some(HashableValue::Number(OrderedFloat(*n))),
+            Value::String(handle) => {
+                // Get content hash from provider
+                provider.get_string_content_hash(*handle)
+                    .map(|hash| HashableValue::String(*handle, hash))
+            },
+            _ => None,
+        }
     }
 
     /// Try to create a hashable value from a Lua value with context for better error messages
@@ -413,7 +461,51 @@ impl HashableValue {
             Value::Nil => Ok(HashableValue::Nil),
             Value::Boolean(b) => Ok(HashableValue::Boolean(*b)),
             Value::Number(n) => Ok(HashableValue::Number(OrderedFloat(*n))),
-            Value::String(s) => Ok(HashableValue::String(*s)),
+            Value::String(handle) => {
+                // For now, use a placeholder hash - the caller should provide the real hash
+                // This is a temporary workaround until we refactor all callers
+                let temp_hash = handle.0.index as u64 ^ (handle.0.generation as u64 * 37);
+                println!("DEBUG HashableValue::from_value_with_context - using temp hash for string handle {:?} in context: {}", handle, context);
+                Ok(HashableValue::String(*handle, temp_hash))
+            },
+            Value::Table(_) => {
+                println!("DEBUG HASHABLE: Table value used in context: {} (tables can't be used as keys)", context);
+                Err(LuaError::TypeError {
+                    expected: format!("nil, boolean, number, or string (in {})", context),
+                    got: "table (tables cannot be used as keys)".to_string(),
+                })
+            },
+            Value::Closure(_) | Value::CFunction(_) | Value::FunctionProto(_) => {
+                println!("DEBUG HASHABLE: Function value used in context: {} (functions can't be used as keys)", context);
+                Err(LuaError::TypeError {
+                    expected: format!("nil, boolean, number, or string (in {})", context),
+                    got: "function (functions cannot be used as keys)".to_string(),
+                })
+            },
+            other => {
+                println!("DEBUG HASHABLE: Unhashable value used in context: {} (type: {})", context, other.type_name());
+                Err(LuaError::TypeError {
+                    expected: format!("nil, boolean, number, or string (in {})", context),
+                    got: format!("{} (cannot be used as a key)", other.type_name()),
+                })
+            }
+        }
+    }
+    
+    /// Create a hashable value from a Lua value with string content hash
+    pub fn from_value_with_hash(value: &Value, string_hash: Option<u64>, context: &str) -> LuaResult<Self> {
+        match value {
+            Value::Nil => Ok(HashableValue::Nil),
+            Value::Boolean(b) => Ok(HashableValue::Boolean(*b)),
+            Value::Number(n) => Ok(HashableValue::Number(OrderedFloat(*n))),
+            Value::String(s) => {
+                match string_hash {
+                    Some(hash) => Ok(HashableValue::String(*s, hash)),
+                    None => Err(LuaError::RuntimeError(
+                        format!("String content hash required for HashableValue::String in context: {}", context)
+                    ))
+                }
+            },
             Value::Table(_) => {
                 println!("DEBUG HASHABLE: Table value used in context: {} (tables can't be used as keys)", context);
                 Err(LuaError::TypeError {
@@ -449,9 +541,56 @@ impl HashableValue {
             HashableValue::Nil => Value::Nil,
             HashableValue::Boolean(b) => Value::Boolean(*b),
             HashableValue::Number(n) => Value::Number(n.0),
-            HashableValue::String(s) => Value::String(*s),
+            HashableValue::String(s, _) => Value::String(*s),
         }
     }
+}
+
+impl PartialEq for HashableValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (HashableValue::Nil, HashableValue::Nil) => true,
+            (HashableValue::Boolean(a), HashableValue::Boolean(b)) => a == b,
+            (HashableValue::Number(a), HashableValue::Number(b)) => a == b,
+            (HashableValue::String(handle_a, hash_a), HashableValue::String(handle_b, hash_b)) => {
+                // Fast path: same handle means same string
+                if handle_a == handle_b {
+                    return true;
+                }
+                // Content-based comparison using cached hashes
+                hash_a == hash_b
+            },
+            _ => false,
+        }
+    }
+}
+
+impl Eq for HashableValue {}
+
+impl std::hash::Hash for HashableValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash the discriminant first
+        std::mem::discriminant(self).hash(state);
+        
+        match self {
+            HashableValue::Nil => {},
+            HashableValue::Boolean(b) => b.hash(state),
+            HashableValue::Number(n) => n.hash(state),
+            HashableValue::String(_, content_hash) => {
+                // Use the cached content hash for consistent hashing
+                content_hash.hash(state);
+            },
+        }
+    }
+}
+
+/// Trait for accessing string content to compute hashes
+pub trait StringContentProvider {
+    /// Get the content bytes of a string by handle
+    fn get_string_content(&self, handle: StringHandle) -> Option<&[u8]>;
+    
+    /// Get the content hash of a string by handle
+    fn get_string_content_hash(&self, handle: StringHandle) -> Option<u64>;
 }
 
 /// Wrapper for f64 that implements Eq and Hash

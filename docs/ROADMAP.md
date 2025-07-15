@@ -28,10 +28,15 @@
 - ✅ SCAN command family for safe iteration
 - ✅ Basic Lua VM with unified stack model
 - 🔄 Complete Lua standard library implementation
+  - ✅ Basic functions (print, type, tostring, tonumber, assert)
+  - ⚠️ String library functions
+  - ⚠️ Table library functions
 - 🔄 Advanced Lua VM features
   - ✅ Table operations
   - ✅ Closures and upvalues
   - ✅ Numerical for loops
+  - ✅ String interning with content-based comparison
+  - ✅ Table field access with string keys
   - ⚠️ Generic for loops (in progress)
   - ⚠️ Full metamethod support (partially implemented)
   - ❌ Coroutines
@@ -70,20 +75,29 @@ The Lua VM implementation follows a specific roadmap to ensure compatibility wit
 - ✅ Basic opcode execution
 - ✅ Table creation and manipulation
 - ✅ Numerical for loops
+- ✅ String interning with content-based comparison
+- ✅ Table operations with proper string key handling
+- ✅ Basic standard library function registration
 
 ### Phase 2: Advanced Features (In Progress)
 - ⚠️ Generic for loops
 - ⚠️ Metamethod handling
+- ⚠️ Complete standard library implementation
+  - ✅ Basic functions (print, type, tostring, tonumber, assert)
+  - ⚠️ String library functions
+  - ⚠️ Table library functions
+  - ❌ Math library
+  - ❌ I/O library (may be limited for Redis)
 - ❌ Coroutines
 - ❌ Garbage collection
 - ❌ Comprehensive error handling
 
 ### Phase 3: Redis Integration (Planned)
 - ⚠️ EVAL/EVALSHA commands
-- ⚠️ Standard library completion
 - ❌ Script caching
 - ❌ SCRIPT LOAD/FLUSH commands
 - ❌ Script timeout management
+- ❌ redis.call and redis.pcall functions
 
 ### Phase 4: Performance Optimization (Future)
 - ❌ Bytecode optimization

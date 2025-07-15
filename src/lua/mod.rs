@@ -13,12 +13,14 @@ pub mod transaction;
 pub mod vm;
 pub mod error;
 pub mod metamethod;
-pub mod stdlib;
 pub mod compiler;
 pub mod codegen;
 pub mod lexer;
 pub mod parser;
 pub mod ast;
+
+#[path = "stdlib/mod.rs"]
+pub mod stdlib;
 
 #[cfg(test)]
 mod test_basic;

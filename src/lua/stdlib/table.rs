@@ -218,7 +218,12 @@ pub fn table_maxn(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     let mut max_n = 0.0;
     
     // Create a transaction
-    let mut tx = HeapTransaction::new(&mut ctx.vm_access.heap);
+    let heap = match ctx.vm_access.get_heap() {
+        Ok(h) => h,
+        Err(e) => return Err(e),
+    };
+    
+    let mut tx = HeapTransaction::new(heap);
     
     // Access the table directly
     let table_obj = tx.get_table(table_handle)?;

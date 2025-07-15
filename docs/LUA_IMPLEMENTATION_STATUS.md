@@ -29,8 +29,17 @@ Instead, we've implemented a unified stack model where:
 Rust's ownership model presents challenges for a garbage-collected VM. To ensure memory safety without sacrificing performance, we've implemented:
 
 1. **Transaction System**: All heap access is through transactions that validate handles before use
-2. **Handle Validation**: Strong type safety for different handle types (tables, strings, etc.)
+2. **Handle Validation**: Strong type safety for different handle types (tables, strings, etc.)  
 3. **Two-phase Borrowing**: Complex operations follow a two-phase pattern to avoid borrowing conflicts
+
+### String Interning System
+
+A proper string interning system has been implemented that ensures:
+
+1. **Content-Based Equality**: Strings are compared by content, not handle identity
+2. **Pre-interning of Common Strings**: Standard library function names and common metamethod names are pre-interned
+3. **Consistent Handle Assignment**: The same string content always gets the same handle within a VM instance
+4. **Transaction Integration**: String creation properly integrates with the transaction system
 
 ## Current Implementation Status
 
@@ -47,7 +56,10 @@ Rust's ownership model presents challenges for a garbage-collected VM. To ensure
 - ✅ Function calls: CALL, RETURN
 - ✅ Basic upvalue support: GETUPVAL, SETUPVAL, CLOSURE, CLOSE
 - ✅ Safe execution via transaction system
-- ✅ Basic string and table handling
+- ✅ String interning with content-based comparison
+- ✅ Table operations with proper string key handling
+- ✅ Global table access with string literal keys
+- ✅ Basic standard library functions (print, type, tostring, tonumber, assert)
 
 ### Partially Implemented Features
 
@@ -65,19 +77,30 @@ Rust's ownership model presents challenges for a garbage-collected VM. To ensure
 - ❌ Error handling with traceback
 - ❌ Garbage collection
 
+### Recent Improvements
+
+1. **String Interning Fix**: The string interning system now properly deduplicates strings based on content, ensuring that identical string literals get the same handle. This fixed issues with global table lookups where function names weren't being found.
+
+2. **Table Key Handling**: Tables now correctly handle string keys with proper content-based hash calculation and equality comparison. This ensures that table field access works correctly with string keys.
+
+3. **Standard Library Registration**: Basic standard library functions are now properly registered in the global table and accessible from Lua scripts. Functions like `print`, `type`, `tostring`, `tonumber`, and `assert` are working correctly.
+
 ### Known Issues
 
 1. **Nested Function Calls**: Some issues with nested function calls due to borrowing constraints
-2. **Metamethod Recursion**: No protection against infinite metamethod recursion
-3. **Memory Management**: No proper garbage collection yet
-4. **Standard Library Gaps**: Many standard library functions are defined but incomplete
+2. **Complex Dynamic String Operations**: Tests with extensive dynamic string operations may cause infinite loops
+3. **Metamethod Recursion**: No protection against infinite metamethod recursion
+4. **Memory Management**: No proper garbage collection yet
+5. **Standard Library Gaps**: Many standard library functions are defined but incomplete
 
 ## Testing Status
 
 The implementation passes basic tests including:
 - Simple arithmetic and control flow
-- Basic table creation and manipulation
+- Basic table creation and manipulation  
 - Simple functions and closures
+- Standard library function calls
+- String interning and table key access
 
 More complex tests involving generic iteration and metamethods are still failing.
 
@@ -98,6 +121,7 @@ The implementation follows these key patterns:
 2. **Transaction-Based Safety**: All memory operations use transactions for safety and clean error handling
 3. **Static Opcode Handlers**: Opcode handlers are implemented as static methods to avoid borrowing conflicts
 4. **Two-Phase Borrowing**: Complex operations that need multiple borrows use a two-phase approach
+5. **String Interning**: All string creation goes through a deduplication system to ensure content-based equality
 
 ## Bytecode Compatibility
 

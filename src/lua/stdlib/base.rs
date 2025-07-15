@@ -1040,8 +1040,18 @@ fn register_function(
     name: &str,
     func: CFunction,
 ) -> LuaResult<()> {
+    println!("DEBUG register_function: Registering '{}' in globals {:?}", name, globals);
+    
     let name_handle = tx.create_string(name)?;
-    tx.set_table_field(globals, Value::String(name_handle), Value::CFunction(func))?;
+    println!("DEBUG register_function: Created string handle {:?} for '{}'", name_handle, name);
+    
+    let name_value = Value::String(name_handle);
+    let func_value = Value::CFunction(func);
+    
+    println!("DEBUG register_function: About to set table field {} -> CFunction", name);
+    tx.set_table_field(globals, name_value, func_value)?;
+    println!("DEBUG register_function: Successfully registered '{}'", name);
+    
     Ok(())
 }
 
@@ -1094,35 +1104,92 @@ pub fn init(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
     
     println!("DEBUG: Got globals table handle: {:?}", globals);
     
-    // Register all base functions
-    register_function(&mut tx, globals, "print", lua_print)?;
-    register_function(&mut tx, globals, "type", lua_type)?;
-    register_function(&mut tx, globals, "tostring", lua_tostring)?;
-    register_function(&mut tx, globals, "tonumber", lua_tonumber)?;
-    register_function(&mut tx, globals, "assert", lua_assert)?;
-    register_function(&mut tx, globals, "error", lua_error)?;
-    register_function(&mut tx, globals, "select", lua_select)?;
-    register_function(&mut tx, globals, "next", lua_next)?;
-    register_function(&mut tx, globals, "pairs", lua_pairs)?;
-    register_function(&mut tx, globals, "ipairs", lua_ipairs)?;
-    register_function(&mut tx, globals, "rawget", lua_rawget)?;
-    register_function(&mut tx, globals, "rawset", lua_rawset)?;
-    register_function(&mut tx, globals, "rawequal", lua_rawequal)?;
-    register_function(&mut tx, globals, "getmetatable", lua_getmetatable)?;
-    register_function(&mut tx, globals, "setmetatable", lua_setmetatable)?;
-    register_function(&mut tx, globals, "pcall", lua_pcall)?;
-    register_function(&mut tx, globals, "load", lua_load)?;
-    register_function(&mut tx, globals, "unpack", lua_unpack)?;
-    register_function(&mut tx, globals, "eval", lua_eval)?;
-    
-    // Also register _G global table pointing to itself
+    // First set up _G._G = _G before registering functions
+    println!("DEBUG: Setting up _G._G first");
     let g_key = tx.create_string("_G")?;
     tx.set_table_field(globals, Value::String(g_key), Value::Table(globals))?;
-    println!("DEBUG: Registered _G global");
+    println!("DEBUG: _G._G setup complete");
+    
+    // Register all base functions
+    println!("DEBUG: Starting function registration");
+    
+    println!("DEBUG: Registering print...");
+    register_function(&mut tx, globals, "print", lua_print)?;
+    
+    println!("DEBUG: Registering type...");
+    register_function(&mut tx, globals, "type", lua_type)?;
+    
+    println!("DEBUG: Registering tostring...");
+    register_function(&mut tx, globals, "tostring", lua_tostring)?;
+    
+    println!("DEBUG: Registering tonumber...");
+    register_function(&mut tx, globals, "tonumber", lua_tonumber)?;
+    
+    println!("DEBUG: Registering assert...");
+    register_function(&mut tx, globals, "assert", lua_assert)?;
+    
+    println!("DEBUG: Registering error...");
+    register_function(&mut tx, globals, "error", lua_error)?;
+    
+    println!("DEBUG: Registering select...");
+    register_function(&mut tx, globals, "select", lua_select)?;
+    
+    println!("DEBUG: Registering next...");
+    register_function(&mut tx, globals, "next", lua_next)?;
+    
+    println!("DEBUG: Registering pairs...");
+    register_function(&mut tx, globals, "pairs", lua_pairs)?;
+    
+    println!("DEBUG: Registering ipairs...");
+    register_function(&mut tx, globals, "ipairs", lua_ipairs)?;
+    
+    println!("DEBUG: Registering rawget...");
+    register_function(&mut tx, globals, "rawget", lua_rawget)?;
+    
+    println!("DEBUG: Registering rawset...");
+    register_function(&mut tx, globals, "rawset", lua_rawset)?;
+    
+    println!("DEBUG: Registering rawequal...");
+    register_function(&mut tx, globals, "rawequal", lua_rawequal)?;
+    
+    println!("DEBUG: Registering getmetatable...");
+    register_function(&mut tx, globals, "getmetatable", lua_getmetatable)?;
+    
+    println!("DEBUG: Registering setmetatable...");
+    register_function(&mut tx, globals, "setmetatable", lua_setmetatable)?;
+    
+    println!("DEBUG: Registering pcall...");
+    register_function(&mut tx, globals, "pcall", lua_pcall)?;
+    
+    println!("DEBUG: Registering load...");
+    register_function(&mut tx, globals, "load", lua_load)?;
+    
+    println!("DEBUG: Registering unpack...");
+    register_function(&mut tx, globals, "unpack", lua_unpack)?;
+    
+    println!("DEBUG: Registering eval...");
+    register_function(&mut tx, globals, "eval", lua_eval)?;
+    
+    println!("DEBUG: All functions registered");
+    
+    // Verify immediately before commit
+    println!("DEBUG: Verifying functions before commit...");
+    let print_key = tx.create_string("print")?;
+    let print_val = tx.read_table_field(globals, &Value::String(print_key))?;
+    println!("DEBUG: Pre-commit check - print function: {:?}", print_val);
     
     println!("DEBUG: Committing base library transaction...");
     tx.commit()?;
     println!("DEBUG: Base library initialization complete");
+    
+    // Verify after commit with a new transaction
+    println!("DEBUG: Post-commit verification...");
+    let mut verify_tx = HeapTransaction::new(vm.heap_mut());
+    let verify_globals = verify_tx.get_globals_table()?;
+    let verify_print_key = verify_tx.create_string("print")?;
+    let verify_print_val = verify_tx.read_table_field(verify_globals, &Value::String(verify_print_key))?;
+    println!("DEBUG: Post-commit check - print function: {:?}", verify_print_val);
+    verify_tx.commit()?;
     
     Ok(())
 }

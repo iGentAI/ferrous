@@ -116,10 +116,34 @@ pub enum ReturnContext {
 }
 
 /// VM access wrapper for ExecutionContext
-pub struct VMAccess<'a> {
+pub struct VMAccess {
     /// Reference to heap
-    pub heap: &'a mut LuaHeap,
+    pub heap: *mut LuaHeap,
 }
+
+impl VMAccess {
+    /// Create a new VMAccess with proper heap reference
+    pub fn new(heap: *mut LuaHeap) -> Self {
+        VMAccess {
+            heap,
+        }
+    }
+    
+    /// Get the heap reference, checking for null pointers
+    pub fn get_heap(&mut self) -> LuaResult<&mut LuaHeap> {
+        if self.heap.is_null() {
+            Err(LuaError::InternalError("VM access not properly initialized".to_string()))
+        } else {
+            // SAFETY: We just checked the pointer is not null, and we trust
+            // that the pointer has a valid lifetime through ExecutionContext
+            unsafe { Ok(&mut *self.heap) }
+        }
+    }
+}
+
+// Implement Send and Sync for VMAccess to allow it to be used across threads if needed
+unsafe impl Send for VMAccess {}
+unsafe impl Sync for VMAccess {}
 
 /// Execution context for C functions
 pub struct ExecutionContext<'a> {
@@ -136,7 +160,7 @@ pub struct ExecutionContext<'a> {
     nargs: usize,
     
     /// Reference to VM for advanced operations
-    pub vm_access: VMAccess<'a>,
+    pub vm_access: VMAccess,
 }
 
 impl<'a> ExecutionContext<'a> {
@@ -152,7 +176,7 @@ impl<'a> ExecutionContext<'a> {
             thread,
             base,
             nargs,
-            vm_access: unsafe { std::mem::zeroed() }, // This will be set properly later
+            vm_access: VMAccess::new(std::ptr::null_mut()),
         }
     }
     
@@ -162,7 +186,7 @@ impl<'a> ExecutionContext<'a> {
         thread: ThreadHandle,
         base: u16,
         nargs: usize,
-        vm_access: VMAccess<'a>,
+        vm_access: VMAccess,
     ) -> Self {
         ExecutionContext {
             tx,
@@ -448,6 +472,27 @@ pub enum StepResult {
 }
 
 impl LuaVM {
+    /// Helper to initialize the _G global properly
+    fn initialize_globals(&mut self) -> LuaResult<()> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        let globals = tx.get_globals_table()?;
+        
+        // Create "_G" string
+        let g_str = tx.create_string("_G")?;
+        let g_key = Value::String(g_str);
+        
+        // Set _G._G = _G
+        tx.set_table_field(globals, g_key.clone(), Value::Table(globals))?;
+        
+        // Debug: Verify it was set
+        let verify = tx.read_table_field(globals, &g_key)?;
+        eprintln!("DEBUG: Initial _G._G setup, verification: {:?}", verify);
+        
+        tx.commit()?;
+        
+        Ok(())
+    }
+    
     /// Create a new VM instance
     pub fn new() -> LuaResult<Self> {
         Self::with_config(VMConfig::default())
@@ -455,16 +500,21 @@ impl LuaVM {
     
     /// Create a new VM with custom configuration
     pub fn with_config(config: VMConfig) -> LuaResult<Self> {
-        let heap = LuaHeap::new()?;
+        let mut heap = LuaHeap::new()?;
         let main_thread = heap.main_thread()?;
         
-        Ok(LuaVM {
+        let mut vm = LuaVM {
             heap,
             operation_queue: VecDeque::new(),
             main_thread,
             current_thread: main_thread,
             config,
-        })
+        };
+        
+        // Ensure globals are properly set up
+        vm.initialize_globals()?;
+        
+        Ok(vm)
     }
     
     /// Execute a closure on the main thread
@@ -564,7 +614,13 @@ impl LuaVM {
     
     /// Initialize the standard library
     pub fn init_stdlib(&mut self) -> LuaResult<()> {
-        super::stdlib::init_stdlib(self)
+        // Initialize all standard libraries
+        crate::lua::stdlib::init_all(self)?;
+        
+        // Re-initialize globals to ensure _G.G is properly set
+        self.initialize_globals()?;
+        
+        Ok(())
     }
     
     /// Execute a single step of the VM
@@ -686,6 +742,8 @@ impl LuaVM {
         args: Vec<Value>,
         expected_results: i32,
     ) -> LuaResult<StepResult> {
+        eprintln!("DEBUG: process_function_call - closure: {:?}, args: {:?}", closure_handle, args);
+        
         let mut tx = HeapTransaction::new(&mut self.heap);
         
         // Get closure details
@@ -693,6 +751,8 @@ impl LuaVM {
         let num_params = closure.proto.num_params as usize;
         let is_vararg = closure.proto.is_vararg;
         let max_stack = closure.proto.max_stack_size as usize;
+        
+        eprintln!("DEBUG: Function has {} params, vararg: {}, max_stack: {}", num_params, is_vararg, max_stack);
         
         // Get current stack state
         let stack_top = tx.get_stack_top(self.current_thread)?;
@@ -735,6 +795,8 @@ impl LuaVM {
             varargs,
         };
         
+        eprintln!("DEBUG: Creating call frame with base register: {}", new_base);
+        
         tx.push_call_frame(self.current_thread, frame)?;
         
         // Commit and continue
@@ -754,10 +816,18 @@ impl LuaVM {
         nargs: usize,
         expected_results: i32,
     ) -> LuaResult<StepResult> {
+        // Take a raw pointer to the heap before creating any mutable borrows
+        let heap_ptr = &mut self.heap as *mut LuaHeap;
+        
+        // Now create the transaction using the heap
         let mut tx = HeapTransaction::new(&mut self.heap);
         
         // Create execution context without VM access initially
         let mut ctx = ExecutionContext::new(&mut tx, self.current_thread, base, nargs);
+        
+        // Set up VM access safely using the raw pointer we captured earlier
+        // This avoids the overlapping mutable borrow problem
+        ctx.vm_access = VMAccess::new(heap_ptr);
         
         // Call the C function
         let actual_results = function(&mut ctx)?;
@@ -876,6 +946,13 @@ impl LuaVM {
         }
         
         let constant = closure.proto.constants[bx].clone();
+        
+        // Debug: Log string constants being loaded
+        if let Value::String(s) = &constant {
+            let str_val = tx.get_string_value(*s)?;
+            eprintln!("DEBUG LOADK: Loading string constant '{}' into register R({})", str_val, base as usize + a);
+        }
+        
         tx.set_register(current_thread, base as usize + a, constant)?;
         
         Ok(())
@@ -932,11 +1009,28 @@ impl LuaVM {
             closure.proto.constants[bx].clone()
         }; // Drop the borrow of tx here
         
+        // Debug: Log what we're looking up
+        if let Value::String(s) = &key {
+            let key_str = tx.get_string_value(*s)?;
+            eprintln!("DEBUG GETGLOBAL: Looking up global '{}'", key_str);
+            
+            // Special handling for "_G" lookup
+            if key_str == "_G" {
+                eprintln!("DEBUG GETGLOBAL: Special handling for _G lookup");
+                let globals = tx.get_globals_table()?;
+                tx.set_register(current_thread, base as usize + a, Value::Table(globals))?;
+                return Ok(());
+            }
+        }
+        
         // Get globals table
         let globals = tx.get_globals_table()?;
+        eprintln!("DEBUG GETGLOBAL: Got globals table handle: {:?}", globals);
         
         // Get value from globals
         let value = tx.get_table_with_metamethods(globals, &key)?;
+        eprintln!("DEBUG GETGLOBAL: Result: {:?}", value);
+        
         tx.set_register(current_thread, base as usize + a, value)?;
         
         Ok(())
@@ -998,6 +1092,12 @@ impl LuaVM {
         } else {
             tx.read_register(current_thread, base as usize + c_idx as usize)?
         };
+        
+        // Debug logging for table access
+        if let Value::String(k) = &key {
+            let key_str = tx.get_string_value(*k)?;
+            eprintln!("DEBUG GETTABLE: Accessing table[{}], table value: {:?}", key_str, table_val);
+        }
         
         // Handle table access
         match table_val {
@@ -1653,18 +1753,20 @@ impl LuaVM {
     
     // Helper methods
     
-    /// Get a constant from current function
+    /// Get constant from current function - safely gets a constant with proper borrow management
     fn get_constant(tx: &mut HeapTransaction, index: usize, current_thread: ThreadHandle) -> LuaResult<Value> {
         let frame = tx.get_current_frame(current_thread)?;
         let closure = tx.get_closure(frame.closure)?;
         
         if index >= closure.proto.constants.len() {
             return Err(LuaError::RuntimeError(format!(
-                "Constant index {} out of bounds",
-                index
+                "Constant index {} out of bounds (max: {})",
+                index,
+                closure.proto.constants.len()
             )));
         }
         
+        // Clone the constant
         Ok(closure.proto.constants[index].clone())
     }
     

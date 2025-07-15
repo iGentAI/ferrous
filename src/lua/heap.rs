@@ -7,7 +7,7 @@ use super::arena::{Arena, Handle};
 use super::error::{LuaError, LuaResult};
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, 
                     UpvalueHandle, UserDataHandle, FunctionProtoHandle};
-use super::value::{LuaString, Table, Closure, Thread, Upvalue, UserData, FunctionProto, Value};
+use super::value::{LuaString, Table, Closure, Thread, Upvalue, UserData, FunctionProto, Value, HashableValue};
 use std::collections::HashMap;
 
 /// The main Lua heap containing all allocated objects
@@ -102,6 +102,8 @@ impl LuaHeap {
 
     /// Pre-intern common strings to ensure handle consistency
     fn pre_intern_common_strings(&mut self) -> LuaResult<()> {
+        println!("DEBUG: Pre-interning common strings...");
+        
         // Standard library function names
         const COMMON_STRINGS: &[&str] = &[
             // Standard library function names
@@ -113,14 +115,56 @@ impl LuaHeap {
             "__index", "__newindex", "__call", "__tostring", "__concat",
             "__add", "__sub", "__mul", "__div", "__mod", "__pow",
             "__unm", "__len", "__eq", "__lt", "__le",
+            "__gc", "__mode",
             
             // Common keys
-            "self", "error", "value"
+            "self", "error", "value", "_G", "_VERSION",
+            
+            // Iterator protocol
+            "next",
+            
+            // Common module/require keys
+            "module", "require", "package", "loaded",
+            
+            // Math functions
+            "math", "string", "table", "coroutine", "debug",
+            "abs", "sin", "cos", "tan", "sqrt", "floor", "ceil",
+            
+            // String methods
+            "len", "sub", "upper", "lower", "char", "byte", "format",
+            "find", "gsub", "match", "gmatch",
+            
+            // Table methods
+            "insert", "remove", "sort", "concat",
+            
+            // Coroutine methods
+            "create", "resume", "yield", "status", "wrap",
+            
+            // Debug methods
+            "traceback", "getinfo", "setlocal", "getlocal",
+            
+            // Numeric strings (commonly used as table indices)
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+            
+            // Boolean strings
+            "true", "false",
+            
+            // Additional stdlib functions that were missing
+            "eval",
         ];
         
+        let mut count = 0;
         for &s in COMMON_STRINGS {
-            self.create_string_internal(s)?;
+            let handle = self.create_string_internal(s)?;
+            count += 1;
+            
+            // Print debug info for key stdlib functions
+            if s == "print" || s == "type" || s == "eval" || s == "_G" {
+                println!("DEBUG: Pre-interned '{}' -> handle {:?}", s, handle);
+            }
         }
+        
+        println!("DEBUG: Pre-interned {} common strings", count);
         
         Ok(())
     }
@@ -167,6 +211,7 @@ impl LuaHeap {
 
     // Internal creation methods (used during initialization and transactions)
     
+    /// Create a string in the heap with proper interning
     pub(crate) fn create_string_internal(&mut self, s: &str) -> LuaResult<StringHandle> {
         let bytes = s.as_bytes().to_vec();
         
@@ -174,31 +219,33 @@ impl LuaHeap {
         if let Some(&handle) = self.string_cache.get(&bytes) {
             // Validate that the cached handle is still valid
             if self.strings.contains(handle.0) {
-                // Add debug output for important strings
-                if s.len() < 30 && (s == "print" || s == "type" || s == "tostring" || s.starts_with("__")) {
-                    println!("DEBUG INTERNING: Reused cached string '{}' with handle {:?}", s, handle);
+                // Debug output for interning hits
+                if s.len() < 50 {
+                    #[cfg(debug_assertions)]
+                    println!("DEBUG INTERNING: Cache hit for '{}' -> handle {:?}", s, handle);
                 }
                 return Ok(handle);
-            } else {
-                // Remove stale cache entry
-                self.string_cache.remove(&bytes);
-                println!("DEBUG INTERNING: Removed stale cache entry for '{}'", s);
             }
+            // Handle is stale, remove from cache
+            self.string_cache.remove(&bytes);
         }
         
-        // Create new string
+        // Create new string - LuaString::from_bytes will compute content hash
         let lua_string = LuaString::from_bytes(bytes.clone());
-        let handle = StringHandle::from(self.strings.insert(lua_string));
+        let content_hash = lua_string.content_hash;
+        let handle = self.strings.insert(lua_string);
+        let string_handle = StringHandle::from(handle);
         
-        // Add debug output for important strings
-        if s.len() < 30 && (s == "print" || s == "type" || s == "tostring" || s.starts_with("__")) {
-            println!("DEBUG INTERNING: Created new string '{}' with handle {:?}", s, handle);
+        // Debug output for new strings
+        if s.len() < 50 {
+            #[cfg(debug_assertions)]
+            println!("DEBUG INTERNING: Created new string '{}' -> handle {:?} with hash {:#x}", s, string_handle, content_hash);
         }
         
-        // Add to cache
-        self.string_cache.insert(bytes, handle);
+        // Add to cache for future interning
+        self.string_cache.insert(bytes, string_handle);
         
-        Ok(handle)
+        Ok(string_handle)
     }
     
     pub(crate) fn create_table_internal(&mut self) -> LuaResult<TableHandle> {
@@ -334,17 +381,34 @@ impl LuaHeap {
     pub(crate) fn get_table_field_internal(&self, table: TableHandle, key: &Value) -> LuaResult<Value> {
         let table_obj = self.get_table(table)?;
         
-        if let Some(value) = table_obj.get_field(key) {
-            Ok(value.clone())
-        } else {
-            Ok(Value::Nil)
-        }
+        // For string keys, we need to get the content hash
+        let hashable_key = match key {
+            Value::String(handle) => {
+                // Get the string to access its content hash
+                let string_ref = self.strings.get(handle.0)
+                    .ok_or(LuaError::InvalidHandle)?;
+                
+                // Print debug info for key lookup
+                if let Ok(str_val) = string_ref.to_str() {
+                    if str_val.len() < 50 {
+                        println!("DEBUG get_table_field_internal: Looking up key '{}' with hash {:#x}", 
+                                str_val, string_ref.content_hash);
+                    }
+                }
+                
+                HashableValue::String(*handle, string_ref.content_hash)
+            },
+            _ => HashableValue::from_value_with_context(key, "get_table_field_internal")?
+        };
+        
+        Ok(table_obj.map.get(&hashable_key)
+            .cloned()
+            .unwrap_or(Value::Nil))
     }
     
     pub(crate) fn set_table_field_internal(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
-        let table_obj = self.get_table_mut(table)?;
-        table_obj.set_field(key, value)?;
-        Ok(())
+        // Delegate to write_table_field which properly handles string content hashes
+        self.write_table_field(table, key, value)
     }
     
     pub(crate) fn get_table_metatable_internal(&self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
@@ -356,6 +420,91 @@ impl LuaHeap {
         let table_obj = self.get_table_mut(table)?;
         table_obj.set_metatable(metatable);
         Ok(())
+    }
+
+    /// Read a field from a table
+    pub fn read_table_field(&mut self, table: TableHandle, key: &Value) -> LuaResult<Value> {
+        let table_ref = self.tables.get(table.0)
+            .ok_or(LuaError::InvalidHandle)?;
+        
+        // For string keys, we need to get the content hash
+        let hashable_key = match key {
+            Value::String(handle) => {
+                // Get the string to access its content hash
+                let string_ref = self.strings.get(handle.0)
+                    .ok_or(LuaError::InvalidHandle)?;
+                HashableValue::String(*handle, string_ref.content_hash)
+            },
+            _ => HashableValue::from_value_with_context(key, "read_table_field")?
+        };
+        
+        // Add debug output for string keys
+        if let Value::String(handle) = key {
+            let string_ref = self.strings.get(handle.0)
+                .ok_or(LuaError::InvalidHandle)?;
+            let key_str = string_ref.to_str().unwrap_or("<invalid utf8>");
+            println!("DEBUG read_table_field: Looking up key '{}' with hash {:#x}", key_str, string_ref.content_hash);
+        }
+        
+        Ok(table_ref.map.get(&hashable_key)
+            .cloned()
+            .unwrap_or(Value::Nil))
+    }
+
+    /// Write a field to a table
+    pub fn write_table_field(&mut self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
+        println!("DEBUG write_table_field: Called with table {:?}, key {:?}, value type: {}", 
+                 table, key, value.type_name());
+        
+        // For string keys, we need to get the content hash
+        let hashable_key = match &key {
+            Value::String(handle) => {
+                // Get the string to access its content hash
+                let string_ref = self.strings.get(handle.0)
+                    .ok_or(LuaError::InvalidHandle)?;
+                
+                // Add debug output
+                let key_str = string_ref.to_str().unwrap_or("<invalid utf8>");
+                println!("DEBUG write_table_field: Setting key '{}' with hash {:#x} to {}", 
+                         key_str, string_ref.content_hash, value.type_name());
+                
+                HashableValue::String(*handle, string_ref.content_hash)
+            },
+            _ => HashableValue::from_value_with_context(&key, "write_table_field")?
+        };
+        
+        let table_ref = self.tables.get_mut(table.0)
+            .ok_or(LuaError::InvalidHandle)?;
+        
+        if value.is_nil() {
+            println!("DEBUG write_table_field: Removing key from table");
+            table_ref.map.remove(&hashable_key);
+        } else {
+            println!("DEBUG write_table_field: Inserting key-value pair into table map");
+            table_ref.map.insert(hashable_key, value);
+            println!("DEBUG write_table_field: Table now has {} entries in map", table_ref.map.len());
+        }
+        
+        println!("DEBUG write_table_field: Operation completed successfully");
+        Ok(())
+    }
+
+
+
+    /// Execute a function with rollback capability (read-only)
+    fn with_rollback<T, F>(&self, f: F) -> LuaResult<T>
+    where
+        F: FnOnce(&Self) -> Option<T>,
+    {
+        f(self).ok_or(LuaError::InvalidHandle)
+    }
+
+    /// Execute a function with rollback capability (mutable)
+    fn with_rollback_mut<T, F>(&mut self, f: F) -> LuaResult<T>
+    where
+        F: FnOnce(&mut Self) -> Option<T>,
+    {
+        f(self).ok_or(LuaError::InvalidHandle)
     }
     
     // Thread register access
@@ -618,6 +767,18 @@ impl LuaHeap {
         } else {
             false
         }
+    }
+}
+
+impl super::value::StringContentProvider for LuaHeap {
+    fn get_string_content(&self, handle: StringHandle) -> Option<&[u8]> {
+        self.strings.get(handle.0)
+            .map(|s| s.as_bytes())
+    }
+    
+    fn get_string_content_hash(&self, handle: StringHandle) -> Option<u64> {
+        self.strings.get(handle.0)
+            .map(|s| s.content_hash)
     }
 }
 
