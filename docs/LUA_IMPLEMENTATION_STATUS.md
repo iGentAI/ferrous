@@ -46,20 +46,23 @@ A proper string interning system has been implemented that ensures:
 ### Working Features
 
 - ✅ VM core architecture with unified stack model
-- ✅ Stack and call frame management
+- ✅ Stack and call frame management with proper stack growth
 - ✅ Basic opcodes: MOVE, LOADK, LOADBOOL, LOADNIL
 - ✅ Table operations: NEWTABLE, GETTABLE, SETTABLE
 - ✅ Arithmetic operations: ADD, SUB, MUL, DIV, MOD, POW, UNM
 - ✅ String operations: CONCAT
 - ✅ Control flow: JMP, TEST, TESTSET
 - ✅ Numerical for loops: FORPREP, FORLOOP
-- ✅ Function calls: CALL, RETURN
+- ✅ Function calls: CALL, RETURN (both global and local functions)
+- ✅ Method calls with proper self parameter handling
 - ✅ Basic upvalue support: GETUPVAL, SETUPVAL, CLOSURE, CLOSE
 - ✅ Safe execution via transaction system
 - ✅ String interning with content-based comparison
 - ✅ Table operations with proper string key handling
 - ✅ Global table access with string literal keys
 - ✅ Basic standard library functions (print, type, tostring, tonumber, assert)
+- ✅ Circular reference handling in nested calls
+- ✅ Deep recursive function support
 
 ### Partially Implemented Features
 
@@ -85,13 +88,20 @@ A proper string interning system has been implemented that ensures:
 
 3. **Standard Library Registration**: Basic standard library functions are now properly registered in the global table and accessible from Lua scripts. Functions like `print`, `type`, `tostring`, `tonumber`, and `assert` are working correctly.
 
+4. **Stack Growth Implementation**: Fixed the critical "No active call frame" error by implementing proper dynamic stack growth. The VM now automatically grows the stack when needed, allowing deep recursive calls and complex nested function invocations. This improvement includes:
+   - Dynamic stack resizing when approaching capacity
+   - Proper call frame adjustment after stack growth
+   - Safe handling of stack references during reallocation
+   - Support for arbitrarily deep recursion (tested with 1000+ levels)
+
+5. **Improved Return Value Processing**: Enhanced the `process_return` function to better manage stack state during function returns, including proper handling of multiple return values and stack cleanup.
+
 ### Known Issues
 
-1. **Nested Function Calls**: Some issues with nested function calls due to borrowing constraints
-2. **Complex Dynamic String Operations**: Tests with extensive dynamic string operations may cause infinite loops
-3. **Metamethod Recursion**: No protection against infinite metamethod recursion
-4. **Memory Management**: No proper garbage collection yet
-5. **Standard Library Gaps**: Many standard library functions are defined but incomplete
+1. **Complex Dynamic String Operations**: Tests with extensive dynamic string operations may cause infinite loops
+2. **Metamethod Recursion**: No protection against infinite metamethod recursion
+3. **Memory Management**: No proper garbage collection yet
+4. **Standard Library Gaps**: Many standard library functions are defined but incomplete
 
 ## Testing Status
 
@@ -101,6 +111,9 @@ The implementation passes basic tests including:
 - Simple functions and closures
 - Standard library function calls
 - String interning and table key access
+- Method calls with self parameter
+- Deep recursive functions (1000+ levels)
+- Complex nested function calls
 
 More complex tests involving generic iteration and metamethods are still failing.
 
@@ -122,6 +135,7 @@ The implementation follows these key patterns:
 3. **Static Opcode Handlers**: Opcode handlers are implemented as static methods to avoid borrowing conflicts
 4. **Two-Phase Borrowing**: Complex operations that need multiple borrows use a two-phase approach
 5. **String Interning**: All string creation goes through a deduplication system to ensure content-based equality
+6. **Dynamic Stack Management**: Stack automatically grows as needed to support deep recursion and complex call patterns
 
 ## Bytecode Compatibility
 

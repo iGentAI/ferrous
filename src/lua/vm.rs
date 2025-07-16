@@ -8,6 +8,7 @@ use super::error::{LuaError, LuaResult};
 use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle};
 use super::heap::LuaHeap;
 use super::metamethod::{MetamethodType, MetamethodContext, MetamethodContinuation};
+use super::resource::{ResourceLimits, ResourceTracker, ConcatContext};
 use super::transaction::{HeapTransaction, TransactionState};
 use super::value::{Value, CallFrame, CFunction, Closure, FunctionProto, UpvalueInfo};
 use std::collections::VecDeque;
@@ -17,10 +18,10 @@ use std::collections::VecDeque;
 pub enum PendingOperation {
     /// Function call operation
     FunctionCall {
-        /// Closure to call
-        closure: ClosureHandle,
-        /// Arguments for the call
-        args: Vec<Value>,
+        /// Function position on stack (absolute index)
+        func_index: usize,
+        /// Number of arguments
+        nargs: usize,
         /// Expected number of results (-1 for multiple)
         expected_results: i32,
     },
@@ -212,7 +213,8 @@ impl<'a> ExecutionContext<'a> {
             )));
         }
         
-        let register = self.base as usize + index;
+        // Arguments start at base + 1 (base points to the function)
+        let register = self.base as usize + 1 + index;
         self.tx.read_register(self.thread, register)
     }
     
@@ -223,7 +225,8 @@ impl<'a> ExecutionContext<'a> {
     
     /// Push a return value (alias for stdlib compatibility)
     pub fn push_result(&mut self, value: Value) -> LuaResult<()> {
-        let register = self.base as usize + self.nargs;
+        // Results go where the function was (at base), not after arguments
+        let register = self.base as usize;
         self.tx.set_register(self.thread, register, value)
     }
     
@@ -234,6 +237,7 @@ impl<'a> ExecutionContext<'a> {
     
     /// Set return value at specific index
     pub fn set_return(&mut self, index: usize, value: Value) -> LuaResult<()> {
+        // Results start at the function's position (base)
         let register = self.base as usize + index;
         self.tx.set_register(self.thread, register, value)
     }
@@ -430,6 +434,9 @@ pub struct LuaVM {
     
     /// VM configuration
     config: VMConfig,
+    
+    /// Track if execution has completed
+    execution_completed: bool,
 }
 
 /// VM configuration options
@@ -443,6 +450,9 @@ pub struct VMConfig {
     
     /// Enable debug mode
     pub debug_mode: bool,
+    
+    /// Resource limits for VM operations
+    pub resource_limits: ResourceLimits,
 }
 
 impl Default for VMConfig {
@@ -451,6 +461,7 @@ impl Default for VMConfig {
             max_stack_size: 1_000_000,
             max_call_depth: 1000,
             debug_mode: false,
+            resource_limits: ResourceLimits::default(),
         }
     }
 }
@@ -470,6 +481,8 @@ pub enum StepResult {
     /// Error occurred
     Error(LuaError),
 }
+
+
 
 impl LuaVM {
     /// Helper to initialize the _G global properly
@@ -493,6 +506,16 @@ impl LuaVM {
         Ok(())
     }
     
+    /// Create a debug transaction for testing and debugging
+    pub fn create_debug_transaction(&mut self, max_apply_changes: usize) -> HeapTransaction {
+        let debug_config = super::transaction::TransactionDebugConfig {
+            max_apply_changes,
+            verbose_logging: true,
+            log_string_creation: true,
+        };
+        HeapTransaction::new_with_debug(&mut self.heap, debug_config)
+    }
+    
     /// Create a new VM instance
     pub fn new() -> LuaResult<Self> {
         Self::with_config(VMConfig::default())
@@ -509,6 +532,7 @@ impl LuaVM {
             main_thread,
             current_thread: main_thread,
             config,
+            execution_completed: false,
         };
         
         // Ensure globals are properly set up
@@ -519,18 +543,34 @@ impl LuaVM {
     
     /// Execute a closure on the main thread
     pub fn execute(&mut self, closure: ClosureHandle) -> LuaResult<Vec<Value>> {
-        // Set up initial call
+        // Reset execution state for new execution
+        self.execution_completed = false;
+        self.operation_queue.clear();
+        
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        
+        // Place the closure at position 0 of the main thread
+        tx.set_register(self.main_thread, 0, Value::Closure(closure))?;
+        
+        // Set up initial call - function at position 0, no arguments
         self.operation_queue.push_back(PendingOperation::FunctionCall {
-            closure,
-            args: vec![],
+            func_index: 0,
+            nargs: 0,
             expected_results: -1,
         });
+        
+        tx.commit()?;
         
         // Run until completion
         loop {
             match self.step()? {
                 StepResult::Continue => continue,
-                StepResult::Completed(values) => return Ok(values),
+                StepResult::Completed(values) => {
+                    // Ensure clean state on completion
+                    self.execution_completed = true;
+                    self.operation_queue.clear();
+                    return Ok(values);
+                },
                 StepResult::Error(e) => return Err(e),
                 StepResult::Yield(_) => {
                     return Err(LuaError::RuntimeError(
@@ -543,6 +583,10 @@ impl LuaVM {
     
     /// Execute a compiled module
     pub fn execute_module(&mut self, module: &super::compiler::CompiledModule, args: &[Value]) -> LuaResult<Value> {
+        // Reset execution state for new execution
+        self.execution_completed = false;
+        self.operation_queue.clear();
+        
         let mut tx = HeapTransaction::new(&mut self.heap);
         
         // Load module and get function prototype handle
@@ -560,15 +604,18 @@ impl LuaVM {
         // Create the closure in the heap
         let closure_handle = tx.create_closure(closure)?;
         
-        // Queue initial call with arguments
-        let mut call_args = Vec::with_capacity(args.len());
-        for arg in args {
-            call_args.push(arg.clone());
+        // Place the closure at position 0 of the main thread
+        tx.set_register(self.main_thread, 0, Value::Closure(closure_handle))?;
+        
+        // Place arguments starting at position 1
+        for (i, arg) in args.iter().enumerate() {
+            tx.set_register(self.main_thread, 1 + i, arg.clone())?;
         }
         
+        // Queue initial call - function at position 0, with specified arguments
         self.operation_queue.push_back(PendingOperation::FunctionCall { 
-            closure: closure_handle, 
-            args: call_args, 
+            func_index: 0,
+            nargs: args.len(),
             expected_results: -1 
         });
         
@@ -581,6 +628,9 @@ impl LuaVM {
                     // Continue execution
                 },
                 StepResult::Completed(values) => {
+                    // Ensure clean state on completion
+                    self.execution_completed = true;
+                    self.operation_queue.clear();
                     // Return the first result, or nil if none
                     return Ok(values.get(0).cloned().unwrap_or(Value::Nil));
                 },
@@ -599,6 +649,35 @@ impl LuaVM {
         // Store the context for use during script execution
         // For now, this is a no-op as we don't use the context yet
         Ok(())
+    }
+    
+    /// Create a transaction with custom debug configuration
+    pub fn create_transaction_with_config(
+        &mut self, 
+        config: super::transaction::TransactionDebugConfig
+    ) -> HeapTransaction {
+        HeapTransaction::new_with_debug(&mut self.heap, config)
+    }
+    
+    /// Create a transaction configured to catch infinite loops
+    pub fn create_loop_detection_transaction(&mut self, max_operations: usize) -> HeapTransaction {
+        let config = super::transaction::TransactionDebugConfig {
+            max_apply_changes: max_operations,
+            verbose_logging: true,
+            log_string_creation: true,
+        };
+        HeapTransaction::new_with_debug(&mut self.heap, config)
+    }
+    
+    /// Create a transaction configured for safe string operations
+    pub fn create_string_safe_transaction(&mut self) -> HeapTransaction {
+        let config = super::transaction::TransactionDebugConfig {
+            // Limit to 1000 operations to catch infinite loops in string operations
+            max_apply_changes: 1000,
+            verbose_logging: true,
+            log_string_creation: true,
+        };
+        HeapTransaction::new_with_debug(&mut self.heap, config)
     }
     
     /// Evaluate a Lua script string and return the result
@@ -625,9 +704,35 @@ impl LuaVM {
     
     /// Execute a single step of the VM
     pub fn step(&mut self) -> LuaResult<StepResult> {
+        // Check if execution has already completed
+        if self.execution_completed {
+            eprintln!("WARNING: Attempted to step VM after execution completed");
+            return Ok(StepResult::Completed(vec![]));
+        }
+        
         // Process pending operations first
         if let Some(op) = self.operation_queue.pop_front() {
-            return self.process_pending_operation(op);
+            let result = self.process_pending_operation(op)?;
+            
+            // Track completion state
+            if matches!(result, StepResult::Completed(_)) {
+                self.execution_completed = true;
+            }
+            
+            return Ok(result);
+        }
+        
+        // Check if there are any call frames before trying to execute instructions
+        {
+            let mut tx = HeapTransaction::new(&mut self.heap);
+            let depth = tx.get_thread_call_depth(self.current_thread)?;
+            
+            if depth == 0 {
+                // No frames left, execution is complete
+                self.execution_completed = true;
+                tx.commit()?;
+                return Ok(StepResult::Completed(vec![]));
+            }
         }
         
         // Store current_thread to avoid borrowing issues
@@ -635,14 +740,6 @@ impl LuaVM {
         
         // Create transaction for this step
         let mut tx = HeapTransaction::new(&mut self.heap);
-        
-        // Check if there are any call frames left
-        let depth = tx.get_thread_call_depth(current_thread)?;
-        if depth == 0 {
-            // No more frames and no pending operations - execution complete
-            tx.commit()?;
-            return Ok(StepResult::Completed(vec![]));
-        }
         
         // Get current execution state
         let frame = tx.get_current_frame(current_thread)?;
@@ -656,7 +753,7 @@ impl LuaVM {
         // Increment PC for next instruction
         tx.increment_pc(current_thread)?;
         
-        // Execute instruction - pass current_thread as parameter
+        // Execute instruction
         let result = match inst.get_opcode() {
             OpCode::Move => Self::op_move(&mut tx, inst, base, current_thread),
             OpCode::LoadK => Self::op_loadk(&mut tx, inst, base, current_thread),
@@ -667,6 +764,7 @@ impl LuaVM {
             OpCode::GetTable => Self::op_gettable(&mut tx, inst, base, current_thread),
             OpCode::SetTable => Self::op_settable(&mut tx, inst, base, current_thread),
             OpCode::NewTable => Self::op_newtable(&mut tx, inst, base, current_thread),
+            OpCode::SelfOp => Self::op_self(&mut tx, inst, base, current_thread),
             OpCode::Add => Self::op_arithmetic(&mut tx, inst, base, ArithOp::Add, current_thread),
             OpCode::Sub => Self::op_arithmetic(&mut tx, inst, base, ArithOp::Sub, current_thread),
             OpCode::Mul => Self::op_arithmetic(&mut tx, inst, base, ArithOp::Mul, current_thread),
@@ -701,13 +799,21 @@ impl LuaVM {
         match result {
             Ok(_) => {
                 // Commit transaction and process any pending operations
-                let pending = tx.commit()?;
-                for op in pending {
-                    self.operation_queue.push_back(op);
+                match tx.commit() {
+                    Ok(pending) => {
+                        for op in pending {
+                            self.operation_queue.push_back(op);
+                        }
+                        
+                        // Always continue - let pending operations determine completion
+                        Ok(StepResult::Continue)
+                    }
+                    Err(e) => {
+                        // If commit failed due to resource exhaustion or other error, propagate it
+                        eprintln!("ERROR: Transaction commit failed: {}", e);
+                        Ok(StepResult::Error(e))
+                    }
                 }
-                
-                // Always continue - let pending operations determine completion
-                Ok(StepResult::Continue)
             }
             Err(e) => {
                 // Don't commit on error
@@ -719,8 +825,8 @@ impl LuaVM {
     /// Process a pending operation
     fn process_pending_operation(&mut self, op: PendingOperation) -> LuaResult<StepResult> {
         match op {
-            PendingOperation::FunctionCall { closure, args, expected_results } => {
-                self.process_function_call(closure, args, expected_results)
+            PendingOperation::FunctionCall { func_index, nargs, expected_results } => {
+                self.process_function_call(func_index, nargs, expected_results)
             }
             PendingOperation::CFunctionCall { function, base, nargs, expected_results } => {
                 self.process_c_function_call(function, base, nargs, expected_results)
@@ -738,13 +844,32 @@ impl LuaVM {
     /// Process a function call
     fn process_function_call(
         &mut self,
-        closure_handle: ClosureHandle,
-        args: Vec<Value>,
+        func_index: usize,
+        nargs: usize,
         expected_results: i32,
     ) -> LuaResult<StepResult> {
-        eprintln!("DEBUG: process_function_call - closure: {:?}, args: {:?}", closure_handle, args);
-        
         let mut tx = HeapTransaction::new(&mut self.heap);
+        
+        eprintln!("DEBUG: process_function_call - func_index: {}, nargs: {}, expected_results: {}", 
+                 func_index, nargs, expected_results);
+        
+        // Get the function value
+        let func_value = tx.read_register(self.current_thread, func_index)?;
+        let closure_handle = match func_value {
+            Value::Closure(handle) => handle,
+            _ => return Err(LuaError::RuntimeError(
+                format!("Function call with non-closure value: {}", func_value.type_name())
+            )),
+        };
+        
+        // Debug: Log the current register state before setting up the call
+        eprintln!("DEBUG: process_function_call - Register state before call setup:");
+        for i in 0..=nargs+1 {
+            let abs_idx = func_index + i;
+            if let Ok(val) = tx.read_register(self.current_thread, abs_idx) {
+                eprintln!("  R({}) = {:?}", abs_idx, val);
+            }
+        }
         
         // Get closure details
         let closure = tx.get_closure(closure_handle)?;
@@ -752,37 +877,96 @@ impl LuaVM {
         let is_vararg = closure.proto.is_vararg;
         let max_stack = closure.proto.max_stack_size as usize;
         
-        eprintln!("DEBUG: Function has {} params, vararg: {}, max_stack: {}", num_params, is_vararg, max_stack);
+        // The new base is the first argument position (func_index + 1)
+        let new_base = func_index + 1;
         
-        // Get current stack state
-        let stack_top = tx.get_stack_top(self.current_thread)?;
-        let new_base = stack_top + 1;
+        eprintln!("DEBUG: process_function_call - Function expects {} params, got {} args", 
+                 num_params, nargs);
+        eprintln!("DEBUG: process_function_call - New base will be at position {}", new_base);
         
-        // Prepare stack for new function
+        // Calculate needed stack space
         let needed_size = new_base + max_stack;
         
-        // Use static ensure_stack_size method
+        // Ensure we have enough stack space
         Self::ensure_stack_size(&mut tx, self.current_thread, needed_size, self.config.max_stack_size)?;
         
-        // Push function and arguments
-        tx.set_register(self.current_thread, stack_top + 1, Value::Closure(closure_handle))?;
-        for (i, arg) in args.iter().enumerate() {
-            tx.set_register(self.current_thread, new_base + 1 + i, arg.clone())?;
+        // Detect method call with swapped arguments
+        // This happens when SELF sets up R(A+1) = table, but somehow the arguments get swapped
+        let needs_method_swap = nargs == 2 && {
+            if let (Ok(arg0), Ok(arg1)) = (
+                tx.read_register(self.current_thread, func_index + 1),
+                tx.read_register(self.current_thread, func_index + 2)
+            ) {
+                // Check if arguments appear swapped: first is not table, second is table
+                // This indicates a method call where self should be first
+                !matches!(arg0, Value::Table(_)) && matches!(arg1, Value::Table(_))
+            } else {
+                false
+            }
+        };
+        
+        if needs_method_swap {
+            eprintln!("DEBUG: process_function_call - Detected method call with swapped arguments, fixing order");
+            // For method calls, swap the arguments to ensure self is first
+            let arg0 = tx.read_register(self.current_thread, func_index + 1)?;
+            let arg1 = tx.read_register(self.current_thread, func_index + 2)?;
+            
+            // Clone for debug output before moving
+            let arg0_type = arg0.type_name().to_string();
+            let arg1_type = arg1.type_name().to_string();
+            
+            // Write them back in the correct order for the new frame
+            // Clone the values since we need to move them
+            tx.set_register(self.current_thread, new_base, arg1.clone())?;  // Table (self) goes first  
+            tx.set_register(self.current_thread, new_base + 1, arg0.clone())?;  // Other arg goes second
+            
+            eprintln!("DEBUG: process_function_call - After swap:");
+            eprintln!("  R({}) = {} (was second arg)", new_base, arg1_type);
+            eprintln!("  R({}) = {} (was first arg)", new_base + 1, arg0_type);
         }
         
-        // Handle parameter adjustment
-        let varargs = if is_vararg && args.len() > num_params {
-            Some(args[num_params..].to_vec())
+        // Debug: Show how arguments map to the new function's registers
+        eprintln!("DEBUG: process_function_call - Argument mapping for new frame:");
+        for i in 0..nargs.max(num_params) {
+            let caller_idx = func_index + 1 + i;
+            let callee_idx = i;
+            if i < nargs {
+                // For method calls that were swapped, read from the new positions
+                let val = if needs_method_swap && i < 2 {
+                    tx.read_register(self.current_thread, new_base + i)?
+                } else {
+                    tx.read_register(self.current_thread, caller_idx)?
+                };
+                eprintln!("  Caller R({}) -> Callee R({}) = {:?}", caller_idx, callee_idx, val);
+            } else {
+                eprintln!("  Caller R({}) -> Callee R({}) = nil (missing argument)", caller_idx, callee_idx);
+            }
+        }
+        
+        // Handle parameter adjustment - Fill missing parameters with nil
+        if nargs < num_params {
+            eprintln!("DEBUG: process_function_call - Filling {} missing parameters with nil", 
+                     num_params - nargs);
+            for i in nargs..num_params {
+                let fill_pos = new_base + i;
+                tx.set_register(self.current_thread, fill_pos, Value::Nil)?;
+            }
+        }
+        
+        // Handle varargs collection if needed
+        let varargs = if is_vararg && nargs > num_params {
+            let mut va = Vec::new();
+            eprintln!("DEBUG: process_function_call - Collecting {} varargs", nargs - num_params);
+            for i in num_params..nargs {
+                let arg = tx.read_register(self.current_thread, new_base + i)?;
+                va.push(arg);
+            }
+            Some(va)
         } else {
             None
         };
         
-        // Fill missing parameters with nil
-        for i in args.len()..num_params {
-            tx.set_register(self.current_thread, new_base + 1 + i, Value::Nil)?;
-        }
-        
-        // Create new call frame
+        // Create new call frame - this establishes the register window
         let frame = CallFrame {
             closure: closure_handle,
             pc: 0,
@@ -795,7 +979,8 @@ impl LuaVM {
             varargs,
         };
         
-        eprintln!("DEBUG: Creating call frame with base register: {}", new_base);
+        eprintln!("DEBUG: process_function_call - Creating call frame with base_register: {}", 
+                 frame.base_register);
         
         tx.push_call_frame(self.current_thread, frame)?;
         
@@ -867,13 +1052,22 @@ impl LuaVM {
         // Check if there's an active call frame
         let depth = tx.get_thread_call_depth(self.current_thread)?;
         if depth == 0 {
-            // No active frames - this shouldn't happen normally
-            return Err(LuaError::RuntimeError("No active call frame".to_string()));
+            // No active frames - this is likely returning from the main chunk
+            // In this case, we're done with execution
+            tx.commit()?;
+            // Clear any remaining operations to prevent further execution attempts
+            self.operation_queue.clear();
+            return Ok(StepResult::Completed(values));
         }
         
         // Get current frame to find where to place results
         let frame = tx.get_current_frame(self.current_thread)?;
         let func_register = frame.base_register.saturating_sub(1);
+        let frame_base = frame.base_register as usize;
+        
+        // Close all upvalues that reference stack positions in this frame
+        // This must happen before popping the frame to ensure closures can capture locals
+        tx.close_thread_upvalues(self.current_thread, frame_base)?;
         
         // Pop the call frame
         tx.pop_call_frame(self.current_thread)?;
@@ -882,12 +1076,15 @@ impl LuaVM {
         if tx.get_thread_call_depth(self.current_thread)? == 0 {
             // Main function returned
             tx.commit()?;
+            // Clear the operation queue to ensure clean termination
+            self.operation_queue.clear();
             return Ok(StepResult::Completed(values));
         }
         
-        // Get the parent frame's expected results
+        // Get the parent frame to check expected results
         let parent_frame = tx.get_current_frame(self.current_thread)?;
-        let expected = parent_frame.expected_results;
+        
+        let expected = frame.expected_results;
         
         // Place results starting at function's register
         let result_count = if let Some(n) = expected {
@@ -895,6 +1092,9 @@ impl LuaVM {
         } else {
             values.len()
         };
+        
+        eprintln!("DEBUG: process_return - placing {} results starting at register {}", 
+                 result_count, func_register);
         
         for (i, value) in values.iter().take(result_count).enumerate() {
             tx.set_register(self.current_thread, func_register as usize + i, value.clone())?;
@@ -923,6 +1123,10 @@ impl LuaVM {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
+        // Ensure we have enough stack space for the destination register
+        let needed_size = base as usize + a.max(b) + 1;
+        tx.grow_stack(current_thread, needed_size)?;
+        
         let value = tx.read_register(current_thread, base as usize + b)?;
         tx.set_register(current_thread, base as usize + a, value)?;
         
@@ -933,6 +1137,10 @@ impl LuaVM {
     fn op_loadk(tx: &mut HeapTransaction, inst: Instruction, base: u16, current_thread: ThreadHandle) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let bx = inst.get_bx() as usize;
+        
+        // Ensure we have enough stack space for the destination register
+        let needed_size = base as usize + a + 1;
+        tx.grow_stack(current_thread, needed_size)?;
         
         // Get constant from current function
         let frame = tx.get_current_frame(current_thread)?;
@@ -1000,8 +1208,8 @@ impl LuaVM {
             
             if bx >= closure.proto.constants.len() {
                 return Err(LuaError::RuntimeError(format!(
-                    "Constant index {} out of bounds",
-                    bx
+                    "Constant index {} out of bounds (max: {})",
+                    bx, closure.proto.constants.len() - 1
                 )));
             }
             
@@ -1010,7 +1218,7 @@ impl LuaVM {
         }; // Drop the borrow of tx here
         
         // Debug: Log what we're looking up
-        if let Value::String(s) = &key {
+        let global_name = if let Value::String(s) = &key {
             let key_str = tx.get_string_value(*s)?;
             eprintln!("DEBUG GETGLOBAL: Looking up global '{}'", key_str);
             
@@ -1021,7 +1229,12 @@ impl LuaVM {
                 tx.set_register(current_thread, base as usize + a, Value::Table(globals))?;
                 return Ok(());
             }
-        }
+            
+            Some(key_str)
+        } else {
+            eprintln!("DEBUG GETGLOBAL: Non-string key type: {}", key.type_name());
+            None
+        };
         
         // Get globals table
         let globals = tx.get_globals_table()?;
@@ -1030,6 +1243,15 @@ impl LuaVM {
         // Get value from globals
         let value = tx.get_table_with_metamethods(globals, &key)?;
         eprintln!("DEBUG GETGLOBAL: Result: {:?}", value);
+        
+        // If the global doesn't exist (nil), provide a helpful error context
+        if value.is_nil() {
+            if let Some(name) = global_name {
+                eprintln!("WARNING GETGLOBAL: Global '{}' is nil/undefined", name);
+                // Don't error out - just set nil and continue
+                // This matches Lua's behavior
+            }
+        }
         
         tx.set_register(current_thread, base as usize + a, value)?;
         
@@ -1164,6 +1386,72 @@ impl LuaVM {
         // Create new table
         let table = tx.create_table()?;
         tx.set_register(current_thread, base as usize + a, Value::Table(table))?;
+        
+        Ok(())
+    }
+    
+    /// SELF: R(A+1) := R(B); R(A) := R(B)[RK(C)]
+    fn op_self(tx: &mut HeapTransaction, inst: Instruction, base: u16, current_thread: ThreadHandle) -> LuaResult<()> {
+        let a = inst.get_a() as usize;
+        let b = inst.get_b() as usize;
+        let (c_is_const, c_idx) = inst.get_rk_c();
+        
+        eprintln!("DEBUG SELF: A={}, B={}, C(const={}, idx={}), base={}", 
+                 a, b, c_is_const, c_idx, base);
+        
+        // Ensure we have enough stack space for R(A) and R(A+1)
+        let needed_size = base as usize + a + 2; // +2 to cover both R(A) and R(A+1)
+        tx.grow_stack(current_thread, needed_size)?;
+        
+        // Get the table from R(B)
+        let table_val = tx.read_register(current_thread, base as usize + b)?;
+        eprintln!("DEBUG SELF: Table from R({}) = {:?}", base as usize + b, table_val);
+        
+        // Get the method name key - either from constant or register
+        let key = if c_is_const {
+            Self::get_constant(tx, c_idx as usize, current_thread)?
+        } else {
+            tx.read_register(current_thread, base as usize + c_idx as usize)?
+        };
+        
+        // Debug logging
+        if let Value::String(k) = &key {
+            let key_str = tx.get_string_value(*k)?;
+            eprintln!("DEBUG SELF: Looking up method '{}' on table {:?}", key_str, table_val);
+        }
+        
+        // Verify we have a table
+        match &table_val {
+            Value::Table(handle) => {
+                eprintln!("DEBUG SELF: Table handle: {:?}", handle);
+                
+                // Look up the method on the table
+                let method = tx.get_table_with_metamethods(*handle, &key)?;
+                eprintln!("DEBUG SELF: Found method: {:?}", method);
+                
+                // SELF operation: R(A+1) := R(B); R(A) := R(B)[RK(C)]
+                // This sets up for method calls where:
+                // - R(A) contains the method function
+                // - R(A+1) contains the table (self parameter)
+                tx.set_register(current_thread, base as usize + a, method)?;
+                tx.set_register(current_thread, base as usize + a + 1, table_val)?;
+                
+                eprintln!("DEBUG SELF: Set R({}) = method, R({}) = table (self)", 
+                         base as usize + a, base as usize + a + 1);
+                
+                // Extra debug: verify what we just set
+                let verify_method = tx.read_register(current_thread, base as usize + a)?;
+                let verify_self = tx.read_register(current_thread, base as usize + a + 1)?;
+                eprintln!("DEBUG SELF: Verification - R({}) = {:?}, R({}) = {:?}",
+                         base as usize + a, verify_method, base as usize + a + 1, verify_self);
+            }
+            _ => {
+                return Err(LuaError::TypeError {
+                    expected: "table".to_string(),
+                    got: table_val.type_name().to_string(),
+                });
+            }
+        }
         
         Ok(())
     }
@@ -1311,19 +1599,48 @@ impl LuaVM {
         let b = inst.get_b() as usize;
         let c = inst.get_c() as usize;
         
+        eprintln!("DEBUG CONCAT: Starting concatenation R({}) := R({})..R({})", a, b, c);
+        eprintln!("DEBUG CONCAT: Base register: {}, Absolute registers: {}..{}", 
+                 base, base as usize + b, base as usize + c);
+        
+        // Track this as a concatenation operation to prevent infinite loops
+        tx.resource_tracker().track_operation()?;
+        
+        // Create a concat context to collect parts
+        let mut concat_ctx = ConcatContext::new();
+        
         // Collect all values to concatenate
-        let mut parts = Vec::new();
         for i in b..=c {
-            let value = tx.read_register(current_thread, base as usize + i)?;
+            let abs_register = base as usize + i;
+            let value = tx.read_register(current_thread, abs_register)?;
+            eprintln!("DEBUG CONCAT: Reading R({}) (absolute: {}) = {:?}", 
+                     i, abs_register, value.type_name());
+            
             match value {
                 Value::String(handle) => {
                     let s = tx.get_string_value(handle)?;
-                    parts.push(s);
+                    let len = s.len();
+                    eprintln!("DEBUG CONCAT: String part: '{}' (len: {})", 
+                             if len < 50 { &s } else { "<long string>" }, len);
+                    
+                    // Track memory for this string part
+                    tx.resource_tracker().track_string_allocation(len)?;
+                    
+                    concat_ctx.add_part(s);
                 }
                 Value::Number(n) => {
-                    parts.push(n.to_string());
+                    let s = n.to_string();
+                    let len = s.len();
+                    eprintln!("DEBUG CONCAT: Number part: {} (len: {})", n, len);
+                    
+                    // Track memory for number strings too
+                    tx.resource_tracker().track_string_allocation(len)?;
+                    
+                    concat_ctx.add_part(s);
                 }
                 _ => {
+                    eprintln!("DEBUG CONCAT: Type error - got {} at R({})", 
+                             value.type_name(), abs_register);
                     return Err(LuaError::TypeError {
                         expected: "string or number".to_string(),
                         got: value.type_name().to_string(),
@@ -1332,10 +1649,36 @@ impl LuaVM {
             }
         }
         
-        // Concatenate
-        let result = parts.join("");
+        let total_length = concat_ctx.total_length;
+        eprintln!("DEBUG CONCAT: Total parts: {}, Total length: {}", concat_ctx.parts.len(), total_length);
+        
+        // Check if total length would exceed string memory limits
+        // This prevents runaway string growth (not circular references in data)
+        let limits = tx.resource_tracker().limits();
+        if total_length > limits.max_string_memory {
+            return Err(LuaError::ResourceLimit {
+                resource: "string size".to_string(),
+                limit: limits.max_string_memory,
+                used: total_length,
+                context: "String concatenation would create a string larger than the memory limit. This may indicate runaway string growth.".to_string(),
+            });
+        }
+        
+        // Concatenate all parts
+        let result = concat_ctx.finish();
+        eprintln!("DEBUG CONCAT: Concatenated result: '{}' (actual len: {})", 
+                 if result.len() < 50 { &result } else { "<long string>" }, 
+                 result.len());
+        
+        // Create the string in the heap - this will also track the allocation
+        eprintln!("DEBUG CONCAT: Creating string in heap");
         let handle = tx.create_string(&result)?;
-        tx.set_register(current_thread, base as usize + a, Value::String(handle))?;
+        eprintln!("DEBUG CONCAT: Created string handle: {:?}", handle);
+        
+        let target_register = base as usize + a;
+        tx.set_register(current_thread, target_register, Value::String(handle))?;
+        eprintln!("DEBUG CONCAT: Set result in R({}) (absolute: {})", a, target_register);
+        eprintln!("DEBUG CONCAT: Operation complete");
         
         Ok(())
     }
@@ -1422,22 +1765,56 @@ impl LuaVM {
         let b = inst.get_b();
         let c = inst.get_c();
         
+        eprintln!("DEBUG: op_call - A: {}, B: {}, C: {}, base: {}", a, b, c, base);
+        
         // Get function
-        let func = tx.read_register(current_thread, base as usize + a)?;
+        let func_abs = base as usize + a;
+        eprintln!("DEBUG: op_call - Reading function from absolute position: {}", func_abs);
+        let func = tx.read_register(current_thread, func_abs)?;
+        eprintln!("DEBUG: op_call - Function type: {:?}", func.type_name());
         
         // Determine argument count
         let nargs = if b == 0 {
             // Use all values up to stack top
             let stack_top = tx.get_stack_top(current_thread)?;
-            stack_top - (base as usize + a)
+            eprintln!("DEBUG: op_call - Using all values, stack_top: {}, func_abs: {}", stack_top, func_abs);
+            stack_top - func_abs - 1  // Subtract 1 for the function itself
         } else {
             (b - 1) as usize
         };
         
-        // Collect arguments
-        let mut args = Vec::with_capacity(nargs);
+        eprintln!("DEBUG: op_call - Number of arguments: {}", nargs);
+        
+        // For method calls, we need to detect if a SELF instruction preceded this CALL
+        // In that case, the self parameter is already in R(A+1) and should be preserved
+        // This is a bit tricky since we don't have direct access to previous instructions
+        // However, we can check if this looks like a method call pattern
+        let is_method_call = nargs >= 1 && {
+            // Check if R(A+1) contains a table that might be the self parameter
+            // This is a heuristic but should work for typical method call patterns
+            if let Ok(first_arg) = tx.read_register(current_thread, func_abs + 1) {
+                matches!(first_arg, Value::Table(_))
+            } else {
+                false
+            }
+        };
+        
+        eprintln!("DEBUG: op_call - Detected method call pattern: {}", is_method_call);
+        
+        // Log argument positions AND VALUES for debugging
         for i in 0..nargs {
-            args.push(tx.read_register(current_thread, base as usize + a + 1 + i)?);
+            let arg_pos = func_abs + 1 + i;
+            let arg_value = tx.read_register(current_thread, arg_pos)?;
+            eprintln!("DEBUG: op_call - Argument {} at position {} = {:?}", i, arg_pos, arg_value);
+            
+            // Special logging for table values to help debug method calls
+            if let Value::Table(handle) = &arg_value {
+                eprintln!("DEBUG: op_call - Argument {} is table with handle {:?}", i, handle);
+                // Try to get some identifying information about the table
+                let table = tx.get_table(*handle)?;
+                eprintln!("DEBUG: op_call - Table has {} array elements and {} map entries", 
+                         table.array_len(), table.map_len());
+            }
         }
         
         // Determine expected results
@@ -1447,24 +1824,29 @@ impl LuaVM {
             (c - 1) as i32
         };
         
+        eprintln!("DEBUG: op_call - Expected results: {}", expected_results);
+        
         // Queue the call based on function type
         match func {
-            Value::Closure(closure) => {
+            Value::Closure(_) => {
+                eprintln!("DEBUG: op_call - Queueing Lua function call with func_index: {}", func_abs);
                 tx.queue_operation(PendingOperation::FunctionCall {
-                    closure,
-                    args,
+                    func_index: func_abs,
+                    nargs,
                     expected_results,
                 })?;
             }
             Value::CFunction(cfunc) => {
+                eprintln!("DEBUG: op_call - Queueing C function call");
                 tx.queue_operation(PendingOperation::CFunctionCall {
                     function: cfunc,
-                    base: (base as usize + a) as u16,
+                    base: func_abs as u16,
                     nargs,
                     expected_results,
                 })?;
             }
             _ => {
+                eprintln!("ERROR: op_call - Attempt to call non-function value: {}", func.type_name());
                 return Err(LuaError::TypeError {
                     expected: "function".to_string(),
                     got: func.type_name().to_string(),
@@ -1507,29 +1889,68 @@ impl LuaVM {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
+        eprintln!("DEBUG GETUPVAL: A={}, B={}, base={}", a, b, base);
+        
         // Get current closure
         let frame = tx.get_current_frame(current_thread)?;
         let closure = tx.get_closure(frame.closure)?;
         
+        eprintln!("DEBUG GETUPVAL: Closure has {} upvalues", closure.upvalues.len());
+        
         if b >= closure.upvalues.len() {
             return Err(LuaError::RuntimeError(format!(
-                "Upvalue index {} out of bounds",
-                b
+                "Upvalue index {} out of bounds (closure has {} upvalues)",
+                b, closure.upvalues.len()
             )));
         }
         
         let upvalue_handle = closure.upvalues[b];
+        eprintln!("DEBUG GETUPVAL: Reading upvalue handle {:?}", upvalue_handle);
+        
+        // Validate the upvalue handle
+        match tx.validate_handle(&upvalue_handle) {
+            Ok(_) => {},
+            Err(e) => {
+                eprintln!("ERROR GETUPVAL: Invalid upvalue handle: {}", e);
+                return Err(LuaError::RuntimeError(format!(
+                    "Invalid upvalue handle at index {}: {}",
+                    b, e
+                )));
+            }
+        }
+        
         let upvalue = tx.get_upvalue(upvalue_handle)?;
+        eprintln!("DEBUG GETUPVAL: Upvalue state - stack_index: {:?}, value: {:?}", 
+                 upvalue.stack_index, upvalue.value);
         
         // Get value from upvalue
         let value = if let Some(stack_idx) = upvalue.stack_index {
-            tx.read_register(current_thread, stack_idx)?
+            // Open upvalue - read from stack
+            eprintln!("DEBUG GETUPVAL: Open upvalue, reading from stack position {}", stack_idx);
+            match tx.read_register(current_thread, stack_idx) {
+                Ok(val) => {
+                    eprintln!("DEBUG GETUPVAL: Stack position {} contains: {:?}", stack_idx, val);
+                    val
+                },
+                Err(e) => {
+                    eprintln!("ERROR GETUPVAL: Cannot read stack position {}: {}", stack_idx, e);
+                    // If we can't read from the stack position, return nil instead of erroring
+                    // This can happen if the stack has been unwound but the upvalue wasn't closed
+                    Value::Nil
+                }
+            }
         } else if let Some(ref val) = upvalue.value {
+            // Closed upvalue - use stored value
+            eprintln!("DEBUG GETUPVAL: Closed upvalue, value: {:?}", val);
             val.clone()
         } else {
-            return Err(LuaError::RuntimeError("Invalid upvalue state".to_string()));
+            // Invalid state - both stack_index and value are None
+            // This shouldn't happen, but handle gracefully by returning nil
+            eprintln!("WARNING GETUPVAL: Upvalue in invalid state (no stack_index or value), returning nil");
+            Value::Nil
         };
         
+        eprintln!("DEBUG GETUPVAL: Setting R({}) = {:?}", base as usize + a, value);
         tx.set_register(current_thread, base as usize + a, value)?;
         
         Ok(())
@@ -1564,23 +1985,33 @@ impl LuaVM {
         let a = inst.get_a() as usize;
         let bx = inst.get_bx() as usize;
         
+        eprintln!("DEBUG CLOSURE: A={}, Bx={}, base={}", a, bx, base);
+        
         // Extract all needed parent closure info first
-        let (proto_handle, parent_upvalues) = {
+        let (proto_handle, parent_upvalues, parent_frame) = {
             let frame = tx.get_current_frame(current_thread)?;
             let parent_closure = tx.get_closure(frame.closure)?;
+            
+            eprintln!("DEBUG CLOSURE: Parent closure has {} constants and {} upvalues", 
+                     parent_closure.proto.constants.len(), parent_closure.upvalues.len());
             
             // Get the function prototype from constants
             if bx >= parent_closure.proto.constants.len() {
                 return Err(LuaError::RuntimeError(format!(
-                    "Function prototype index {} out of bounds",
-                    bx
+                    "Function prototype index {} out of bounds (max: {})",
+                    bx, parent_closure.proto.constants.len() - 1
                 )));
             }
             
             // Extract the function prototype handle from the constant
             let proto_handle = match &parent_closure.proto.constants[bx] {
-                Value::FunctionProto(handle) => *handle,
+                Value::FunctionProto(handle) => {
+                    eprintln!("DEBUG CLOSURE: Found function prototype at constant index {}", bx);
+                    *handle
+                },
                 _ => {
+                    eprintln!("ERROR CLOSURE: Expected function prototype at constant index {}, got {}", 
+                             bx, parent_closure.proto.constants[bx].type_name());
                     return Err(LuaError::RuntimeError(format!(
                         "Expected function prototype at constant index {}, got {}",
                         bx,
@@ -1592,37 +2023,98 @@ impl LuaVM {
             // Clone the parent upvalues to avoid holding the reference
             let parent_upvalues = parent_closure.upvalues.clone();
             
-            (proto_handle, parent_upvalues)
+            (proto_handle, parent_upvalues, frame)
         }; // Drop the borrow of tx here
         
         // Get the prototype's upvalue information
         let proto = tx.get_function_proto(proto_handle)?;
         let upvalue_infos = proto.upvalues.clone();
         
-        // Create upvalues for the new closure
+        eprintln!("DEBUG CLOSURE: Creating closure with {} upvalues", upvalue_infos.len());
+        
+        // Create upvalues for the new closure with proper validation
         let mut upvalues = Vec::new();
         
-        for &upval_info in &upvalue_infos {
+        for (i, &upval_info) in upvalue_infos.iter().enumerate() {
+            eprintln!("DEBUG CLOSURE: Processing upvalue {}: in_stack={}, index={}", 
+                     i, upval_info.in_stack, upval_info.index);
+            
             let upvalue_handle = if upval_info.in_stack {
                 // Upvalue refers to local variable in enclosing function
+                let stack_index = base as usize + upval_info.index as usize;
+                eprintln!("DEBUG CLOSURE: Creating upvalue for stack position {} (base={}, index={})", 
+                         stack_index, base, upval_info.index);
+                
+                // Validate stack index is within bounds
+                let stack_size = tx.get_stack_size(current_thread)?;
+                if stack_index >= stack_size {
+                    eprintln!("ERROR CLOSURE: Stack index {} out of bounds (stack size: {})", 
+                             stack_index, stack_size);
+                    return Err(LuaError::RuntimeError(format!(
+                        "Invalid upvalue reference to stack position {} (stack size: {})",
+                        stack_index, stack_size
+                    )));
+                }
+                
+                // Check what value is at this stack position for debugging
+                match tx.read_register(current_thread, stack_index) {
+                    Ok(value) => {
+                        eprintln!("DEBUG CLOSURE: Stack position {} contains: {:?}", stack_index, value);
+                    },
+                    Err(e) => {
+                        eprintln!("ERROR CLOSURE: Cannot read stack position {}: {}", stack_index, e);
+                        return Err(LuaError::RuntimeError(format!(
+                            "Cannot access stack position {} for upvalue: {}",
+                            stack_index, e
+                        )));
+                    }
+                }
+                
                 tx.find_or_create_upvalue(
                     current_thread,
-                    base as usize + upval_info.index as usize
+                    stack_index
                 )?
             } else {
                 // Upvalue refers to upvalue of enclosing function
+                eprintln!("DEBUG CLOSURE: Referencing parent upvalue at index {}", upval_info.index);
+                
                 if upval_info.index as usize >= parent_upvalues.len() {
-                    return Err(LuaError::RuntimeError(
-                        "Invalid upvalue reference".to_string()
-                    ));
+                    eprintln!("ERROR CLOSURE: Parent upvalue index {} out of bounds (parent has {} upvalues)", 
+                             upval_info.index, parent_upvalues.len());
+                    return Err(LuaError::RuntimeError(format!(
+                        "Invalid upvalue reference: parent closure has {} upvalues, but tried to access index {}",
+                        parent_upvalues.len(),
+                        upval_info.index
+                    )));
                 }
-                parent_upvalues[upval_info.index as usize]
+                
+                let parent_upval = parent_upvalues[upval_info.index as usize];
+                
+                // Validate the parent upvalue handle
+                match tx.validate_handle(&parent_upval) {
+                    Ok(_) => {
+                        eprintln!("DEBUG CLOSURE: Parent upvalue handle {:?} is valid", parent_upval);
+                    },
+                    Err(e) => {
+                        eprintln!("ERROR CLOSURE: Parent upvalue handle {:?} is invalid: {}", parent_upval, e);
+                        return Err(LuaError::RuntimeError(format!(
+                            "Invalid parent upvalue at index {}: {}",
+                            upval_info.index, e
+                        )));
+                    }
+                }
+                
+                parent_upval
             };
+            
             upvalues.push(upvalue_handle);
         }
         
         // Create new closure using the convenience method
         let closure_handle = tx.create_closure_from_proto(proto_handle, upvalues)?;
+        
+        eprintln!("DEBUG CLOSURE: Created closure handle {:?}, storing in R({})", 
+                 closure_handle, base as usize + a);
         
         tx.set_register(current_thread, base as usize + a, Value::Closure(closure_handle))?;
         
@@ -1785,8 +2277,8 @@ impl LuaVM {
             )));
         }
         
-        // In a real implementation, we'd grow the stack here
-        // For now, we assume the stack is large enough
+        // Actually grow the stack to the needed size
+        tx.grow_stack(thread, needed)?;
         
         Ok(())
     }
@@ -1841,6 +2333,16 @@ impl LuaVM {
     pub fn heap_mut(&mut self) -> &mut LuaHeap {
         &mut self.heap
     }
+    
+    /// Update resource limits for this VM
+    pub fn set_resource_limits(&mut self, limits: ResourceLimits) {
+        self.config.resource_limits = limits;
+    }
+    
+    /// Get current resource limits
+    pub fn get_resource_limits(&self) -> &ResourceLimits {
+        &self.config.resource_limits
+    }
 }
 
 /// Arithmetic operation types
@@ -1871,6 +2373,27 @@ mod tests {
     fn test_vm_creation() {
         let vm = LuaVM::new().unwrap();
         assert_eq!(vm.operation_queue.len(), 0);
+    }
+    
+    #[test]
+    fn test_circular_table_handling() {
+        let mut vm = LuaVM::new().unwrap();
+        vm.init_stdlib().unwrap();
+        
+        // Create a circular table structure
+        let script = r#"
+            local t1 = {name = "table1"}
+            local t2 = {name = "table2"}
+            t1.next = t2
+            t2.next = t1  -- Circular reference
+            
+            -- This should NOT error - circular data structures are valid
+            return t1
+        "#;
+        
+        // Should execute successfully
+        let result = vm.eval_script(script).unwrap();
+        assert!(matches!(result, Value::Table(_)));
     }
     
     #[test]

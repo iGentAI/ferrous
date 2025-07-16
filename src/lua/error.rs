@@ -71,6 +71,17 @@ pub enum LuaError {
     StackOverflow,
     InstructionLimitExceeded,
     Timeout,
+    ResourceExhausted { 
+        resource: String, 
+        limit: usize, 
+        attempted: usize 
+    },
+    ResourceLimit {
+        resource: String,
+        limit: usize,
+        used: usize,
+        context: String,
+    },
     
     // Handle and validation errors
     InvalidHandle,
@@ -134,6 +145,14 @@ impl fmt::Display for LuaError {
             LuaError::StackOverflow => write!(f, "stack overflow"),
             LuaError::InstructionLimitExceeded => write!(f, "instruction limit exceeded"),
             LuaError::Timeout => write!(f, "script execution timeout"),
+            LuaError::ResourceExhausted { resource, limit, attempted } => {
+                write!(f, "resource exhausted: {} limit {} exceeded (attempted {})", 
+                       resource, limit, attempted)
+            }
+            LuaError::ResourceLimit { resource, limit, used, context } => {
+                write!(f, "resource limit exceeded: {} (limit: {}, used: {}) - {}", 
+                       resource, limit, used, context)
+            }
             
             LuaError::InvalidHandle => write!(f, "invalid handle"),
             LuaError::StaleHandle => write!(f, "stale handle (generation mismatch)"),

@@ -397,6 +397,40 @@ impl CodeGenContext {
     }
 }
 
+/// Resolve an upvalue through parent contexts
+fn resolve_upvalue(ctx: &mut CodeGenContext, name: &str, parent: Option<&CodeGenContext>) -> Option<u8> {
+    // If we have no parent, we can't have upvalues
+    let parent_ctx = parent?;
+    
+    // First, check if the parent has this as a local
+    if let Some(parent_local_reg) = parent_ctx.lookup_local(name) {
+        // The parent has this variable as a local
+        // We need to create an upvalue that references the parent's local
+        
+        // Check if we already have this upvalue
+        for (i, upval) in ctx.current_function.upvalues.iter().enumerate() {
+            if upval.in_stack && upval.index == parent_local_reg {
+                return Some(i as u8);
+            }
+        }
+        
+        // Create a new upvalue
+        let upval_idx = ctx.current_function.upvalues.len() as u8;
+        ctx.current_function.upvalues.push(CompilationUpvalue {
+            in_stack: true,
+            index: parent_local_reg,
+        });
+        
+        return Some(upval_idx);
+    }
+    
+    // If the parent doesn't have it as a local, check if it has it as an upvalue
+    // This would require recursively checking the parent's parent
+    // For now, we'll leave this unimplemented as the basic case should work
+    
+    None
+}
+
 /// Generate bytecode from AST
 pub fn generate_bytecode(chunk: &Chunk) -> LuaResult<CompleteCompilationOutput> {
     let mut ctx = CodeGenContext::new();
@@ -441,24 +475,36 @@ fn compile_chunk(ctx: &mut CodeGenContext, chunk: &Chunk) -> LuaResult<()> {
 
 /// Compile a statement
 fn compile_statement(ctx: &mut CodeGenContext, statement: &Statement) -> LuaResult<()> {
+    compile_statement_with_parent(ctx, statement, None)
+}
+
+/// Compile a statement with parent context
+fn compile_statement_with_parent(
+    ctx: &mut CodeGenContext, 
+    statement: &Statement,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     match statement {
-        Statement::LocalDeclaration(decl) => compile_local_declaration(ctx, decl),
-        Statement::Assignment(assign) => compile_assignment(ctx, assign),
+        Statement::LocalDeclaration(decl) => compile_local_declaration_with_parent(ctx, decl, parent),
+        Statement::Assignment(assign) => compile_assignment_with_parent(ctx, assign, parent),
         Statement::FunctionCall(call) => {
-            compile_function_call(ctx, call)?;
+            compile_function_call_with_parent(ctx, call, parent)?;
             Ok(())
         }
-        Statement::Return { expressions } => compile_return_statement(ctx, expressions),
+        Statement::Return { expressions } => compile_return_statement_with_parent(ctx, expressions, parent),
         Statement::If { condition, body, else_ifs, else_block } => {
-            compile_if_statement(ctx, condition, body, else_ifs, else_block)
+            compile_if_statement_with_parent(ctx, condition, body, else_ifs, else_block, parent)
         }
-        Statement::While { condition, body } => compile_while_loop(ctx, condition, body),
-        Statement::Do(block) => compile_block(ctx, block),
+        Statement::While { condition, body } => compile_while_loop_with_parent(ctx, condition, body, parent),
+        Statement::Do(block) => compile_block_with_parent(ctx, block, parent),
         Statement::ForLoop { variable, initial, limit, step, body } => {
-            compile_for_loop(ctx, variable, initial, limit, step.as_ref(), body)
+            compile_for_loop_with_parent(ctx, variable, initial, limit, step.as_ref(), body, parent)
         }
         Statement::LocalFunctionDefinition { name, parameters, is_vararg, body } => {
-            compile_local_function_definition(ctx, name, parameters, *is_vararg, body)
+            compile_local_function_definition_with_parent(ctx, name, parameters, *is_vararg, body)
+        }
+        Statement::FunctionDefinition { name, parameters, is_vararg, body } => {
+            compile_function_definition_with_parent(ctx, name, parameters, *is_vararg, body)
         }
         _ => Err(LuaError::NotImplemented(format!("Statement type: {:?}", statement))),
     }
@@ -466,6 +512,15 @@ fn compile_statement(ctx: &mut CodeGenContext, statement: &Statement) -> LuaResu
 
 /// Compile a local variable declaration
 fn compile_local_declaration(ctx: &mut CodeGenContext, decl: &LocalDeclaration) -> LuaResult<()> {
+    compile_local_declaration_with_parent(ctx, decl, None)
+}
+
+/// Compile a local variable declaration with parent context
+fn compile_local_declaration_with_parent(
+    ctx: &mut CodeGenContext, 
+    decl: &LocalDeclaration,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     let num_names = decl.names.len();
     let num_exprs = decl.expressions.len();
     
@@ -479,7 +534,7 @@ fn compile_local_declaration(ctx: &mut CodeGenContext, decl: &LocalDeclaration) 
     if num_exprs > 0 {
         for (i, expr) in decl.expressions.iter().enumerate() {
             if i < num_names {
-                compile_expression_to_register(ctx, expr, base_reg + i as u8)?;
+                compile_expression_to_register_with_parent(ctx, expr, base_reg + i as u8, parent)?;
             }
         }
     }
@@ -501,18 +556,35 @@ fn compile_local_declaration(ctx: &mut CodeGenContext, decl: &LocalDeclaration) 
 
 /// Compile an assignment
 fn compile_assignment(ctx: &mut CodeGenContext, assign: &Assignment) -> LuaResult<()> {
+    compile_assignment_with_parent(ctx, assign, None)
+}
+
+/// Compile an assignment with parent context
+fn compile_assignment_with_parent(
+    ctx: &mut CodeGenContext, 
+    assign: &Assignment,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     // For now, handle simple local variable assignments
     if assign.variables.len() == 1 && assign.expressions.len() == 1 {
         match &assign.variables[0] {
             Variable::Name(name) => {
                 if let Some(reg) = ctx.lookup_local(name) {
                     // Assign to existing local
-                    compile_expression_to_register(ctx, &assign.expressions[0], reg)?;
+                    compile_expression_to_register_with_parent(ctx, &assign.expressions[0], reg, parent)?;
+                    return Ok(());
+                } else if let Some(upval_idx) = resolve_upvalue(ctx, name, parent) {
+                    // Assign to upvalue
+                    let value_reg = ctx.allocate_register()?;
+                    compile_expression_to_register_with_parent(ctx, &assign.expressions[0], value_reg, parent)?;
+                    
+                    ctx.emit(Instruction::create_ABC(OpCode::SetUpval, value_reg as u32, upval_idx as u32, 0));
+                    ctx.free_registers_to(value_reg);
                     return Ok(());
                 } else {
                     // Global assignment
                     let value_reg = ctx.allocate_register()?;
-                    compile_expression_to_register(ctx, &assign.expressions[0], value_reg)?;
+                    compile_expression_to_register_with_parent(ctx, &assign.expressions[0], value_reg, parent)?;
                     
                     let string_idx = ctx.add_string(name);
                     let const_idx = ctx.add_constant(CompilationConstant::String(string_idx))?;
@@ -525,10 +597,10 @@ fn compile_assignment(ctx: &mut CodeGenContext, assign: &Assignment) -> LuaResul
             Variable::Member { table, field } => {
                 // Table member assignment: table.field = value
                 let table_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, table, table_reg)?;
+                compile_expression_to_register_with_parent(ctx, table, table_reg, parent)?;
                 
                 let value_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, &assign.expressions[0], value_reg)?;
+                compile_expression_to_register_with_parent(ctx, &assign.expressions[0], value_reg, parent)?;
                 
                 // Create string constant for the field
                 let field_idx = ctx.add_string(field);
@@ -548,13 +620,13 @@ fn compile_assignment(ctx: &mut CodeGenContext, assign: &Assignment) -> LuaResul
             Variable::Index { table, key } => {
                 // Table index assignment: table[key] = value
                 let table_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, table, table_reg)?;
+                compile_expression_to_register_with_parent(ctx, table, table_reg, parent)?;
                 
                 let key_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, key, key_reg)?;
+                compile_expression_to_register_with_parent(ctx, key, key_reg, parent)?;
                 
                 let value_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, &assign.expressions[0], value_reg)?;
+                compile_expression_to_register_with_parent(ctx, &assign.expressions[0], value_reg, parent)?;
                 
                 // SETTABLE: table[key] = value
                 ctx.emit(Instruction::create_ABC(
@@ -575,6 +647,16 @@ fn compile_assignment(ctx: &mut CodeGenContext, assign: &Assignment) -> LuaResul
 
 /// Compile an expression to a specific register
 fn compile_expression_to_register(ctx: &mut CodeGenContext, expr: &Expression, target: u8) -> LuaResult<()> {
+    compile_expression_to_register_with_parent(ctx, expr, target, None)
+}
+
+/// Compile an expression to a specific register with parent context for upvalue resolution
+fn compile_expression_to_register_with_parent(
+    ctx: &mut CodeGenContext, 
+    expr: &Expression, 
+    target: u8,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     match expr {
         Expression::Nil => {
             ctx.emit(Instruction::create_ABC(OpCode::LoadNil, target as u32, target as u32, 0));
@@ -592,25 +674,25 @@ fn compile_expression_to_register(ctx: &mut CodeGenContext, expr: &Expression, t
             ctx.emit(Instruction::create_ABx(OpCode::LoadK, target as u32, const_idx));
         }
         Expression::Variable(var) => {
-            compile_variable_to_register(ctx, var, target)?;
+            compile_variable_to_register_with_parent(ctx, var, target, parent)?;
         }
         Expression::BinaryOp { left, operator, right } => {
-            compile_binary_op(ctx, left, operator, right, target)?;
+            compile_binary_op_with_parent(ctx, left, operator, right, target, parent)?;
         }
         Expression::UnaryOp { operator, operand } => {
-            compile_unary_op(ctx, operator, operand, target)?;
+            compile_unary_op_with_parent(ctx, operator, operand, target, parent)?;
         }
         Expression::FunctionCall(call) => {
-            let base = compile_function_call(ctx, call)?;
+            let base = compile_function_call_with_parent(ctx, call, parent)?;
             if base != target {
                 ctx.emit(Instruction::create_ABC(OpCode::Move, target as u32, base as u32, 0));
             }
         }
         Expression::TableConstructor(tc) => {
-            compile_table_constructor(ctx, tc, target)?;
+            compile_table_constructor_with_parent(ctx, tc, target, parent)?;
         }
         Expression::FunctionDef { parameters, is_vararg, body } => {
-            compile_function_expression(ctx, parameters, *is_vararg, body, target)?;
+            compile_function_expression_with_parent(ctx, parameters, *is_vararg, body, target)?;
         }
         _ => return Err(LuaError::NotImplemented(format!("Expression type: {:?}", expr))),
     }
@@ -620,6 +702,18 @@ fn compile_expression_to_register(ctx: &mut CodeGenContext, expr: &Expression, t
 
 /// Compile a table constructor
 fn compile_table_constructor(ctx: &mut CodeGenContext, tc: &TableConstructor, target: u8) -> LuaResult<()> {
+    compile_table_constructor_with_parent(ctx, tc, target, None)
+}
+
+/// Compile a table constructor with parent context
+fn compile_table_constructor_with_parent(
+    ctx: &mut CodeGenContext, 
+    tc: &TableConstructor, 
+    target: u8,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
+    eprintln!("DEBUG: compile_table_constructor - target: {}, free_register: {}", target, ctx.free_register);
+    
     // Create the table with size hints (B = array size, C = hash size)
     // For now, we'll use 0, 0 and let the VM resize as needed
     ctx.emit(Instruction::create_ABC(OpCode::NewTable, target as u32, 0, 0));
@@ -634,12 +728,14 @@ fn compile_table_constructor(ctx: &mut CodeGenContext, tc: &TableConstructor, ta
                 // Array-style entry: t[array_index] = expr
                 // Allocate register for the value
                 let value_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, expr, value_reg)?;
+                eprintln!("DEBUG: Table list field - compiling value to register {}", value_reg);
+                compile_expression_to_register_with_parent(ctx, expr, value_reg, parent)?;
                 
                 // Create constant for the array index
                 let index_const = ctx.add_constant(CompilationConstant::Number(array_index as f64))?;
                 
                 // SETTABLE: table[index] = value
+                eprintln!("DEBUG: Emitting SETTABLE for list field - R({})[const({})] = R({})", target, index_const, value_reg);
                 ctx.emit(Instruction::create_ABC(
                     OpCode::SetTable, 
                     target as u32,
@@ -655,13 +751,15 @@ fn compile_table_constructor(ctx: &mut CodeGenContext, tc: &TableConstructor, ta
                 // Record-style entry: t.key = value
                 // Allocate register for the value
                 let value_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, value, value_reg)?;
+                eprintln!("DEBUG: Table record field '{}' - compiling value to register {}", key, value_reg);
+                compile_expression_to_register_with_parent(ctx, value, value_reg, parent)?;
                 
                 // Create string constant for the key
                 let key_string_idx = ctx.add_string(key);
                 let key_const = ctx.add_constant(CompilationConstant::String(key_string_idx))?;
                 
                 // SETTABLE: table[key] = value
+                eprintln!("DEBUG: Emitting SETTABLE for record field - R({})[const({})] = R({})", target, key_const, value_reg);
                 ctx.emit(Instruction::create_ABC(
                     OpCode::SetTable,
                     target as u32,
@@ -676,12 +774,15 @@ fn compile_table_constructor(ctx: &mut CodeGenContext, tc: &TableConstructor, ta
                 // Computed index entry: t[key_expr] = value
                 // Allocate registers for key and value
                 let key_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, key, key_reg)?;
+                eprintln!("DEBUG: Table index field - compiling key to register {}", key_reg);
+                compile_expression_to_register_with_parent(ctx, key, key_reg, parent)?;
                 
                 let value_reg = ctx.allocate_register()?;
-                compile_expression_to_register(ctx, value, value_reg)?;
+                eprintln!("DEBUG: Table index field - compiling value to register {}", value_reg);
+                compile_expression_to_register_with_parent(ctx, value, value_reg, parent)?;
                 
                 // SETTABLE: table[key] = value
+                eprintln!("DEBUG: Emitting SETTABLE for index field - R({})[R({})] = R({})", target, key_reg, value_reg);
                 ctx.emit(Instruction::create_ABC(
                     OpCode::SetTable,
                     target as u32,
@@ -694,11 +795,23 @@ fn compile_table_constructor(ctx: &mut CodeGenContext, tc: &TableConstructor, ta
         }
     }
     
+    eprintln!("DEBUG: Table constructor complete, final free_register: {}", ctx.free_register);
+    
     Ok(())
 }
 
 /// Compile a variable access to a register
 fn compile_variable_to_register(ctx: &mut CodeGenContext, var: &Variable, target: u8) -> LuaResult<()> {
+    compile_variable_to_register_with_parent(ctx, var, target, None)
+}
+
+/// Compile a variable access to a register with parent context for upvalue resolution
+fn compile_variable_to_register_with_parent(
+    ctx: &mut CodeGenContext, 
+    var: &Variable, 
+    target: u8,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     match var {
         Variable::Name(name) => {
             if let Some(reg) = ctx.lookup_local(name) {
@@ -706,6 +819,9 @@ fn compile_variable_to_register(ctx: &mut CodeGenContext, var: &Variable, target
                 if reg != target {
                     ctx.emit(Instruction::create_ABC(OpCode::Move, target as u32, reg as u32, 0));
                 }
+            } else if let Some(upval_idx) = resolve_upvalue(ctx, name, parent) {
+                // Upvalue access
+                ctx.emit(Instruction::create_ABC(OpCode::GetUpval, target as u32, upval_idx as u32, 0));
             } else {
                 // Global variable
                 let string_idx = ctx.add_string(name);
@@ -715,14 +831,26 @@ fn compile_variable_to_register(ctx: &mut CodeGenContext, var: &Variable, target
         }
         Variable::Member { table, field } => {
             // Table member access: table.field
-            let table_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, table, table_reg)?;
+            eprintln!("DEBUG: compile_variable_to_register Member - target: {}, free_register: {}", target, ctx.free_register);
+            
+            // Check if we need a temporary register for the table
+            let table_reg = if ctx.free_register > target {
+                // We have registers allocated beyond target, so allocate a new one
+                ctx.allocate_register()?
+            } else {
+                // Use the target register temporarily for the table
+                target
+            };
+            
+            eprintln!("DEBUG: Using table_reg: {} for table expression", table_reg);
+            compile_expression_to_register_with_parent(ctx, table, table_reg, parent)?;
             
             // Create string constant for the field name
             let field_idx = ctx.add_string(field);
             let field_const = ctx.add_constant(CompilationConstant::String(field_idx))?;
             
             // GETTABLE: R(target) = table[field]
+            eprintln!("DEBUG: Emitting GETTABLE - R({}) = R({})[const({})]", target, table_reg, field_const);
             ctx.emit(Instruction::create_ABC(
                 OpCode::GetTable,
                 target as u32,
@@ -730,17 +858,37 @@ fn compile_variable_to_register(ctx: &mut CodeGenContext, var: &Variable, target
                 Instruction::encode_constant(field_const)
             ));
             
-            ctx.free_registers_to(target + 1);
+            // Only free registers if we allocated beyond the target
+            // The key insight: if table_reg == target, we're reusing the target register
+            // and the GETTABLE will overwrite it anyway. If table_reg > target, then
+            // we need to free back to just after target.
+            if table_reg > target {
+                eprintln!("DEBUG: Freeing registers from {} back to {}", ctx.free_register, target + 1);
+                ctx.free_registers_to(target + 1);
+            }
+            // If table_reg == target, no freeing needed - the value is already in the right place
         }
         Variable::Index { table, key } => {
             // Table index access: table[key]
-            let table_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, table, table_reg)?;
+            eprintln!("DEBUG: compile_variable_to_register Index - target: {}, free_register: {}", target, ctx.free_register);
             
+            // We need to carefully manage registers here
+            // Strategy: compile table first, then key, ensuring we don't overwrite needed values
+            
+            let table_reg = if ctx.free_register > target {
+                ctx.allocate_register()?
+            } else {
+                target
+            };
+            
+            compile_expression_to_register_with_parent(ctx, table, table_reg, parent)?;
+            
+            // Allocate key register - must be after table register
             let key_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, key, key_reg)?;
+            compile_expression_to_register_with_parent(ctx, key, key_reg, parent)?;
             
             // GETTABLE: R(target) = table[key]
+            eprintln!("DEBUG: Emitting GETTABLE - R({}) = R({})[R({})]", target, table_reg, key_reg);
             ctx.emit(Instruction::create_ABC(
                 OpCode::GetTable,
                 target as u32,
@@ -748,6 +896,9 @@ fn compile_variable_to_register(ctx: &mut CodeGenContext, var: &Variable, target
                 key_reg as u32
             ));
             
+            // Free registers back to just after target
+            // This ensures target retains its value
+            eprintln!("DEBUG: Freeing registers from {} back to {}", ctx.free_register, target + 1);
             ctx.free_registers_to(target + 1);
         }
     }
@@ -757,6 +908,18 @@ fn compile_variable_to_register(ctx: &mut CodeGenContext, var: &Variable, target
 
 /// Compile a binary operation
 fn compile_binary_op(ctx: &mut CodeGenContext, left: &Expression, op: &BinaryOperator, right: &Expression, target: u8) -> LuaResult<()> {
+    compile_binary_op_with_parent(ctx, left, op, right, target, None)
+}
+
+/// Compile a binary operation with parent context
+fn compile_binary_op_with_parent(
+    ctx: &mut CodeGenContext, 
+    left: &Expression, 
+    op: &BinaryOperator, 
+    right: &Expression, 
+    target: u8,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     match op {
         // Arithmetic operations
         BinaryOperator::Add | BinaryOperator::Sub | BinaryOperator::Mul | 
@@ -771,29 +934,47 @@ fn compile_binary_op(ctx: &mut CodeGenContext, left: &Expression, op: &BinaryOpe
                 _ => unreachable!(),
             };
             
-            // Compile operands
-            let left_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, left, left_reg)?;
+            eprintln!("DEBUG: compile_binary_op {:?} - target: {}, free_register: {}", op, target, ctx.free_register);
+            
+            // Compile operands, being careful about register allocation
+            let left_reg = if ctx.free_register > target {
+                ctx.allocate_register()?
+            } else {
+                // If we don't have extra registers, we need to use target for left operand temporarily
+                target
+            };
+            eprintln!("DEBUG: Compiling left operand to register {}", left_reg);
+            compile_expression_to_register_with_parent(ctx, left, left_reg, parent)?;
             
             let right_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, right, right_reg)?;
+            eprintln!("DEBUG: Compiling right operand to register {}", right_reg);
+            compile_expression_to_register_with_parent(ctx, right, right_reg, parent)?;
             
             // Emit operation
+            eprintln!("DEBUG: Emitting {:?} - R({}) = R({}) op R({})", opcode, target, left_reg, right_reg);
             ctx.emit(Instruction::create_ABC(opcode, target as u32, left_reg as u32, right_reg as u32));
             
-            // Free temporary registers
+            // Free temporary registers back to just after target
+            eprintln!("DEBUG: Freeing registers from {} back to {}", ctx.free_register, target + 1);
             ctx.free_registers_to(target + 1);
         }
         
         BinaryOperator::Concat => {
+            eprintln!("DEBUG: compile_binary_op Concat - target: {}, free_register: {}", target, ctx.free_register);
+            
             // Compile operands
-            let left_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, left, left_reg)?;
+            let left_reg = if ctx.free_register > target {
+                ctx.allocate_register()?
+            } else {
+                target
+            };
+            compile_expression_to_register_with_parent(ctx, left, left_reg, parent)?;
             
             let right_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, right, right_reg)?;
+            compile_expression_to_register_with_parent(ctx, right, right_reg, parent)?;
             
             // Emit operation
+            eprintln!("DEBUG: Emitting CONCAT - R({}) = R({})..R({})", target, left_reg, right_reg);
             ctx.emit(Instruction::create_ABC(OpCode::Concat, target as u32, left_reg as u32, right_reg as u32));
             
             // Free temporary registers
@@ -803,7 +984,7 @@ fn compile_binary_op(ctx: &mut CodeGenContext, left: &Expression, op: &BinaryOpe
         BinaryOperator::Or => {
             // Short-circuit OR: if left is true, use left, else use right
             // First compile left operand to target
-            compile_expression_to_register(ctx, left, target)?;
+            compile_expression_to_register_with_parent(ctx, left, target, parent)?;
             
             // TESTSET: if R(target) is truthy, skip next instruction, else R(target) := R(right_reg)
             // We need to compile right first to a temp register
@@ -812,7 +993,7 @@ fn compile_binary_op(ctx: &mut CodeGenContext, left: &Expression, op: &BinaryOpe
             ctx.emit(Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 1)); // C=1 means test for truthy
             
             // Compile right operand to target (only executed if left was falsey)
-            compile_expression_to_register(ctx, right, target)?;
+            compile_expression_to_register_with_parent(ctx, right, target, parent)?;
             
             // Patch the TESTSET instruction
             ctx.current_function.bytecode[skip_pc] = Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 1).0;
@@ -823,28 +1004,34 @@ fn compile_binary_op(ctx: &mut CodeGenContext, left: &Expression, op: &BinaryOpe
         BinaryOperator::And => {
             // Short-circuit AND: if left is false, use left, else use right
             // First compile left operand to target
-            compile_expression_to_register(ctx, left, target)?;
+            compile_expression_to_register_with_parent(ctx, left, target, parent)?;
             
             // TESTSET: if R(target) is falsey, skip next instruction, else R(target) := R(right_reg)
             ctx.emit(Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 0)); // C=0 means test for falsey
             
             // Compile right operand to target (only executed if left was truthy)
-            compile_expression_to_register(ctx, right, target)?;
+            compile_expression_to_register_with_parent(ctx, right, target, parent)?;
             
             ctx.free_registers_to(target + 1);
         }
         
         BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt | 
         BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
+            eprintln!("DEBUG: compile_binary_op comparison {:?} - target: {}, free_register: {}", op, target, ctx.free_register);
+            
             // Comparisons are more complex - they use conditional jumps
             // For now, compile to a boolean result
             
-            // Compile operands
-            let left_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, left, left_reg)?;
+            // Compile operands - being careful not the clobber target prematurely
+            let left_reg = if ctx.free_register > target {
+                ctx.allocate_register()?
+            } else {
+                target
+            };
+            compile_expression_to_register_with_parent(ctx, left, left_reg, parent)?;
             
             let right_reg = ctx.allocate_register()?;
-            compile_expression_to_register(ctx, right, right_reg)?;
+            compile_expression_to_register_with_parent(ctx, right, right_reg, parent)?;
             
             // The comparison instructions work by skipping the next instruction if the test fails
             // So we need to use LOADBOOL with the skip flag
@@ -874,6 +1061,7 @@ fn compile_binary_op(ctx: &mut CodeGenContext, left: &Expression, op: &BinaryOpe
             // Load true
             ctx.emit(Instruction::create_ABC(OpCode::LoadBool, target as u32, 1, 0));
             
+            // Free temporary registers
             ctx.free_registers_to(target + 1);
         }
         
@@ -885,17 +1073,41 @@ fn compile_binary_op(ctx: &mut CodeGenContext, left: &Expression, op: &BinaryOpe
 
 /// Compile a unary operation
 fn compile_unary_op(ctx: &mut CodeGenContext, op: &UnaryOperator, operand: &Expression, target: u8) -> LuaResult<()> {
+    compile_unary_op_with_parent(ctx, op, operand, target, None)
+}
+
+/// Compile a unary operation with parent context
+fn compile_unary_op_with_parent(
+    ctx: &mut CodeGenContext, 
+    op: &UnaryOperator, 
+    operand: &Expression, 
+    target: u8,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     let opcode = match op {
         UnaryOperator::Not => OpCode::Not,
         UnaryOperator::Minus => OpCode::Unm,
         UnaryOperator::Length => OpCode::Len,
     };
     
-    let operand_reg = ctx.allocate_register()?;
-    compile_expression_to_register(ctx, operand, operand_reg)?;
+    eprintln!("DEBUG: compile_unary_op {:?} - target: {}, free_register: {}", op, target, ctx.free_register);
     
+    // Compile operand, being careful about register allocation
+    let operand_reg = if ctx.free_register > target {
+        ctx.allocate_register()?
+    } else {
+        // If no extra registers available, use target temporarily
+        target
+    };
+    
+    eprintln!("DEBUG: Compiling operand to register {}", operand_reg);
+    compile_expression_to_register_with_parent(ctx, operand, operand_reg, parent)?;
+    
+    eprintln!("DEBUG: Emitting {:?} - R({}) = op R({})", opcode, target, operand_reg);
     ctx.emit(Instruction::create_ABC(opcode, target as u32, operand_reg as u32, 0));
     
+    // Free temporary registers back to just after target
+    eprintln!("DEBUG: Freeing registers from {} back to {}", ctx.free_register, target + 1);
     ctx.free_registers_to(target + 1);
     
     Ok(())
@@ -903,42 +1115,111 @@ fn compile_unary_op(ctx: &mut CodeGenContext, op: &UnaryOperator, operand: &Expr
 
 /// Compile a function call
 fn compile_function_call(ctx: &mut CodeGenContext, call: &FunctionCall) -> LuaResult<u8> {
-    // Allocate register for function
-    let func_reg = ctx.allocate_register()?;
-    
-    // Compile function expression
-    compile_expression_to_register(ctx, &call.function, func_reg)?;
-    
-    // Compile arguments
-    let args = match &call.args {
-        CallArgs::Args(exprs) => exprs,
-        _ => return Err(LuaError::NotImplemented("Special call syntax".to_string())),
-    };
-    
-    for arg in args {
-        let arg_reg = ctx.allocate_register()?;
-        compile_expression_to_register(ctx, arg, arg_reg)?;
+    compile_function_call_with_parent(ctx, call, None)
+}
+
+/// Compile a function call with parent context
+fn compile_function_call_with_parent(
+    ctx: &mut CodeGenContext, 
+    call: &FunctionCall,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<u8> {
+    // Check if this is a method call (table:method())
+    if let Some(method_name) = &call.method {
+        // Method call - use SELF instruction
+        
+        // Allocate registers for function and self (must be consecutive)
+        let func_reg = ctx.allocate_register()?;
+        let self_reg = ctx.allocate_register()?; // This should be func_reg + 1
+        
+        debug_assert_eq!(self_reg, func_reg + 1, "SELF requires consecutive registers");
+        
+        // Compile the table expression to get the object
+        compile_expression_to_register_with_parent(ctx, &call.function, func_reg, parent)?;
+        
+        // Create string constant for the method name
+        let method_idx = ctx.add_string(method_name);
+        let method_const = ctx.add_constant(CompilationConstant::String(method_idx))?;
+        
+        // Emit SELF instruction: R(A+1) := R(B); R(A) := R(B)[RK(C)]
+        // This sets R(func_reg) = table[method] and R(func_reg+1) = table
+        ctx.emit(Instruction::create_ABC(
+            OpCode::SelfOp,
+            func_reg as u32,
+            func_reg as u32,  // B is the table register (same as func_reg before SELF)
+            Instruction::encode_constant(method_const),
+        ));
+        
+        // Compile arguments (starting after the implicit self parameter)
+        let args = match &call.args {
+            CallArgs::Args(exprs) => exprs,
+            _ => return Err(LuaError::NotImplemented("Special call syntax".to_string())),
+        };
+        
+        for arg in args {
+            let arg_reg = ctx.allocate_register()?;
+            compile_expression_to_register_with_parent(ctx, arg, arg_reg, parent)?;
+        }
+        
+        // Emit CALL instruction
+        // For method calls, nargs includes the implicit self parameter
+        let nargs = args.len() as u32 + 2; // +1 for function, +1 for self
+        let nresults = 2; // 1 result + 1
+        ctx.emit(Instruction::create_ABC(OpCode::Call, func_reg as u32, nargs, nresults));
+        
+        // Free registers except result
+        ctx.free_registers_to(func_reg + 1);
+        
+        Ok(func_reg)
+    } else {
+        // Regular function call
+        
+        // Allocate register for function
+        let func_reg = ctx.allocate_register()?;
+        
+        // Compile function expression
+        compile_expression_to_register_with_parent(ctx, &call.function, func_reg, parent)?;
+        
+        // Compile arguments
+        let args = match &call.args {
+            CallArgs::Args(exprs) => exprs,
+            _ => return Err(LuaError::NotImplemented("Special call syntax".to_string())),
+        };
+        
+        for arg in args {
+            let arg_reg = ctx.allocate_register()?;
+            compile_expression_to_register_with_parent(ctx, arg, arg_reg, parent)?;
+        }
+        
+        // Emit CALL instruction
+        let nargs = args.len() as u32 + 1; // +1 because B includes the function
+        let nresults = 2; // 1 result + 1
+        ctx.emit(Instruction::create_ABC(OpCode::Call, func_reg as u32, nargs, nresults));
+        
+        // Free registers except result
+        ctx.free_registers_to(func_reg + 1);
+        
+        Ok(func_reg)
     }
-    
-    // Emit CALL instruction
-    let nargs = args.len() as u32 + 1; // +1 because B includes the function
-    let nresults = 2; // 1 result + 1
-    ctx.emit(Instruction::create_ABC(OpCode::Call, func_reg as u32, nargs, nresults));
-    
-    // Free registers except result
-    ctx.free_registers_to(func_reg + 1);
-    
-    Ok(func_reg)
 }
 
 /// Compile return statement
 fn compile_return_statement(ctx: &mut CodeGenContext, expressions: &[Expression]) -> LuaResult<()> {
+    compile_return_statement_with_parent(ctx, expressions, None)
+}
+
+/// Compile return statement with parent context
+fn compile_return_statement_with_parent(
+    ctx: &mut CodeGenContext, 
+    expressions: &[Expression],
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     let base_reg = ctx.free_register;
     
     // Compile return values
     for expr in expressions {
         let reg = ctx.allocate_register()?;
-        compile_expression_to_register(ctx, expr, reg)?;
+        compile_expression_to_register_with_parent(ctx, expr, reg, parent)?;
     }
     
     // Emit RETURN instruction
@@ -956,11 +1237,23 @@ fn compile_if_statement(
     else_ifs: &[(Expression, Block)],
     else_block: &Option<Block>,
 ) -> LuaResult<()> {
+    compile_if_statement_with_parent(ctx, condition, body, else_ifs, else_block, None)
+}
+
+/// Compile if statement with parent context
+fn compile_if_statement_with_parent(
+    ctx: &mut CodeGenContext,
+    condition: &Expression,
+    body: &Block,
+    else_ifs: &[(Expression, Block)],
+    else_block: &Option<Block>,
+    parent: Option<&CodeGenContext>,
+) -> LuaResult<()> {
     let mut jump_to_end = Vec::new();
     
     // Compile main if condition
     let cond_reg = ctx.allocate_register()?;
-    compile_expression_to_register(ctx, condition, cond_reg)?;
+    compile_expression_to_register_with_parent(ctx, condition, cond_reg, parent)?;
     
     // TEST instruction - skip next instruction if false
     ctx.emit(Instruction::create_ABC(OpCode::Test, cond_reg as u32, 0, 1)); // C=1 means skip if false
@@ -970,7 +1263,7 @@ fn compile_if_statement(
     ctx.free_registers_to(cond_reg);
     
     // Compile then body
-    compile_block(ctx, body)?;
+    compile_block_with_parent(ctx, body, parent)?;
     
     // Jump to end
     jump_to_end.push(ctx.current_pc());
@@ -993,11 +1286,21 @@ fn compile_if_statement(
 
 /// Compile while loop
 fn compile_while_loop(ctx: &mut CodeGenContext, condition: &Expression, body: &Block) -> LuaResult<()> {
+    compile_while_loop_with_parent(ctx, condition, body, None)
+}
+
+/// Compile while loop with parent context
+fn compile_while_loop_with_parent(
+    ctx: &mut CodeGenContext, 
+    condition: &Expression, 
+    body: &Block,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     let loop_start = ctx.current_pc();
     
     // Compile condition
     let cond_reg = ctx.allocate_register()?;
-    compile_expression_to_register(ctx, condition, cond_reg)?;
+    compile_expression_to_register_with_parent(ctx, condition, cond_reg, parent)?;
     
     // TEST instruction - skip next instruction if false
     ctx.emit(Instruction::create_ABC(OpCode::Test, cond_reg as u32, 0, 1));
@@ -1007,7 +1310,7 @@ fn compile_while_loop(ctx: &mut CodeGenContext, condition: &Expression, body: &B
     ctx.free_registers_to(cond_reg);
     
     // Compile body
-    compile_block(ctx, body)?;
+    compile_block_with_parent(ctx, body, parent)?;
     
     // Jump back to start
     let jump_offset = -(ctx.current_pc() as i32 - loop_start as i32 + 1);
@@ -1029,6 +1332,19 @@ fn compile_for_loop(
     step: Option<&Expression>,
     body: &Block,
 ) -> LuaResult<()> {
+    compile_for_loop_with_parent(ctx, variable, initial, limit, step, body, None)
+}
+
+/// Compile a numerical for loop with parent context
+fn compile_for_loop_with_parent(
+    ctx: &mut CodeGenContext,
+    variable: &str,
+    initial: &Expression,
+    limit: &Expression,
+    step: Option<&Expression>,
+    body: &Block,
+    parent: Option<&CodeGenContext>,
+) -> LuaResult<()> {
     // For loops use 4 consecutive registers:
     // R(A): internal loop index
     // R(A+1): limit value
@@ -1042,14 +1358,14 @@ fn compile_for_loop(
     let user_var = ctx.allocate_register()?;
     
     // Compile initial value to R(A)
-    compile_expression_to_register(ctx, initial, loop_base)?;
+    compile_expression_to_register_with_parent(ctx, initial, loop_base, parent)?;
     
     // Compile limit to R(A+1)
-    compile_expression_to_register(ctx, limit, loop_base + 1)?;
+    compile_expression_to_register_with_parent(ctx, limit, loop_base + 1, parent)?;
     
     // Compile step to R(A+2) (default to 1 if not specified)
     if let Some(step_expr) = step {
-        compile_expression_to_register(ctx, step_expr, loop_base + 2)?;
+        compile_expression_to_register_with_parent(ctx, step_expr, loop_base + 2, parent)?;
     } else {
         // Load constant 1 as default step
         let const_idx = ctx.add_constant(CompilationConstant::Number(1.0))?;
@@ -1066,7 +1382,7 @@ fn compile_for_loop(
     
     // Compile loop body
     let loop_start = ctx.current_pc();
-    compile_block(ctx, body)?;
+    compile_block_with_parent(ctx, body, parent)?;
     
     // FORLOOP: increment and test
     // Convert to signed i32 first, then apply negation
@@ -1091,15 +1407,35 @@ fn compile_for_loop(
 
 /// Compile a block
 fn compile_block(ctx: &mut CodeGenContext, block: &Block) -> LuaResult<()> {
+    compile_block_with_parent(ctx, block, None)
+}
+
+/// Compile a block with parent context
+fn compile_block_with_parent(
+    ctx: &mut CodeGenContext, 
+    block: &Block,
+    parent: Option<&CodeGenContext>
+) -> LuaResult<()> {
     // TODO: Implement proper scoping
     for statement in &block.statements {
-        compile_statement(ctx, statement)?;
+        compile_statement_with_parent(ctx, statement, parent)?;
     }
     Ok(())
 }
 
 /// Compile a function expression
 fn compile_function_expression(
+    ctx: &mut CodeGenContext,
+    parameters: &[String],
+    is_vararg: bool,
+    body: &Block,
+    target: u8
+) -> LuaResult<()> {
+    compile_function_expression_with_parent(ctx, parameters, is_vararg, body, target)
+}
+
+/// Compile a function expression with proper parent context setup
+fn compile_function_expression_with_parent(
     ctx: &mut CodeGenContext,
     parameters: &[String],
     is_vararg: bool,
@@ -1119,8 +1455,8 @@ fn compile_function_expression(
         child_ctx.add_local(param, reg);
     }
     
-    // Compile the function body
-    compile_block(&mut child_ctx, body)?;
+    // Compile the function body with parent context
+    compile_block_with_parent(&mut child_ctx, body, Some(ctx))?;
     
     // Add implicit return if not present
     if !ends_with_return(&body.statements) {
@@ -1142,8 +1478,18 @@ fn compile_function_expression(
     // Emit CLOSURE instruction to create the function at runtime
     ctx.emit(Instruction::create_ABx(OpCode::Closure, target as u32, const_idx));
     
-    // TODO: Handle upvalues here when upvalue support is implemented
-    // For now, functions without upvalues work fine
+    // Emit instructions to set up upvalues if any
+    let num_upvalues = ctx.current_function.prototypes[proto_idx].upvalues.len();
+    for i in 0..num_upvalues {
+        let upval = ctx.current_function.prototypes[proto_idx].upvalues[i];
+        if upval.in_stack {
+            // MOVE: upvalue refers to a local variable in the enclosing function
+            ctx.emit(Instruction::create_ABC(OpCode::Move, 0, upval.index as u32, 0));
+        } else {
+            // GETUPVAL: upvalue refers to an upvalue in the enclosing function
+            ctx.emit(Instruction::create_ABC(OpCode::GetUpval, 0, upval.index as u32, 0));
+        }
+    }
     
     Ok(())
 }
@@ -1156,14 +1502,125 @@ fn compile_local_function_definition(
     is_vararg: bool,
     body: &Block
 ) -> LuaResult<()> {
+    compile_local_function_definition_with_parent(ctx, name, parameters, is_vararg, body)
+}
+
+/// Compile a local function definition with parent context
+fn compile_local_function_definition_with_parent(
+    ctx: &mut CodeGenContext,
+    name: &str,
+    parameters: &[String],
+    is_vararg: bool,
+    body: &Block
+) -> LuaResult<()> {
     // Allocate a register for the function
     let func_reg = ctx.allocate_register()?;
     
     // Compile the function expression to that register
-    compile_function_expression(ctx, parameters, is_vararg, body, func_reg)?;
+    compile_function_expression_with_parent(ctx, parameters, is_vararg, body, func_reg)?;
     
     // Register the function name as a local variable
     ctx.add_local(name, func_reg);
+    
+    Ok(())
+}
+
+/// Compile a global function definition
+fn compile_function_definition(
+    ctx: &mut CodeGenContext,
+    name: &FunctionName,
+    parameters: &[String],
+    is_vararg: bool,
+    body: &Block
+) -> LuaResult<()> {
+    compile_function_definition_with_parent(ctx, name, parameters, is_vararg, body)
+}
+
+/// Compile a global function definition with parent context
+fn compile_function_definition_with_parent(
+    ctx: &mut CodeGenContext,
+    name: &FunctionName,
+    parameters: &[String],
+    is_vararg: bool,
+    body: &Block
+) -> LuaResult<()> {
+    // First compile the function expression
+    let func_reg = ctx.allocate_register()?;
+    
+    // If it's a method (has : syntax), add 'self' as first parameter
+    let mut params = parameters.to_vec();
+    if name.method.is_some() {
+        params.insert(0, "self".to_string());
+    }
+    
+    compile_function_expression_with_parent(ctx, &params, is_vararg, body, func_reg)?;
+    
+    // Now we need to store it in the right place
+    if name.names.len() == 1 && name.method.is_none() {
+        // Simple global function: function f() end
+        let func_name = &name.names[0];
+        let string_idx = ctx.add_string(func_name);
+        let const_idx = ctx.add_constant(CompilationConstant::String(string_idx))?;
+        
+        ctx.emit(Instruction::create_ABx(OpCode::SetGlobal, func_reg as u32, const_idx));
+    } else {
+        // Table member function: function a.b.c() or a.b:method()
+        
+        // Get the first table - check if it's local or global
+        let first_name = &name.names[0];
+        let mut table_reg = ctx.allocate_register()?;
+        
+        if let Some(local_reg) = ctx.lookup_local(first_name) {
+            // It's a local variable - use MOVE
+            ctx.emit(Instruction::create_ABC(OpCode::Move, table_reg as u32, local_reg as u32, 0));
+        } else {
+            // It's a global variable - use GETGLOBAL
+            let string_idx = ctx.add_string(first_name);
+            let const_idx = ctx.add_constant(CompilationConstant::String(string_idx))?;
+            ctx.emit(Instruction::create_ABx(OpCode::GetGlobal, table_reg as u32, const_idx));
+        }
+        
+        // Navigate through the table chain (a.b.c)
+        for i in 1..name.names.len() {
+            let field_name = &name.names[i];
+            let field_idx = ctx.add_string(field_name);
+            let field_const = ctx.add_constant(CompilationConstant::String(field_idx))?;
+            
+            // Allocate new register for next table
+            let next_reg = ctx.allocate_register()?;
+            
+            // Get the next table: next_reg = table_reg[field]
+            ctx.emit(Instruction::create_ABC(
+                OpCode::GetTable,
+                next_reg as u32,
+                table_reg as u32,
+                Instruction::encode_constant(field_const)
+            ));
+            
+            // Update table_reg to the new register
+            table_reg = next_reg;
+        }
+        
+        // Now set the function in the final table
+        // The field name is either the method name (if method syntax) or would have been handled in the loop
+        if let Some(method) = &name.method {
+            let field_idx = ctx.add_string(method);
+            let field_const = ctx.add_constant(CompilationConstant::String(field_idx))?;
+            
+            // Set table[field] = function
+            ctx.emit(Instruction::create_ABC(
+                OpCode::SetTable,
+                table_reg as u32,
+                Instruction::encode_constant(field_const),
+                func_reg as u32
+            ));
+        }
+        
+        ctx.free_registers_to(table_reg);
+    }
+    
+    // Free function register
+    ctx.free_registers_to(func_reg);
     
     Ok(())
 }
@@ -1246,5 +1703,332 @@ mod tests {
             Instruction(instr).get_opcode() == OpCode::Closure
         });
         assert!(closure_found);
+    }
+    
+    #[test]
+    fn test_global_function_definition() {
+        use super::ast::*;
+        
+        // Test simple global function: function f() return 1 end
+        let mut chunk = Chunk::new();
+        chunk.statements.push(Statement::FunctionDefinition {
+            name: FunctionName {
+                names: vec!["f".to_string()],
+                method: None,
+            },
+            parameters: vec![],
+            is_vararg: false,
+            body: Block {
+                statements: vec![Statement::Return {
+                    expressions: vec![Expression::Number(1.0)],
+                }],
+            },
+        });
+        
+        let output = generate_bytecode(&chunk).unwrap();
+        
+        // Should have a CLOSURE instruction followed by SETGLOBAL
+        let mut found_closure = false;
+        let mut found_setglobal = false;
+        
+        for &instr in &output.main.bytecode {
+            let inst = Instruction(instr);
+            if inst.get_opcode() == OpCode::Closure {
+                found_closure = true;
+            } else if inst.get_opcode() == OpCode::SetGlobal {
+                found_setglobal = true;
+            }
+        }
+        
+        assert!(found_closure, "Should have CLOSURE instruction");
+        assert!(found_setglobal, "Should have SETGLOBAL instruction");
+    }
+    
+    #[test]
+    fn test_method_function_definition() {
+        use super::ast::*;
+        
+        // Test method definition: function obj:method(x) return x end
+        let mut chunk = Chunk::new();
+        chunk.statements.push(Statement::FunctionDefinition {
+            name: FunctionName {
+                names: vec!["obj".to_string()],
+                method: Some("method".to_string()),
+            },
+            parameters: vec!["x".to_string()],
+            is_vararg: false,
+            body: Block {
+                statements: vec![Statement::Return {
+                    expressions: vec![Expression::Variable(Variable::Name("x".to_string()))],
+                }],
+            },
+        });
+        
+        let output = generate_bytecode(&chunk).unwrap();
+        
+        // The compiled function should have 2 parameters (self + x)
+        assert_eq!(output.main.prototypes.len(), 1);
+        assert_eq!(output.main.prototypes[0].num_params, 2);
+        
+        // Should have instructions to get obj, then set method on it
+        let mut found_getglobal = false;
+        let mut found_settable = false;
+        
+        for &instr in &output.main.bytecode {
+            let inst = Instruction(instr);
+            if inst.get_opcode() == OpCode::GetGlobal {
+                found_getglobal = true;
+            } else if inst.get_opcode() == OpCode::SetTable {
+                found_settable = true;
+            }
+        }
+        
+        assert!(found_getglobal, "Should have GETGLOBAL for obj");
+        assert!(found_settable, "Should have SETTABLE for method");
+    }
+    
+    #[test]
+    fn test_method_call_compilation() {
+        use super::ast::*;
+        
+        // Test method call: obj:method(x, y)
+        let mut chunk = Chunk::new();
+        chunk.statements.push(Statement::FunctionCall(FunctionCall {
+            function: Expression::Variable(Variable::Name("obj".to_string())),
+            method: Some("method".to_string()),
+            args: CallArgs::Args(vec![
+                Expression::Variable(Variable::Name("x".to_string())),
+                Expression::Variable(Variable::Name("y".to_string())),
+            ]),
+        }));
+        
+        let output = generate_bytecode(&chunk).unwrap();
+        
+        // Should have GETGLOBAL for obj, GETGLOBAL for x, GETGLOBAL for y,
+        // SELF for method setup, and CALL
+        let mut found_getglobal = 0;
+        let mut found_self = false;
+        let mut found_call = false;
+        
+        for &instr in &output.main.bytecode {
+            let inst = Instruction(instr);
+            match inst.get_opcode() {
+                OpCode::GetGlobal => found_getglobal += 1,
+                OpCode::SelfOp => found_self = true,
+                OpCode::Call => {
+                    found_call = true;
+                    // Check that B (nargs) is 4 (function + self + 2 args)
+                    assert_eq!(inst.get_b(), 4, "CALL should have 4 arguments (func, self, x, y)");
+                }
+                _ => {}
+            }
+        }
+        
+        assert_eq!(found_getglobal, 3, "Should have GETGLOBAL for obj, x, and y");
+        assert!(found_self, "Should have SELF instruction for method call");
+        assert!(found_call, "Should have CALL instruction");
+        
+        // Verify the string "method" is in the string table
+        assert!(output.strings.iter().any(|s| s == "method"), 
+                "Method name should be in string table");
+    }
+    
+    #[test]
+    fn test_regular_vs_method_call() {
+        use super::ast::*;
+        
+        // Test 1: Regular function call obj.method(x)
+        let mut chunk1 = Chunk::new();
+        chunk1.statements.push(Statement::FunctionCall(FunctionCall {
+            function: Expression::Variable(Variable::Member {
+                table: Box::new(Expression::Variable(Variable::Name("obj".to_string()))),
+                field: "method".to_string(),
+            }),
+            method: None,
+            args: CallArgs::Args(vec![
+                Expression::Variable(Variable::Name("x".to_string())),
+            ]),
+        }));
+        
+        let output1 = generate_bytecode(&chunk1).unwrap();
+        
+        // Test 2: Method call obj:method(x)
+        let mut chunk2 = Chunk::new();
+        chunk2.statements.push(Statement::FunctionCall(FunctionCall {
+            function: Expression::Variable(Variable::Name("obj".to_string())),
+            method: Some("method".to_string()),
+            args: CallArgs::Args(vec![
+                Expression::Variable(Variable::Name("x".to_string())),
+            ]),
+        }));
+        
+        let output2 = generate_bytecode(&chunk2).unwrap();
+        
+        // Regular call should have GETTABLE, method call should have SELF
+        let has_gettable = output1.main.bytecode.iter()
+            .any(|&instr| Instruction(instr).get_opcode() == OpCode::GetTable);
+        let has_self = output2.main.bytecode.iter()
+            .any(|&instr| Instruction(instr).get_opcode() == OpCode::SelfOp);
+        
+        assert!(has_gettable, "Regular call should use GETTABLE");
+        assert!(has_self, "Method call should use SELF");
+        assert!(!output1.main.bytecode.iter()
+            .any(|&instr| Instruction(instr).get_opcode() == OpCode::SelfOp),
+            "Regular call should not use SELF");
+        
+        // Check CALL instruction argument counts
+        for &instr in &output1.main.bytecode {
+            let inst = Instruction(instr);
+            if inst.get_opcode() == OpCode::Call {
+                assert_eq!(inst.get_b(), 2, "Regular call should have 2 args (func + x)");
+            }
+        }
+        
+        for &instr in &output2.main.bytecode {
+            let inst = Instruction(instr);
+            if inst.get_opcode() == OpCode::Call {
+                assert_eq!(inst.get_b(), 3, "Method call should have 3 args (func + self + x)");
+            }
+        }
+    }
+    
+    #[test]
+    fn test_nested_table_function_definition() {
+        use super::ast::*;
+        
+        // Test nested table function: function a.b.c.d() return 1 end
+        let mut chunk = Chunk::new();
+        chunk.statements.push(Statement::FunctionDefinition {
+            name: FunctionName {
+                names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                method: Some("d".to_string()),
+            },
+            parameters: vec![],
+            is_vararg: false,
+            body: Block {
+                statements: vec![Statement::Return {
+                    expressions: vec![Expression::Number(1.0)],
+                }],
+            },
+        });
+        
+        let output = generate_bytecode(&chunk).unwrap();
+        
+        // Should have instructions to navigate the table chain
+        let mut found_getglobal = false;
+        let mut gettable_count = 0;
+        let mut found_settable = false;
+        let mut found_closure = false;
+        
+        for &instr in &output.main.bytecode {
+            let inst = Instruction(instr);
+            match inst.get_opcode() {
+                OpCode::GetGlobal => found_getglobal = true,
+                OpCode::GetTable => gettable_count += 1,
+                OpCode::SetTable => found_settable = true,
+                OpCode::Closure => found_closure = true,
+                _ => {}
+            }
+        }
+        
+        assert!(found_getglobal, "Should have GETGLOBAL for 'a'");
+        assert_eq!(gettable_count, 2, "Should have 2 GETTABLE instructions for b and c");
+        assert!(found_closure, "Should have CLOSURE instruction");
+        assert!(found_settable, "Should have SETTABLE for method 'd'");
+    }
+    
+    #[test]
+    fn test_method_call_register_layout() {
+        use super::ast::*;
+        
+        // Test that method calls set up registers correctly: obj:method(x)
+        let mut chunk = Chunk::new();
+        chunk.statements.push(Statement::FunctionCall(FunctionCall {
+            function: Expression::Variable(Variable::Name("obj".to_string())),
+            method: Some("method".to_string()),
+            args: CallArgs::Args(vec![
+                Expression::Variable(Variable::Name("x".to_string())),
+            ]),
+        }));
+        
+        let output = generate_bytecode(&chunk).unwrap();
+        
+        // Find SELF and CALL instructions
+        let mut self_instr = None;
+        let mut call_instr = None;
+        
+        for (i, &instr) in output.main.bytecode.iter().enumerate() {
+            let inst = Instruction(instr);
+            match inst.get_opcode() {
+                OpCode::SelfOp => self_instr = Some((i, inst)),
+                OpCode::Call => call_instr = Some((i, inst)),
+                _ => {}
+            }
+        }
+        
+        assert!(self_instr.is_some(), "Should have SELF instruction");
+        assert!(call_instr.is_some(), "Should have CALL instruction");
+        
+        // Verify SELF instruction setup
+        let (_, self_inst) = self_instr.unwrap();
+        let self_a = self_inst.get_a();
+        let self_b = self_inst.get_b();
+        
+        // SELF should use same register for A and B (the table)
+        assert_eq!(self_a, self_b, "SELF should use same register for table");
+        
+        // Verify CALL instruction has correct argument count
+        let (_, call_inst) = call_instr.unwrap();
+        let call_a = call_inst.get_a();
+        let call_b = call_inst.get_b();
+        
+        // CALL A should match SELF A (function register)
+        assert_eq!(call_a, self_a, "CALL should use same base register as SELF");
+        
+        // CALL B should be 3 (function + self + 1 arg)
+        assert_eq!(call_b, 3, "CALL should have 3 arguments total");
+    }
+    
+    #[test]
+    fn test_simple_global_function_registers() {
+        use super::ast::*;
+        
+        // Test that simple global functions use minimal registers
+        let mut chunk = Chunk::new();
+        chunk.statements.push(Statement::FunctionDefinition {
+            name: FunctionName {
+                names: vec!["add".to_string()],
+                method: None,
+            },
+            parameters: vec!["a".to_string(), "b".to_string()],
+            is_vararg: false,
+            body: Block {
+                statements: vec![Statement::Return {
+                    expressions: vec![Expression::BinaryOp {
+                        left: Box::new(Expression::Variable(Variable::Name("a".to_string()))),
+                        operator: BinaryOperator::Add,
+                        right: Box::new(Expression::Variable(Variable::Name("b".to_string()))),
+                    }],
+                }],
+            },
+        });
+        
+        let output = generate_bytecode(&chunk).unwrap();
+        
+        // Should have CLOSURE followed by SETGLOBAL
+        let mut found_sequence = false;
+        for i in 0..output.main.bytecode.len()-1 {
+            let inst1 = Instruction(output.main.bytecode[i]);
+            let inst2 = Instruction(output.main.bytecode[i+1]);
+            
+            if inst1.get_opcode() == OpCode::Closure && inst2.get_opcode() == OpCode::SetGlobal {
+                // Both should use the same register
+                assert_eq!(inst1.get_a(), inst2.get_a(), "CLOSURE and SETGLOBAL should use same register");
+                found_sequence = true;
+                break;
+            }
+        }
+        
+        assert!(found_sequence, "Should have CLOSURE immediately followed by SETGLOBAL");
     }
 }
