@@ -49,13 +49,18 @@ A proper string interning system has been implemented that ensures:
 - ✅ Stack and call frame management with proper stack growth
 - ✅ Basic opcodes: MOVE, LOADK, LOADBOOL, LOADNIL
 - ✅ Table operations: NEWTABLE, GETTABLE, SETTABLE
+- ✅ Table array initialization with SETLIST
 - ✅ Arithmetic operations: ADD, SUB, MUL, DIV, MOD, POW, UNM
 - ✅ String operations: CONCAT
+- ✅ String type operations and conversions
 - ✅ Control flow: JMP, TEST, TESTSET
-- ✅ Numerical for loops: FORPREP, FORLOOP
 - ✅ Function calls: CALL, RETURN (both global and local functions)
 - ✅ Method calls with proper self parameter handling
+- ✅ Tail calls (TAILCALL) for optimized recursion
+- ✅ Variable argument functions (VARARG opcode)
 - ✅ Basic upvalue support: GETUPVAL, SETUPVAL, CLOSURE, CLOSE
+- ✅ Closures with proper upvalue capturing
+- ✅ Basic metatable mechanism (__index metamethod)
 - ✅ Safe execution via transaction system
 - ✅ String interning with content-based comparison
 - ✅ Table operations with proper string key handling
@@ -66,14 +71,15 @@ A proper string interning system has been implemented that ensures:
 
 ### Partially Implemented Features
 
+- ⚠️ Numerical for loops: FORPREP, FORLOOP (still has issues with step register handling)
 - ⚠️ Table manipulation: table.insert, table.remove, etc.
 - ⚠️ Metamethod support: Basic table metamethods
+- ⚠️ TFORLOOP opcode for generic iteration
 - ⚠️ Standard library: Partial implementation of base, string, table libraries
 
 ### Not Yet Implemented
 
-- ❌ Generic FOR loops (for k,v in pairs())
-- ❌ TFORLOOP opcode for generic iteration
+- ❌ Generic FOR loops (for k,v in pairs()) - The infrastructure exists but reliability issues remain
 - ❌ Complete metamethod support
 - ❌ Coroutines
 - ❌ Complete standard library implementation
@@ -82,49 +88,55 @@ A proper string interning system has been implemented that ensures:
 
 ### Recent Improvements
 
-1. **String Interning Fix**: The string interning system now properly deduplicates strings based on content, ensuring that identical string literals get the same handle. This fixed issues with global table lookups where function names weren't being found.
+1. **TAILCALL Implementation**: Added full support for tail call optimization, allowing recursive functions that don't grow the stack. This implementation correctly reuses the current stack frame, closes any required upvalues, and handles call result propagation according to the Lua 5.1 specification.
 
-2. **Table Key Handling**: Tables now correctly handle string keys with proper content-based hash calculation and equality comparison. This ensures that table field access works correctly with string keys.
+2. **VARARG Opcode Support**: Implemented the VARARG opcode for handling variable argument functions. The implementation correctly handles both explicit argument count (B > 0) and "all varargs" mode (B = 0).
 
-3. **Standard Library Registration**: Basic standard library functions are now properly registered in the global table and accessible from Lua scripts. Functions like `print`, `type`, `tostring`, `tonumber`, and `assert` are working correctly.
+3. **SETLIST Implementation**: Added support for bulk array initialization with the SETLIST opcode. This allows efficient table array initialization, properly handling the FPF (Fields Per Flush) constant from Lua 5.1.
 
-4. **Stack Growth Implementation**: Fixed the critical "No active call frame" error by implementing proper dynamic stack growth. The VM now automatically grows the stack when needed, allowing deep recursive calls and complex nested function invocations. This improvement includes:
-   - Dynamic stack resizing when approaching capacity
-   - Proper call frame adjustment after stack growth
-   - Safe handling of stack references during reallocation
-   - Support for arbitrarily deep recursion (tested with 1000+ levels)
+4. **Improved Metatable Support**: Enhanced the implementation of the __index metamethod, allowing tables to properly inherit properties from their metatables.
 
-5. **Improved Return Value Processing**: Enhanced the `process_return` function to better manage stack state during function returns, including proper handling of multiple return values and stack cleanup.
+5. **String Handling Improvements**: Enhanced string concatenation (CONCAT opcode) with proper memory management and type conversion, and improved the string interning system to ensure consistent handles for identical strings.
 
 ### Known Issues
 
-1. **Complex Dynamic String Operations**: Tests with extensive dynamic string operations may cause infinite loops
-2. **Metamethod Recursion**: No protection against infinite metamethod recursion
-3. **Memory Management**: No proper garbage collection yet
-4. **Standard Library Gaps**: Many standard library functions are defined but incomplete
+1. **For Loop Register Corruption**: Numeric for loops (FORPREP/FORLOOP) have issues with register handling, particularly with the step register becoming nil during execution.
+
+2. **TFORLOOP Reliability**: While implemented, TFORLOOP (generic for loops) has reliability issues with complex iteration.
+
+3. **Metamethod Recursion**: No protection against infinite metamethod recursion.
+
+4. **Memory Management**: No proper garbage collection yet.
+
+5. **Standard Library Gaps**: Many standard library functions are defined but incomplete.
 
 ## Testing Status
 
-The implementation passes basic tests including:
-- Simple arithmetic and control flow
-- Basic table creation and manipulation  
-- Simple functions and closures
-- Standard library function calls
-- String interning and table key access
-- Method calls with self parameter
-- Deep recursive functions (1000+ levels)
-- Complex nested function calls
+Our testing confirms that the implementation successfully handles:
+- ✅ Simple arithmetic and control flow
+- ✅ Table creation, access and manipulation
+- ✅ String operations (concatenation, type conversion)
+- ✅ Function definition and calls
+- ✅ Closure creation with proper upvalue handling
+- ✅ Method calls with self parameter
+- ✅ Tail calls and recursion
+- ✅ Variable argument functions
+- ✅ Basic metamethod functionality (__index)
 
-More complex tests involving generic iteration and metamethods are still failing.
+However, the following still have issues:
+- ❌ Numeric for loops (register corruption issues)
+- ❌ Generic for loops with pairs/ipairs (unreliable)
+- ❌ Complex metamethod chains
 
 ## Next Steps
 
-1. Implement generic FOR loops (TFORLOOP)
-2. Enhance metamethod support
-3. Add proper error handling with traceback
-4. Extend standard library coverage
-5. Implement memory management/garbage collection
-6. Add coroutine support
+1. Fix the for loop register corruption issues
+2. Complete and stabilize TFORLOOP implementation
+3. Enhance metamethod support
+4. Add proper error handling with traceback
+5. Extend standard library coverage
+6. Implement memory management/garbage collection
+7. Add coroutine support
 
 ## Implementation Approach
 
@@ -136,6 +148,7 @@ The implementation follows these key patterns:
 4. **Two-Phase Borrowing**: Complex operations that need multiple borrows use a two-phase approach
 5. **String Interning**: All string creation goes through a deduplication system to ensure content-based equality
 6. **Dynamic Stack Management**: Stack automatically grows as needed to support deep recursion and complex call patterns
+7. **Strict Register Allocation**: Register allocation carefully follows Lua 5.1 specification to avoid corruption
 
 ## Bytecode Compatibility
 

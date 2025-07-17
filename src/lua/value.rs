@@ -316,6 +316,13 @@ impl Table {
             self.array[index - 1] = value;
         } else if index == self.array.len() + 1 {
             self.array.push(value);
+        } else if index > self.array.len() + 1 {
+            // When setting an index beyond the current array length + 1,
+            // we need to fill the gaps with nil values
+            while self.array.len() < index - 1 {
+                self.array.push(Value::Nil);
+            }
+            self.array.push(value);
         }
         // Otherwise, fall back to hash part
     }

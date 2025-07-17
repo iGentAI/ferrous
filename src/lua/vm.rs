@@ -75,6 +75,31 @@ pub enum PendingOperation {
         /// Target register offset
         offset: usize,
     },
+    
+    /// TFORLOOP continuation after iterator function returns
+    TForLoopContinuation {
+        /// Base register
+        base: usize,
+        /// A field from instruction
+        a: usize,
+        /// C field from instruction (result count)
+        c: usize,
+        /// PC value of the TFORLOOP instruction for loop back
+        pc_before_tforloop: usize,
+    },
+    
+    /// Tail call operation
+    TailCall {
+        /// Function position on stack
+        func_index: usize,
+        /// Number of arguments
+        nargs: usize,
+    },
+    
+    /// Complete a tail call to a C function
+    /// This is needed because C functions don't update the PC directly,
+    /// so we need to handle their return values specially.
+    TailCallReturn,
 }
 
 /// Context for tracking where to return results
@@ -782,13 +807,20 @@ impl LuaVM {
             OpCode::Test => Self::op_test(&mut tx, inst, base, current_thread),
             OpCode::TestSet => Self::op_testset(&mut tx, inst, base, current_thread),
             OpCode::Call => Self::op_call(&mut tx, inst, base, current_thread),
+            OpCode::TailCall => Self::op_tailcall(&mut tx, inst, base, current_thread),
             OpCode::Return => Self::op_return(&mut tx, inst, base, current_thread),
             OpCode::ForPrep => Self::op_forprep(&mut tx, inst, base, current_thread),
-            OpCode::ForLoop => Self::op_forloop(&mut tx, inst, base, current_thread),
+            OpCode::ForLoop => {
+                eprintln!("DEBUG step(): Executing FORLOOP opcode");
+                Self::op_forloop(&mut tx, inst, base, current_thread)
+            },
+            OpCode::TForLoop => Self::op_tforloop(&mut tx, inst, base, current_thread),
+            OpCode::VarArg => Self::op_vararg(&mut tx, inst, base, current_thread),
             OpCode::GetUpval => Self::op_getupval(&mut tx, inst, base, current_thread),
             OpCode::SetUpval => Self::op_setupval(&mut tx, inst, base, current_thread),
             OpCode::Closure => Self::op_closure(&mut tx, inst, base, current_thread),
             OpCode::Close => Self::op_close(&mut tx, inst, base, current_thread),
+            OpCode::SetList => Self::op_setlist(&mut tx, inst, base, current_thread),
             _ => Err(LuaError::NotImplemented(format!(
                 "Opcode {:?}",
                 inst.get_opcode()
@@ -832,6 +864,33 @@ impl LuaVM {
                 self.process_c_function_call(function, base, nargs, expected_results)
             }
             PendingOperation::Return { values } => {
+                self.process_return(values)
+            }
+            PendingOperation::TForLoopContinuation { base, a, c, pc_before_tforloop } => {
+                self.process_tforloop_continuation(base, a, c, pc_before_tforloop)
+            }
+            PendingOperation::TailCall { func_index, nargs } => {
+                self.process_tail_call(func_index, nargs)
+            }
+            PendingOperation::TailCallReturn => {
+                // For tail calls to C functions, we need to propagate the return values
+                // We can collect the values from the stack and return them
+                let mut tx = HeapTransaction::new(&mut self.heap);
+                let frame = tx.get_current_frame(self.current_thread)?;
+                let base = frame.base_register as usize;
+                
+                // Collect all values from the call's base to the stack top
+                let mut values = Vec::new();
+                let top = tx.get_stack_top(self.current_thread)?;
+                
+                for i in base..=top {
+                    let value = tx.read_register(self.current_thread, i)?;
+                    values.push(value);
+                }
+                
+                tx.commit()?;
+                
+                // Return the values
                 self.process_return(values)
             }
             _ => Err(LuaError::NotImplemented(format!(
@@ -1108,6 +1167,232 @@ impl LuaVM {
         }
         
         // Commit and continue
+        let pending = tx.commit()?;
+        for op in pending {
+            self.operation_queue.push_back(op);
+        }
+        
+        Ok(StepResult::Continue)
+    }
+    
+    /// Process TFORLOOP continuation after iterator function returns
+    /// 
+    /// This handles the iterator protocol after the iterator function has returned.
+    /// If the first result is not nil, it updates the control variable and jumps
+    /// back to continue the loop. If the first result is nil, it skips to the
+    /// instruction after the JMP that follows the TFORLOOP.
+    fn process_tforloop_continuation(
+        &mut self,
+        base: usize,
+        a: usize,
+        c: usize,
+        pc_before_tforloop: usize,
+    ) -> LuaResult<StepResult> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        
+        eprintln!("DEBUG process_tforloop_continuation: base={}, a={}, c={}, pc_before_tforloop={}",
+                 base, a, c, pc_before_tforloop);
+        
+        // First result will be at R(A+3)
+        let first_result_idx = base + a + 3;
+        
+        // Read first result (nil means iterator is done)
+        let first_result = tx.read_register(self.current_thread, first_result_idx)?;
+        
+        eprintln!("DEBUG process_tforloop_continuation: First result: {:?}", first_result);
+        
+        if !first_result.is_nil() {
+            // Continue iteration - copy first result to control variable
+            let control_var_idx = base + a + 2;
+            eprintln!("DEBUG process_tforloop_continuation: Updating control variable at R({}) = {:?}", 
+                     control_var_idx, first_result);
+            
+            tx.set_register(self.current_thread, control_var_idx, first_result)?;
+            
+            // Get the current frame to check the current PC
+            let frame = tx.get_current_frame(self.current_thread)?;
+            
+            // In Lua, TFORLOOP is normally followed by a JMP instruction that jumps back
+            // to the start of the loop. When the iteration continues, we want the JMP to
+            // execute so the loop body runs again.
+            
+            // We need to keep the current PC as is since execution will naturally
+            // continue to the JMP instruction after this operation
+
+            let pending = tx.commit()?;
+            for op in pending {
+                self.operation_queue.push_back(op);
+            }
+            
+            Ok(StepResult::Continue)
+        } else {
+            // Iterator is done - TFORLOOP spec says to skip next instruction in this case,
+            // which would be the JMP instruction that loops back.
+            
+            // Get current PC
+            let pc = tx.get_pc(self.current_thread)?;
+            
+            eprintln!("DEBUG process_tforloop_continuation: Iterator done, current PC: {}, skipping to PC {}", 
+                     pc, pc + 1);
+            
+            // Skip the JMP instruction
+            tx.set_pc(self.current_thread, pc + 1)?;
+            
+            let pending = tx.commit()?;
+            for op in pending {
+                self.operation_queue.push_back(op);
+            }
+            
+            Ok(StepResult::Continue)
+        }
+    }
+    
+    /// Process a tail call operation
+    /// 
+    /// Tail calls are a critical optimization for recursive functions, allowing
+    /// them to run without consuming additional stack space. Instead of creating
+    /// a new stack frame, we reuse the current one.
+    fn process_tail_call(
+        &mut self,
+        func_index: usize,
+        nargs: usize,
+    ) -> LuaResult<StepResult> {
+        let mut tx = HeapTransaction::new(&mut self.heap);
+        
+        eprintln!("DEBUG process_tail_call: func_index={}, nargs={}", func_index, nargs);
+        
+        // Get function and current frame information
+        let func_value = tx.read_register(self.current_thread, func_index)?;
+        let frame = tx.get_current_frame(self.current_thread)?;
+        let frame_base = frame.base_register as usize;
+        
+        // Save expected_results to maintain across frame reuse
+        let expected_results = frame.expected_results;
+        
+        eprintln!("DEBUG process_tail_call: Function type: {}, current frame base: {}", 
+                 func_value.type_name(), frame_base);
+        
+        // Critically important: close upvalues before we overwrite the stack
+        // This ensures any locals captured by upvalues have their values preserved
+        tx.close_thread_upvalues(self.current_thread, frame_base)?;
+        
+        // For tail calls, we need to move the function and arguments to the beginning
+        // of the current frame, replacing the current function
+        
+        // The destination is actually one position before the current base
+        // This is where the function being called is stored in Lua's calling convention
+        let dest_base = frame_base - 1; 
+        
+        eprintln!("DEBUG process_tail_call: Moving function and args to position {}", dest_base);
+        
+        // Move function to its new position
+        if dest_base != func_index {
+            tx.set_register(self.current_thread, dest_base, func_value.clone())?;
+        }
+        
+        // Move arguments to their new positions
+        for i in 0..nargs {
+            let src = func_index + 1 + i;  // Argument position
+            let dst = dest_base + 1 + i;   // New position (after function)
+            
+            if src != dst {  // Avoid unnecessary moves
+                let arg = tx.read_register(self.current_thread, src)?;
+                tx.set_register(self.current_thread, dst, arg)?;
+            }
+        }
+        
+        // Handle based on function type
+        match func_value {
+            Value::Closure(closure_handle) => {
+                // Get closure details
+                let closure = tx.get_closure(closure_handle)?;
+                let num_params = closure.proto.num_params as usize;
+                let is_vararg = closure.proto.is_vararg;
+                let max_stack = closure.proto.max_stack_size as usize;
+                
+                eprintln!("DEBUG process_tail_call: Closure expecting {} params, is_vararg={}", 
+                         num_params, is_vararg);
+                
+                // Handle parameter count mismatch
+                if nargs < num_params {
+                    // Fill missing parameters with nil
+                    for i in nargs..num_params {
+                        tx.set_register(self.current_thread, dest_base + 1 + i, Value::Nil)?;
+                    }
+                }
+                
+                // Handle varargs if needed
+                let varargs = if is_vararg && nargs > num_params {
+                    // Collect varargs
+                    let mut va = Vec::new();
+                    for i in num_params..nargs {
+                        let arg = tx.read_register(self.current_thread, dest_base + 1 + i)?;
+                        va.push(arg);
+                    }
+                    Some(va)
+                } else {
+                    None
+                };
+                
+                // Ensure we have enough stack space
+                let needed_size = dest_base + 1 + max_stack;
+                tx.grow_stack(self.current_thread, needed_size)?;
+                
+                // Update current frame to call the new function
+                // Pop the frame from call_frames
+                tx.pop_call_frame(self.current_thread)?;
+                
+                // Create a new frame for the tail-called function
+                let new_frame = CallFrame {
+                    closure: closure_handle,
+                    pc: 0,  // Start at the beginning of the new function
+                    base_register: (dest_base + 1) as u16,  // Base is after function
+                    expected_results,  // Preserve expected results from caller
+                    varargs,  // Pass collected varargs if any
+                };
+                
+                // Push the new frame
+                tx.push_call_frame(self.current_thread, new_frame)?;
+                
+                eprintln!("DEBUG process_tail_call: Created new frame with base_register={}", 
+                         dest_base + 1);
+            },
+            Value::CFunction(cfunc) => {
+                // For C functions, we can't reuse the frame directly
+                // Queue a normal C function call and pop the current frame
+                
+                eprintln!("DEBUG process_tail_call: Handling C function tail call");
+                
+                // Pop current frame since it won't be reused for C functions
+                tx.pop_call_frame(self.current_thread)?;
+                
+                // Convert expected results to form used by CFunctionCall
+                let expected = match expected_results {
+                    Some(n) => n as i32,
+                    None => -1  // Multiple results
+                };
+                
+                // Queue C function call
+                tx.queue_operation(PendingOperation::CFunctionCall {
+                    function: cfunc,
+                    base: dest_base as u16,
+                    nargs,
+                    expected_results: expected,
+                })?;
+                
+                // Queue a return operation for after the C function call
+                // This is needed because C functions don't update PC directly
+                tx.queue_operation(PendingOperation::TailCallReturn)?;
+            },
+            _ => {
+                return Err(LuaError::TypeError {
+                    expected: "function".to_string(),
+                    got: func_value.type_name().to_string(),
+                });
+            }
+        }
+        
+        // Commit the transaction
         let pending = tx.commit()?;
         for op in pending {
             self.operation_queue.push_back(op);
@@ -1857,6 +2142,56 @@ impl LuaVM {
         Ok(())
     }
     
+    /// TAILCALL: return R(A)(R(A+1), ..., R(A+B-1))
+    /// 
+    /// This performs a tail call - a function call that reuses the current stack frame.
+    /// Tail calls are a critical optimization in Lua that enables proper recursion without stack growth.
+    fn op_tailcall(
+        tx: &mut HeapTransaction,
+        inst: Instruction,
+        base: u16,
+        current_thread: ThreadHandle
+    ) -> LuaResult<()> {
+        let a = inst.get_a() as usize;
+        let b = inst.get_b();
+        
+        eprintln!("DEBUG TAILCALL: A={}, B={}, base={}", a, b, base);
+        
+        // Get function from register
+        let func_abs = base as usize + a;
+        let func = tx.read_register(current_thread, func_abs)?;
+        
+        eprintln!("DEBUG TAILCALL: Function at register R({}) = {:?}", func_abs, func);
+        
+        // Determine number of arguments (same logic as CALL)
+        let nargs = if b == 0 {
+            // Use all values up to stack top
+            let stack_top = tx.get_stack_top(current_thread)?;
+            eprintln!("DEBUG TAILCALL: Using all values, stack_top: {}, func_abs: {}", stack_top, func_abs);
+            stack_top - func_abs - 1  // Subtract function position
+        } else {
+            (b - 1) as usize  // B includes the function itself, so subtract 1
+        };
+        
+        eprintln!("DEBUG TAILCALL: Number of arguments: {}", nargs);
+        
+        // Log each argument for debugging
+        for i in 0..nargs {
+            let arg_pos = func_abs + 1 + i;
+            if let Ok(arg) = tx.read_register(current_thread, arg_pos) {
+                eprintln!("DEBUG TAILCALL: Argument {} at position {} = {:?}", i, arg_pos, arg);
+            }
+        }
+        
+        // Queue the tail call (will be handled by process_tail_call)
+        tx.queue_operation(PendingOperation::TailCall {
+            func_index: func_abs,
+            nargs,
+        })?;
+        
+        Ok(())
+    }
+    
     /// RETURN: return R(A), ... ,R(A+B-2)
     fn op_return(tx: &mut HeapTransaction, inst: Instruction, base: u16, current_thread: ThreadHandle) -> LuaResult<()> {
         let a = inst.get_a() as usize;
@@ -2133,111 +2468,497 @@ impl LuaVM {
     }
     
     /// FORPREP: R(A)-=R(A+2); pc+=sBx
+    /// Prepares for a numeric for loop by subtracting step from initial and checking if the loop should run
     fn op_forprep(tx: &mut HeapTransaction, inst: Instruction, base: u16, current_thread: ThreadHandle) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let sbx = inst.get_sbx();
         
-        // Get the three values: initial, limit, step
-        let initial = tx.read_register(current_thread, base as usize + a)?;
-        let limit = tx.read_register(current_thread, base as usize + a + 1)?;
-        let step = tx.read_register(current_thread, base as usize + a + 2)?;
+        let loop_base = base as usize + a;
         
-        // All values must be numbers
-        let initial_num = match initial {
-            Value::Number(n) => n,
+        // Ensure stack space for all loop registers
+        tx.grow_stack(current_thread, loop_base + 4)?;  // Need 4 registers
+        
+        eprintln!("DEBUG FORPREP: A={}, sbx={}, base={}, loop_base={}", a, sbx, base, loop_base);
+        
+        // Get the three values with detailed logging
+        eprintln!("DEBUG FORPREP: Reading initial at position {}", loop_base);
+        let initial = tx.read_register(current_thread, loop_base)?;
+        eprintln!("DEBUG FORPREP: Initial value: {:?}", initial);
+        
+        eprintln!("DEBUG FORPREP: Reading limit at position {}", loop_base + 1);
+        let limit = tx.read_register(current_thread, loop_base + 1)?;
+        eprintln!("DEBUG FORPREP: Limit value: {:?}", limit);
+        
+        eprintln!("DEBUG FORPREP: Reading step at position {}", loop_base + 2);
+        let step = tx.read_register(current_thread, loop_base + 2)?;
+        eprintln!("DEBUG FORPREP: Step value: {:?}", step);
+        
+        // Convert to numbers with error handling
+        let initial_num = match &initial {
+            Value::Number(n) => *n,
             _ => return Err(LuaError::TypeError {
                 expected: "number".to_string(),
-                got: initial.type_name().to_string(),
+                got: format!("for initial value: {}", initial.type_name()),
             }),
         };
         
-        let limit_num = match limit {
-            Value::Number(n) => n,
+        let limit_num = match &limit {
+            Value::Number(n) => *n,
             _ => return Err(LuaError::TypeError {
                 expected: "number".to_string(),
-                got: limit.type_name().to_string(),
+                got: format!("for limit value: {}", limit.type_name()),
             }),
         };
         
-        let step_num = match step {
-            Value::Number(n) => n,
+        // Critical: Ensure step exists, providing default if needed
+        let step_num = match &step {
+            Value::Number(n) => *n,
+            Value::Nil => {
+                eprintln!("DEBUG FORPREP: Step is nil, initializing with default 1.0");
+                let default_step = Value::Number(1.0);
+                tx.set_register(current_thread, loop_base + 2, default_step.clone())?;
+                1.0  // Use 1.0 for calculations
+            },
             _ => return Err(LuaError::TypeError {
                 expected: "number".to_string(),
-                got: step.type_name().to_string(),
+                got: format!("for step value: {}", step.type_name()),
             }),
         };
         
-        // Check for invalid step
+        // Ensure step is not zero
         if step_num == 0.0 {
-            return Err(LuaError::RuntimeError("for loop step is zero".to_string()));
+            return Err(LuaError::RuntimeError("for loop step must be different from 0".to_string()));
         }
         
-        // Prepare loop: subtract step from initial value
+        // Per Lua 5.1 spec: Subtract step from initial counter 
         let prepared_initial = initial_num - step_num;
-        tx.set_register(current_thread, base as usize + a, Value::Number(prepared_initial))?;
+        eprintln!("DEBUG FORPREP: Prepared initial value = {}", prepared_initial);
+        tx.set_register(current_thread, loop_base, Value::Number(prepared_initial))?;
         
         // Check if loop should run at all
         let should_run = if step_num > 0.0 {
-            prepared_initial + step_num <= limit_num
+            prepared_initial + step_num <= limit_num // For positive step
         } else {
-            prepared_initial + step_num >= limit_num
+            prepared_initial + step_num >= limit_num // For negative step
         };
+        
+        eprintln!("DEBUG FORPREP: Loop should run: {}", should_run);
         
         if !should_run {
             // Skip the loop entirely
             let pc = tx.get_pc(current_thread)?;
             let new_pc = (pc as i32 + sbx) as usize;
+            eprintln!("DEBUG FORPREP: Loop will not run, jumping to PC={}", new_pc);
             tx.set_pc(current_thread, new_pc)?;
+        } else {
+            eprintln!("DEBUG FORPREP: Loop will run, continuing to next instruction");
+        }
+        
+        // Additional validation for debugging
+        eprintln!("DEBUG FORPREP: Verifying step after setup");
+        let verify_step = tx.read_register(current_thread, loop_base + 2)?;
+        eprintln!("DEBUG FORPREP: Step is now: {:?}", verify_step);
+        
+        Ok(())
+    }
+    
+    /// FORLOOP: R(A)+=R(A+2); if R(A) <?= R(A+1) then { R(A+3)=R(A); pc-=sBx }
+    /// Increments the loop variable and tests if the loop should continue
+    fn op_forloop(tx: &mut HeapTransaction, inst: Instruction, base: u16, current_thread: ThreadHandle) -> LuaResult<()> {
+        let a = inst.get_a() as usize;
+        let sbx = inst.get_sbx();
+        
+        let loop_base = base as usize + a;
+        
+        eprintln!("DEBUG FORLOOP [START]: A={}, sbx={}, base={}, loop_base={}", a, sbx, base, loop_base);
+        
+        // CRITICAL: Ensure stack has space for all loop registers
+        tx.grow_stack(current_thread, loop_base + 4)?;  // Ensure space for all 4 loop registers
+        
+        // Dump the full register state for debugging
+        eprintln!("DEBUG FORLOOP [REGISTERS]:");
+        for i in 0..10 {
+            let abs_index = loop_base + i;
+            match tx.read_register(current_thread, abs_index) {
+                Ok(val) => eprintln!("  Register R({}) = {:?}", abs_index, val),
+                Err(e) => eprintln!("  Register R({}) = Error: {}", abs_index, e),
+            }
+        }
+        
+        // Step 1: Read the internal counter value
+        eprintln!("DEBUG FORLOOP [STEP 1]: Reading internal counter at R({})", loop_base);
+        let loop_var = match tx.read_register(current_thread, loop_base) {
+            Ok(val) => val,
+            Err(e) => {
+                eprintln!("DEBUG FORLOOP [ERROR]: Failed to read counter: {}", e);
+                return Err(e);
+            }
+        };
+        eprintln!("DEBUG FORLOOP [STEP 1]: Internal counter = {:?}", loop_var);
+        
+        // Step 2: Read the limit value
+        eprintln!("DEBUG FORLOOP [STEP 2]: Reading limit at R({})", loop_base + 1);
+        let limit = match tx.read_register(current_thread, loop_base + 1) {
+            Ok(val) => val,
+            Err(e) => {
+                eprintln!("DEBUG FORLOOP [ERROR]: Failed to read limit: {}", e);
+                return Err(e);
+            }
+        };
+        eprintln!("DEBUG FORLOOP [STEP 2]: Limit = {:?}", limit);
+        
+        // Step 3: Read the step value
+        eprintln!("DEBUG FORLOOP [STEP 3]: Reading step at R({})", loop_base + 2);
+        let step = match tx.read_register(current_thread, loop_base + 2) {
+            Ok(val) => val,
+            Err(e) => {
+                eprintln!("DEBUG FORLOOP [ERROR]: Failed to read step: {}", e);
+                return Err(e);
+            }
+        };
+        eprintln!("DEBUG FORLOOP [STEP 3]: Step = {:?}", step);
+        
+        // Step 4: Convert values to numbers (with specific type error messages)
+        let loop_num = match &loop_var {
+            Value::Number(n) => *n,
+            _ => {
+                let error_msg = format!("for loop variable is not a number (got: {})", loop_var.type_name());
+                eprintln!("DEBUG FORLOOP [ERROR]: {}", error_msg);
+                return Err(LuaError::TypeError {
+                    expected: "number".to_string(),
+                    got: loop_var.type_name().to_string(),
+                });
+            }
+        };
+        
+        let limit_num = match &limit {
+            Value::Number(n) => *n,
+            _ => {
+                let error_msg = format!("for loop limit is not a number (got: {})", limit.type_name());
+                eprintln!("DEBUG FORLOOP [ERROR]: {}", error_msg);
+                return Err(LuaError::TypeError {
+                    expected: "number".to_string(),
+                    got: limit.type_name().to_string(),
+                });
+            }
+        };
+        
+        // Handle nil step by defaulting to 1.0 (per Lua spec)
+        let step_num = match &step {
+            Value::Number(n) => {
+                eprintln!("DEBUG FORLOOP [STEP 4]: Step is a number: {}", n);
+                *n
+            },
+            Value::Nil => {
+                eprintln!("DEBUG FORLOOP [STEP 4]: Step is nil, defaulting to 1.0");
+                // Set the step for future iterations
+                tx.set_register(current_thread, loop_base + 2, Value::Number(1.0))?;
+                1.0
+            },
+            _ => {
+                let error_msg = format!("for loop step is not a number (got: {})", step.type_name());
+                eprintln!("DEBUG FORLOOP [ERROR]: {}", error_msg);
+                return Err(LuaError::TypeError {
+                    expected: "number".to_string(),
+                    got: format!("number and {}", step.type_name()),
+                });
+            }
+        };
+        
+        // Step 5: Check for zero step
+        if step_num == 0.0 {
+            let error_msg = "for loop step cannot be zero";
+            eprintln!("DEBUG FORLOOP [ERROR]: {}", error_msg);
+            return Err(LuaError::RuntimeError(error_msg.to_string()));
+        }
+        
+        // Step 6: Increment loop counter
+        let new_loop_num = loop_num + step_num;
+        eprintln!("DEBUG FORLOOP [STEP 6]: Incrementing counter {} + {} = {}", loop_num, step_num, new_loop_num);
+        match tx.set_register(current_thread, loop_base, Value::Number(new_loop_num)) {
+            Ok(_) => {},
+            Err(e) => {
+                eprintln!("DEBUG FORLOOP [ERROR]: Failed to set incremented counter: {}", e);
+                return Err(e);
+            }
+        }
+        
+        // Step 7: Check if loop should continue
+        let should_continue = if step_num > 0.0 {
+            new_loop_num <= limit_num  // For positive step, continue if <= limit
+        } else {
+            new_loop_num >= limit_num  // For negative step, continue if >= limit
+        };
+        
+        eprintln!("DEBUG FORLOOP [STEP 7]: Loop should continue: {}", should_continue);
+        
+        if should_continue {
+            // Step 8a: Set user variable to new loop value
+            eprintln!("DEBUG FORLOOP [STEP 8a]: Setting user variable R({}) = {}", loop_base + 3, new_loop_num);
+            match tx.set_register(current_thread, loop_base + 3, Value::Number(new_loop_num)) {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("DEBUG FORLOOP [ERROR]: Failed to set user variable: {}", e);
+                    return Err(e);
+                }
+            }
+            
+            // Step 9a: Jump back to loop start
+            let pc = tx.get_pc(current_thread)?;
+            let new_pc = (pc as i32 + sbx) as usize;
+            eprintln!("DEBUG FORLOOP [STEP 9a]: Jumping back to PC={}", new_pc);
+            match tx.set_pc(current_thread, new_pc) {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("DEBUG FORLOOP [ERROR]: Failed to jump back: {}", e);
+                    return Err(e);
+                }
+            }
+        } else {
+            // Step 8b/9b: Loop complete, just continue to next instruction
+            eprintln!("DEBUG FORLOOP [STEP 8b/9b]: Loop complete, continuing to next instruction");
+        }
+        
+        eprintln!("DEBUG FORLOOP [COMPLETE]: Successfully executed FORLOOP");
+        Ok(())
+    }
+    
+    /// TForLoop: R(A+3), R(A+4), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2));
+    ///           if R(A+3) ~= nil then R(A+2) := R(A+3) else pc++
+    /// 
+    /// This implements Lua's generic iteration protocol for 'for k,v in pairs(t) do' style loops.
+    /// A points to the stack location containing the iterator function.
+    fn op_tforloop(
+        tx: &mut HeapTransaction,
+        inst: Instruction,
+        base: u16,
+        current_thread: ThreadHandle
+    ) -> LuaResult<()> {
+        let a = inst.get_a() as usize;
+        let c = inst.get_c() as usize;
+        
+        eprintln!("DEBUG TFORLOOP: A={}, C={}, base={}", a, c, base);
+        
+        // TFORLOOP uses these registers:
+        // R(A)   = iterator function
+        // R(A+1) = state
+        // R(A+2) = control variable (current key)
+        // Results will be placed in R(A+3) to R(A+2+C)
+        
+        // Read the iterator function and arguments
+        let func_idx = base as usize + a;
+        let state_idx = base as usize + a + 1;
+        let control_idx = base as usize + a + 2;
+        
+        let func = tx.read_register(current_thread, func_idx)?;
+        let state = tx.read_register(current_thread, state_idx)?;
+        let control = tx.read_register(current_thread, control_idx)?;
+        
+        eprintln!("DEBUG TFORLOOP: Iterator function: {:?}", func);
+        eprintln!("DEBUG TFORLOOP: State: {:?}", state);
+        eprintln!("DEBUG TFORLOOP: Control variable: {:?}", control);
+        
+        // Set up function call: R(A)(R(A+1), R(A+2))
+        // The stack is arranged as:
+        // [base+a] = function
+        // [base+a+1] = state
+        // [base+a+2] = control variable
+        // [base+a+3] = first result (will be placed here)
+        
+        // Ensure we have enough stack space for results
+        let needed_size = base as usize + a + 3 + c;
+        tx.grow_stack(current_thread, needed_size)?;
+        
+        // Place parameters for the call at the same position (no need to copy)
+        // The function takes state and control as parameters
+        
+        // Queue the call operation based on function type
+        match func {
+            Value::Closure(closure) => {
+                eprintln!("DEBUG TFORLOOP: Queueing Lua function call");
+                tx.queue_operation(PendingOperation::FunctionCall {
+                    func_index: func_idx,
+                    nargs: 2,  // state and control as arguments
+                    expected_results: c as i32,  // Number of results needed
+                })?;
+            },
+            Value::CFunction(cfunc) => {
+                eprintln!("DEBUG TFORLOOP: Queueing C function call");
+                tx.queue_operation(PendingOperation::CFunctionCall {
+                    function: cfunc,
+                    base: func_idx as u16,
+                    nargs: 2,  // state and control as arguments
+                    expected_results: c as i32,  // Number of results needed 
+                })?;
+            },
+            _ => {
+                return Err(LuaError::TypeError {
+                    expected: "function".to_string(),
+                    got: func.type_name().to_string()
+                });
+            }
+        }
+        
+        // Store current PC for reuse by continuation
+        let pc = tx.get_pc(current_thread)?;
+        
+        // Queue the continuation to check loop condition after call completes
+        tx.queue_operation(PendingOperation::TForLoopContinuation {
+            base: base as usize,
+            a,
+            c,
+            pc_before_tforloop: pc - 1, // Storing the PC value of the TFORLOOP instruction
+        })?;
+        
+        Ok(())
+    }
+    
+    /// VARARG: R(A), R(A+1), ..., R(A+B-2) = vararg
+    /// 
+    /// This opcode loads variable arguments passed to a vararg function.
+    /// If B is 0, it loads all varargs. Otherwise, it loads B-1 varargs.
+    /// If there are fewer varargs than requested, the remaining registers are filled with nil.
+    fn op_vararg(
+        tx: &mut HeapTransaction,
+        inst: Instruction,
+        base: u16,
+        current_thread: ThreadHandle
+    ) -> LuaResult<()> {
+        let a = inst.get_a() as usize;
+        let b = inst.get_b() as usize;
+        
+        eprintln!("DEBUG VARARG: A={}, B={}, base={}", a, b, base);
+        
+        // Get current frame to access varargs
+        let frame = tx.get_current_frame(current_thread)?;
+        
+        // Get varargs from frame (may be None if function is not vararg)
+        let varargs = frame.varargs.as_ref();
+        
+        eprintln!("DEBUG VARARG: Has varargs: {}", varargs.is_some());
+        
+        // Determine how many values to copy
+        let (num_to_copy, total_varargs) = match varargs {
+            Some(va) => {
+                eprintln!("DEBUG VARARG: Available varargs: {}", va.len());
+                if b == 0 {
+                    // Copy all varargs
+                    (va.len(), va.len())
+                } else {
+                    // Copy specific number (B-1)
+                    let requested = b - 1;
+                    eprintln!("DEBUG VARARG: Requested {} values", requested);
+                    (requested, va.len())
+                }
+            }
+            None => {
+                // No varargs available
+                eprintln!("DEBUG VARARG: No varargs available");
+                if b == 0 {
+                    (0, 0)  // No varargs to copy
+                } else {
+                    (b - 1, 0)  // Will fill with nils
+                }
+            }
+        };
+        
+        eprintln!("DEBUG VARARG: Will copy {} values (total available: {})", num_to_copy, total_varargs);
+        
+        // Ensure stack has space
+        let needed_size = base as usize + a + num_to_copy;
+        tx.grow_stack(current_thread, needed_size)?;
+        
+        // Copy varargs to destination registers
+        for i in 0..num_to_copy {
+            let value = if let Some(va) = varargs {
+                if i < va.len() {
+                    eprintln!("DEBUG VARARG: Copying vararg {} to register R({})", i, base as usize + a + i);
+                    va[i].clone()
+                } else {
+                    eprintln!("DEBUG VARARG: Filling register R({}) with nil (not enough varargs)", base as usize + a + i);
+                    Value::Nil  // Fill with nil if not enough varargs
+                }
+            } else {
+                eprintln!("DEBUG VARARG: Filling register R({}) with nil (no varargs)", base as usize + a + i);
+                Value::Nil  // No varargs available
+            };
+            
+            tx.set_register(current_thread, base as usize + a + i, value)?;
         }
         
         Ok(())
     }
     
-    /// FORLOOP: R(A)+=R(A+2); if R(A) <= R(A+1) then { R(A+3)=R(A); pc+=sBx }
-    fn op_forloop(tx: &mut HeapTransaction, inst: Instruction, base: u16, current_thread: ThreadHandle) -> LuaResult<()> {
+    /// SETLIST: R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
+    /// 
+    /// Bulk assignment to table array part
+    fn op_setlist(
+        tx: &mut HeapTransaction,
+        inst: Instruction,
+        base: u16,
+        current_thread: ThreadHandle
+    ) -> LuaResult<()> {
         let a = inst.get_a() as usize;
-        let sbx = inst.get_sbx();
+        let b = inst.get_b() as usize;
+        let c = inst.get_c() as usize;
         
-        // Get loop variable, limit, and step
-        let loop_var = tx.read_register(current_thread, base as usize + a)?;
-        let limit = tx.read_register(current_thread, base as usize + a + 1)?;
-        let step = tx.read_register(current_thread, base as usize + a + 2)?;
+        // Fields per flush (Lua 5.1 uses 50)
+        const FIELDS_PER_FLUSH: usize = 50;
         
-        // All must be numbers
-        let loop_num = match loop_var {
-            Value::Number(n) => n,
-            _ => return Err(LuaError::RuntimeError("for loop variable is not a number".to_string())),
+        eprintln!("DEBUG SETLIST: A={}, B={}, C={}, base={}", a, b, c, base);
+        
+        // Get the table
+        let table_val = tx.read_register(current_thread, base as usize + a)?;
+        let table_handle = match table_val {
+            Value::Table(h) => h,
+            _ => return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: table_val.type_name().to_string(),
+            }),
         };
         
-        let limit_num = match limit {
-            Value::Number(n) => n,
-            _ => return Err(LuaError::RuntimeError("for loop limit is not a number".to_string())),
-        };
-        
-        let step_num = match step {
-            Value::Number(n) => n,
-            _ => return Err(LuaError::RuntimeError("for loop step is not a number".to_string())),
-        };
-        
-        // Increment loop variable
-        let new_loop_num = loop_num + step_num;
-        tx.set_register(current_thread, base as usize + a, Value::Number(new_loop_num))?;
-        
-        // Check if we should continue
-        let should_continue = if step_num > 0.0 {
-            new_loop_num <= limit_num
+        // Calculate base index in table
+        let table_base = if c == 0 {
+            // Special case: next instruction contains actual C value
+            // For now, we'll handle the common case
+            0
         } else {
-            new_loop_num >= limit_num
+            (c - 1) * FIELDS_PER_FLUSH
         };
         
-        if should_continue {
-            // Copy internal loop variable to external (user-visible) variable
-            tx.set_register(current_thread, base as usize + a + 3, Value::Number(new_loop_num))?;
+        // Number of elements to set
+        let count = if b == 0 {
+            // Set all values from R(A+1) to top
+            let top = tx.get_stack_top(current_thread)?;
+            let top_rel = top.saturating_sub(base as usize + a + 1);
+            eprintln!("DEBUG SETLIST: B=0, using all values up to stack top. Found {} values", top_rel + 1);
+            top_rel + 1
+        } else {
+            b
+        };
+        
+        eprintln!("DEBUG SETLIST: Setting {} elements starting at table index {}", 
+                 count, table_base + 1);
+        
+        // Set elements one by one using the optimized array element setter
+        for i in 0..count {
+            let source_register = base as usize + a + 1 + i;
+            let value = tx.read_register(current_thread, source_register)?;
+            let array_index = table_base + i + 1; // +1 for 1-based indexing
             
-            // Jump back
-            let pc = tx.get_pc(current_thread)?;
-            let new_pc = (pc as i32 + sbx) as usize;
-            tx.set_pc(current_thread, new_pc)?;
+            eprintln!("DEBUG SETLIST: Setting table element [{}] = {:?} from register R({})",
+                     array_index, value, source_register);
+            
+            // Use the dedicated array element setter
+            tx.set_table_array_element(table_handle, array_index, value)?;
+        }
+        
+        // Debug check if indices were set correctly
+        if count > 0 {
+            let check_idx = table_base + 1; // First index in this batch
+            let check_key = Value::Number(check_idx as f64);
+            let check_value = tx.read_table_field(table_handle, &check_key)?;
+            eprintln!("DEBUG SETLIST: Verification - table[{}] = {:?}", check_idx, check_value);
         }
         
         Ok(())

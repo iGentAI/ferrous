@@ -505,10 +505,11 @@ pub fn lua_pairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 
 /// Ipairs iterator function - internal helper for ipairs()
 pub fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    println!("DEBUG IPAIRS_ITER: Function called with {} arguments", ctx.arg_count());
+    eprintln!("DEBUG IPAIRS_ITER: Function called with {} arguments", ctx.arg_count());
     
     // Validate argument count
     if ctx.arg_count() != 2 {
+        eprintln!("DEBUG IPAIRS_ITER: Error - wrong number of arguments (expected 2, got {})", ctx.arg_count());
         return Err(LuaError::ArgumentError {
             expected: 2,
             got: ctx.arg_count(),
@@ -519,7 +520,7 @@ pub fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     let table = match ctx.get_arg(0)? {
         Value::Table(handle) => handle,
         other => {
-            println!("DEBUG IPAIRS_ITER: First argument is not a table, got: {}", other.type_name());
+            eprintln!("DEBUG IPAIRS_ITER: Error - first argument is not a table, got: {}", other.type_name());
             return Err(LuaError::TypeError {
                 expected: "table".to_string(),
                 got: other.type_name().to_string(),
@@ -531,7 +532,7 @@ pub fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     let index = match ctx.get_arg(1)? {
         Value::Number(n) => n as i64,
         other => {
-            println!("DEBUG IPAIRS_ITER: Second argument is not a number, got: {}", other.type_name());
+            eprintln!("DEBUG IPAIRS_ITER: Error - second argument is not a number, got: {}", other.type_name());
             return Err(LuaError::TypeError {
                 expected: "number".to_string(),
                 got: other.type_name().to_string(),
@@ -541,30 +542,32 @@ pub fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     
     // Calculate next index
     let next_idx = index + 1;
-    println!("DEBUG IPAIRS_ITER: Looking up index {} in table", next_idx);
+    eprintln!("DEBUG IPAIRS_ITER: Looking up index {} in table", next_idx);
     
     // Look up this index in the table
     let value = ctx.table_get(table, Value::Number(next_idx as f64))?;
     
     // If value is nil, we're at the end of iteration
     if value.is_nil() {
-        println!("DEBUG IPAIRS_ITER: Index {} is nil, ending iteration", next_idx);
+        eprintln!("DEBUG IPAIRS_ITER: Index {} is nil, ending iteration", next_idx);
         ctx.push_result(Value::Nil)?;
         return Ok(1); // Return nil to end iteration
     }
     
     // Otherwise, return the next index and value
-    println!("DEBUG IPAIRS_ITER: Found value at index {}: {:?}", next_idx, value);
+    eprintln!("DEBUG IPAIRS_ITER: Found value at index {}: {:?}", next_idx, value);
     ctx.push_result(Value::Number(next_idx as f64))?;  // Return next index
     ctx.push_result(value)?;                         // Return value at that index
     
-    Ok(2)
+    eprintln!("DEBUG IPAIRS_ITER: Returning index={} and value, return count=2", next_idx);
+    
+    Ok(2) // Return 2 values: index and value
 }
 
 /// Ipairs function - returns an iterator for array part of table
 /// Signature: ipairs(t)
 pub fn lua_ipairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    println!("DEBUG IPAIRS: ipairs() called with {} arguments", ctx.arg_count());
+    eprintln!("DEBUG IPAIRS: ipairs() called with {} arguments", ctx.arg_count());
     if ctx.arg_count() != 1 {
         return Err(LuaError::ArgumentError {
             expected: 1,
@@ -574,7 +577,7 @@ pub fn lua_ipairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     
     // Check that argument is a table
     let table_val = ctx.get_arg(0)?;
-    println!("DEBUG IPAIRS: Table argument type: {}", table_val.type_name());
+    eprintln!("DEBUG IPAIRS: Table argument type: {}", table_val.type_name());
     
     match table_val {
         Value::Table(_) => {
@@ -583,15 +586,29 @@ pub fn lua_ipairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
             // 2. invariant state (table)
             // 3. initial control variable (0)
             // This must match the order expected by TFORLOOP
-            println!("DEBUG IPAIRS: Returning iterator triplet: (ipairs_iter, table, 0)");
-            ctx.push_result(Value::CFunction(ipairs_iter))?;  // Iterator function
-            ctx.push_result(table_val)?;                      // State (the table)
-            ctx.push_result(Value::Number(0.0))?;             // Initial control variable (index 0)
+            eprintln!("DEBUG IPAIRS: Returning iterator triplet: (ipairs_iter, table, 0)");
+            
+            // Important: Create the CFunction explicitly here to ensure it's a valid function reference
+            let iter_func = Value::CFunction(ipairs_iter);
+            
+            // Check the type of the iterator function before using it
+            eprintln!("DEBUG IPAIRS: Iterator function type: {}", iter_func.type_name());
+            
+            // Make sure first return value is proper CFunction
+            ctx.set_return(0, iter_func)?;
+            
+            // Return the table as state
+            ctx.set_return(1, table_val)?;
+            
+            // Return 0 as initial control value
+            ctx.set_return(2, Value::Number(0.0))?;
+            
+            eprintln!("DEBUG IPAIRS: Verified returns: function, table, number");
             
             Ok(3) // Return 3 values
         },
         other => {
-            println!("DEBUG IPAIRS: Error - argument is not a table: {}", other.type_name());
+            eprintln!("DEBUG IPAIRS: Error - argument is not a table: {}", other.type_name());
             Err(LuaError::TypeError {
                 expected: "table".to_string(),
                 got: other.type_name().to_string(),

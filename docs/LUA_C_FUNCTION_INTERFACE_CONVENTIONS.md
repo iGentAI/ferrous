@@ -2,11 +2,13 @@
 
 ## Overview
 
-This document defines the conventions for interfacing between the Ferrous Lua VM's register window system and C functions (standard library and custom functions). Proper coordination on both sides of this interface is critical for correct behavior.
+This document defines the conventions for interfacing between the Ferrous Lua VM's transaction-based system and C functions (standard library and custom functions). Proper coordination on both sides of this interface is critical for correct behavior.
 
 ## 1. Core Architectural Principles
 
-### 1.1 Register Window to Stack Mapping
+### 1.1 Lua 5.1 Stack vs. Ferrous Transaction System
+
+In official Lua 5.1, C functions directly manipulate the Lua stack through a C API. The Ferrous VM adapts this pattern to a transaction-based system for Rust's safety guarantees while preserving the same semantics:
 
 ```
 ┌────────────────┐       ┌────────────────┐       ┌────────────────┐
@@ -126,7 +128,7 @@ C functions must:
 
 ### 4.1 `next()` Implementation
 
-The `next()` function MUST:
+The `next()` function MUST follow Lua 5.1's iterator protocol exactly:
 1. Accept exactly 2 arguments:
    - `table`: a valid table to iterate
    - `index`: the previous key (or nil for first iteration)
@@ -163,10 +165,12 @@ fn next_function(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 
 ### 4.2 `pairs()` and `ipairs()` Contract
 
-The VM expects these functions to return a specific triplet:
+In Lua 5.1, these functions MUST return a specific triplet in this precise order:
 1. Iterator function
 2. State (usually table)
 3. Initial control value (nil or 0)
+
+**Critical Note**: The exact return order is essential for TFORLOOP to work correctly. The first return must always be the function.
 
 ```rust
 // Example pairs() implementation
@@ -186,12 +190,36 @@ fn pairs_function(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         _ => return Err(LuaError::RuntimeError("Cannot find next function".to_string()))
     };
     
-    // Return triplet: next, table, nil
+    // Return triplet IN THIS EXACT ORDER: next, table, nil
     ctx.push_result(Value::CFunction(next))?;
     ctx.push_result(Value::Table(table))?;
     ctx.push_result(Value::Nil)?;
     
     Ok(3) // Return 3 values
+}
+```
+
+**ipairs() Example**:
+```rust
+fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    // Get table and index arguments
+    let table = ctx.table_arg(0)?;
+    let index = ctx.number_arg(1)? as i64;
+    
+    // Get next index (ipairs uses sequential indices)
+    let next_idx = index + 1;
+    let value = ctx.table_get(table, Value::Number(next_idx as f64))?;
+    
+    // If nil, iteration ends
+    if value.is_nil() {
+        ctx.push_result(Value::Nil)?;
+        return Ok(1);
+    }
+    
+    // Return index, value pair
+    ctx.push_result(Value::Number(next_idx as f64))?;
+    ctx.push_result(value)?;
+    return Ok(2);
 }
 ```
 

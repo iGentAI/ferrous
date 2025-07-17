@@ -543,21 +543,26 @@ R(A+2): <arg2>        ...
 - **R(A)**: Internal loop index (input/output)
 - **R(A+1)**: Limit value (input)
 - **R(A+2)**: Step value (input)
+- **R(A+3)**: User variable (not modified by FORPREP)
 - **sBx**: Jump offset to loop end
 
 **Operation**:
 ```
-R(A) -= R(A+2)  -- prepare index
-if not loop_will_run then pc += sBx
+R(A) -= R(A+2);  -- prepare index with step subtracted
+if (loop won't run based on step sign and bounds) then pc += sBx; -- skip loop
 ```
 
 **Register Layout**:
 ```
-R(A):   index (internal, modified)
+R(A):   internal index (modified by VM)
 R(A+1): limit (constant during loop)
-R(A+2): step (constant during loop)
-R(A+3): user variable (visible in loop body)
+R(A+2): step (constant during loop) 
+R(A+3): user variable (set by FORLOOP, not FORPREP)
 ```
+
+**Critical Implementation Note**: FORPREP never modifies R(A+3). Only FORLOOP should update the user-visible variable.
+
+**Compiler Requirements**: These 4 registers must be allocated consecutively before any expression compilation, and the compiler must ensure they are not corrupted by operations in the loop body.
 
 ---
 
@@ -574,36 +579,46 @@ R(A+3): user variable (visible in loop body)
 
 **Operation**:
 ```
-R(A) += R(A+2)
-if loop_continues then
-    R(A+3) := R(A)
-    pc += sBx
+R(A) += R(A+2);  -- increment internal counter
+if (R(A) <= R(A+1) for positive step, or >= for negative) then
+    R(A+3) := R(A);  -- update user-visible variable
+    pc -= sBx;       -- jump back to start
 end
 ```
+
+**Critical Implementation Note**: FORLOOP only updates the user variable R(A+3) when the loop continues. This is the only opcode that should write to R(A+3) in a numeric for loop.
 
 ---
 
 #### 33. TFORLOOP (ABC Format)
 
-**Purpose**: Generic for loop iteration
+**Purpose**: Generic for loop iteration (for-in loops using pairs/ipairs)
 
 **Register Usage**:
 - **R(A)**: Iterator function (input)
-- **R(A+1)**: State value (input)
+- **R(A+1)**: State value (input/output)
 - **R(A+2)**: Control variable (input/output)
 - **R(A+3)...R(A+2+C)**: Loop variables (output)
 - **C**: Number of loop variables
 
 **Operation**:
 ```
-R(A+3), ..., R(A+2+C) := R(A)(R(A+1), R(A+2))
-if R(A+3) ~= nil then
-    R(A+2) := R(A+3)
+R(A+3), ..., R(A+2+C) := R(A)(R(A+1), R(A+2));  -- Call iterator with state and control
+if R(A+3) ~= nil then  -- First result determines if iteration continues
+    R(A+2) := R(A+3);  -- Update control variable to first result for next iteration
 else
-    pc++  -- exit loop
+    pc++;  -- Skip next instruction (the JMP back to loop start)
+end
 ```
 
-**Iterator Protocol**: Follows standard Lua iterator convention
+**Iterator Protocol**: 
+The Lua 5.1 iterator protocol works as follows:
+1. Iterator function takes two args: state and control variable
+2. Iterator returns nil when iteration is complete
+3. First return value becomes the new control variable for next iteration
+4. For pairs/ipairs, this means (key, value) where key becomes the control
+
+**Compiler-VM Coordination**: The compiler must ensure the registers for iterator function, state, control variable, and loop variables are allocated consecutively and preserved throughout the loop body.
 
 ---
 
@@ -683,13 +698,15 @@ else
 **Operation**: 
 ```
 for i = 1, B do
-    R(A)[C*50 + i] := R(A+i)
+    R(A)[C*FPF + i] := R(A+i)  -- Where FPF (Fields Per Flush) = 50 in Lua 5.1
 end
 ```
 
-**Special Case**: If B = 0, use all values up to stack top
+**Special Cases**: 
+- If **B = 0**, use all values up to stack top
+- If **C = 0**, next instruction contains the real C value (>255)
 
-**Status**: Not implemented in current Ferrous version
+**Implementation Note**: This opcode efficiently implements array initialization for tables. The FPF constant (50) is defined in the Lua 5.1 source as `LFIELDS_PER_FLUSH`.
 
 ---
 

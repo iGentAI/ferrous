@@ -15,6 +15,7 @@ This document defines the architecture for Ferrous Lua, a Rust implementation of
 7. [Iterator Protocol](#iterator-protocol)
 8. [Memory Management](#memory-management)
 9. [Implementation Guidelines](#implementation-guidelines)
+10. [Compiler-VM Coordination](#compiler-vm-coordination)
 
 ## Architectural Foundation
 
@@ -772,6 +773,71 @@ impl Transaction<'_> {
 3. **Upvalue Lifetime**: Always close upvalues when leaving their scope
 4. **C Function Returns**: Must return exact count, not approximate
 5. **Iterator Protocol**: Must return nil to terminate, not nothing
+
+## Compiler-VM Coordination
+
+### Register Allocation Strategy
+
+In Lua 5.1, the compiler and VM have a critical coordination pattern for register allocation:
+
+1. **Sequential Allocation**: The compiler allocates registers sequentially, with careful tracking of which registers are in use.
+
+2. **Register Lifecycle Management**: 
+   - For regular expressions, registers are allocated as needed and freed when no longer used
+   - For special constructs (like loops), specific register patterns are required
+
+3. **For Loop Register Allocation**:
+   ```
+   loop_base = allocate_register();     // R(A)
+   loop_limit = allocate_register();    // R(A+1)
+   loop_step = allocate_register();     // R(A+2)
+   loop_var = allocate_register();      // R(A+3)
+   
+   // These MUST be allocated consecutively before any expression compilation
+   // The compiler must ensure these aren't reused by operations inside the loop
+   ```
+
+4. **Expression Compilation**: When compiling expressions for special constructs:
+   ```
+   // Correct: Compile directly to target registers
+   compile_expression(initial, loop_base);
+   compile_expression(limit, loop_limit);
+   compile_expression(step, loop_step);
+   ```
+
+5. **Register Protection**: 
+   The Lua 5.1 compiler doesn't have explicit register "protection", but rather carefully tracks which registers are "in use" vs. "free" to prevent register corruption.
+
+### SETLIST Batch Processing
+
+The Lua 5.1 compiler generates SETLIST instructions with a specific batching pattern:
+
+1. **Constant Batch Size**: Lua 5.1 uses a constant `LFIELDS_PER_FLUSH` (50) to determine batch sizes
+2. **Multiple SETLIST Instructions**: For tables with more than 50 elements, multiple SETLIST instructions are generated
+3. **Batch Index**: The C parameter is used as a 1-based batch index, where the array position is calculated as:
+   ```
+   array_index = (C-1)*LFIELDS_PER_FLUSH + i
+   ```
+
+### Iterator Protocol Implementation
+
+For TFORLOOP to work correctly, the compiler and VM must coordinate on the iterator protocol:
+
+1. **Function Call Setup**:
+   ```
+   // In compiler:
+   emit_call(iter_func_reg, 2);  // Call with 2 args (state and control)
+   emit_tforloop(iter_func_reg, num_vars);  // Process results
+   ```
+
+2. **VM Execution**:
+   ```
+   // In VM TFORLOOP handler:
+   // Process results of iterator call that were placed at R(A+3)...R(A+2+C)
+   // Update control variable if iteration continues: R(A+2) = R(A+3)
+   ```
+
+By following these coordination patterns, the Ferrous implementation maintains complete compatibility with Lua 5.1 while adding the safety benefits of transaction-based heap access and Rust's ownership model.
 
 ## Conclusion
 
