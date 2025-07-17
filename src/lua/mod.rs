@@ -9,6 +9,8 @@ pub mod arena;
 pub mod handle;
 pub mod value;
 pub mod heap;
+pub mod refcell_heap;
+pub mod refcell_vm;
 pub mod metamethod;
 pub mod resource;
 pub mod transaction;
@@ -23,12 +25,16 @@ pub mod ast;
 #[path = "stdlib/mod.rs"]
 pub mod stdlib;
 
+pub mod refcell_stdlib;
+
 #[cfg(test)]
 mod test_basic;
 
 pub use self::error::{LuaError, LuaResult};
 pub use self::value::Value;
 pub use self::vm::LuaVM;
+pub use self::refcell_vm::RefCellVM;
+pub use self::refcell_heap::RefCellHeap;
 pub use self::compiler::{compile, CompiledModule};
 pub use self::codegen::OpCode;
 pub use self::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle};

@@ -775,6 +775,15 @@ impl LuaVM {
         let instruction = tx.get_instruction(frame.closure, pc)?;
         let inst = Instruction(instruction);
         
+        // Debug: Log frame info for FORPREP and FORLOOP
+        match inst.get_opcode() {
+            OpCode::ForPrep | OpCode::ForLoop => {
+                eprintln!("DEBUG step(): Executing {:?} with frame base_register={}, pc={}", 
+                         inst.get_opcode(), base, pc);
+            },
+            _ => {}
+        }
+        
         // Increment PC for next instruction
         tx.increment_pc(current_thread)?;
         
@@ -2480,6 +2489,15 @@ impl LuaVM {
         
         eprintln!("DEBUG FORPREP: A={}, sbx={}, base={}, loop_base={}", a, sbx, base, loop_base);
         
+        // CRITICAL DEBUG: Validate we're not trying to access registers before the function's base
+        if loop_base < base as usize {
+            eprintln!("ERROR FORPREP: loop_base {} is less than function base {}", loop_base, base);
+            return Err(LuaError::RuntimeError(format!(
+                "FORPREP: Invalid register access - loop_base {} < base {}",
+                loop_base, base
+            )));
+        }
+        
         // Get the three values with detailed logging
         eprintln!("DEBUG FORPREP: Reading initial at position {}", loop_base);
         let initial = tx.read_register(current_thread, loop_base)?;
@@ -2491,7 +2509,7 @@ impl LuaVM {
         
         eprintln!("DEBUG FORPREP: Reading step at position {}", loop_base + 2);
         let step = tx.read_register(current_thread, loop_base + 2)?;
-        eprintln!("DEBUG FORPREP: Step value: {:?}", step);
+        eprintln!("DEBUG FORPREP: Step value before processing: {:?}", step);
         
         // Convert to numbers with error handling
         let initial_num = match &initial {
@@ -2501,6 +2519,12 @@ impl LuaVM {
                 got: format!("for initial value: {}", initial.type_name()),
             }),
         };
+        
+        // CRITICAL: Check if we're about to write to an invalid register
+        if base > 0 && loop_base == 0 {
+            eprintln!("WARNING FORPREP: Attempting to write to R(0) when function base is {}. This may be outside the function's register window!", base);
+            eprintln!("WARNING FORPREP: The compiler may have generated incorrect bytecode, or there's a register calculation issue.");
+        }
         
         let limit_num = match &limit {
             Value::Number(n) => *n,
@@ -2515,9 +2539,7 @@ impl LuaVM {
             Value::Number(n) => *n,
             Value::Nil => {
                 eprintln!("DEBUG FORPREP: Step is nil, initializing with default 1.0");
-                let default_step = Value::Number(1.0);
-                tx.set_register(current_thread, loop_base + 2, default_step.clone())?;
-                1.0  // Use 1.0 for calculations
+                1.0
             },
             _ => return Err(LuaError::TypeError {
                 expected: "number".to_string(),
@@ -2530,10 +2552,53 @@ impl LuaVM {
             return Err(LuaError::RuntimeError("for loop step must be different from 0".to_string()));
         }
         
+        // CRITICAL FIX: Always write the step value back to ensure it's properly initialized
+        // This ensures FORLOOP will see a valid step value even across transaction boundaries
+        eprintln!("DEBUG FORPREP: Writing step value {} to register {}", step_num, loop_base + 2);
+        tx.set_register(current_thread, loop_base + 2, Value::Number(step_num))?;
+        eprintln!("DEBUG FORPREP: Successfully wrote step value");
+        
+        // Verify step write
+        let verify_step = tx.read_register(current_thread, loop_base + 2)?;
+        eprintln!("DEBUG FORPREP: Verified step register now contains: {:?}", verify_step);
+        
         // Per Lua 5.1 spec: Subtract step from initial counter 
         let prepared_initial = initial_num - step_num;
-        eprintln!("DEBUG FORPREP: Prepared initial value = {}", prepared_initial);
-        tx.set_register(current_thread, loop_base, Value::Number(prepared_initial))?;
+        eprintln!("DEBUG FORPREP: Prepared initial value = {} (original {} - step {})", 
+                 prepared_initial, initial_num, step_num);
+        
+        // CRITICAL: Write prepared initial value with verification
+        eprintln!("DEBUG FORPREP: About to write prepared initial {} to register {}", prepared_initial, loop_base);
+        match tx.set_register(current_thread, loop_base, Value::Number(prepared_initial)) {
+            Ok(_) => {
+                eprintln!("DEBUG FORPREP: Successfully wrote prepared initial value");
+                
+                // Immediately verify the write
+                match tx.read_register(current_thread, loop_base) {
+                    Ok(verify_val) => {
+                        eprintln!("DEBUG FORPREP: Verification read of R({}) = {:?}", loop_base, verify_val);
+                        if let Value::Number(n) = verify_val {
+                            if (n - prepared_initial).abs() > f64::EPSILON {
+                                eprintln!("ERROR FORPREP: Write verification failed! Wrote {} but read {}", prepared_initial, n);
+                            }
+                        } else {
+                            eprintln!("ERROR FORPREP: Write verification failed! Expected Number but got {:?}", verify_val);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("ERROR FORPREP: Failed to verify write: {}", e);
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!("ERROR FORPREP: Failed to write prepared initial: {}", e);
+                return Err(e);
+            }
+        }
+        
+        // Initialize R(A+3) to nil - FORLOOP will set it when loop runs
+        eprintln!("DEBUG FORPREP: Initializing user variable R({}) to nil", loop_base + 3);
+        tx.set_register(current_thread, loop_base + 3, Value::Nil)?;
         
         // Check if loop should run at all
         let should_run = if step_num > 0.0 {
@@ -2542,7 +2607,8 @@ impl LuaVM {
             prepared_initial + step_num >= limit_num // For negative step
         };
         
-        eprintln!("DEBUG FORPREP: Loop should run: {}", should_run);
+        eprintln!("DEBUG FORPREP: Loop should run: {} (prepared {} + step {} vs limit {})", 
+                 should_run, prepared_initial, step_num, limit_num);
         
         if !should_run {
             // Skip the loop entirely
@@ -2555,9 +2621,13 @@ impl LuaVM {
         }
         
         // Additional validation for debugging
-        eprintln!("DEBUG FORPREP: Verifying step after setup");
-        let verify_step = tx.read_register(current_thread, loop_base + 2)?;
-        eprintln!("DEBUG FORPREP: Step is now: {:?}", verify_step);
+        eprintln!("DEBUG FORPREP: Final register state after setup:");
+        for i in 0..4 {
+            match tx.read_register(current_thread, loop_base + i) {
+                Ok(reg_val) => eprintln!("  R({}) = {:?}", loop_base + i, reg_val),
+                Err(e) => eprintln!("  R({}) = ERROR: {}", loop_base + i, e),
+            }
+        }
         
         Ok(())
     }
@@ -2575,9 +2645,9 @@ impl LuaVM {
         // CRITICAL: Ensure stack has space for all loop registers
         tx.grow_stack(current_thread, loop_base + 4)?;  // Ensure space for all 4 loop registers
         
-        // Dump the full register state for debugging
-        eprintln!("DEBUG FORLOOP [REGISTERS]:");
-        for i in 0..10 {
+        // Dump the register state for debugging
+        eprintln!("DEBUG FORLOOP [REGISTERS]: Initial state");
+        for i in 0..4 {
             let abs_index = loop_base + i;
             match tx.read_register(current_thread, abs_index) {
                 Ok(val) => eprintln!("  Register R({}) = {:?}", abs_index, val),
@@ -2616,7 +2686,7 @@ impl LuaVM {
                 return Err(e);
             }
         };
-        eprintln!("DEBUG FORLOOP [STEP 3]: Step = {:?}", step);
+        eprintln!("DEBUG FORLOOP [STEP 3]: Step value read = {:?}", step);
         
         // Step 4: Convert values to numbers (with specific type error messages)
         let loop_num = match &loop_var {
@@ -2643,15 +2713,16 @@ impl LuaVM {
             }
         };
         
-        // Handle nil step by defaulting to 1.0 (per Lua spec)
+        // CRITICAL FIX: Defensive handling of nil/invalid step values
+        // This shouldn't happen if FORPREP initialized correctly, but adds safety
         let step_num = match &step {
             Value::Number(n) => {
-                eprintln!("DEBUG FORLOOP [STEP 4]: Step is a number: {}", n);
+                eprintln!("DEBUG FORLOOP [STEP 4]: Step is a valid number: {}", n);
                 *n
             },
             Value::Nil => {
-                eprintln!("DEBUG FORLOOP [STEP 4]: Step is nil, defaulting to 1.0");
-                // Set the step for future iterations
+                eprintln!("WARNING FORLOOP [STEP 4]: Step is nil, defaulting to 1.0 (FORPREP should have initialized this!)");
+                // Write the default value back to the register for consistency
                 tx.set_register(current_thread, loop_base + 2, Value::Number(1.0))?;
                 1.0
             },
@@ -2660,12 +2731,12 @@ impl LuaVM {
                 eprintln!("DEBUG FORLOOP [ERROR]: {}", error_msg);
                 return Err(LuaError::TypeError {
                     expected: "number".to_string(),
-                    got: format!("number and {}", step.type_name()),
+                    got: format!("for step value: {}", step.type_name()),
                 });
             }
         };
         
-        // Step 5: Check for zero step
+        // Step 5: Check for zero step (defensive check)
         if step_num == 0.0 {
             let error_msg = "for loop step cannot be zero";
             eprintln!("DEBUG FORLOOP [ERROR]: {}", error_msg);
@@ -2676,7 +2747,9 @@ impl LuaVM {
         let new_loop_num = loop_num + step_num;
         eprintln!("DEBUG FORLOOP [STEP 6]: Incrementing counter {} + {} = {}", loop_num, step_num, new_loop_num);
         match tx.set_register(current_thread, loop_base, Value::Number(new_loop_num)) {
-            Ok(_) => {},
+            Ok(_) => {
+                eprintln!("DEBUG FORLOOP [STEP 6]: Successfully set new counter value");
+            },
             Err(e) => {
                 eprintln!("DEBUG FORLOOP [ERROR]: Failed to set incremented counter: {}", e);
                 return Err(e);
@@ -2690,13 +2763,16 @@ impl LuaVM {
             new_loop_num >= limit_num  // For negative step, continue if >= limit
         };
         
-        eprintln!("DEBUG FORLOOP [STEP 7]: Loop should continue: {}", should_continue);
+        eprintln!("DEBUG FORLOOP [STEP 7]: Should continue = {} (new value {} vs limit {})", 
+                 should_continue, new_loop_num, limit_num);
         
         if should_continue {
             // Step 8a: Set user variable to new loop value
             eprintln!("DEBUG FORLOOP [STEP 8a]: Setting user variable R({}) = {}", loop_base + 3, new_loop_num);
             match tx.set_register(current_thread, loop_base + 3, Value::Number(new_loop_num)) {
-                Ok(_) => {},
+                Ok(_) => {
+                    eprintln!("DEBUG FORLOOP [STEP 8a]: Successfully set user variable");
+                },
                 Err(e) => {
                     eprintln!("DEBUG FORLOOP [ERROR]: Failed to set user variable: {}", e);
                     return Err(e);
@@ -2706,9 +2782,11 @@ impl LuaVM {
             // Step 9a: Jump back to loop start
             let pc = tx.get_pc(current_thread)?;
             let new_pc = (pc as i32 + sbx) as usize;
-            eprintln!("DEBUG FORLOOP [STEP 9a]: Jumping back to PC={}", new_pc);
+            eprintln!("DEBUG FORLOOP [STEP 9a]: Jumping back from PC {} to PC {}", pc, new_pc);
             match tx.set_pc(current_thread, new_pc) {
-                Ok(_) => {},
+                Ok(_) => {
+                    eprintln!("DEBUG FORLOOP [STEP 9a]: Successfully jumped back");
+                },
                 Err(e) => {
                     eprintln!("DEBUG FORLOOP [ERROR]: Failed to jump back: {}", e);
                     return Err(e);
@@ -2717,6 +2795,16 @@ impl LuaVM {
         } else {
             // Step 8b/9b: Loop complete, just continue to next instruction
             eprintln!("DEBUG FORLOOP [STEP 8b/9b]: Loop complete, continuing to next instruction");
+        }
+        
+        // Final state dump for debugging
+        eprintln!("DEBUG FORLOOP [COMPLETE]: Final register state:");
+        for i in 0..4 {
+            let abs_index = loop_base + i;
+            match tx.read_register(current_thread, abs_index) {
+                Ok(val) => eprintln!("  Register R({}) = {:?}", abs_index, val),
+                Err(_) => {}, // Ignore errors in debug output
+            }
         }
         
         eprintln!("DEBUG FORLOOP [COMPLETE]: Successfully executed FORLOOP");

@@ -113,6 +113,9 @@ pub enum LuaError {
     InternalError(String),
     NotImplemented(String),
     
+    // RefCell borrow error (for RefCellHeap)
+    BorrowError(String),
+    
     // Script execution control
     ScriptKilled,
 }
@@ -177,6 +180,7 @@ impl fmt::Display for LuaError {
             
             LuaError::InternalError(msg) => write!(f, "internal error: {}", msg),
             LuaError::NotImplemented(feature) => write!(f, "not implemented: {}", feature),
+            LuaError::BorrowError(msg) => write!(f, "borrow error: {}", msg),
             
             LuaError::ScriptKilled => write!(f, "script killed by user"),
         }

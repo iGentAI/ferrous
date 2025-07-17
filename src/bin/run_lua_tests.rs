@@ -3,7 +3,7 @@
 //! This binary provides a simple CLI to run Lua compliance tests,
 //! testing all opcodes and language features.
 
-use ferrous::lua::{LuaVM, Value, compile};
+use ferrous::lua::{RefCellVM, Value, compile};
 use std::env;
 use std::fs;
 use std::process;
@@ -18,7 +18,7 @@ fn run_script(script_path: &str) -> Result<Value, String> {
     };
     
     // Create a VM instance
-    let mut vm = match LuaVM::new() {
+    let mut vm = match RefCellVM::new() {
         Ok(vm) => vm,
         Err(e) => return Err(format!("Failed to create VM: {:?}", e)),
     };

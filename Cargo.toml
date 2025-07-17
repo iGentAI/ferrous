@@ -71,3 +71,7 @@ path = "tests/lua/tforloop_test_runner.rs"
 [[bin]]
 name = "test_vm"
 path = "src/bin/test_vm.rs"
+
+[[example]]
+name = "for_loop_comparison"
+path = "examples/for_loop_comparison.rs"

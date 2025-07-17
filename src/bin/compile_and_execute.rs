@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
-use ferrous::lua::{compile, vm as lua_vm, Value};
+use ferrous::lua::{compile, refcell_vm, Value};
 
 fn main() {
     // Parse command line arguments
@@ -52,7 +52,7 @@ fn main() {
     println!("Running script...");
     
     // Create VM and initialize standard library
-    let mut vm = match lua_vm::LuaVM::new() {
+    let mut vm = match refcell_vm::RefCellVM::new() {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("Error creating VM: {}", e);
@@ -80,13 +80,9 @@ fn main() {
         Value::Nil => println!("Result: nil"),
         Value::Boolean(b) => println!("Result: {}", b),
         Value::Number(n) => println!("Result: {}", n),
-        Value::String(_) => {
-            // Create a transaction to access the string value
-            let mut tx = ferrous::lua::transaction::HeapTransaction::new(vm.heap_mut());
-            match tx.get_string_value(match result {
-                Value::String(h) => h,
-                _ => unreachable!(),
-            }) {
+        Value::String(string_handle) => {
+            // Access string value directly through RefCellHeap
+            match vm.heap().get_string_value(string_handle) {
                 Ok(s) => println!("Result: \"{}\"", s),
                 Err(e) => println!("Result: <error reading string: {}>", e),
             }
@@ -94,10 +90,9 @@ fn main() {
         Value::Table(table_handle) => {
             println!("DEBUG: Handling table return value with handle: {:?}", table_handle);
             // Provide more information about the returned table
-            let mut tx = ferrous::lua::transaction::HeapTransaction::new(vm.heap_mut());
             
             // Try to get basic table info
-            match tx.get_table(table_handle) {
+            match vm.heap().get_table(table_handle) {
                 Ok(table) => {
                     let array_len = table.array.len();
                     let hash_len = table.map.len();
