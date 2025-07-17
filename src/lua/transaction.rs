@@ -3,15 +3,47 @@
 //! This module implements the transaction pattern for safe, atomic access
 //! to the Lua heap with proper type-safe handle validation.
 
-use super::arena::Handle;
+use super::arena::{Arena, Handle};
 use super::error::{LuaError, LuaResult};
-use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, 
-                    UpvalueHandle, UserDataHandle, FunctionProtoHandle};
+use super::handle::*;
 use super::heap::LuaHeap;
-use super::value::{Value, Closure, Thread, Upvalue, UserData, CallFrame, FunctionProto, HashableValue};
-use super::vm::{PendingOperation, ReturnContext};
+use super::metamethod::{MetamethodContext, MetamethodContinuation};
+use super::resource::{ResourceTracker, ResourceLimits};
+use super::value::{CallFrame, Closure, FunctionProto, HashableValue, LuaString, 
+                   StringContentProvider, Table, Thread, ThreadStatus, 
+                   Upvalue, UserData, Value};
+use super::vm::PendingOperation;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::marker::PhantomData;
+use std::any::TypeId;
+
+// Missing type definitions for the new transaction structure
+#[derive(Debug, Clone)]
+struct ThreadInfo {
+    // Thread information cache
+}
+
+#[derive(Debug, Clone)]
+struct StringCache {
+    by_content: HashMap<String, StringHandle>,
+}
+
+impl StringCache {
+    fn new() -> Self {
+        StringCache {
+            by_content: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HandleRecord {
+    // Handle tracking record
+}
+
+// Static counter for tracking string creation depth
+// This helps identify potential circular dependencies during string creation
+static mut STRING_CREATE_DEPTH: usize = 0;
+
 
 /// Trait for type-safe handle validation
 pub trait ValidatableHandle: Clone + Copy {
@@ -142,6 +174,40 @@ pub enum TransactionState {
     Aborted,
 }
 
+/// Debug configuration for transactions
+#[derive(Debug, Clone)]
+pub struct TransactionDebugConfig {
+    /// Maximum number of apply_change calls before aborting (0 = unlimited)
+    pub max_apply_changes: usize,
+    
+    /// Enable verbose debug logging
+    pub verbose_logging: bool,
+    
+    /// Log string creation operations
+    pub log_string_creation: bool,
+}
+
+impl Default for TransactionDebugConfig {
+    fn default() -> Self {
+        TransactionDebugConfig {
+            max_apply_changes: 0, // Unlimited by default
+            verbose_logging: false,
+            log_string_creation: false,
+        }
+    }
+}
+
+impl TransactionDebugConfig {
+    /// Create a debug config for catching infinite loops
+    pub fn with_apply_limit(limit: usize) -> Self {
+        TransactionDebugConfig {
+            max_apply_changes: limit,
+            verbose_logging: true,
+            log_string_creation: true,
+        }
+    }
+}
+
 /// Changes that can be made through a transaction
 #[derive(Debug, Clone)]
 pub enum HeapChange {
@@ -198,12 +264,19 @@ pub enum HeapChange {
     SetUpvalue {
         upvalue: UpvalueHandle,
         value: Value,
+        thread: ThreadHandle,
     },
     
     /// Close upvalue
     CloseUpvalue {
         upvalue: UpvalueHandle,
         value: Value,
+    },
+    
+    /// Grow thread stack to ensure it has at least the specified size
+    GrowStack {
+        thread: ThreadHandle,
+        min_size: usize,
     },
 }
 
@@ -241,36 +314,125 @@ impl ValidationScope {
     }
 }
 
-/// Transaction for atomic heap operations
+/// Heap transaction for atomic mutations
 pub struct HeapTransaction<'a> {
-    /// Reference to the heap
     heap: &'a mut LuaHeap,
-    
-    /// Accumulated changes
     changes: Vec<HeapChange>,
-    
-    /// Pending operations for the VM
-    pending_operations: VecDeque<PendingOperation>,
-    
-    /// Current transaction state
+    thread_cache: HashMap<ThreadHandle, ThreadInfo>,
+    string_cache: StringCache,
+    new_handles: Vec<HandleRecord>,
     state: TransactionState,
-    
-    /// Validation scope
+    debug_config: TransactionDebugConfig,
+    resource_tracker: ResourceTracker,
+    pending_operations: VecDeque<PendingOperation>,
     validation_scope: ValidationScope,
 }
 
 impl<'a> HeapTransaction<'a> {
     /// Create a new transaction
     pub fn new(heap: &'a mut LuaHeap) -> Self {
+        // Get default limits from heap if available, otherwise use defaults
+        let limits = ResourceLimits::default();
+        HeapTransaction::new_with_limits(heap, limits)
+    }
+    
+    /// Create a new transaction with specific resource limits
+    pub fn new_with_limits(heap: &'a mut LuaHeap, limits: ResourceLimits) -> Self {
+        let debug_config = TransactionDebugConfig {
+            max_apply_changes: 0,  // 0 means no limit by default
+            verbose_logging: false,
+            log_string_creation: false,
+        };
+        
         HeapTransaction {
             heap,
             changes: Vec::new(),
-            pending_operations: VecDeque::new(),
+            thread_cache: HashMap::new(),
+            string_cache: StringCache::new(),
+            new_handles: Vec::new(),
             state: TransactionState::Active,
+            debug_config,
+            resource_tracker: ResourceTracker::new(limits),
+            pending_operations: VecDeque::new(),
             validation_scope: ValidationScope::new(),
         }
     }
     
+    /// Create a new transaction with debug configuration
+    pub fn new_with_debug(heap: &'a mut LuaHeap, config: TransactionDebugConfig) -> Self {
+        // Use debug config to set resource limits appropriately
+        let limits = if config.max_apply_changes > 0 {
+            ResourceLimits {
+                max_transaction_ops: config.max_apply_changes,
+                ..Default::default()
+            }
+        } else {
+            ResourceLimits::default()
+        };
+        
+        let mut tx = HeapTransaction::new_with_limits(heap, limits);
+        tx.debug_config = config;
+        tx
+    }
+    
+    /// Set debug configuration
+    pub fn set_debug_config(&mut self, config: TransactionDebugConfig) {
+        self.debug_config = config;
+    }
+    
+    /// Track a concatenation operation
+    pub fn track_concat_operation(&mut self) -> LuaResult<()> {
+        self.ensure_active()?;
+        // Concat is a transaction operation
+        self.resource_tracker.track_operation()
+    }
+    
+    /// Track string memory allocation
+    pub fn track_string_allocation(&mut self, size: usize) -> LuaResult<()> {
+        self.ensure_active()?;
+        self.resource_tracker.track_string_allocation(size)
+    }
+    
+    /// Check if a string size would exceed limits
+    pub fn check_string_size_limit(&mut self, size: usize) -> LuaResult<()> {
+        self.ensure_active()?;
+        let limits = self.resource_tracker.limits();
+        if size > limits.max_string_memory {
+            Err(LuaError::ResourceLimit {
+                resource: "string size".to_string(),
+                limit: limits.max_string_memory,
+                used: size,
+                context: "String size exceeds maximum allowed size".to_string(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+    
+    /// Collect all validated table handles for safety during potential reallocation
+    fn collect_validated_table_handles(&self) -> Vec<TableHandle> {
+        let mut handles = Vec::new();
+        for key in &self.validation_scope.validated {
+            // Compare TypeId directly with the TypeId of Table
+            if key.type_id == TypeId::of::<Table>() {
+                handles.push(TableHandle::from_raw_parts(key.index, key.generation));
+            }
+        }
+        handles
+    }
+    
+    /// Collect all validated closure handles for safety during potential reallocation
+    fn collect_validated_closure_handles(&self) -> Vec<ClosureHandle> {
+        let mut handles = Vec::new();
+        for key in &self.validation_scope.validated {
+            // Compare TypeId directly with the TypeId of Closure
+            if key.type_id == TypeId::of::<Closure>() {
+                handles.push(ClosureHandle::from_raw_parts(key.index, key.generation));
+            }
+        }
+        handles
+    }
+
     /// Ensure the transaction is active
     fn ensure_active(&self) -> LuaResult<()> {
         match self.state {
@@ -279,6 +441,8 @@ impl<'a> HeapTransaction<'a> {
             TransactionState::Aborted => Err(LuaError::InvalidTransactionState),
         }
     }
+    
+
     
     /// Type-safe handle validation with caching
     pub fn validate_handle<H: ValidatableHandle>(&mut self, handle: &H) -> LuaResult<()> {
@@ -322,19 +486,25 @@ impl<'a> HeapTransaction<'a> {
     
     /// Create a new string
     pub fn create_string(&mut self, s: &str) -> LuaResult<StringHandle> {
-        self.ensure_active()?;
-        
-        // Use validation-aware creation to ensure handles remain valid during reallocation
-        let validated_handles = self.collect_validated_string_handles();
-        let handle = self.heap.create_string_with_validation(s, &validated_handles)?;
-        
-        // Add debug output for string interning troubleshooting
-        if s.len() < 30 && (s == "print" || s == "type" || s == "tostring" || s.starts_with("__")) {
-            println!("DEBUG INTERNING: Created string '{}' with handle {:?}", s, handle);
+        if self.debug_config.log_string_creation {
+            eprintln!("DEBUG: HeapTransaction::create_string - Creating string '{}'", 
+                     if s.len() < 50 { s } else { "<long string>" });
         }
         
-        // Mark as created
-        self.validation_scope.mark_created(&handle);
+        // Track string memory allocation
+        self.resource_tracker.track_string_allocation(s.len())?;
+        
+        // Check string cache first
+        let cache_key = s.to_string();
+        if let Some(&handle) = self.string_cache.by_content.get(&cache_key) {
+            if self.debug_config.log_string_creation {
+                eprintln!("DEBUG: HeapTransaction::create_string - Found in local cache");
+            }
+            return Ok(handle);
+        }
+        
+        // Create string using heap-level interning
+        let handle = self.heap.create_string_with_validation(s, &[])?;
         
         Ok(handle)
     }
@@ -417,6 +587,65 @@ impl<'a> HeapTransaction<'a> {
         self.changes.push(HeapChange::SetTableField { table, key, value });
         Ok(())
     }
+
+    /// Optimized method for setting array elements during table operations
+    pub fn set_table_array_element(&mut self, table: TableHandle, index: usize, value: Value) -> LuaResult<()> {
+        self.ensure_active()?;
+        
+        // Validate handles
+        self.validate_with_context(&table, "set_table_array_element")?;
+        self.validate_value(&value, "set_table_array_element value")?;
+        
+        eprintln!("DEBUG set_table_array_element: Setting table[{}] = {:?}", index, value);
+        
+        // Get the table object to directly manipulate its array part
+        let table_obj = self.heap.get_table_mut(table)?;
+        
+        if index > 0 {
+            // For array indices, ensure the array is large enough
+            if index <= table_obj.array.len() {
+                // Replace existing element
+                eprintln!("DEBUG set_table_array_element: Replacing existing element at index {}", index);
+                table_obj.array[index - 1] = value;
+            } else if index == table_obj.array.len() + 1 {
+                // Append to the array (common case)
+                eprintln!("DEBUG set_table_array_element: Appending element to array at index {}", index);
+                table_obj.array.push(value);
+            } else {
+                // Need to grow the array
+                eprintln!("DEBUG set_table_array_element: Growing array from {} to {}", 
+                         table_obj.array.len(), index);
+                         
+                // Fill gaps with nil values
+                while table_obj.array.len() < index - 1 {
+                    table_obj.array.push(Value::Nil);
+                }
+                table_obj.array.push(value);
+            }
+        } else {
+            // For non-array indices (0 or negative), use the map part
+            eprintln!("DEBUG set_table_array_element: Non-array index {}, using hash part", index);
+            let key = Value::Number(index as f64);
+            let key_hashable = match HashableValue::from_value_with_context(&key, "set_table_array_element") {
+                Ok(hashable) => hashable,
+                Err(_) => {
+                    // This shouldn't happen for number keys, but handle it gracefully
+                    return Err(LuaError::RuntimeError(
+                        format!("Invalid table index: {}", index)
+                    ));
+                }
+            };
+            
+            // Set in the hash part
+            if value.is_nil() {
+                table_obj.map.remove(&key_hashable);
+            } else {
+                table_obj.map.insert(key_hashable, value);
+            }
+        }
+
+        Ok(())
+    }
     
     /// Get table metatable
     pub fn get_table_metatable(&mut self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
@@ -455,6 +684,11 @@ impl<'a> HeapTransaction<'a> {
         self.validate_with_context(&globals, "get_globals_table")?;
         
         Ok(globals)
+    }
+
+    /// Get the globals table
+    pub fn globals(&mut self) -> LuaResult<TableHandle> {
+        self.heap.globals()
     }
 
     /// Get metatable from a table using the two-phase pattern
@@ -601,6 +835,18 @@ impl<'a> HeapTransaction<'a> {
         Ok(())
     }
     
+    /// Ensure thread stack has at least the specified size
+    pub fn grow_stack(&mut self, thread: ThreadHandle, min_size: usize) -> LuaResult<()> {
+        self.ensure_active()?;
+        
+        // Validate the thread handle
+        self.validate_with_context(&thread, "grow_stack")?;
+        
+        // Queue the stack growth operation
+        self.changes.push(HeapChange::GrowStack { thread, min_size });
+        Ok(())
+    }
+    
     /// Push call frame (queued)
     pub fn push_call_frame(&mut self, thread: ThreadHandle, frame: CallFrame) -> LuaResult<()> {
         self.ensure_active()?;
@@ -737,6 +983,34 @@ impl<'a> HeapTransaction<'a> {
         Ok(handle)
     }
     
+    /// Create a closure from a function prototype handle
+    pub fn create_closure_from_proto(
+        &mut self, 
+        proto_handle: FunctionProtoHandle, 
+        upvalues: Vec<UpvalueHandle>
+    ) -> LuaResult<ClosureHandle> {
+        self.ensure_active()?;
+        
+        // Validate the prototype handle
+        self.validate_with_context(&proto_handle, "create_closure_from_proto")?;
+        
+        // Validate all upvalue handles
+        for (i, upvalue) in upvalues.iter().enumerate() {
+            self.validate_with_context(upvalue, &format!("create_closure_from_proto upvalue[{}]", i))?;
+        }
+        
+        // Get a copy of the prototype
+        let proto = self.heap.get_function_proto(proto_handle)?.clone();
+        
+        // Create the closure
+        let closure = Closure {
+            proto,
+            upvalues,
+        };
+        
+        self.create_closure(closure)
+    }
+    
     /// Get closure
     pub fn get_closure(&mut self, handle: ClosureHandle) -> LuaResult<&Closure> {
         self.ensure_active()?;
@@ -789,14 +1063,15 @@ impl<'a> HeapTransaction<'a> {
     }
     
     /// Set upvalue (queued)
-    pub fn set_upvalue(&mut self, upvalue: UpvalueHandle, value: Value) -> LuaResult<()> {
+    pub fn set_upvalue(&mut self, upvalue: UpvalueHandle, value: Value, thread: ThreadHandle) -> LuaResult<()> {
         self.ensure_active()?;
         
         // Validate handles
         self.validate_with_context(&upvalue, "set_upvalue")?;
+        self.validate_with_context(&thread, "set_upvalue thread")?;
         self.validate_value(&value, "set_upvalue value")?;
         
-        self.changes.push(HeapChange::SetUpvalue { upvalue, value });
+        self.changes.push(HeapChange::SetUpvalue { upvalue, value, thread });
         Ok(())
     }
     
@@ -946,7 +1221,7 @@ impl<'a> HeapTransaction<'a> {
             HashableValue::Boolean(false) => 1,
             HashableValue::Boolean(true) => 2,
             HashableValue::Number(n) => 3,
-            HashableValue::String(_) => 4,
+            HashableValue::String(_, _) => 4,
         });
         
         // Find current key's position and return the next one
@@ -969,70 +1244,100 @@ impl<'a> HeapTransaction<'a> {
     /// Validate handles in a pending operation
     fn validate_pending_operation(&mut self, op: &PendingOperation) -> LuaResult<()> {
         match op {
-            PendingOperation::FunctionCall { closure, args, .. } => {
-                self.validate_with_context(closure, "pending function call")?;
-                for (i, arg) in args.iter().enumerate() {
-                    self.validate_value(arg, &format!("function call arg {}", i))?;
+            PendingOperation::FunctionCall { func_index: _, nargs: _, expected_results: _ } => {
+                // Function calls now use stack indices, not closure handles
+                // The function and arguments will be validated when accessed from the stack
+                // No handle validation needed here
+            },
+            PendingOperation::CFunctionCall { .. } => {
+                // C function calls don't contain handles that need validation
+            },
+            PendingOperation::Return { values } => {
+                // Validate any handles in the return values
+                for (i, value) in values.iter().enumerate() {
+                    self.validate_value(value, &format!("return value {}", i))?;
                 }
             },
-            // Add validation for other operation types as needed
-            _ => {} // Other operations don't contain handles or are not yet implemented
+            PendingOperation::MetamethodCall { method, target, args, .. } => {
+                self.validate_with_context(method, "metamethod name")?;
+                self.validate_value(target, "metamethod target")?;
+                for (i, arg) in args.iter().enumerate() {
+                    self.validate_value(arg, &format!("metamethod arg {}", i))?;
+                }
+            },
+            PendingOperation::ResumeAfterMetamethod { result, .. } => {
+                self.validate_value(result, "metamethod result")?;
+            },
+            PendingOperation::TableNext { table, key, .. } => {
+                self.validate_with_context(table, "table next")?;
+                self.validate_value(key, "table next key")?;
+            },
+            PendingOperation::TForLoopContinuation { .. } => {
+                // No handles to validate
+            },
+            PendingOperation::TailCall { .. } => {
+                // No handles to validate - all values referenced by stack indices
+            },
+            PendingOperation::TailCallReturn => {
+                // No handles to validate
+            },
         }
         Ok(())
     }
     
     // Transaction control
     
-    /// Commit all changes atomically - follows the pattern in LUA_TRANSACTION_PATTERNS.md
+    /// Commit all changes atomically
     pub fn commit(&mut self) -> LuaResult<Vec<PendingOperation>> {
-        self.ensure_active()?;
+        // If the transaction has already been committed we simply return an
+        // empty pending-operation list instead of treating it as an error.
+        if self.state == TransactionState::Committed {
+            return Ok(Vec::new());
+        }
+
+        // Abortions are still errors
+        if self.state == TransactionState::Aborted {
+            return Err(LuaError::InvalidTransactionState);
+        }
+
+        debug_assert_eq!(self.state, TransactionState::Active);
         
-        // No handle validation here - all changes were validated when queued
-        // This matches the design pattern specified in LUA_TRANSACTION_PATTERNS.md:
-        // "Handles are validated when queued, not when committed"
-        
-        #[cfg(debug_assertions)]
-        // Phase 1: Debug check that all handles in changes have been validated
-        {
-            for change in &self.changes {
-                // This just ensures we're applying the pattern consistently
-                match change {
-                    HeapChange::SetTableField { table, .. } => {
-                        // Table was already validated when operation was queued
-                        debug_assert!(self.validation_scope.is_valid(table), 
-                                      "SetTableField with unvalidated handle queued");
-                    },
-                    HeapChange::SetTableMetatable { table, metatable } => {
-                        // Both handles were already validated
-                        debug_assert!(self.validation_scope.is_valid(table),
-                                      "SetTableMetatable with unvalidated table handle queued");
-                        if let Some(mt) = metatable {
-                            debug_assert!(self.validation_scope.is_valid(mt),
-                                          "SetTableMetatable with unvalidated metatable handle queued");
-                        }
-                    },
-                    // Similar checks for other change types...
-                    _ => {}
-                }
-            }
+        // Check if we're exceeding the maximum number of apply_changes operations
+        // This is a safety mechanism to prevent infinite loops
+        if self.debug_config.max_apply_changes > 0 && 
+           self.changes.len() > self.debug_config.max_apply_changes {
+            return Err(LuaError::ResourceLimit {
+                resource: "transaction operations".to_string(),
+                limit: self.debug_config.max_apply_changes,
+                used: self.changes.len(),
+                context: "Maximum number of operations in a single transaction exceeded. This likely indicates an infinite loop, not circular references in tables.".to_string()
+            });
         }
         
-        // Phase 2: Apply all changes - avoid borrow checker issue by collecting changes first
-        let changes: Vec<_> = self.changes.drain(..).collect();
+        // Take ownership of changes to avoid borrow issues
+        let changes = std::mem::take(&mut self.changes);
         
+        // Apply all changes one by one
         for change in changes {
-            self.apply_change(change)?;
+            let mut ops = self.apply_change(&change)?;
+            
+            // Use extend to append all operations from the Vec
+            self.pending_operations.extend(ops.drain(..));
         }
         
         // Mark as committed
         self.state = TransactionState::Committed;
         
         // Return pending operations
-        Ok(self.pending_operations.drain(..).collect())
+        let pending_ops: Vec<_> = self.pending_operations.drain(..).collect();
+        Ok(pending_ops)
     }
     
     /// Apply a single change to the heap
-    fn apply_change(&mut self, change: HeapChange) -> LuaResult<()> {
+    fn apply_change(&mut self, change: &HeapChange) -> LuaResult<Vec<PendingOperation>> {
+        // Track this operation
+        self.resource_tracker.track_operation()?;
+        
         match change {
             HeapChange::SetTableField { table, key, value } => {
                 // For table keys, we need to verify the key is hashable
@@ -1040,55 +1345,66 @@ impl<'a> HeapTransaction<'a> {
                 if !super::value::HashableValue::is_hashable(&key) {
                     // Non-hashable key (like a table) - use Nil instead to avoid errors
                     // This matches Lua behavior where tables can't be used as keys
-                    self.heap.set_table_field_internal(table, Value::Nil, value)?;
+                    self.heap.set_table_field_internal(*table, &Value::Nil, value)?;
                 } else {
                     // Normal case - key is hashable
-                    self.heap.set_table_field_internal(table, key, value)?;
+                    self.heap.set_table_field_internal(*table, key, value)?;
                 }
             }
             HeapChange::SetTableMetatable { table, metatable } => {
-                self.heap.set_table_metatable_internal(table, metatable)?;
+                self.heap.set_table_metatable_internal(*table, metatable)?;
             }
             HeapChange::SetRegister { thread, index, value } => {
-                self.heap.set_thread_register_internal(thread, index, value)?;
+                self.heap.set_thread_register_internal(*thread, *index, value)?;
             }
             HeapChange::PushStack { thread, value } => {
-                let thread_obj = self.heap.get_thread_mut(thread)?;
-                thread_obj.stack.push(value);
+                let thread_obj = self.heap.get_thread_mut(*thread)?;
+                thread_obj.stack.push(value.clone());
             }
             HeapChange::PopStack { thread, count } => {
-                let thread_obj = self.heap.get_thread_mut(thread)?;
-                for _ in 0..count {
+                let thread_obj = self.heap.get_thread_mut(*thread)?;
+                for _ in 0..*count {
                     thread_obj.stack.pop();
                 }
             }
             HeapChange::PushCallFrame { thread, frame } => {
-                let thread_obj = self.heap.get_thread_mut(thread)?;
-                thread_obj.call_frames.push(frame);
+                let thread_obj = self.heap.get_thread_mut(*thread)?;
+                thread_obj.call_frames.push(frame.clone());
             }
             HeapChange::PopCallFrame { thread } => {
-                let thread_obj = self.heap.get_thread_mut(thread)?;
+                let thread_obj = self.heap.get_thread_mut(*thread)?;
                 thread_obj.call_frames.pop();
             }
             HeapChange::SetPC { thread, pc } => {
-                let thread_obj = self.heap.get_thread_mut(thread)?;
+                let thread_obj = self.heap.get_thread_mut(*thread)?;
                 if let Some(frame) = thread_obj.call_frames.last_mut() {
-                    frame.pc = pc;
+                    frame.pc = *pc;
                 }
             }
-            HeapChange::SetUpvalue { upvalue, value } => {
-                let upvalue_obj = self.heap.get_upvalue_mut(upvalue)?;
-                if upvalue_obj.stack_index.is_none() {
-                    upvalue_obj.value = Some(value);
+            HeapChange::SetUpvalue { upvalue, value, thread } => {
+                let upvalue_obj = self.heap.get_upvalue_mut(*upvalue)?;
+                if let Some(stack_index) = upvalue_obj.stack_index {
+                    // Open upvalue - update the value at the stack position
+                    self.heap.set_thread_register_internal(*thread, stack_index, value)?;
+                } else {
+                    // Closed upvalue - update the stored value
+                    upvalue_obj.value = Some(value.clone());
                 }
             }
             HeapChange::CloseUpvalue { upvalue, value } => {
-                let upvalue_obj = self.heap.get_upvalue_mut(upvalue)?;
+                let upvalue_obj = self.heap.get_upvalue_mut(*upvalue)?;
                 upvalue_obj.stack_index = None;
-                upvalue_obj.value = Some(value);
+                upvalue_obj.value = Some(value.clone());
+            }
+            HeapChange::GrowStack { thread, min_size } => {
+                let thread_obj = self.heap.get_thread_mut(*thread)?;
+                if thread_obj.stack.len() < *min_size {
+                    // Grow the stack by filling with nil values
+                    thread_obj.stack.resize(*min_size, Value::Nil);
+                }
             }
         }
-        Ok(())
+        Ok(Vec::new())
     }
     
     /// Abort the transaction (discard all changes)
@@ -1096,7 +1412,6 @@ impl<'a> HeapTransaction<'a> {
         self.ensure_active()?;
         
         self.changes.clear();
-        self.pending_operations.clear();
         self.state = TransactionState::Aborted;
         
         Ok(())
@@ -1105,86 +1420,27 @@ impl<'a> HeapTransaction<'a> {
     /// Reset transaction for reuse
     pub fn reset(&mut self) -> LuaResult<()> {
         self.changes.clear();
+        self.thread_cache.clear();
+        self.string_cache = StringCache::new();
+        self.new_handles.clear();
+        self.state = TransactionState::Active;
         self.pending_operations.clear();
         self.validation_scope = ValidationScope::new();
-        self.state = TransactionState::Active;
         
         Ok(())
     }
     
-    /// Create a validation scope for batch operations
-    pub fn validation_scope(&mut self) -> ValidScope<'a, '_> {
-        ValidScope::new(self)
-    }
-    
-    /// Collect all validated string handles in current transaction
-    fn collect_validated_string_handles(&self) -> Vec<StringHandle> {
-        // Collect all string handles that have been validated in this transaction
-        self.validation_scope.validated.iter()
-            .filter(|key| key.type_id == std::any::TypeId::of::<super::value::LuaString>())
-            .map(|key| {
-                // Use the factory method instead of direct field access
-                StringHandle::from_raw_parts(key.index, key.generation)
-            })
-            .collect()
-    }
 
-    /// Collect all validated table handles in current transaction
-    fn collect_validated_table_handles(&self) -> Vec<TableHandle> {
-        // Collect all table handles that have been validated in this transaction
-        self.validation_scope.validated.iter()
-            .filter(|key| key.type_id == std::any::TypeId::of::<super::value::Table>())
-            .map(|key| {
-                // Use the factory method instead of direct field access
-                TableHandle::from_raw_parts(key.index, key.generation)
-            })
-            .collect()
-    }
-
-    /// Collect all validated closure handles in current transaction
-    fn collect_validated_closure_handles(&self) -> Vec<ClosureHandle> {
-        // Collect all closure handles that have been validated in this transaction
-        self.validation_scope.validated.iter()
-            .filter(|key| key.type_id == std::any::TypeId::of::<super::value::Closure>())
-            .map(|key| {
-                // Use the factory method instead of direct field access
-                ClosureHandle::from_raw_parts(key.index, key.generation)
-            })
-            .collect()
-    }
     
     /// Create a function prototype
     pub fn create_function_proto(&mut self, proto: FunctionProto) -> LuaResult<FunctionProtoHandle> {
-        self.ensure_active()?;
-        
-        // Use validation-aware creation to ensure handles remain valid during reallocation
-        let validated_handles = self.collect_validated_function_proto_handles();
-        let handle = self.heap.create_function_proto_with_validation(proto, &validated_handles)?;
-        
-        // Mark as created
-        self.validation_scope.mark_created(&handle);
-        
+        let handle = self.heap.create_function_proto_with_validation(proto, &[])?;
         Ok(handle)
     }
     
     /// Get function prototype
     pub fn get_function_proto(&mut self, handle: FunctionProtoHandle) -> LuaResult<&FunctionProto> {
-        self.ensure_active()?;
-        
-        // Validate the handle
-        self.validate_with_context(&handle, "get_function_proto")?;
-        
         self.heap.get_function_proto(handle)
-    }
-    
-    /// Collect all validated function proto handles in current transaction
-    fn collect_validated_function_proto_handles(&self) -> Vec<FunctionProtoHandle> {
-        self.validation_scope.validated.iter()
-            .filter(|key| key.type_id == std::any::TypeId::of::<super::value::FunctionProto>())
-            .map(|key| {
-                FunctionProtoHandle::from_raw_parts(key.index, key.generation)
-            })
-            .collect()
     }
     
     /// Get function prototype as a copy
@@ -1223,27 +1479,57 @@ impl<'a> HeapTransaction<'a> {
         // Validate thread handle
         self.validate_with_context(&thread, "find_or_create_upvalue")?;
         
-        // Phase 1: Extract needed data to avoid nested borrows
+        eprintln!("DEBUG find_or_create_upvalue: Looking for upvalue at stack index {}", stack_index);
+        
+        // Phase 1: Validate stack index is within bounds
+        let stack_size = {
+            let thread_obj = self.heap.get_thread(thread)?;
+            thread_obj.stack.len()
+        };
+        
+        if stack_index >= stack_size {
+            eprintln!("ERROR find_or_create_upvalue: Stack index {} out of bounds (stack size: {})", 
+                     stack_index, stack_size);
+            return Err(LuaError::RuntimeError(format!(
+                "Cannot create upvalue for stack index {} (stack size: {})",
+                stack_index, stack_size
+            )));
+        }
+        
+        // Phase 2: Extract needed data to avoid nested borrows
         let open_upvalues = {
             let thread_obj = self.heap.get_thread(thread)?;
             thread_obj.open_upvalues.clone() // Clone the vector to avoid borrow issues
         };
         
-        // Phase 2: Search for existing upvalue (not holding heap borrow)
+        eprintln!("DEBUG find_or_create_upvalue: Thread has {} open upvalues", open_upvalues.len());
+        
+        // Phase 3: Search for existing upvalue (not holding heap borrow)
         for &upvalue_handle in &open_upvalues {
             // Validate the upvalue handle
-            self.validate_with_context(&upvalue_handle, "find_or_create_upvalue existing")?;
-            
-            // Check if it references our target stack slot
-            let upvalue = self.heap.get_upvalue(upvalue_handle)?;
-            if let Some(idx) = upvalue.stack_index {
-                if idx == stack_index {
-                    return Ok(upvalue_handle);
+            match self.validate_handle(&upvalue_handle) {
+                Ok(_) => {
+                    // Check if it references our target stack slot
+                    let upvalue = self.heap.get_upvalue(upvalue_handle)?;
+                    if let Some(idx) = upvalue.stack_index {
+                        if idx == stack_index {
+                            eprintln!("DEBUG find_or_create_upvalue: Found existing upvalue for stack index {}", 
+                                     stack_index);
+                            return Ok(upvalue_handle);
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("WARNING find_or_create_upvalue: Skipping invalid upvalue handle: {}", e);
+                    // Skip invalid handles instead of failing
+                    continue;
                 }
             }
         }
         
-        // Phase 3: Create new upvalue (no heap borrows currently held)
+        eprintln!("DEBUG find_or_create_upvalue: Creating new upvalue for stack index {}", stack_index);
+        
+        // Phase 4: Create new upvalue (no heap borrows currently held)
         let new_upvalue = Upvalue {
             stack_index: Some(stack_index),
             value: None,
@@ -1251,13 +1537,16 @@ impl<'a> HeapTransaction<'a> {
         
         let upvalue_handle = self.create_upvalue(new_upvalue)?;
         
-        // Phase 4: Add to thread's open_upvalues list
+        // Phase 5: Add to thread's open_upvalues list
         // First collect stack indices from open upvalues
         let mut upvalue_indices = Vec::new();
         for &handle in &open_upvalues {
-            if let Ok(upval) = self.heap.get_upvalue(handle) {
-                if let Some(idx) = upval.stack_index {
-                    upvalue_indices.push((handle, idx));
+            // Validate handles before using them
+            if self.validate_handle(&handle).is_ok() {
+                if let Ok(upval) = self.heap.get_upvalue(handle) {
+                    if let Some(idx) = upval.stack_index {
+                        upvalue_indices.push((handle, idx));
+                    }
                 }
             }
         }
@@ -1268,12 +1557,16 @@ impl<'a> HeapTransaction<'a> {
             .position(|(_, idx)| *idx < stack_index)
             .unwrap_or(upvalue_indices.len());
         
+        eprintln!("DEBUG find_or_create_upvalue: Inserting new upvalue at position {} in open_upvalues list", 
+                 insert_pos);
+        
         // Now we can safely add the upvalue to the thread
         {
             let thread_obj = self.heap.get_thread_mut(thread)?;
             thread_obj.open_upvalues.insert(insert_pos, upvalue_handle);
         }
         
+        eprintln!("DEBUG find_or_create_upvalue: Successfully created upvalue handle {:?}", upvalue_handle);
         Ok(upvalue_handle)
     }
     
@@ -1440,6 +1733,31 @@ impl<'a> HeapTransaction<'a> {
         
         Ok(())
     }
+
+    /// Get resource tracker (for external use in operations)
+    pub fn resource_tracker(&mut self) -> &mut ResourceTracker {
+        &mut self.resource_tracker
+    }
+    
+    /// Get current resource usage summary
+    pub fn resource_usage(&self) -> String {
+        self.resource_tracker.usage_summary()
+    }
+
+    /// True while the transaction is still active.
+    pub fn is_active(&self) -> bool {
+        self.state == TransactionState::Active
+    }
+
+    /// Current state accessor (used by VM for finer checks when needed).
+    pub fn state(&self) -> TransactionState {
+        self.state
+    }
+
+    /// Create a validation scope for enforcing validation patterns
+    pub fn validation_scope<'b>(&'b mut self) -> ValidScope<'a, 'b> {
+        ValidScope::new(self)
+    }
 }
 
 /// ValidScope - a scope that enforces validation patterns
@@ -1551,7 +1869,18 @@ impl<'a, 'tx> Drop for ValidScope<'a, 'tx> {
     }
 }
 
+/// Guard to ensure STRING_CREATE_DEPTH is decremented on drop
+struct StringCreateGuard;
 
+impl Drop for StringCreateGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if STRING_CREATE_DEPTH > 0 {
+                STRING_CREATE_DEPTH -= 1;
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

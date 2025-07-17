@@ -116,7 +116,7 @@ pub fn lua_tostring(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     let value = ctx.get_arg(0)?;
     
     // Check for __tostring metamethod
-    let mt_result = ctx.check_metamethod(&value, "__tostring");
+    let mt_result = ctx.check_metamethod(&value, "__tostring")?;
     
     if let Some(func) = mt_result {
         // Call metamethod with the value
@@ -371,6 +371,9 @@ pub fn lua_select(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 /// Next function - returns the next key-value pair from a table
 /// Signature: next(table [, index])
 pub fn lua_next(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    println!("DEBUG NEXT: next() called with {} arguments", ctx.arg_count());
+    
+    // Validate argument count - must be 1 or 2
     let arg_count = ctx.arg_count();
     if arg_count < 1 || arg_count > 2 {
         return Err(LuaError::ArgumentError {
@@ -379,33 +382,41 @@ pub fn lua_next(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
+    // Get table argument with strict type checking
     let table_val = ctx.get_arg(0)?;
     let table_handle = match table_val {
         Value::Table(h) => h,
-        _ => return Err(LuaError::TypeError {
-            expected: "table".to_string(),
-            got: table_val.type_name().to_string(),
-        }),
+        other => {
+            println!("DEBUG NEXT: First argument is not a table, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: other.type_name().to_string(),
+            });
+        }
     };
     
     // Get the current key (nil means start from beginning)
-    let current_key = if arg_count >= 2 {
-        ctx.get_arg(1)?
-    } else {
-        Value::Nil
-    };
+    let current_key = ctx.get_arg(1)?;
     
-    // Get next key-value pair
+    println!("DEBUG NEXT: Looking for next key after {:?}", current_key);
+    
+    // According to the register allocation contract & Lua 5.1 spec,
+    // iterator functions must follow a strict return pattern:
+    // 1. Return nil to end iteration, OR
+    // 2. Return key, value pair to continue
     match ctx.table_next(table_handle, current_key)? {
         Some((key, value)) => {
+            println!("DEBUG NEXT: Found next pair: {:?} -> {:?}", key, value);
+            // Return key-value pair for next iteration
             ctx.push_result(key)?;
             ctx.push_result(value)?;
-            Ok(2)
+            Ok(2)  // Return 2 values: key and value
         },
         None => {
-            // No more elements
+            // No more elements - return nil to end iteration
+            println!("DEBUG NEXT: No more pairs, returning nil");
             ctx.push_result(Value::Nil)?;
-            Ok(1)
+            Ok(1)  // Return 1 value: nil
         }
     }
 }
@@ -450,6 +461,9 @@ fn pairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 /// Pairs function - returns an iterator for table pairs
 /// Signature: pairs(t)
 pub fn lua_pairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    println!("DEBUG PAIRS: pairs() called with {} arguments", ctx.arg_count());
+    
+    // Validate argument count
     if ctx.arg_count() != 1 {
         return Err(LuaError::ArgumentError {
             expected: 1,
@@ -457,71 +471,103 @@ pub fn lua_pairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
+    // Get table argument with strict type checking
     let table_val = ctx.get_arg(0)?;
-    match table_val {
-        Value::Table(_) => {
-            // Return: iterator_function, table, nil
-            ctx.push_result(Value::CFunction(pairs_iter))?;
-            ctx.push_result(table_val)?;
-            ctx.push_result(Value::Nil)?;
-            Ok(3)
-        },
-        _ => Err(LuaError::TypeError {
-            expected: "table".to_string(),
-            got: table_val.type_name().to_string(),
-        }),
-    }
+    let table_handle = match table_val {
+        Value::Table(h) => h,
+        other => {
+            println!("DEBUG PAIRS: Argument is not a table, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: other.type_name().to_string(),
+            });
+        }
+    };
+    
+    // Get the next function to use as the iterator
+    let next_func = match ctx.globals_get("next")? {
+        Value::CFunction(f) => f,
+        other => {
+            println!("DEBUG PAIRS: Could not find next function, got: {}", other.type_name());
+            return Err(LuaError::RuntimeError("Could not find next function".to_string()));
+        }
+    };
+    
+    println!("DEBUG PAIRS: Returning next function, table, and nil");
+    
+    // Return the iterator triplet: next, table, nil
+    ctx.push_result(Value::CFunction(next_func))?;
+    ctx.push_result(Value::Table(table_handle))?;
+    ctx.push_result(Value::Nil)?;
+    
+    Ok(3) // Return 3 values (iterator function, state, initial control value)
 }
 
 /// Ipairs iterator function - internal helper for ipairs()
-fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
-    // This is the iterator function for ipairs
-    // It receives: table, current_index
+pub fn ipairs_iter(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    eprintln!("DEBUG IPAIRS_ITER: Function called with {} arguments", ctx.arg_count());
+    
+    // Validate argument count
     if ctx.arg_count() != 2 {
+        eprintln!("DEBUG IPAIRS_ITER: Error - wrong number of arguments (expected 2, got {})", ctx.arg_count());
         return Err(LuaError::ArgumentError {
             expected: 2,
             got: ctx.arg_count(),
         });
     }
     
-    let table_val = ctx.get_arg(0)?;
-    let index_val = ctx.get_arg(1)?;
-    
-    let table_handle = match table_val {
-        Value::Table(h) => h,
-        _ => return Err(LuaError::TypeError {
-            expected: "table".to_string(),
-            got: table_val.type_name().to_string(),
-        }),
-    };
-    
-    let current_index = match index_val {
-        Value::Number(n) => n as usize,
-        _ => 0,
-    };
-    
-    // Get next array element
-    let next_index = current_index + 1;
-    let key = Value::Number(next_index as f64);
-    
-    match ctx.table_get(table_handle, key.clone())? {
-        Value::Nil => {
-            // End of array part
-            ctx.push_result(Value::Nil)?;
-            Ok(1)
-        },
-        value => {
-            // Return index and value
-            ctx.push_result(key)?;
-            ctx.push_result(value)?;
-            Ok(2)
+    // Get table argument
+    let table = match ctx.get_arg(0)? {
+        Value::Table(handle) => handle,
+        other => {
+            eprintln!("DEBUG IPAIRS_ITER: Error - first argument is not a table, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: other.type_name().to_string(),
+            });
         }
+    };
+    
+    // Get index argument
+    let index = match ctx.get_arg(1)? {
+        Value::Number(n) => n as i64,
+        other => {
+            eprintln!("DEBUG IPAIRS_ITER: Error - second argument is not a number, got: {}", other.type_name());
+            return Err(LuaError::TypeError {
+                expected: "number".to_string(),
+                got: other.type_name().to_string(),
+            });
+        }
+    };
+    
+    // Calculate next index
+    let next_idx = index + 1;
+    eprintln!("DEBUG IPAIRS_ITER: Looking up index {} in table", next_idx);
+    
+    // Look up this index in the table
+    let value = ctx.table_get(table, Value::Number(next_idx as f64))?;
+    
+    // If value is nil, we're at the end of iteration
+    if value.is_nil() {
+        eprintln!("DEBUG IPAIRS_ITER: Index {} is nil, ending iteration", next_idx);
+        ctx.push_result(Value::Nil)?;
+        return Ok(1); // Return nil to end iteration
     }
+    
+    // Otherwise, return the next index and value
+    eprintln!("DEBUG IPAIRS_ITER: Found value at index {}: {:?}", next_idx, value);
+    ctx.push_result(Value::Number(next_idx as f64))?;  // Return next index
+    ctx.push_result(value)?;                         // Return value at that index
+    
+    eprintln!("DEBUG IPAIRS_ITER: Returning index={} and value, return count=2", next_idx);
+    
+    Ok(2) // Return 2 values: index and value
 }
 
 /// Ipairs function - returns an iterator for array part of table
 /// Signature: ipairs(t)
 pub fn lua_ipairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    eprintln!("DEBUG IPAIRS: ipairs() called with {} arguments", ctx.arg_count());
     if ctx.arg_count() != 1 {
         return Err(LuaError::ArgumentError {
             expected: 1,
@@ -529,19 +575,45 @@ pub fn lua_ipairs(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
+    // Check that argument is a table
     let table_val = ctx.get_arg(0)?;
+    eprintln!("DEBUG IPAIRS: Table argument type: {}", table_val.type_name());
+    
     match table_val {
         Value::Table(_) => {
-            // Return: iterator_function, table, 0
-            ctx.push_result(Value::CFunction(ipairs_iter))?;
-            ctx.push_result(table_val)?;
-            ctx.push_result(Value::Number(0.0))?;
-            Ok(3)
+            // Return the iterator triplet with values in the correct order:
+            // 1. iterator function (ipairs_iter)
+            // 2. invariant state (table)
+            // 3. initial control variable (0)
+            // This must match the order expected by TFORLOOP
+            eprintln!("DEBUG IPAIRS: Returning iterator triplet: (ipairs_iter, table, 0)");
+            
+            // Important: Create the CFunction explicitly here to ensure it's a valid function reference
+            let iter_func = Value::CFunction(ipairs_iter);
+            
+            // Check the type of the iterator function before using it
+            eprintln!("DEBUG IPAIRS: Iterator function type: {}", iter_func.type_name());
+            
+            // Make sure first return value is proper CFunction
+            ctx.set_return(0, iter_func)?;
+            
+            // Return the table as state
+            ctx.set_return(1, table_val)?;
+            
+            // Return 0 as initial control value
+            ctx.set_return(2, Value::Number(0.0))?;
+            
+            eprintln!("DEBUG IPAIRS: Verified returns: function, table, number");
+            
+            Ok(3) // Return 3 values
         },
-        _ => Err(LuaError::TypeError {
-            expected: "table".to_string(),
-            got: table_val.type_name().to_string(),
-        }),
+        other => {
+            eprintln!("DEBUG IPAIRS: Error - argument is not a table: {}", other.type_name());
+            Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: other.type_name().to_string(),
+            })
+        }
     }
 }
 
@@ -822,6 +894,47 @@ pub fn lua_load(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     Ok(2)
 }
 
+/// Eval function - evaluates a string as Lua code
+/// Signature: eval(code)
+pub fn lua_eval(ctx: &mut ExecutionContext) -> LuaResult<i32> {
+    if ctx.arg_count() < 1 {
+        return Err(LuaError::ArgumentError {
+            expected: 1,
+            got: ctx.arg_count(),
+        });
+    }
+    
+    // Get the source code string
+    let source_code = match ctx.get_arg(0)? {
+        Value::String(_) => ctx.get_arg_str(0)?,
+        Value::Number(n) => n.to_string(),
+        _ => return Err(LuaError::TypeError {
+            expected: "string".to_string(),
+            got: ctx.get_arg(0)?.type_name().to_string(),
+        }),
+    };
+    
+    println!("DEBUG EVAL: Evaluating code: {}", source_code);
+    
+    // Use the VM's eval_script method to evaluate the code
+    match ctx.eval_script(&source_code) {
+        Ok(result) => {
+            // Successfully evaluated, push the result
+            println!("DEBUG EVAL: Evaluation successful, result type: {}", result.type_name());
+            ctx.push_result(result)?;
+            Ok(1)
+        },
+        Err(e) => {
+            // Error during evaluation
+            println!("DEBUG EVAL: Evaluation failed: {:?}", e);
+            
+            // In a pcall-like manner, we could return nil + error message,
+            // but for now we'll propagate the error
+            Err(e)
+        }
+    }
+}
+
 /// Lua pcall function - runs a function in protected mode and captures errors
 /// Signature: pcall(f, ...)
 pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
@@ -845,7 +958,7 @@ pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
             }
             
             // Execute the closure in protected mode
-            match ctx.vm_access.execute_function(closure, &args) {
+            match ctx.execute_function(closure, &args) {
                 Ok(value) => {
                     // Success - first push the success status
                     ctx.push_result(Value::Boolean(true))?;
@@ -904,19 +1017,14 @@ pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
                         _ => format!("{}", e),
                     };
                     
-                    // Create a fresh transaction to update the status and add error message
-                    let mut tx = HeapTransaction::new(&mut ctx.vm_access.heap);
-                    
-                    // Create error message string
-                    let err_handle = tx.create_string(&error_msg)?;
+                    // Create error message string and update status using existing context
+                    let err_handle = ctx.create_string(&error_msg)?;
                     
                     // Replace the success status with false
-                    tx.set_register(thread_handle, base_index, Value::Boolean(false))?;
+                    ctx.set_return(0, Value::Boolean(false))?;
                     
                     // Add the error message as second return value
-                    tx.set_register(thread_handle, base_index + 1, Value::String(err_handle))?;
-                    
-                    tx.commit()?;
+                    ctx.set_return(1, Value::String(err_handle))?;
                     
                     // We've manually set exactly 2 return values
                     Ok(2)
@@ -940,6 +1048,28 @@ pub fn lua_pcall(ctx: &mut ExecutionContext) -> LuaResult<i32> {
 /// Helper to add execution context methods
 impl<'vm> ExecutionContext<'vm> {
     // All implementations removed - they're defined in vm.rs
+}
+
+/// Helper function to register a function in the globals table
+fn register_function(
+    tx: &mut HeapTransaction,
+    globals: TableHandle,
+    name: &str,
+    func: CFunction,
+) -> LuaResult<()> {
+    println!("DEBUG register_function: Registering '{}' in globals {:?}", name, globals);
+    
+    let name_handle = tx.create_string(name)?;
+    println!("DEBUG register_function: Created string handle {:?} for '{}'", name_handle, name);
+    
+    let name_value = Value::String(name_handle);
+    let func_value = Value::CFunction(func);
+    
+    println!("DEBUG register_function: About to set table field {} -> CFunction", name);
+    tx.set_table_field(globals, name_value, func_value)?;
+    println!("DEBUG register_function: Successfully registered '{}'", name);
+    
+    Ok(())
 }
 
 /// Create a table with all base library functions
@@ -974,6 +1104,7 @@ pub fn create_base_lib() -> HashMap<&'static str, CFunction> {
     
     // Loading functions
     base_lib.insert("load", lua_load as CFunction);
+    base_lib.insert("eval", lua_eval as CFunction);
     
     // Error handling
     base_lib.insert("pcall", lua_pcall as CFunction);
@@ -981,35 +1112,109 @@ pub fn create_base_lib() -> HashMap<&'static str, CFunction> {
     base_lib
 }
 
-/// Initialize the base library in a VM
-pub fn init_base_lib(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
-    use crate::lua::transaction::HeapTransaction;
+/// Initialize the base library
+pub fn init(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
+    println!("DEBUG: Initializing base library");
     
-    println!("DEBUG STDLIB: Starting standard library initialization");
-    
-    // Create a transaction
     let mut tx = HeapTransaction::new(vm.heap_mut());
-    
-    // Get the global table
     let globals = tx.get_globals_table()?;
     
-    // Add all stdlib functions
-    let stdlib = create_base_lib();
-    println!("DEBUG STDLIB: Registering {} standard library functions", stdlib.len());
+    println!("DEBUG: Got globals table handle: {:?}", globals);
     
-    for (name, func) in stdlib {
-        let name_handle = tx.create_string(name)?;
-        
-        // Add debug output for function registration
-        println!("DEBUG STDLIB: Registered function '{}' with handle {:?}", name, name_handle);
-        
-        tx.set_table_field(globals, Value::String(name_handle), Value::CFunction(func))?;
-    }
+    // First set up _G._G = _G before registering functions
+    println!("DEBUG: Setting up _G._G first");
+    let g_key = tx.create_string("_G")?;
+    tx.set_table_field(globals, Value::String(g_key), Value::Table(globals))?;
+    println!("DEBUG: _G._G setup complete");
     
-    // Commit the transaction
+    // Register all base functions
+    println!("DEBUG: Starting function registration");
+    
+    println!("DEBUG: Registering print...");
+    register_function(&mut tx, globals, "print", lua_print)?;
+    
+    println!("DEBUG: Registering type...");
+    register_function(&mut tx, globals, "type", lua_type)?;
+    
+    println!("DEBUG: Registering tostring...");
+    register_function(&mut tx, globals, "tostring", lua_tostring)?;
+    
+    println!("DEBUG: Registering tonumber...");
+    register_function(&mut tx, globals, "tonumber", lua_tonumber)?;
+    
+    println!("DEBUG: Registering assert...");
+    register_function(&mut tx, globals, "assert", lua_assert)?;
+    
+    println!("DEBUG: Registering error...");
+    register_function(&mut tx, globals, "error", lua_error)?;
+    
+    println!("DEBUG: Registering select...");
+    register_function(&mut tx, globals, "select", lua_select)?;
+    
+    println!("DEBUG: Registering next...");
+    register_function(&mut tx, globals, "next", lua_next)?;
+    
+    println!("DEBUG: Registering pairs...");
+    register_function(&mut tx, globals, "pairs", lua_pairs)?;
+    
+    println!("DEBUG: Registering ipairs...");
+    register_function(&mut tx, globals, "ipairs", lua_ipairs)?;
+    
+    println!("DEBUG: Registering rawget...");
+    register_function(&mut tx, globals, "rawget", lua_rawget)?;
+    
+    println!("DEBUG: Registering rawset...");
+    register_function(&mut tx, globals, "rawset", lua_rawset)?;
+    
+    println!("DEBUG: Registering rawequal...");
+    register_function(&mut tx, globals, "rawequal", lua_rawequal)?;
+    
+    println!("DEBUG: Registering getmetatable...");
+    register_function(&mut tx, globals, "getmetatable", lua_getmetatable)?;
+    
+    println!("DEBUG: Registering setmetatable...");
+    register_function(&mut tx, globals, "setmetatable", lua_setmetatable)?;
+    
+    println!("DEBUG: Registering pcall...");
+    register_function(&mut tx, globals, "pcall", lua_pcall)?;
+    
+    println!("DEBUG: Registering load...");
+    register_function(&mut tx, globals, "load", lua_load)?;
+    
+    println!("DEBUG: Registering unpack...");
+    register_function(&mut tx, globals, "unpack", lua_unpack)?;
+    
+    println!("DEBUG: Registering eval...");
+    register_function(&mut tx, globals, "eval", lua_eval)?;
+    
+    println!("DEBUG: All functions registered");
+    
+    // Verify immediately before commit
+    println!("DEBUG: Verifying functions before commit...");
+    let print_key = tx.create_string("print")?;
+    let print_val = tx.read_table_field(globals, &Value::String(print_key))?;
+    println!("DEBUG: Pre-commit check - print function: {:?}", print_val);
+    
+    println!("DEBUG: Committing base library transaction...");
     tx.commit()?;
+    println!("DEBUG: Base library initialization complete");
     
-    println!("DEBUG STDLIB: Standard library initialization completed");
+    // Verify after commit with a new transaction
+    println!("DEBUG: Post-commit verification...");
+    let mut verify_tx = HeapTransaction::new(vm.heap_mut());
+    let verify_globals = verify_tx.get_globals_table()?;
+    let verify_print_key = verify_tx.create_string("print")?;
+    let verify_print_val = verify_tx.read_table_field(verify_globals, &Value::String(verify_print_key))?;
+    println!("DEBUG: Post-commit check - print function: {:?}", verify_print_val);
+    verify_tx.commit()?;
+    
     Ok(())
+}
+
+/// Initialize the base library in a VM
+pub fn init_base_lib(vm: &mut crate::lua::vm::LuaVM) -> LuaResult<()> {
+    // Simply delegate to init() - this ensures we only have one implementation
+    // to maintain and all functions are properly registered
+    init(vm)
 }
 

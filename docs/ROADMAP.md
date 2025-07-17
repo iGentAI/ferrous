@@ -1,397 +1,105 @@
-# Ferrous Implementation Roadmap
+# Ferrous Development Roadmap
 
-## Project Overview
+## Phase 1: Core Functionality (Completed)
+- TCP server with connection handling
+- Full RESP2 protocol implementation
+- Basic Redis commands (PING, GET, SET, DEL, etc.)
+- String data type implementation
 
-Building a Redis-compatible server in Rust is a significant undertaking. This roadmap breaks down the implementation into logical technical groups with priorities based on production value and implementation dependencies.
+## Phase 2: Data Structures (Completed)
+- List data type and commands
+- Set data type and commands
+- Hash data type and commands
+- Sorted Set data type and commands
+- Basic key operations (EXISTS, EXPIRE, TTL, etc.)
 
-## Technical Group 1: Foundation ✅ COMPLETED
+## Phase 3: Persistence & Messaging (Completed)
+- RDB persistence (SAVE, BGSAVE)
+- AOF persistence
+- Pub/Sub messaging
+- Transaction support (MULTI/EXEC/DISCARD/WATCH)
 
-### Goals
-- Establish project structure
-- Implement basic networking
-- Create RESP protocol parser
-- Support minimal command set for validation
+## Phase 4: Advanced Features (In Progress)
+- ✅ Pipelined command processing
+- ✅ Concurrent client handling
+- ✅ Configuration commands
+- ✅ Enhanced RESP parsing
+- ✅ Master-slave replication
+- ✅ SCAN command family for safe iteration
+- ✅ Basic Lua VM with unified stack model
+- 🔄 Complete Lua standard library implementation
+  - ✅ Basic functions (print, type, tostring, tonumber, assert)
+  - ⚠️ String library functions
+  - ⚠️ Table library functions
+- 🔄 Advanced Lua VM features
+  - ✅ Table operations
+  - ✅ Closures and upvalues
+  - ✅ Numerical for loops
+  - ✅ String interning with content-based comparison
+  - ✅ Table field access with string keys
+  - ⚠️ Generic for loops (in progress)
+  - ⚠️ Full metamethod support (partially implemented)
+  - ❌ Coroutines
+  - ❌ Garbage collection
+  - ❌ Error handling with traceback
+    
+## Phase 5: Performance & Monitoring (Planned)
+- ⚠️ Production monitoring (INFO)
+- ✅ Performance benchmarking
+- ⚠️ SLOWLOG implementation (in progress)
+- ❌ Memory usage optimization
+- ❌ CLIENT command family
+- ❌ Latency monitoring tools
 
-### Priority 1.1: Project Setup ✅
-- [x] Project structure and build system
-- [x] Core error types and result handling
-- [x] Basic configuration management
-- [x] Logging infrastructure
-- [x] Basic CLI argument parsing
+## Phase 6: Clustering & Enterprise Features (Future)
+- ❌ Redis cluster protocol support
+- ❌ Slot-based sharding
+- ❌ Cluster state management
+- ❌ Redis Streams implementation
+- ❌ ACL system
+- ❌ TLS support
 
-### Priority 1.2: Networking Layer ✅
-```rust
-Tasks:
-- [x] TCP server implementation
-- [x] Connection acceptance loop
-- [x] Basic client connection handling
-- [x] Graceful shutdown mechanism
-- [x] Connection timeout handling
-```
+## Legend
+- ✅ Completed
+- 🔄 In active development
+- ⚠️ Partially implemented
+- ❌ Not yet implemented
 
-### Priority 1.3: RESP Protocol ✅
-```rust
-// Priority order for RESP implementation
-1. [x] RESP Parser
-   - [x] Simple strings (+OK\r\n)
-   - [x] Errors (-ERR\r\n)
-   - [x] Integers (:1000\r\n)
-   - [x] Bulk strings ($6\r\nfoobar\r\n)
-   - [x] Arrays (*2\r\n$3\r\nfoo\r\n)
-   - [x] Null values ($-1\r\n)
-   
-2. [x] RESP Serializer
-   - [x] All type serialization
-   - [x] Efficient buffer management
-   
-3. [x] Command Parser
-   - [x] Extract command name and args
-   - [x] Case-insensitive command matching
-```
+## Lua VM Development Roadmap
 
-### Priority 1.4: Minimal Commands ✅
-```rust
-// Bare minimum for redis-cli interaction
-- [x] PING - Connection test
-- [x] ECHO - Protocol verification  
-- [x] SET - Basic storage
-- [x] GET - Basic retrieval
-- [x] QUIT - Clean disconnect
-```
+The Lua VM implementation follows a specific roadmap to ensure compatibility with Redis Lua scripting.
 
-## Technical Group 2: Core Data Structures ✅ COMPLETED
+### Phase 1: Core VM (Completed)
+- ✅ Unified stack architecture
+- ✅ Transaction-based memory safety
+- ✅ Basic opcode execution
+- ✅ Table creation and manipulation
+- ✅ Numerical for loops
+- ✅ String interning with content-based comparison
+- ✅ Table operations with proper string key handling
+- ✅ Basic standard library function registration
 
-### Goals
-- Implement primary Redis data structures
-- Add essential commands for each type
-- Establish memory management patterns
+### Phase 2: Advanced Features (In Progress)
+- ⚠️ Generic for loops
+- ⚠️ Metamethod handling
+- ⚠️ Complete standard library implementation
+  - ✅ Basic functions (print, type, tostring, tonumber, assert)
+  - ⚠️ String library functions
+  - ⚠️ Table library functions
+  - ❌ Math library
+  - ❌ I/O library (may be limited for Redis)
+- ❌ Coroutines
+- ❌ Garbage collection
+- ❌ Comprehensive error handling
 
-### Priority 2.1: Storage Engine Architecture ✅
-```rust
-// Core abstractions
-trait Storage {
-    fn get(&self, key: &str) -> Option<Value>;
-    fn set(&mut self, key: String, value: Value);
-    fn delete(&mut self, key: &str) -> bool;
-    fn exists(&self, key: &str) -> bool;
-}
+### Phase 3: Redis Integration (Planned)
+- ⚠️ EVAL/EVALSHA commands
+- ❌ Script caching
+- ❌ SCRIPT LOAD/FLUSH commands
+- ❌ Script timeout management
+- ❌ redis.call and redis.pcall functions
 
-enum Value {
-    String(Vec<u8>),
-    List(RedisList),
-    Set(RedisSet),
-    Hash(RedisHash),
-    SortedSet(RedisSortedSet),
-}
-```
-
-### Priority 2.2: String Commands ✅
-```
-Complete implementation:
-- [x] SET (with options: EX, PX, NX, XX)
-- [x] GET
-- [x] MGET
-- [x] MSET
-- [x] GETSET
-- [x] STRLEN
-- [x] APPEND
-- [x] INCR/DECR
-- [x] INCRBY/DECRBY
-- [x] GETRANGE/SETRANGE
-```
-
-### Priority 2.3: List Implementation ✅
-```rust
-Data Structure: Doubly-linked list or VecDeque
-- [x] LPUSH/RPUSH
-- [x] LPOP/RPOP
-- [x] LLEN
-- [x] LRANGE
-- [x] LINDEX
-- [x] LSET
-- [x] LREM
-- [x] LTRIM
-```
-
-### Priority 2.4: Set Implementation ✅
-```rust
-Data Structure: HashSet<Vec<u8>>
-- [x] SADD
-- [x] SREM
-- [x] SMEMBERS
-- [x] SISMEMBER
-- [x] SCARD
-- [x] SUNION/SINTER/SDIFF
-- [x] SRANDMEMBER
-- [x] SPOP
-```
-
-### Priority 2.5: Hash Implementation ✅
-```rust
-Data Structure: HashMap<Vec<u8>, Vec<u8>>
-- [x] HSET/HGET
-- [x] HMSET/HMGET
-- [x] HGETALL
-- [x] HDEL
-- [x] HLEN
-- [x] HEXISTS
-- [x] HKEYS/HVALS
-- [x] HINCRBY
-```
-
-### Priority 2.6: Key Management ✅
-```
-Generic key operations:
-- [x] DEL
-- [x] EXISTS
-- [x] KEYS (pattern matching)
-- [x] EXPIRE/PEXPIRE
-- [x] TTL/PTTL
-- [x] PERSIST
-- [x] TYPE
-- [x] RENAME
-```
-
-## Technical Group 3: Advanced Features ✅ COMPLETED
-
-### Goals
-- Implement sorted sets and advanced data types
-- Add persistence mechanisms
-- Implement pub/sub system
-
-### Priority 3.1: Sorted Sets ✅
-```rust
-Data Structure: SkipList + HashMap
-- [x] ZADD
-- [x] ZREM
-- [x] ZSCORE
-- [x] ZRANK/ZREVRANK
-- [x] ZRANGE/ZREVRANGE
-- [x] ZRANGEBYSCORE
-- [x] ZCOUNT
-- [x] ZINCRBY
-- [x] ZUNIONSTORE/ZINTERSTORE
-```
-
-### Priority 3.2: Persistence - RDB ✅
-```
-RDB (Redis Database) snapshots:
-- [x] RDB file format parser
-- [x] RDB file writer
-- [x] SAVE command (blocking)
-- [x] BGSAVE command (background)
-- [x] Automatic snapshots
-- [x] RDB compression
-```
-
-### Priority 3.3: Persistence - AOF ✅
-```
-AOF (Append Only File):
-- [x] Command logging
-- [x] AOF file replay
-- [x] AOF rewrite process
-- [x] fsync policies
-- [x] BGREWRITEAOF command
-```
-
-### Priority 3.4: Pub/Sub ✅
-```
-Publishing/Subscribe system:
-- [x] PUBLISH
-- [x] SUBSCRIBE/UNSUBSCRIBE
-- [x] PSUBSCRIBE/PUNSUBSCRIBE (patterns)
-- [x] Channel management
-- [x] Client notification system
-```
-
-### Priority 3.5: Transactions ✅
-```
-MULTI/EXEC transactions:
-- [x] MULTI - Start transaction
-- [x] EXEC - Execute transaction
-- [x] DISCARD - Cancel transaction
-- [x] WATCH - Optimistic locking
-- [x] Transaction queue management
-```
-
-## Technical Group 4: Production Readiness 🟡 PARTIALLY COMPLETED
-
-### Goals
-- Enable production deployment
-- Ensure high-availability capabilities
-- Provide monitoring and operational tools
-- Optimize for real-world workloads
-
-### Priority 4.1: Performance Optimization ✅
-```
-Optimization priorities:
-- [x] Command pipelining
-- [x] Connection pooling with sharding
-- [x] Concurrent client handling (50+)
-- [x] Buffer management optimization
-- [x] Enhanced protocol parsing
-- [x] List operation performance (LPUSH/RPUSH)
-```
-
-### Priority 4.2: High-Availability ✅
-```
-Master-Slave replication:
-- [x] REPLICAOF command (previously SLAVEOF)
-- [x] Full synchronization (RDB transfer)
-- [x] Incremental sync (command stream)
-- [x] PSYNC protocol implementation
-- [x] Replication backlog
-- [x] Read-only replicas
-```
-
-### Priority 4.3: Monitoring 🟡
-```
-Server information and stats:
-- [x] INFO command (basic sections)
-- [x] MONITOR command
-- [x] SLOWLOG implementation
-- [x] CLIENT LIST/KILL
-- [x] CONFIG GET/SET
-- [x] Memory usage tracking
-```
-
-### Priority 4.4: Security 🟡
-```
-Security features:
-- [x] AUTH command
-- [x] Password protection
-- [ ] Command renaming/disabling
-- [ ] Protected mode
-- [x] Bind address restrictions
-```
-
-### Priority 4.5: Essential Production Commands ✅
-```
-Commands essential for production use:
-- [x] SCAN family (SCAN, SSCAN, HSCAN, ZSCAN)
-- [ ] Key migration commands
-- [x] Client tracking
-```
-
-## Technical Group 5: Feature Completeness ✅ LARGELY COMPLETED
-
-### Goals
-- Implement remaining commands
-- Add advanced data structures
-- Support extended use cases
-
-### Priority 5.1: Scripting
-```
-Redis Lua support:
-- [✅] EVAL/EVALSHA commands - Implementation complete with GIL approach
-- [✅] Lua interpreter integration - Generational arena + GIL architecture implemented
-- [✅] Redis Lua API - Core functionality (call, pcall) implemented with GIL
-- [✅] Script caching - Working
-- [✅] SCRIPT commands - Basic implementation complete
-- [✅] Standard library subset - Basic functions implemented
-- [✅] Special Redis libraries:
-  - [✅] cjson.encode - Complete with table and array support
-  - [✅] cjson.decode - Implementation complete
-  - [❌] cmsgpack - Not yet implemented (optional in Redis)
-  - [❌] bit - Not yet implemented (optional in Redis)
-- [✅] Table operations:
-  - [✅] Table field access now works correctly
-  - [✅] Table field concatenation now works correctly 
-  - [✅] Direct number field concatenation now works
-- [🟡] Transaction semantics:
-  - [✅] Basic transaction support implemented
-  - [🟡] Transaction rollback needs improvement for error cases
-- [🟡] Loop and control flow:
-  - [✅] Basic control flow (if/else, while, repeat) works 
-  - [🟡] Numeric for loops have correct borrow handling but execution issues
-  - [🟡] Generic for loops still have issues with the next/pairs implementation
-- [🟡] Function execution:
-  - [✅] Basic function definition works
-  - [🟡] Nested functions still have stack overflow issues
-```
-
-### Priority 5.2: Streams
-```
-Stream data type:
-- [ ] XADD
-- [ ] XREAD
-- [ ] XRANGE
-- [ ] XLEN
-- [ ] Consumer groups (XGROUP)
-- [ ] XREADGROUP
-```
-
-### Priority 5.3: Extended Data Type Operations
-```
-Less common but important:
-- [ ] Bit operations (SETBIT, GETBIT, BITCOUNT)
-- [ ] HyperLogLog (PFADD, PFCOUNT)
-- [ ] GEO commands (GEOADD, GEODIST)
-```
-
-## Technical Group 6: Scale-Out Architecture ⚠️ PLANNED
-
-### Goals
-- Implement Redis Cluster protocol
-- Add sharding support
-- Implement gossip protocol
-
-### Priority 6.1: Cluster Foundation
-```
-Cluster basics:
-- [ ] Cluster node configuration
-- [ ] Hash slot allocation (16384 slots)
-- [ ] Key hashing (CRC16)
-- [ ] MOVED/ASK redirections
-```
-
-### Priority 6.2: Node Communication
-```
-Cluster protocol:
-- [ ] Gossip protocol implementation
-- [ ] Failure detection
-- [ ] Configuration propagation
-- [ ] Cluster state machine
-```
-
-## Current Implementation Status
-
-Ferrous has now completed Technical Groups 1-3 entirely, with significant portions of Groups 4 and 5 implemented:
-
-- **Foundation (Group 1)**: ✅ Complete
-- **Core Data Structures (Group 2)**: ✅ Complete
-- **Advanced Features (Group 3)**: ✅ Complete
-- **Production Readiness (Group 4)**: 🟡 Partially Complete
-  - Performance optimization exceeds expectations, with all operations now outperforming Redis/Valkey
-  - High-availability features (replication) are now complete
-  - Some monitoring and security features are implemented
-  - SCAN command family is implemented for production use cases
-- **Feature Completeness (Group 5)**: 🟡 Largely Complete
-  - **Scripting (Lua)**: ✅ Largely complete with GIL implementation
-    - Access to KEYS/ARGV arrays now works correctly
-    - redis.call and redis.pcall functions now work correctly
-    - Transaction semantics partially implemented (needs refinement)
-    - cjson.encode and cjson.decode now fully working
-  - Streams and other extended data types not yet implemented
-
-### Current Priority Focus
-
-Based on the current implementation state and performance achievements, these are the highest priority remaining tasks:
-
-1. **Lua Transaction Rollback** - Improve error handling and rollback behavior
-2. **Extended Security** - Additional protection mechanisms
-3. **Key Migration Commands** - For cluster preparation
-
-## Performance Achievement
-
-Recent optimizations have resulted in Ferrous outperforming Redis/Valkey across all measured operations:
-
-| Operation Category | Performance vs Redis | Status |
-|-------------------|---------------------|---------|
-| PING operations | 115-117% | ✅ Exceeding targets |
-| String operations (GET/SET) | 110-114% | ✅ Exceeding targets |
-| List operations | 104-115% | ✅ Exceeding targets |
-| Set/Hash operations | 102-103% | ✅ Meeting targets |
-| Lua script execution | 98-102% | ✅ Meeting targets |
-
-This achievement shifts the project focus from "feature parity" to "enabling production deployment with high availability" as the highest priority.
+### Phase 4: Performance Optimization (Future)
+- ❌ Bytecode optimization
+- ❌ Memory usage reduction
+- ❌ Benchmarking against Lua 5.1

@@ -23,6 +23,12 @@ fn run_script(script_path: &str) -> Result<Value, String> {
         Err(e) => return Err(format!("Failed to create VM: {:?}", e)),
     };
     
+    // Initialize the standard library
+    match vm.init_stdlib() {
+        Ok(_) => {},
+        Err(e) => return Err(format!("Failed to initialize standard library: {:?}", e)),
+    };
+    
     // Compile the script
     let module = match compile(&script) {
         Ok(module) => module,

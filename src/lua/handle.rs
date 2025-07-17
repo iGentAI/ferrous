@@ -43,6 +43,48 @@ typed_handle!(UpvalueHandle, Upvalue);
 typed_handle!(UserDataHandle, UserData);
 typed_handle!(FunctionProtoHandle, FunctionProto);
 
+impl From<StringHandle> for Handle<LuaString> {
+    fn from(handle: StringHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<TableHandle> for Handle<Table> {
+    fn from(handle: TableHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<ClosureHandle> for Handle<Closure> {
+    fn from(handle: ClosureHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<ThreadHandle> for Handle<Thread> {
+    fn from(handle: ThreadHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<UpvalueHandle> for Handle<Upvalue> {
+    fn from(handle: UpvalueHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<UserDataHandle> for Handle<UserData> {
+    fn from(handle: UserDataHandle) -> Self {
+        handle.0
+    }
+}
+
+impl From<FunctionProtoHandle> for Handle<FunctionProto> {
+    fn from(handle: FunctionProtoHandle) -> Self {
+        handle.0
+    }
+}
+
 /// Resource trait for objects that can be stored in the heap
 pub trait Resource: Sized {
     /// The typed handle type for this resource
@@ -81,23 +123,27 @@ impl Resource for FunctionProto {
 // Instead, they use a pattern matching approach based on how Arena itself constructs handles
 
 impl StringHandle {
-    /// Create a handle from raw parts
+    /// Create a handle from raw parts (used by transaction validation)
     pub(crate) fn from_raw_parts(index: u32, generation: u32) -> Self {
-        StringHandle(Handle::from_raw_parts(index, generation))
+        // Create a raw Handle<LuaString> and wrap it
+        let handle = super::arena::Handle::from_raw_parts(index, generation);
+        StringHandle(handle)
     }
 }
 
 impl TableHandle {
-    /// Create a handle from raw parts
+    /// Create a handle from raw parts (used by transaction validation) 
     pub(crate) fn from_raw_parts(index: u32, generation: u32) -> Self {
-        TableHandle(Handle::from_raw_parts(index, generation))
+        let handle = super::arena::Handle::from_raw_parts(index, generation);
+        TableHandle(handle)
     }
 }
 
 impl ClosureHandle {
-    /// Create a handle from raw parts
+    /// Create a handle from raw parts (used by transaction validation)
     pub(crate) fn from_raw_parts(index: u32, generation: u32) -> Self {
-        ClosureHandle(Handle::from_raw_parts(index, generation))
+        let handle = super::arena::Handle::from_raw_parts(index, generation);
+        ClosureHandle(handle)
     }
 }
 
@@ -123,9 +169,10 @@ impl UserDataHandle {
 }
 
 impl FunctionProtoHandle {
-    /// Create a handle from raw parts
+    /// Create a handle from raw parts (used by transaction validation)
     pub(crate) fn from_raw_parts(index: u32, generation: u32) -> Self {
-        FunctionProtoHandle(Handle::from_raw_parts(index, generation))
+        let handle = super::arena::Handle::from_raw_parts(index, generation);
+        FunctionProtoHandle(handle)
     }
 }
 
@@ -133,14 +180,14 @@ impl FunctionProtoHandle {
 impl<T> Handle<T> {
     /// Create a new handle for testing purposes only
     /// This should only be used in tests, not production code
-    pub fn new_for_testing(index: u32, generation: u32) -> Self {
+    pub fn new(index: u32, generation: u32) -> Self {
         Handle::from_raw_parts(index, generation)
     }
 }
 
 #[cfg(test)]
 impl StringHandle {
-    /// Create an invalid handle for testing
+    /// Create an invalid handle for testing error handling
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         StringHandle::from_raw_parts(index, generation)
     }
@@ -148,7 +195,7 @@ impl StringHandle {
 
 #[cfg(test)]
 impl TableHandle {
-    /// Create an invalid handle for testing
+    /// Create an invalid handle for testing error handling
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         TableHandle::from_raw_parts(index, generation)
     }
@@ -156,7 +203,7 @@ impl TableHandle {
 
 #[cfg(test)]
 impl ClosureHandle {
-    /// Create an invalid handle for testing
+    /// Create an invalid handle for testing error handling
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         ClosureHandle::from_raw_parts(index, generation)
     }
@@ -164,7 +211,7 @@ impl ClosureHandle {
 
 #[cfg(test)]
 impl ThreadHandle {
-    /// Create an invalid handle for testing
+    /// Create an invalid handle for testing error handling
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         ThreadHandle::from_raw_parts(index, generation)
     }
@@ -172,7 +219,7 @@ impl ThreadHandle {
 
 #[cfg(test)]
 impl UpvalueHandle {
-    /// Create an invalid handle for testing
+    /// Create an invalid handle for testing error handling
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         UpvalueHandle::from_raw_parts(index, generation)
     }
@@ -180,7 +227,7 @@ impl UpvalueHandle {
 
 #[cfg(test)]
 impl UserDataHandle {
-    /// Create an invalid handle for testing
+    /// Create an invalid handle for testing error handling
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         UserDataHandle::from_raw_parts(index, generation)
     }
@@ -188,7 +235,7 @@ impl UserDataHandle {
 
 #[cfg(test)]
 impl FunctionProtoHandle {
-    /// Create an invalid handle for testing
+    /// Create an invalid handle for testing error handling
     pub fn new_invalid_for_testing(index: u32, generation: u32) -> Self {
         FunctionProtoHandle::from_raw_parts(index, generation)
     }

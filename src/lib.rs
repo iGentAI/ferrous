@@ -20,13 +20,21 @@ pub use network::server::Server;
 pub use protocol::resp::RespFrame;
 pub use config::Config;
 
+// Re-export Lua types
 pub use lua::LuaGIL;
+
+// Re-export VM types from the lua module
+pub use lua::vm::LuaVM;
+pub use lua::value::Value;
+pub use lua::compile;
+pub use lua::handle::TableHandle;
+pub use lua::transaction::HeapTransaction;
 
 // Include compliance tests in the test framework
 #[cfg(test)]
 mod tests {
-    use super::lua::{LuaVM, Value, compile, handle::TableHandle};
-    use super::lua::transaction::HeapTransaction;
+    use crate::lua::{LuaVM, Value, compile, handle::TableHandle};
+    use crate::lua::transaction::HeapTransaction;
     use std::fs;
     use std::path::Path;
 

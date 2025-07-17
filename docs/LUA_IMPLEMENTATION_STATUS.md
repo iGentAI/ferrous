@@ -1,140 +1,165 @@
-# Lua VM Implementation Status Tracker
+# Lua VM Implementation Status
 
-## Overview
+## Implementation Overview
 
-This document tracks the implementation status of the Lua VM for Ferrous Redis, updated as of July 2025. It is based on the architectural specifications in the `LUA_ARCHITECTURE.md`, `LUA_TRANSACTION_PATTERNS.md`, and other design documents.
+The Lua VM for Ferrous is being implemented following a unified stack architecture, which is different from the originally planned register window approach. This document outlines the current implementation status, architecture decisions, and known limitations.
 
-**Current Overall Status**: The core VM functions for basic Lua scripts. Recent fixes have addressed critical issues with table return values and LOADNIL opcode handling. The VM can now execute scripts with arithmetic operations, basic control flow, table creation/manipulation, and return complex data structures like tables. Simple closures work, but complex upvalue handling has issues. Many standard library functions are still placeholder implementations, and Redis integration is minimal. Development should continue with improving upvalue handling and completing the standard library before Redis integration.
+## Architecture Decisions
 
-## Core Components Status
+### Unified Stack Model vs Register Windows
 
-| Component | Status | Description | Priority |
-|-----------|--------|-------------|----------|
-| **Arena System** | ✅ Complete | Generational arena with proper handle validation implemented | Done |
-| **Value System** | ✅ Complete | All Lua value types implemented with proper attributes, including Function Prototypes | Done |
-| **Handle System** | ✅ Complete | Handle wrapper types implemented with proper traits | Done |
-| **Heap** | ✅ Complete | Object storage with arenas and string interning | Done |
-| **Transaction** | ✅ Complete | Fully implemented with proper validation and caching | Done |
-| **Handle Validation** | ✅ Complete | Type-safe validation framework with validation caching implemented | Done |
-| **C Function Execution** | ✅ Complete | Isolated execution context with transaction-safe boundaries | Done |
-| **VM Structure** | ✅ Complete | Core state machine with all opcodes implemented | Done |
-| **Register Allocation** | ✅ Complete | Proper register scoping and lifetime management between compiler and VM | Done |
-| **Closure System** | ⚠️ Partial | Function prototype support and basic closures work, but complex upvalue handling has issues | High |
-| **Compiler** | ✅ Complete | Lexer and parser implemented, bytecode generation with proper opcode encoding now working | Done |
-| **Metamethod System** | ⚠️ Partial | Basic metamethod support, but some aspects still use placeholder implementations | High |
-| **Standard Library** | ⚠️ Partial | Basic functions (print, type, tostring) and some math functions implemented. Many standard library functions still contain placeholder code or are unimplemented | High |
-| **Error Handling** | ⚠️ Partial | Basic error types defined; pcall implemented but with limitations; xpcall missing; no traceback generation | High |
-| **Memory Management** | ❌ Missing | No garbage collection implemented; memory grows unbounded | Medium |
-| **Redis API Integration** | ❌ Missing | All Redis API functions (redis.call/pcall, KEYS/ARGV) have placeholder implementations | Low |
+The initial approach for the Lua VM was to use a register window model, which would allocate separate windows of registers for each function call. However, this approach was abandoned due to fundamental incompatibilities with Lua 5.1's design:
 
-## VM Opcode Implementation Status
+1. **Stack Continuity Requirement**: Lua 5.1 assumes a contiguous stack where any function can access any stack position. Register windows create isolated segments that violate this assumption.
 
-| Opcode | Status | Known Issues |
-|--------|--------|--------------|
-| **Basic Operations** (MOVE, LOADK, etc.) | ✅ Complete | LOADNIL parameter interpretation fixed (July 2025) |
-| **Table Operations** (GETTABLE, SETTABLE) | ✅ Complete | Table return value handling fixed (July 2025) |
-| **Arithmetic** (ADD, SUB, MUL, etc.) | ✅ Complete | None |
-| **Control Flow** (TEST, JMP, CALL, etc.) | ✅ Complete | None |
-| **Concatenation** (CONCAT) | ✅ Complete | Implementation is complex and could be simplified |
-| **Function Creation** (CLOSURE) | ⚠️ Partial | Basic function creation works, but upvalue handling has issues |
-| **Loops** (FORLOOP, TFORLOOP) | ⚠️ Partial | Numeric loops work, but generic loops have limitations |
+2. **C API Compatibility**: Lua's C API relies heavily on direct stack manipulation. Windows would require complex translation layers that degrade performance and correctness.
 
-## Standard Library Status
+3. **Upvalue Handling**: Upvalues in Lua store absolute stack indices. With windows, these indices become meaningless across window boundaries.
 
-| Library | Status | Description |
-|---------|--------|-------------|
-| **Base** | ⚠️ Partial | Core functions implemented; metamethod support incomplete |
-| **Math** | ⚠️ Partial | Basic functions implemented; advanced functions missing |
-| **String** | ⚠️ Partial | Simple operations work (len, sub); pattern matching unimplemented |
-| **Table** | ⚠️ Partial | Basic functions implemented; sorting and advanced operations unimplemented |
-| **IO** | ❌ Missing | Not implemented |
-| **OS** | ❌ Missing | Not implemented |
-| **Debug** | ❌ Missing | Not implemented |
-| **Package** | ❌ Missing | Not implemented |
+4. **Performance Concerns**: Window allocation/deallocation overhead and complex index translation on every access outweigh any potential benefits.
 
-## Language Feature Status
+Instead, we've implemented a unified stack model where:
+- A single contiguous stack exists for all values
+- Functions operate on stack slices defined by base pointers
+- Registers are simply stack positions relative to the base
+- This enables efficient C interoperability
 
-| Feature | Status | Description |
-|---------|--------|-------------|
-| **Basic Types** | ✅ Complete | nil, boolean, number, string all implemented |
-| **Tables** | ✅ Complete | Table creation, field access, and return values all working |
-| **Functions** | ✅ Complete | Function definition, calls, varargs, and multiple returns implemented |
-| **Local Variables** | ✅ Complete | Local variable declarations and assignments working |
-| **Global Variables** | ✅ Complete | Global variable access and assignment working |
-| **Arithmetic** | ✅ Complete | All operations implemented with proper coercion and metamethod support |
-| **Comparisons** | ✅ Complete | Equality and relational operators implemented with metamethod support |
-| **Control Flow** | ✅ Complete | If statements and all loop types working, with proper register handling |
-| **Closures** | ⚠️ Partial | Simple closures work, but complex upvalue capturing has issues |
-| **Metatables** | ⚠️ Partial | Basic metamethod support implemented; some methods have placeholder implementations |
-| **String Operations** | ⚠️ Partial | Concatenation and length working, pattern matching unimplemented |
-| **Error Handling** | ⚠️ Partial | Error propagation works; pcall exists but xpcall missing; no traceback generation |
-| **Standard Library** | ⚠️ Partial | Core functions implemented, math/string/table libraries incomplete |
-| **Coroutines** | ❌ Missing | Not implemented |
+### Transaction-Based Memory Safety
+
+Rust's ownership model presents challenges for a garbage-collected VM. To ensure memory safety without sacrificing performance, we've implemented:
+
+1. **Transaction System**: All heap access is through transactions that validate handles before use
+2. **Handle Validation**: Strong type safety for different handle types (tables, strings, etc.)  
+3. **Two-phase Borrowing**: Complex operations follow a two-phase pattern to avoid borrowing conflicts
+
+### String Interning System
+
+A proper string interning system has been implemented that ensures:
+
+1. **Content-Based Equality**: Strings are compared by content, not handle identity
+2. **Pre-interning of Common Strings**: Standard library function names and common metamethod names are pre-interned
+3. **Consistent Handle Assignment**: The same string content always gets the same handle within a VM instance
+4. **Transaction Integration**: String creation properly integrates with the transaction system
+
+## Current Implementation Status
+
+### Working Features
+
+- ✅ VM core architecture with unified stack model
+- ✅ Stack and call frame management with proper stack growth
+- ✅ Basic opcodes: MOVE, LOADK, LOADBOOL, LOADNIL
+- ✅ Table operations: NEWTABLE, GETTABLE, SETTABLE
+- ✅ Table array initialization with SETLIST
+- ✅ Arithmetic operations: ADD, SUB, MUL, DIV, MOD, POW, UNM
+- ✅ String operations: CONCAT
+- ✅ String type operations and conversions
+- ✅ Control flow: JMP, TEST, TESTSET
+- ✅ Function calls: CALL, RETURN (both global and local functions)
+- ✅ Method calls with proper self parameter handling
+- ✅ Tail calls (TAILCALL) for optimized recursion
+- ✅ Variable argument functions (VARARG opcode)
+- ✅ Basic upvalue support: GETUPVAL, SETUPVAL, CLOSURE, CLOSE
+- ✅ Closures with proper upvalue capturing
+- ✅ Basic metatable mechanism (__index metamethod)
+- ✅ Safe execution via transaction system
+- ✅ String interning with content-based comparison
+- ✅ Table operations with proper string key handling
+- ✅ Global table access with string literal keys
+- ✅ Basic standard library functions (print, type, tostring, tonumber, assert)
+- ✅ Circular reference handling in nested calls
+- ✅ Deep recursive function support
+
+### Partially Implemented Features
+
+- ⚠️ Numerical for loops: FORPREP, FORLOOP (still has issues with step register handling)
+- ⚠️ Table manipulation: table.insert, table.remove, etc.
+- ⚠️ Metamethod support: Basic table metamethods
+- ⚠️ TFORLOOP opcode for generic iteration
+- ⚠️ Standard library: Partial implementation of base, string, table libraries
+
+### Not Yet Implemented
+
+- ❌ Generic FOR loops (for k,v in pairs()) - The infrastructure exists but reliability issues remain
+- ❌ Complete metamethod support
+- ❌ Coroutines
+- ❌ Complete standard library implementation
+- ❌ Error handling with traceback
+- ❌ Garbage collection
+
+### Recent Improvements
+
+1. **TAILCALL Implementation**: Added full support for tail call optimization, allowing recursive functions that don't grow the stack. This implementation correctly reuses the current stack frame, closes any required upvalues, and handles call result propagation according to the Lua 5.1 specification.
+
+2. **VARARG Opcode Support**: Implemented the VARARG opcode for handling variable argument functions. The implementation correctly handles both explicit argument count (B > 0) and "all varargs" mode (B = 0).
+
+3. **SETLIST Implementation**: Added support for bulk array initialization with the SETLIST opcode. This allows efficient table array initialization, properly handling the FPF (Fields Per Flush) constant from Lua 5.1.
+
+4. **Improved Metatable Support**: Enhanced the implementation of the __index metamethod, allowing tables to properly inherit properties from their metatables.
+
+5. **String Handling Improvements**: Enhanced string concatenation (CONCAT opcode) with proper memory management and type conversion, and improved the string interning system to ensure consistent handles for identical strings.
+
+### Known Issues
+
+1. **For Loop Register Corruption**: Numeric for loops (FORPREP/FORLOOP) have issues with register handling, particularly with the step register becoming nil during execution.
+
+2. **TFORLOOP Reliability**: While implemented, TFORLOOP (generic for loops) has reliability issues with complex iteration.
+
+3. **Metamethod Recursion**: No protection against infinite metamethod recursion.
+
+4. **Memory Management**: No proper garbage collection yet.
+
+5. **Standard Library Gaps**: Many standard library functions are defined but incomplete.
 
 ## Testing Status
 
-| Test Type | Status | Notes |
-|-----------|--------|-------|
-| **Arena Tests** | ✅ Passing | Basic arena operations verified |
-| **Handle Tests** | ✅ Passing | Type safety and validation confirmed |
-| **Transaction Tests** | ✅ Passing | 13 comprehensive tests covering all aspects of handle validation |
-| **VM Tests** | ✅ Passing | Core opcodes functionality tests passing |
-| **Closure Tests** | ⚠️ Partial | Simple closure tests pass, but complex closures fail |
-| **Compiler Tests** | ✅ Passing | Basic compiler tests passing with fixed register allocation |
-| **Bytecode Tests** | ✅ Passing | Basic bytecode validation tests passing |
-| **Register Allocation Tests** | ✅ Passing | Tests for the register allocation system |
-| **String Interning Tests** | ✅ Passing | String identity semantics verified |
-| **Standard Library Tests** | ⚠️ Partial | Only basic functionality tested; comprehensive tests needed |
-| **Metamethod Tests** | ⚠️ Partial | Basic tests exist; edge cases not fully covered |
-| **Redis Interface Tests** | ❌ Not Started | No tests for Redis integration yet |
+Our testing confirms that the implementation successfully handles:
+- ✅ Simple arithmetic and control flow
+- ✅ Table creation, access and manipulation
+- ✅ String operations (concatenation, type conversion)
+- ✅ Function definition and calls
+- ✅ Closure creation with proper upvalue handling
+- ✅ Method calls with self parameter
+- ✅ Tail calls and recursion
+- ✅ Variable argument functions
+- ✅ Basic metamethod functionality (__index)
 
-## Recent Fixes
+However, the following still have issues:
+- ❌ Numeric for loops (register corruption issues)
+- ❌ Generic for loops with pairs/ipairs (unreliable)
+- ❌ Complex metamethod chains
 
-1. **Table Return Values (July 2025)**
-   - Fixed a critical issue where tables weren't properly returned from Lua scripts
-   - The bug was in the compiler's `emit_return` method, which generated RETURN instructions with B=1 (meaning "return 0 values") when it should have used B=2 (meaning "return 1 value")
-   - Now tables can be properly created, manipulated, and returned from scripts
+## Next Steps
 
-2. **LOADNIL Parameter Handling (July 2025)**
-   - Fixed an incorrect implementation of the LOADNIL opcode
-   - The implementation was setting B+1 registers to nil instead of B registers as per Lua 5.1 spec
-   - Now variable initialization and assignments that set multiple variables to nil work correctly
+1. Fix the for loop register corruption issues
+2. Complete and stabilize TFORLOOP implementation
+3. Enhance metamethod support
+4. Add proper error handling with traceback
+5. Extend standard library coverage
+6. Implement memory management/garbage collection
+7. Add coroutine support
 
-3. **Register Allocation (July 2025)**
-   - Fixed a critical issue where registers were prematurely freed by the compiler
-   - Implemented proper register lifetime tracking across nested expressions
-   - Resolved issues with function calls containing concatenation expressions
-   - Fixed VM handling of CONCAT with correct immediate vs. deferred operation handling
+## Implementation Approach
 
-## Critical Implementation Priorities
+The implementation follows these key patterns:
 
-1. **Improve Upvalue and Closure Handling**
-   - Fix complex upvalue capturing issues
-   - Complete the upvalue closing mechanism
-   - Ensure proper upvalue sharing between closures
+1. **Non-Recursive Execution**: All function calls and complex operations are queued rather than executed recursively to avoid stack overflow
+2. **Transaction-Based Safety**: All memory operations use transactions for safety and clean error handling
+3. **Static Opcode Handlers**: Opcode handlers are implemented as static methods to avoid borrowing conflicts
+4. **Two-Phase Borrowing**: Complex operations that need multiple borrows use a two-phase approach
+5. **String Interning**: All string creation goes through a deduplication system to ensure content-based equality
+6. **Dynamic Stack Management**: Stack automatically grows as needed to support deep recursion and complex call patterns
+7. **Strict Register Allocation**: Register allocation carefully follows Lua 5.1 specification to avoid corruption
 
-2. **Complete Standard Library**
-   - Add remaining math library functions
-   - Implement full string library with pattern matching
-   - Complete table manipulation functions
-   - Replace placeholder implementations with proper code
+## Bytecode Compatibility
 
-3. **Enhance Error Handling**
-   - Implement xpcall
-   - Add proper traceback generation
-   - Complete error propagation logic
-   - Include source locations in error messages
+The VM is designed to be compatible with Lua 5.1 bytecode. The bytecode format follows the Lua 5.1 specification:
+- 32-bit instructions
+- 6-bit opcode field
+- Various operand formats (ABC, ABx, AsBx)
 
-4. **Add Memory Management**
-   - Implement non-recursive garbage collection
-   - Add memory pressure monitoring
-   - Implement resource limits
+## C API Compatibility
 
-5. **Comprehensive Test Suite**
-   - Add more complex test scripts
-   - Test edge cases in standard library functions
-   - Ensure full compliance with Lua 5.1
-
-## Conclusion
-
-The Lua VM implementation has a solid architectural foundation with recent fixes addressing critical issues in opcode handling. The VM can now execute simple to moderately complex scripts, including arithmetic operations, control flow, table manipulation, and returning tables from functions. Areas that need further work include upvalue handling in complex closures, completing the standard library, error handling with tracebacks, and implementing garbage collection. The Redis integration layer remains a lower priority until the core VM functionality is complete and stable.
+The C API compatibility is being maintained through careful mapping of C functions to the VM's internal structure:
+- C functions receive an ExecutionContext that safely wraps the VM state
+- Proper stack manipulation APIs are provided
+- Type checking and error handling follow Lua 5.1 conventions

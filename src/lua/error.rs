@@ -71,6 +71,17 @@ pub enum LuaError {
     StackOverflow,
     InstructionLimitExceeded,
     Timeout,
+    ResourceExhausted { 
+        resource: String, 
+        limit: usize, 
+        attempted: usize 
+    },
+    ResourceLimit {
+        resource: String,
+        limit: usize,
+        used: usize,
+        context: String,
+    },
     
     // Handle and validation errors
     InvalidHandle,
@@ -88,6 +99,12 @@ pub enum LuaError {
     // Transaction errors
     TransactionError(String),
     InvalidTransactionState,
+    DetailedTransactionStateError {
+        current_state: String,
+        expected_state: String,
+        operation: String,
+        location: String,
+    },
     
     // C function errors
     CFunctionError(String),
@@ -128,6 +145,14 @@ impl fmt::Display for LuaError {
             LuaError::StackOverflow => write!(f, "stack overflow"),
             LuaError::InstructionLimitExceeded => write!(f, "instruction limit exceeded"),
             LuaError::Timeout => write!(f, "script execution timeout"),
+            LuaError::ResourceExhausted { resource, limit, attempted } => {
+                write!(f, "resource exhausted: {} limit {} exceeded (attempted {})", 
+                       resource, limit, attempted)
+            }
+            LuaError::ResourceLimit { resource, limit, used, context } => {
+                write!(f, "resource limit exceeded: {} (limit: {}, used: {}) - {}", 
+                       resource, limit, used, context)
+            }
             
             LuaError::InvalidHandle => write!(f, "invalid handle"),
             LuaError::StaleHandle => write!(f, "stale handle (generation mismatch)"),
@@ -143,6 +168,10 @@ impl fmt::Display for LuaError {
             
             LuaError::TransactionError(msg) => write!(f, "transaction error: {}", msg),
             LuaError::InvalidTransactionState => write!(f, "invalid transaction state"),
+            LuaError::DetailedTransactionStateError { current_state, expected_state, operation, location } => {
+                write!(f, "transaction state error: expected state '{}' but was '{}' when performing '{}' at '{}'", 
+                       expected_state, current_state, operation, location)
+            }
             
             LuaError::CFunctionError(msg) => write!(f, "C function error: {}", msg),
             
@@ -274,5 +303,22 @@ mod tests {
         assert!(err_string.contains("type error: expected table, got nil"));
         assert!(err_string.contains("stack traceback:"));
         assert!(err_string.contains("[pc=7]")); // When no file/line available
+    }
+    
+    #[test]
+    fn test_detailed_transaction_state_error() {
+        let err = LuaError::DetailedTransactionStateError {
+            current_state: "Committed".to_string(),
+            expected_state: "Active".to_string(),
+            operation: "set_register".to_string(),
+            location: "vm.rs:1234".to_string(),
+        };
+        
+        let err_string = err.to_string();
+        assert!(err_string.contains("transaction state error:"));
+        assert!(err_string.contains("expected state 'Active'"));
+        assert!(err_string.contains("was 'Committed'"));
+        assert!(err_string.contains("performing 'set_register'"));
+        assert!(err_string.contains("at 'vm.rs:1234'"));
     }
 }

@@ -23,7 +23,7 @@ pub fn string_byte(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
+    let s = ctx.get_arg_str(0)?;
     
     let i = if argc >= 2 {
         let index = ctx.get_number_arg(1)?;
@@ -121,8 +121,8 @@ pub fn string_find(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
-    let pattern = ctx.get_string_arg(1)?;
+    let s = ctx.get_arg_str(0)?;
+    let pattern = ctx.get_arg_str(1)?;
     
     let init = if argc >= 3 {
         let idx = ctx.get_number_arg(2)?;
@@ -184,7 +184,7 @@ pub fn string_format(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let format_string = ctx.get_string_arg(0)?;
+    let format_string = ctx.get_arg_str(0)?;
     
     // Simple initial implementation that handles basic formatting
     // A full implementation would need to handle all Lua's format specifiers
@@ -296,7 +296,7 @@ pub fn string_len(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
+    let s = ctx.get_arg_str(0)?;
     ctx.push_result(Value::Number(s.len() as f64))?;
     
     Ok(1)
@@ -312,7 +312,7 @@ pub fn string_lower(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
+    let s = ctx.get_arg_str(0)?;
     let result = s.to_lowercase();
     
     let handle = ctx.create_string(&result)?;
@@ -332,8 +332,8 @@ pub fn string_match(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
-    let pattern = ctx.get_string_arg(1)?;
+    let s = ctx.get_arg_str(0)?;
+    let pattern = ctx.get_arg_str(1)?;
     
     // Placeholder implementation - pattern matching in Lua requires
     // a significant implementation. This is a simple approach that
@@ -363,7 +363,7 @@ pub fn string_rep(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
+    let s = ctx.get_arg_str(0)?;
     let n = ctx.get_number_arg(1)?.floor() as isize;
     
     if n < 0 {
@@ -373,7 +373,7 @@ pub fn string_rep(ctx: &mut ExecutionContext) -> LuaResult<i32> {
     }
     
     let sep = if argc >= 3 {
-        ctx.get_string_arg(2)?
+        ctx.get_arg_str(2)?
     } else {
         "".to_string()
     };
@@ -412,7 +412,7 @@ pub fn string_reverse(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
+    let s = ctx.get_arg_str(0)?;
     let result: String = s.chars().rev().collect();
     
     let handle = ctx.create_string(&result)?;
@@ -432,7 +432,7 @@ pub fn string_sub(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
+    let s = ctx.get_arg_str(0)?;
     let i = ctx.get_number_arg(1)?.floor() as isize;
     
     // Default j to -1 (last character)
@@ -480,7 +480,7 @@ pub fn string_upper(ctx: &mut ExecutionContext) -> LuaResult<i32> {
         });
     }
     
-    let s = ctx.get_string_arg(0)?;
+    let s = ctx.get_arg_str(0)?;
     let result = s.to_uppercase();
     
     let handle = ctx.create_string(&result)?;
