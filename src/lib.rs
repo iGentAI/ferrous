@@ -24,17 +24,17 @@ pub use config::Config;
 pub use lua::LuaGIL;
 
 // Re-export VM types from the lua module
-pub use lua::vm::LuaVM;
-pub use lua::value::Value;
+pub use lua::LuaVM;
+pub use lua::LuaHeap;
+pub use lua::Value;
 pub use lua::compile;
 pub use lua::handle::TableHandle;
-pub use lua::transaction::HeapTransaction;
+// HeapTransaction has been removed - we now use RefCell-based direct access
 
 // Include compliance tests in the test framework
 #[cfg(test)]
 mod tests {
     use crate::lua::{LuaVM, Value, compile, handle::TableHandle};
-    use crate::lua::transaction::HeapTransaction;
     use std::fs;
     use std::path::Path;
 
@@ -68,16 +68,14 @@ mod tests {
                     Err(_) => return false,
                 };
                 
-                let mut tx = HeapTransaction::new(vm.heap_mut());
-                
                 // Create a string handle for the key
-                let key_handle = match tx.create_string(key) {
+                let key_handle = match vm.heap().create_string(key) {
                     Ok(handle) => handle,
                     Err(_) => return false,
                 };
                 
-                // Get the value from the table
-                let value = match tx.read_table_field(*handle, &Value::String(key_handle)) {
+                // Get the value from the table using RefCell-based heap directly
+                let value = match vm.heap().get_table_field(*handle, &Value::String(key_handle)) {
                     Ok(value) => value,
                     Err(_) => return false,
                 };

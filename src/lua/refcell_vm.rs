@@ -4,11 +4,120 @@
 //! eliminating the transaction system complexity while maintaining memory safety.
 
 use super::codegen::{Instruction, OpCode};
+use super::compiler::CompiledModule;
+use super::codegen::CompilationConstant;
 use super::error::{LuaError, LuaResult};
-use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle};
+use super::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle, FunctionProtoHandle};
 use super::refcell_heap::RefCellHeap;
-use super::value::{Value, CallFrame, CFunction, Closure, FunctionProto};
+use super::value::{Value, CallFrame, CFunction, Closure, FunctionProto, UpvalueInfo};
 use std::collections::VecDeque;
+
+/// Trait for execution contexts that provide access to VM state during C function calls.
+/// 
+/// This trait abstracts over different VM implementations, allowing C functions to be
+/// written once and work with both transaction-based and RefCell-based VMs.
+pub trait ExecutionContext {
+    /// Get the number of arguments passed to this C function
+    fn arg_count(&self) -> usize;
+    
+    /// Get the number of arguments (alias for arg_count)
+    fn nargs(&self) -> usize {
+        self.arg_count()
+    }
+    
+    /// Get an argument value by index (0-based)
+    fn get_arg(&self, index: usize) -> LuaResult<Value>;
+    
+    /// Get an argument value by index (alias for get_arg)
+    fn arg(&self, index: usize) -> LuaResult<Value> {
+        self.get_arg(index)
+    }
+    
+    /// Push a return value
+    fn push_result(&mut self, value: Value) -> LuaResult<()>;
+    
+    /// Push a return value (alias for push_result)
+    fn push_return(&mut self, value: Value) -> LuaResult<()> {
+        self.push_result(value)
+    }
+    
+    /// Set a return value at a specific index
+    fn set_return(&mut self, index: usize, value: Value) -> LuaResult<()>;
+    
+    /// Create a new string
+    fn create_string(&self, s: &str) -> LuaResult<StringHandle>;
+    
+    /// Create a new table
+    fn create_table(&self) -> LuaResult<TableHandle>;
+    
+    /// Get a table field
+    fn get_table_field(&self, table: TableHandle, key: &Value) -> LuaResult<Value>;
+    
+    /// Set a table field
+    fn set_table_field(&self, table: TableHandle, key: Value, value: Value) -> LuaResult<()>;
+    
+    /// Get argument as string
+    fn get_arg_str(&self, index: usize) -> LuaResult<String>;
+    
+    /// Get argument as number
+    fn get_number_arg(&self, index: usize) -> LuaResult<f64>;
+    
+    /// Get argument as boolean  
+    fn get_bool_arg(&self, index: usize) -> LuaResult<bool>;
+    
+    /// Get next key-value pair from table
+    fn table_next(&self, table: TableHandle, key: Value) -> LuaResult<Option<(Value, Value)>>;
+    
+    /// Get string value from handle
+    fn get_string_from_handle(&self, handle: StringHandle) -> LuaResult<String>;
+    
+    /// Check for metamethod on a value
+    fn check_metamethod(&self, value: &Value, method_name: &str) -> LuaResult<Option<Value>>;
+    
+    /// Call a metamethod
+    fn call_metamethod(&mut self, func: Value, args: Vec<Value>) -> LuaResult<Vec<Value>>;
+    
+    /// Get table field with metamethod support
+    fn table_get(&self, table: TableHandle, key: Value) -> LuaResult<Value>;
+    
+    /// Get table field without metamethods
+    fn table_raw_get(&self, table: TableHandle, key: Value) -> LuaResult<Value>;
+    
+    /// Set table field without metamethods
+    fn table_raw_set(&self, table: TableHandle, key: Value, value: Value) -> LuaResult<()>;
+    
+    /// Get table length
+    fn table_length(&self, table: TableHandle) -> LuaResult<usize>;
+    
+    /// Set metatable for a table
+    fn set_metatable(&self, table: TableHandle, metatable: Option<TableHandle>) -> LuaResult<()>;
+    
+    /// Get metatable for a table
+    fn get_metatable(&self, table: TableHandle) -> LuaResult<Option<TableHandle>>;
+    
+    /// Get the current thread
+    fn get_current_thread(&self) -> LuaResult<ThreadHandle>;
+    
+    /// Get the base register index
+    fn get_base_index(&self) -> LuaResult<usize>;
+    
+    /// Get the number of results pushed so far
+    fn get_results_pushed(&self) -> usize;
+    
+    /// Get a value from the global table
+    fn globals_get(&self, name: &str) -> LuaResult<Value>;
+    
+    /// Execute a function
+    fn execute_function(&mut self, closure: ClosureHandle, args: &[Value]) -> LuaResult<Value>;
+    
+    /// Evaluate a Lua script
+    fn eval_script(&mut self, script: &str) -> LuaResult<Value>;
+    
+    /// Get table field by integer index
+    fn get_table_field_by_int(&self, table: TableHandle, index: isize) -> LuaResult<Value> {
+        self.table_raw_get(table, Value::Number(index as f64))
+    }
+}
 
 /// Pending operations for non-recursive VM execution
 #[derive(Debug, Clone)]
@@ -31,6 +140,18 @@ pub enum PendingOperation {
     /// Return from function
     Return {
         values: Vec<Value>,
+    },
+    
+    /// TFORLOOP continuation after iterator function returns
+    TForLoopContinuation {
+        /// Base register
+        base: usize,
+        /// A field from instruction
+        a: usize,
+        /// C field from instruction (result count)
+        c: usize,
+        /// PC value before the iterator call for proper control flow
+        pc_before_call: usize,
     },
 }
 
@@ -81,6 +202,21 @@ impl RefCellVM {
         Self::with_config(VMConfig::default())
     }
     
+    /// Create a function prototype in the heap
+    pub fn create_function_proto(&mut self, proto: FunctionProto) -> LuaResult<FunctionProtoHandle> {
+        self.heap.create_function_proto(proto)
+    }
+    
+    /// Get a copy of a function prototype
+    pub fn get_function_proto_copy(&self, handle: FunctionProtoHandle) -> LuaResult<FunctionProto> {
+        self.heap.get_function_proto_copy(handle)
+    }
+    
+    /// Replace a function prototype with a new one
+    pub fn replace_function_proto(&mut self, handle: FunctionProtoHandle, proto: FunctionProto) -> LuaResult<()> {
+        self.heap.replace_function_proto(handle, proto)
+    }
+    
     /// Create a new VM with custom configuration
     pub fn with_config(config: VMConfig) -> LuaResult<Self> {
         let heap = RefCellHeap::new()?;
@@ -112,17 +248,18 @@ impl RefCellVM {
         
         // Execute until completion
         loop {
+            // Always process pending operations first
             if let Some(op) = self.operation_queue.pop_front() {
                 match self.process_pending_operation(op)? {
                     StepResult::Continue => continue,
                     StepResult::Completed(values) => return Ok(values),
                 }
-            } else {
-                // No pending operations, execute next instruction
-                match self.step()? {
-                    StepResult::Continue => continue,
-                    StepResult::Completed(values) => return Ok(values),
-                }
+            }
+            
+            // Then execute next instruction if no pending operations
+            match self.step()? {
+                StepResult::Continue => continue,
+                StepResult::Completed(values) => return Ok(values),
             }
         }
     }
@@ -218,6 +355,9 @@ impl RefCellVM {
             }
             PendingOperation::Return { values } => {
                 self.process_return(values)
+            }
+            PendingOperation::TForLoopContinuation { base, a, c, pc_before_call } => {
+                self.process_tforloop_continuation(base, a, c, pc_before_call)
             }
         }
     }
@@ -316,6 +456,55 @@ impl RefCellVM {
             for i in values.len()..n {
                 self.heap.set_thread_register(self.current_thread, func_register as usize + i, &Value::Nil)?;
             }
+        }
+        
+        Ok(StepResult::Continue)
+    }
+    
+    /// Process TFORLOOP continuation after iterator function returns
+    /// 
+    /// This handles the iterator protocol after the iterator function has returned.
+    /// If the first result is not nil, it updates the control variable and continues
+    /// the loop. If the first result is nil, it exits the loop by skipping the JMP.
+    fn process_tforloop_continuation(
+        &mut self,
+        base: usize,
+        a: usize,
+        c: usize,
+        pc_before_call: usize,
+    ) -> LuaResult<StepResult> {
+        eprintln!("DEBUG process_tforloop_continuation: base={}, a={}, c={}, pc_before_call={}",
+                 base, a, c, pc_before_call);
+        
+        // First result will be at R(A+3)
+        let first_result_idx = base + a + 3;
+        
+        // Read first result (nil means iterator is done)
+        let first_result = self.heap.get_thread_register(self.current_thread, first_result_idx)?;
+        
+        eprintln!("DEBUG process_tforloop_continuation: First result: {:?}", first_result);
+        
+        if !first_result.is_nil() {
+            // Continue iteration - copy first result to control variable
+            let control_var_idx = base + a + 2;
+            eprintln!("DEBUG process_tforloop_continuation: Updating control variable at R({}) = {:?}", 
+                     control_var_idx, first_result);
+            
+            self.heap.set_thread_register(self.current_thread, control_var_idx, &first_result)?;
+            
+            // In Lua, TFORLOOP is normally followed by a JMP instruction that jumps back
+            // to the start of the loop. When the iteration continues, we let execution
+            // continue naturally so the JMP will be executed.
+            
+            eprintln!("DEBUG process_tforloop_continuation: Iterator continuing, will execute JMP");
+        } else {
+            // Iterator is done - skip next instruction (which should be the JMP)
+            let pc = self.heap.get_pc(self.current_thread)?;
+            
+            eprintln!("DEBUG process_tforloop_continuation: Iterator done, skipping JMP at PC {}", pc);
+            
+            // Skip the JMP instruction
+            self.heap.set_pc(self.current_thread, pc + 1)?;
         }
         
         Ok(StepResult::Continue)
@@ -612,12 +801,35 @@ impl RefCellVM {
         eprintln!("DEBUG op_call: func at R({}), {} args, {} results expected", 
                  func_abs, nargs, expected_results);
         
-        // Queue the function call
-        self.operation_queue.push_back(PendingOperation::FunctionCall {
-            func_index: func_abs,
-            nargs,
-            expected_results,
-        });
+        // Get the function value to determine its type
+        let func_value = self.heap.get_thread_register(self.current_thread, func_abs)?;
+        
+        // Queue the appropriate operation based on function type
+        match func_value {
+            Value::Closure(_) => {
+                eprintln!("DEBUG op_call: Queueing Lua function call");
+                self.operation_queue.push_back(PendingOperation::FunctionCall {
+                    func_index: func_abs,
+                    nargs,
+                    expected_results,
+                });
+            }
+            Value::CFunction(cfunc) => {
+                eprintln!("DEBUG op_call: Queueing C function call");
+                self.operation_queue.push_back(PendingOperation::CFunctionCall {
+                    function: cfunc,
+                    base: func_abs as u16,
+                    nargs,
+                    expected_results,
+                });
+            }
+            _ => {
+                return Err(LuaError::TypeError {
+                    expected: "function".to_string(),
+                    got: func_value.type_name().to_string(),
+                });
+            }
+        }
         
         Ok(())
     }
@@ -1188,26 +1400,67 @@ impl RefCellVM {
         let a = inst.get_a() as usize;
         let c = inst.get_c() as usize;
         
-        // Call the iterator function: R(A)(R(A+1), R(A+2))
+        eprintln!("DEBUG TFORLOOP: A={}, C={}, base={}", a, c, base);
+        
+        // TFORLOOP uses these registers:
+        // R(A)   = iterator function
+        // R(A+1) = state
+        // R(A+2) = control variable (current key)
+        // Results will be placed in R(A+3) to R(A+2+C)
+        
+        // Read the iterator function and arguments
         let func_idx = base as usize + a;
         let state_idx = base as usize + a + 1;
         let control_idx = base as usize + a + 2;
         
-        // Save current values
         let func = self.heap.get_thread_register(self.current_thread, func_idx)?;
         let state = self.heap.get_thread_register(self.current_thread, state_idx)?;
         let control = self.heap.get_thread_register(self.current_thread, control_idx)?;
         
-        // Set up for call
-        self.heap.set_thread_register(self.current_thread, func_idx, &func)?;
-        self.heap.set_thread_register(self.current_thread, func_idx + 1, &state)?;
-        self.heap.set_thread_register(self.current_thread, func_idx + 2, &control)?;
+        eprintln!("DEBUG TFORLOOP: Iterator function: {:?}", func);
+        eprintln!("DEBUG TFORLOOP: State: {:?}", state);
+        eprintln!("DEBUG TFORLOOP: Control variable: {:?}", control);
         
-        // Queue the iterator call
-        self.operation_queue.push_back(PendingOperation::FunctionCall {
-            func_index: func_idx,
-            nargs: 2,
-            expected_results: c as i32,
+        // Ensure we have enough stack space for results
+        let needed_size = base as usize + a + 3 + c;
+        self.heap.grow_stack(self.current_thread, needed_size)?;
+        
+        // Store current PC for continuation
+        let current_pc = self.heap.get_pc(self.current_thread)?;
+        
+        // Queue the call operation based on function type
+        match func {
+            Value::Closure(_) => {
+                eprintln!("DEBUG TFORLOOP: Queueing Lua function call");
+                self.operation_queue.push_back(PendingOperation::FunctionCall {
+                    func_index: func_idx,
+                    nargs: 2,  // state and control as arguments
+                    expected_results: c as i32,  // Number of results needed
+                });
+            },
+            Value::CFunction(cfunc) => {
+                eprintln!("DEBUG TFORLOOP: Queueing C function call");
+                self.operation_queue.push_back(PendingOperation::CFunctionCall {
+                    function: cfunc,
+                    base: func_idx as u16,
+                    nargs: 2,  // state and control as arguments
+                    expected_results: c as i32,  // Number of results needed 
+                });
+            },
+            _ => {
+                return Err(LuaError::TypeError {
+                    expected: "function".to_string(),
+                    got: func.type_name().to_string()
+                });
+            }
+        }
+        
+        // Queue the continuation to check loop condition after call completes
+        self.operation_queue.push_back(PendingOperation::TForLoopContinuation {
+            base: base as usize,
+            a,
+            c,
+            pc_before_call: current_pc - 1, // PC of the TFORLOOP instruction
         });
         
         Ok(())
@@ -1298,19 +1551,21 @@ impl RefCellVM {
         
         let value = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
         
-        // Get current closure
-        let frame = self.heap.get_current_frame(self.current_thread)?;
-        let closure = self.heap.get_closure(frame.closure)?;
+        // Get current closure and extract needed info
+        let upvalue_handle = {
+            let frame = self.heap.get_current_frame(self.current_thread)?;
+            let closure = self.heap.get_closure(frame.closure)?;
+            
+            if a >= closure.upvalues.len() {
+                return Err(LuaError::RuntimeError(format!(
+                    "Upvalue index {} out of bounds", a
+                )));
+            }
+            
+            closure.upvalues[a]
+        };
         
-        if a >= closure.upvalues.len() {
-            return Err(LuaError::RuntimeError(format!(
-                "Upvalue index {} out of bounds", a
-            )));
-        }
-        
-        let upvalue_handle = closure.upvalues[a];
-        
-        // Update upvalue value
+        // Now update upvalue value with no active borrows
         self.set_upvalue_value(upvalue_handle, &value)?;
         
         Ok(())
@@ -1412,32 +1667,19 @@ impl RefCellVM {
     fn process_c_function_call(
         &mut self,
         function: CFunction,
-        base: u16,
+        base: u16,  
         nargs: usize,
         expected_results: i32,
     ) -> LuaResult<StepResult> {
-        eprintln!("DEBUG process_c_function_call: base={}, nargs={}", base, nargs);
+        eprintln!("DEBUG process_c_function_call: base={}, nargs={}, expected_results={}", base, nargs, expected_results);
         
         // Create execution context for C function
         let mut ctx = RefCellExecutionContext::new(&self.heap, self.current_thread, base, nargs);
         
-        // Cast the CFunction to work with our context type
-        // This is a bit of a hack - in a real implementation we'd need to handle
-        // the type mismatch between transaction-based and RefCell-based contexts
-        // For now, we'll create a simple adapter
-        
         // Call the C function with our context
-        // Note: This requires the C functions to be written to work with RefCellExecutionContext
-        // For standard library functions, we'd need adapters
-        let actual_results = match function as usize {
-            // Match against known function pointers and call adapted versions
-            _ => {
-                eprintln!("WARNING: C function calls not fully implemented in RefCellVM");
-                // For now, just push nil as result
-                ctx.push_result(Value::Nil)?;
-                1
-            }
-        };
+        // The CFunction type expects a trait object, so we pass a mutable reference
+        // that implements the ExecutionContext trait
+        let actual_results = function(&mut ctx)?;
         
         // Validate result count
         if actual_results < 0 {
@@ -1445,6 +1687,8 @@ impl RefCellVM {
                 "C function returned negative result count".to_string()
             ));
         }
+        
+        eprintln!("DEBUG process_c_function_call: C function returned {} results", actual_results);
         
         // Adjust results to expected count
         if expected_results >= 0 {
@@ -1454,6 +1698,11 @@ impl RefCellVM {
                 for i in actual_results as usize..expected {
                     ctx.set_return(i, Value::Nil)?;
                 }
+            } else if actual_results > expected as i32 {
+                // Trim excess results
+                // The context already placed the results in the correct registers
+                // We don't need to do anything here since the calling code will only
+                // use the expected number of results
             }
         }
         
@@ -1467,14 +1716,135 @@ impl RefCellVM {
         // Clear any previous state
         self.operation_queue.clear();
         
-        // Create a function prototype from the module
+        // Step 1: Create all string handles
+        let mut string_handles = Vec::with_capacity(module.strings.len());
+        for s in &module.strings {
+            string_handles.push(self.heap.create_string(s)?);
+        }
+        
+        // Step 2: Create all function prototypes (two-pass approach like in loader)
+        let mut proto_handles = Vec::with_capacity(module.prototypes.len());
+        
+        // First pass - create prototypes with placeholder constants
+        for proto in &module.prototypes {
+            // Create temporary constants with Nil for unresolved references
+            let mut temp_constants = Vec::with_capacity(proto.constants.len());
+            for constant in &proto.constants {
+                match constant {
+                    CompilationConstant::Nil => temp_constants.push(Value::Nil),
+                    CompilationConstant::Boolean(b) => temp_constants.push(Value::Boolean(*b)),
+                    CompilationConstant::Number(n) => temp_constants.push(Value::Number(*n)),
+                    CompilationConstant::String(idx) => {
+                        if *idx < string_handles.len() {
+                            temp_constants.push(Value::String(string_handles[*idx]));
+                        } else {
+                            return Err(LuaError::RuntimeError(format!(
+                                "Invalid string index: {}", idx
+                            )));
+                        }
+                    }
+                    CompilationConstant::FunctionProto(_) | CompilationConstant::Table(_) => {
+                        // Use Nil as placeholder for now
+                        temp_constants.push(Value::Nil);
+                    }
+                }
+            }
+            
+            // Convert upvalues
+            let vm_upvalues: Vec<UpvalueInfo> = proto.upvalues.iter().map(|u| UpvalueInfo {
+                in_stack: u.in_stack,
+                index: u.index,
+            }).collect();
+            
+            // Create temporary prototype
+            let temp_proto = FunctionProto {
+                bytecode: proto.bytecode.clone(),
+                constants: temp_constants,
+                num_params: proto.num_params,
+                is_vararg: proto.is_vararg,
+                max_stack_size: proto.max_stack_size,
+                upvalues: vm_upvalues,
+            };
+            
+            proto_handles.push(self.heap.create_function_proto(temp_proto)?);
+        }
+        
+        // Second pass - update FunctionProto and Table constants
+        for (i, proto) in module.prototypes.iter().enumerate() {
+            let proto_handle = proto_handles[i];
+            let mut updated_proto = self.heap.get_function_proto_copy(proto_handle)?;
+            
+            // Update constants that reference other prototypes or tables
+            for (j, constant) in proto.constants.iter().enumerate() {
+                match constant {
+                    CompilationConstant::FunctionProto(idx) => {
+                        if *idx < proto_handles.len() {
+                            updated_proto.constants[j] = Value::FunctionProto(proto_handles[*idx]);
+                        } else {
+                            return Err(LuaError::RuntimeError(format!(
+                                "Invalid function prototype index: {}", idx
+                            )));
+                        }
+                    }
+                    CompilationConstant::Table(entries) => {
+                        let table_handle = self.create_table_constant(entries, &string_handles, &proto_handles)?;
+                        updated_proto.constants[j] = Value::Table(table_handle);
+                    }
+                    _ => {} // Already set in first pass
+                }
+            }
+            
+            // Replace the prototype with updated constants
+            self.heap.replace_function_proto(proto_handle, updated_proto)?;
+        }
+        
+        // Step 3: Convert main function constants
+        let mut main_constants = Vec::with_capacity(module.constants.len());
+        for constant in &module.constants {
+            let value = match constant {
+                CompilationConstant::Nil => Value::Nil,
+                CompilationConstant::Boolean(b) => Value::Boolean(*b),
+                CompilationConstant::Number(n) => Value::Number(*n),
+                CompilationConstant::String(idx) => {
+                    if *idx < string_handles.len() {
+                        Value::String(string_handles[*idx])
+                    } else {
+                        return Err(LuaError::RuntimeError(format!(
+                            "Invalid string index: {}", idx
+                        )));
+                    }
+                }
+                CompilationConstant::FunctionProto(idx) => {
+                    if *idx < proto_handles.len() {
+                        Value::FunctionProto(proto_handles[*idx])
+                    } else {
+                        return Err(LuaError::RuntimeError(format!(
+                            "Invalid function prototype index: {}", idx
+                        )));
+                    }
+                }
+                CompilationConstant::Table(entries) => {
+                    let table_handle = self.create_table_constant(entries, &string_handles, &proto_handles)?;
+                    Value::Table(table_handle)
+                }
+            };
+            main_constants.push(value);
+        }
+        
+        // Convert main upvalues
+        let vm_upvalues: Vec<UpvalueInfo> = module.upvalues.iter().map(|u| UpvalueInfo {
+            in_stack: u.in_stack,
+            index: u.index,
+        }).collect();
+        
+        // Create main function prototype
         let proto = FunctionProto {
             bytecode: module.bytecode.clone(),
-            constants: module.constants.clone(),
+            constants: main_constants,
             num_params: module.num_params,
             is_vararg: module.is_vararg,
             max_stack_size: module.max_stack_size,
-            upvalues: module.upvalues.clone(),
+            upvalues: vm_upvalues,
         };
         
         // Create the closure in the heap
@@ -1502,6 +1872,18 @@ impl RefCellVM {
         
         // Execute until completion
         loop {
+            // Always process pending operations first
+            if let Some(op) = self.operation_queue.pop_front() {
+                match self.process_pending_operation(op)? {
+                    StepResult::Continue => continue,
+                    StepResult::Completed(values) => {
+                        // Return the first result, or nil if none
+                        return Ok(values.get(0).cloned().unwrap_or(Value::Nil));
+                    }
+                }
+            }
+            
+            // Then execute next instruction if no pending operations
             match self.step()? {
                 StepResult::Continue => continue,
                 StepResult::Completed(values) => {
@@ -1520,6 +1902,24 @@ impl RefCellVM {
         super::refcell_stdlib::init_refcell_stdlib(self)
     }
     
+    /// Set context (for compatibility with LuaGIL interface)
+    pub fn set_context(&mut self, _context: super::ScriptContext) -> LuaResult<()> {
+        // RefCellVM doesn't use contexts in the same way as the transaction-based VM
+        // This is a no-op for compatibility
+        Ok(())
+    }
+    
+    /// Evaluate a Lua script
+    pub fn eval_script(&mut self, script: &str) -> LuaResult<Value> {
+        eprintln!("DEBUG eval_script: Compiling script");
+        
+        // Parse and compile the script
+        let module = super::compiler::compile(script)?;
+        
+        // Execute the compiled module
+        self.execute_module(&module, &[])
+    }
+    
     /// Get heap reference for library functions
     pub fn heap(&self) -> &RefCellHeap {
         &self.heap
@@ -1533,6 +1933,64 @@ impl RefCellVM {
     /// Set table field
     pub fn set_table_field(&self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
         self.heap.set_table_field(table, &key, &value)
+    }
+    
+    /// Helper method to create a table constant
+    fn create_table_constant(
+        &mut self,
+        entries: &[(CompilationConstant, CompilationConstant)],
+        string_handles: &[StringHandle],
+        proto_handles: &[FunctionProtoHandle],
+    ) -> LuaResult<TableHandle> {
+        // Create the table
+        let table_handle = self.heap.create_table()?;
+        
+        // Populate the table with entries
+        for (key_const, value_const) in entries {
+            // Convert key constant to Value
+            let key = self.constant_to_value(key_const, string_handles, proto_handles)?;
+            
+            // Convert value constant to Value
+            let value = self.constant_to_value(value_const, string_handles, proto_handles)?;
+            
+            // Set the field
+            self.heap.set_table_field(table_handle, &key, &value)?;
+        }
+        
+        Ok(table_handle)
+    }
+    
+    /// Helper to convert CompilationConstant to Value
+    fn constant_to_value(
+        &mut self,
+        constant: &CompilationConstant,
+        string_handles: &[StringHandle],
+        proto_handles: &[FunctionProtoHandle],
+    ) -> LuaResult<Value> {
+        match constant {
+            CompilationConstant::Nil => Ok(Value::Nil),
+            CompilationConstant::Boolean(b) => Ok(Value::Boolean(*b)),
+            CompilationConstant::Number(n) => Ok(Value::Number(*n)),
+            CompilationConstant::String(idx) => {
+                if *idx < string_handles.len() {
+                    Ok(Value::String(string_handles[*idx]))
+                } else {
+                    Err(LuaError::RuntimeError(format!("Invalid string index: {}", idx)))
+                }
+            }
+            CompilationConstant::FunctionProto(idx) => {
+                if *idx < proto_handles.len() {
+                    Ok(Value::FunctionProto(proto_handles[*idx]))
+                } else {
+                    Err(LuaError::RuntimeError(format!("Invalid prototype index: {}", idx)))
+                }
+            }
+            CompilationConstant::Table(entries) => {
+                // Recursively create table
+                let table = self.create_table_constant(entries, string_handles, proto_handles)?;
+                Ok(Value::Table(table))
+            }
+        }
     }
 }
 
@@ -1584,35 +2042,12 @@ pub struct RefCellExecutionContext<'a> {
     results_pushed: usize,
 }
 
-impl<'a> RefCellExecutionContext<'a> {
-    /// Create a new execution context
-    pub fn new(
-        heap: &'a RefCellHeap,
-        thread: ThreadHandle,
-        base: u16,
-        nargs: usize,
-    ) -> Self {
-        RefCellExecutionContext {
-            heap,
-            thread,
-            base,
-            nargs,
-            results_pushed: 0,
-        }
-    }
-    
-    /// Get the number of arguments
-    pub fn nargs(&self) -> usize {
+impl<'a> ExecutionContext for RefCellExecutionContext<'a> {
+    fn arg_count(&self) -> usize {
         self.nargs
     }
     
-    /// Get the number of arguments (alias)
-    pub fn arg_count(&self) -> usize {
-        self.nargs
-    }
-    
-    /// Get an argument value (0-indexed)
-    pub fn get_arg(&self, index: usize) -> LuaResult<Value> {
+    fn get_arg(&self, index: usize) -> LuaResult<Value> {
         if index >= self.nargs {
             return Err(LuaError::RuntimeError(format!(
                 "Argument {} out of range (passed {})",
@@ -1626,13 +2061,7 @@ impl<'a> RefCellExecutionContext<'a> {
         self.heap.get_thread_register(self.thread, register)
     }
     
-    /// Get an argument value (0-indexed) - alias
-    pub fn arg(&self, index: usize) -> LuaResult<Value> {
-        self.get_arg(index)
-    }
-    
-    /// Push a return value
-    pub fn push_result(&mut self, value: Value) -> LuaResult<()> {
+    fn push_result(&mut self, value: Value) -> LuaResult<()> {
         // Results go where the function was (at base), not after arguments
         let register = self.base as usize + self.results_pushed;
         self.heap.set_thread_register(self.thread, register, &value)?;
@@ -1640,13 +2069,7 @@ impl<'a> RefCellExecutionContext<'a> {
         Ok(())
     }
     
-    /// Push a return value (alias)
-    pub fn push_return(&mut self, value: Value) -> LuaResult<()> {
-        self.push_result(value)
-    }
-    
-    /// Set return value at specific index
-    pub fn set_return(&mut self, index: usize, value: Value) -> LuaResult<()> {
+    fn set_return(&mut self, index: usize, value: Value) -> LuaResult<()> {
         // Results start at the function's position (base)
         let register = self.base as usize + index;
         self.heap.set_thread_register(self.thread, register, &value)?;
@@ -1657,28 +2080,23 @@ impl<'a> RefCellExecutionContext<'a> {
         Ok(())
     }
     
-    /// Create a string
-    pub fn create_string(&self, s: &str) -> LuaResult<StringHandle> {
+    fn create_string(&self, s: &str) -> LuaResult<StringHandle> {
         self.heap.create_string(s)
     }
     
-    /// Create a table
-    pub fn create_table(&self) -> LuaResult<TableHandle> {
+    fn create_table(&self) -> LuaResult<TableHandle> {
         self.heap.create_table()
     }
     
-    /// Read a table field
-    pub fn get_table_field(&self, table: TableHandle, key: &Value) -> LuaResult<Value> {
+    fn get_table_field(&self, table: TableHandle, key: &Value) -> LuaResult<Value> {
         self.heap.get_table_field(table, key)
     }
     
-    /// Set a table field
-    pub fn set_table_field(&self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
+    fn set_table_field(&self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
         self.heap.set_table_field(table, &key, &value)
     }
     
-    /// Get argument as a string
-    pub fn get_arg_str(&self, index: usize) -> LuaResult<String> {
+    fn get_arg_str(&self, index: usize) -> LuaResult<String> {
         let value = self.get_arg(index)?;
         match value {
             Value::String(handle) => self.get_string_from_handle(handle),
@@ -1689,8 +2107,7 @@ impl<'a> RefCellExecutionContext<'a> {
         }
     }
     
-    /// Get argument as a number
-    pub fn get_number_arg(&self, index: usize) -> LuaResult<f64> {
+    fn get_number_arg(&self, index: usize) -> LuaResult<f64> {
         let value = self.get_arg(index)?;
         match value {
             Value::Number(n) => Ok(n),
@@ -1701,8 +2118,7 @@ impl<'a> RefCellExecutionContext<'a> {
         }
     }
     
-    /// Get argument as a boolean
-    pub fn get_bool_arg(&self, index: usize) -> LuaResult<bool> {
+    fn get_bool_arg(&self, index: usize) -> LuaResult<bool> {
         let value = self.get_arg(index)?;
         match value {
             Value::Boolean(b) => Ok(b),
@@ -1713,18 +2129,15 @@ impl<'a> RefCellExecutionContext<'a> {
         }
     }
     
-    /// Get table next key-value pair
-    pub fn table_next(&self, table: TableHandle, key: Value) -> LuaResult<Option<(Value, Value)>> {
+    fn table_next(&self, table: TableHandle, key: Value) -> LuaResult<Option<(Value, Value)>> {
         self.heap.table_next(table, key)
     }
     
-    /// Get string from handle
-    pub fn get_string_from_handle(&self, handle: StringHandle) -> LuaResult<String> {
+    fn get_string_from_handle(&self, handle: StringHandle) -> LuaResult<String> {
         self.heap.get_string_value(handle)
     }
     
-    /// Check for metamethod on a value
-    pub fn check_metamethod(&self, value: &Value, method_name: &str) -> LuaResult<Option<Value>> {
+    fn check_metamethod(&self, value: &Value, method_name: &str) -> LuaResult<Option<Value>> {
         match value {
             Value::Table(handle) => {
                 // Get the metatable if any
@@ -1747,73 +2160,78 @@ impl<'a> RefCellExecutionContext<'a> {
         }
     }
     
-    /// Call a metamethod (not implemented for RefCellVM)
-    pub fn call_metamethod(&mut self, _func: Value, _args: Vec<Value>) -> LuaResult<Vec<Value>> {
+    fn call_metamethod(&mut self, _func: Value, _args: Vec<Value>) -> LuaResult<Vec<Value>> {
         Err(LuaError::NotImplemented("metamethod calls in RefCellVM".to_string()))
     }
     
-    /// Get table with metamethod support
-    pub fn table_get(&self, table: TableHandle, key: Value) -> LuaResult<Value> {
+    fn table_get(&self, table: TableHandle, key: Value) -> LuaResult<Value> {
         // For now, just do raw get - metamethods not implemented
         self.heap.get_table_field(table, &key)
     }
     
-    /// Get table raw (no metamethods)
-    pub fn table_raw_get(&self, table: TableHandle, key: Value) -> LuaResult<Value> {
+    fn table_raw_get(&self, table: TableHandle, key: Value) -> LuaResult<Value> {
         self.heap.get_table_field(table, &key)
     }
     
-    /// Set table raw (no metamethods)
-    pub fn table_raw_set(&self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
+    fn table_raw_set(&self, table: TableHandle, key: Value, value: Value) -> LuaResult<()> {
         self.heap.set_table_field(table, &key, &value)
     }
     
-    /// Get table length
-    pub fn table_length(&self, table: TableHandle) -> LuaResult<usize> {
+    fn table_length(&self, table: TableHandle) -> LuaResult<usize> {
         let table_obj = self.heap.get_table(table)?;
         Ok(table_obj.array_len())
     }
     
-    /// Set metatable for a table
-    pub fn set_metatable(&self, table: TableHandle, metatable: Option<TableHandle>) -> LuaResult<()> {
+    fn set_metatable(&self, table: TableHandle, metatable: Option<TableHandle>) -> LuaResult<()> {
         self.heap.set_table_metatable(table, metatable)
     }
     
-    /// Get metatable for a table
-    pub fn get_metatable(&self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
+    fn get_metatable(&self, table: TableHandle) -> LuaResult<Option<TableHandle>> {
         self.heap.get_table_metatable(table)
     }
     
-    /// Get the current thread
-    pub fn get_current_thread(&self) -> LuaResult<ThreadHandle> {
+    fn get_current_thread(&self) -> LuaResult<ThreadHandle> {
         Ok(self.thread)
     }
     
-    /// Get the base register index
-    pub fn get_base_index(&self) -> LuaResult<usize> {
+    fn get_base_index(&self) -> LuaResult<usize> {
         Ok(self.base as usize)
     }
     
-    /// Get the number of results pushed
-    pub fn get_results_pushed(&self) -> usize {
+    fn get_results_pushed(&self) -> usize {
         self.results_pushed
     }
     
-    /// Get a value from globals
-    pub fn globals_get(&self, name: &str) -> LuaResult<Value> {
+    fn globals_get(&self, name: &str) -> LuaResult<Value> {
         let name_handle = self.heap.create_string(name)?;
         let globals = self.heap.globals()?;
         self.heap.get_table_field(globals, &Value::String(name_handle))
     }
     
-    /// Execute a function (not implemented for RefCellVM)
-    pub fn execute_function(&mut self, _closure: ClosureHandle, _args: &[Value]) -> LuaResult<Value> {
+    fn execute_function(&mut self, _closure: ClosureHandle, _args: &[Value]) -> LuaResult<Value> {
         Err(LuaError::NotImplemented("execute_function in RefCellVM".to_string()))
     }
     
-    /// Evaluate a Lua script (not implemented for RefCellVM)
-    pub fn eval_script(&mut self, _script: &str) -> LuaResult<Value> {
+    fn eval_script(&mut self, _script: &str) -> LuaResult<Value> {
         Err(LuaError::NotImplemented("eval_script in RefCellVM".to_string()))
+    }
+}
+
+impl<'a> RefCellExecutionContext<'a> {
+    /// Create a new execution context
+    pub fn new(
+        heap: &'a RefCellHeap,
+        thread: ThreadHandle,
+        base: u16,
+        nargs: usize,
+    ) -> Self {
+        RefCellExecutionContext {
+            heap,
+            thread,
+            base,
+            nargs,
+            results_pushed: 0,
+        }
     }
 }
 
@@ -1868,6 +2286,94 @@ mod tests {
         
         // Create closure in heap
         let closure_handle = vm.heap.create_closure(closure).unwrap();
+        
+        // Execute - this should complete without errors
+        let results = vm.execute(closure_handle).unwrap();
+        assert_eq!(results.len(), 0); // No return values
+    }
+    
+    #[test]
+    fn test_tforloop_iterator() {
+        let mut vm = RefCellVM::new().unwrap();
+        
+        // Create a simple iterator function that returns values 1, 2, 3, then nil
+        // This simulates what pairs() would return
+        let iter_proto = FunctionProto {
+            bytecode: vec![
+                // R(0) = state (table), R(1) = current key
+                // Check if key is nil (first iteration)
+                Instruction::create_ABC(OpCode::Eq, 1, 1, 0).0,     // if R(1) == nil (const 0)
+                Instruction::create_sBx(OpCode::Jmp, 0, 3).0,      // skip to first key
+                
+                // Check current key value
+                Instruction::create_ABC(OpCode::Eq, 0, 1, 1).0,    // if R(1) == 1
+                Instruction::create_ABC(OpCode::LoadK, 0, 2, 0).0, // R(0) = 2 (next key)
+                Instruction::create_sBx(OpCode::Jmp, 0, 8).0,      // jump to return
+                
+                // First iteration - return 1
+                Instruction::create_ABC(OpCode::LoadK, 0, 1, 0).0, // R(0) = 1
+                Instruction::create_sBx(OpCode::Jmp, 0, 5).0,      // jump to return
+                
+                // Check if key is 2
+                Instruction::create_ABC(OpCode::Eq, 0, 1, 2).0,    // if R(1) == 2
+                Instruction::create_ABC(OpCode::LoadK, 0, 3, 0).0, // R(0) = 3
+                Instruction::create_sBx(OpCode::Jmp, 0, 2).0,      // jump to return
+                
+                // Otherwise return nil (end of iteration)
+                Instruction::create_ABC(OpCode::LoadNil, 0, 0, 0).0, // R(0) = nil
+                
+                // Return R(0) and R(0) (key, value)
+                Instruction::create_ABC(OpCode::Return, 0, 3, 0).0, // return 2 values
+            ],
+            constants: vec![
+                Value::Nil,
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+            ],
+            num_params: 2, // state and current key
+            is_vararg: false,
+            max_stack_size: 3,
+            upvalues: vec![],
+        };
+        
+        let iter_closure = Closure {
+            proto: iter_proto,
+            upvalues: vec![],
+        };
+        
+        // Create main function that uses TFORLOOP
+        let main_proto = FunctionProto {
+            bytecode: vec![
+                // Set up iterator (R(0) = iterator, R(1) = state, R(2) = nil)
+                Instruction::create_ABC(OpCode::Closure, 0, 0, 0).0, // R(0) = iterator closure
+                Instruction::create_ABC(OpCode::NewTable, 1, 0, 0).0, // R(1) = {} (dummy state)
+                Instruction::create_ABC(OpCode::LoadNil, 2, 2, 0).0, // R(2) = nil (initial key)
+                
+                // TFORLOOP
+                Instruction::create_ABC(OpCode::TForLoop, 0, 0, 2).0, // 2 results (key, value)
+                Instruction::create_sBx(OpCode::Jmp, 0, -1).0,        // jump back
+                
+                // Return
+                Instruction::create_ABC(OpCode::Return, 0, 1, 0).0,
+            ],
+            constants: vec![
+                // The iterator function proto should be here
+                Value::FunctionProto(vm.heap.create_function_proto(iter_closure.proto).unwrap()),
+            ],
+            num_params: 0,
+            is_vararg: false,
+            max_stack_size: 6, // Need space for iterator state and results
+            upvalues: vec![],
+        };
+        
+        let main_closure = Closure {
+            proto: main_proto,
+            upvalues: vec![],
+        };
+        
+        // Create closure in heap
+        let closure_handle = vm.heap.create_closure(main_closure).unwrap();
         
         // Execute - this should complete without errors
         let results = vm.execute(closure_handle).unwrap();

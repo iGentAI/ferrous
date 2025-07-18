@@ -7,7 +7,7 @@ use super::ast::*;
 use super::error::{LuaError, LuaResult};
 use std::collections::HashMap;
 
-/// Constant value during compilation
+/// Compilation Constant types
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompilationConstant {
     /// Nil constant

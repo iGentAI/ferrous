@@ -8,13 +8,10 @@ use std::sync::Arc;  // Ensure Arc is imported
 pub mod arena;
 pub mod handle;
 pub mod value;
-pub mod heap;
 pub mod refcell_heap;
 pub mod refcell_vm;
 pub mod metamethod;
 pub mod resource;
-pub mod transaction;
-pub mod vm;
 pub mod error;
 pub mod compiler;
 pub mod codegen;
@@ -32,9 +29,8 @@ mod test_basic;
 
 pub use self::error::{LuaError, LuaResult};
 pub use self::value::Value;
-pub use self::vm::LuaVM;
-pub use self::refcell_vm::RefCellVM;
-pub use self::refcell_heap::RefCellHeap;
+pub use self::refcell_vm::RefCellVM as LuaVM;
+pub use self::refcell_heap::RefCellHeap as LuaHeap;
 pub use self::compiler::{compile, CompiledModule};
 pub use self::codegen::OpCode;
 pub use self::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle};
@@ -181,7 +177,7 @@ pub struct ScriptContext {
 /// Manages a pool of Lua VMs and script caching
 pub struct LuaGIL {
     /// Pool of available VMs
-    vm_pool: Arc<Mutex<Vec<vm::LuaVM>>>,
+    vm_pool: Arc<Mutex<Vec<LuaVM>>>,
     
     /// Script cache mapping SHA1 hash to compiled scripts
     script_cache: Arc<RwLock<HashMap<String, String>>>,
@@ -197,7 +193,7 @@ impl LuaGIL {
         let mut pool = Vec::new();
         
         // Create initial VM
-        match vm::LuaVM::new() {
+        match LuaVM::new() {
             Ok(mut vm) => {
                 // Initialize standard library
                 if let Err(e) = vm.init_stdlib() {
@@ -299,7 +295,7 @@ impl LuaGIL {
     }
     
     /// Get a VM from the pool
-    fn get_vm(&self) -> Result<vm::LuaVM, FerrousError> {
+    fn get_vm(&self) -> Result<LuaVM, FerrousError> {
         let mut pool = self.vm_pool.lock().map_err(|_| {
             FerrousError::Internal("Failed to acquire VM pool lock".to_string())
         })?;
@@ -308,7 +304,7 @@ impl LuaGIL {
             Ok(vm)
         } else {
             // Create a new VM if pool is empty
-            let mut new_vm = vm::LuaVM::new().map_err(|e| {
+            let mut new_vm = LuaVM::new().map_err(|e| {
                 FerrousError::LuaError(format!("Failed to create Lua VM: {}", e))
             })?;
             
@@ -322,7 +318,7 @@ impl LuaGIL {
     }
     
     /// Return a VM to the pool
-    fn return_vm(&self, vm: vm::LuaVM) {
+    fn return_vm(&self, vm: LuaVM) {
         if let Ok(mut pool) = self.vm_pool.lock() {
             // Reset VM state before returning to pool
             // TODO: Implement VM reset
@@ -346,15 +342,12 @@ impl LuaGIL {
             },
             value::Value::String(handle) => {
                 // Get a VM to access the string value
-                let mut vm = self.get_vm()?;
+                let vm = self.get_vm()?;
                 
-                // Use transaction to get the string value
-                let string_value = {
-                    let mut tx = transaction::HeapTransaction::new(vm.heap_mut());
-                    let value = tx.get_string_value(handle.clone())?;
-                    tx.commit()?;
-                    value
-                };
+                // Get string value from the heap
+                let string_value = vm.heap().get_string_value(handle).map_err(|e| {
+                    FerrousError::LuaError(format!("Failed to get string value: {}", e))
+                })?;
                 
                 // Return the VM to the pool
                 self.return_vm(vm);

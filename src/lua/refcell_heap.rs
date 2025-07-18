@@ -1013,6 +1013,25 @@ impl RefCellHeap {
         Ok(proto.clone())
     }
     
+    /// Replace a function prototype in place
+    pub fn replace_function_proto(&self, handle: FunctionProtoHandle, proto: FunctionProto) -> LuaResult<()> {
+        let mut function_protos = self.function_protos.try_borrow_mut()
+            .map_err(|_| LuaError::BorrowError("Failed to borrow function protos arena for writing".to_string()))?;
+        
+        // Ensure the handle is valid
+        if !function_protos.contains(handle.0) {
+            return Err(LuaError::InvalidHandle);
+        }
+        
+        // Replace the prototype
+        if let Some(proto_slot) = function_protos.get_mut(handle.0) {
+            *proto_slot = proto;
+            Ok(())
+        } else {
+            Err(LuaError::InvalidHandle)
+        }
+    }
+    
     // Helper methods for common patterns
     
     /// Get table field with metamethod support

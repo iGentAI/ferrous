@@ -11,7 +11,7 @@ use std::fmt;
 use std::hash::Hasher;
 
 /// Type representing a C function callable from Lua
-pub type CFunction = fn(&mut crate::lua::vm::ExecutionContext) -> LuaResult<i32>;
+pub type CFunction = fn(&mut dyn super::refcell_vm::ExecutionContext) -> LuaResult<i32>;
 
 /// Main Lua value type
 #[derive(Debug, Clone, PartialEq)]

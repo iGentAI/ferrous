@@ -26,22 +26,18 @@
 - ✅ Enhanced RESP parsing
 - ✅ Master-slave replication
 - ✅ SCAN command family for safe iteration
-- ✅ Basic Lua VM with unified stack model
-- 🔄 Complete Lua standard library implementation
-  - ✅ Basic functions (print, type, tostring, tonumber, assert)
-  - ⚠️ String library functions
-  - ⚠️ Table library functions
-- 🔄 Advanced Lua VM features
-  - ✅ Table operations
-  - ✅ Closures and upvalues
+- 🔄 RefCellVM Lua implementation
+  - ✅ Basic language features (variables, arithmetic, strings)
   - ✅ Numerical for loops
-  - ✅ String interning with content-based comparison
-  - ✅ Table field access with string keys
-  - ⚠️ Generic for loops (in progress)
-  - ⚠️ Full metamethod support (partially implemented)
-  - ❌ Coroutines
-  - ❌ Garbage collection
-  - ❌ Error handling with traceback
+  - ⚠️ Basic table operations (partially implemented)
+  - ❌ Functions and closures (not implemented)
+  - ❌ Generic for loops (not implemented)
+  - ❌ Metamethods (not implemented)
+- 🔄 Lua Standard Library
+  - ⚠️ Basic functions (print, type, tostring implemented)
+  - ❌ Table library (not implemented)
+  - ❌ String library (not implemented)
+  - ❌ Math library (not implemented)
     
 ## Phase 5: Performance & Monitoring (Planned)
 - ⚠️ Production monitoring (INFO)
@@ -67,39 +63,39 @@
 
 ## Lua VM Development Roadmap
 
-The Lua VM implementation follows a specific roadmap to ensure compatibility with Redis Lua scripting.
+The Lua VM implementation roadmap reflects the current RefCellVM architecture.
 
-### Phase 1: Core VM (Completed)
-- ✅ Unified stack architecture
-- ✅ Transaction-based memory safety
+### Phase 1: Core VM Features (In Progress)
+- ✅ RefCellVM architecture with interior mutability
+- ✅ Arena-based memory management with handle validation
 - ✅ Basic opcode execution
-- ✅ Table creation and manipulation
 - ✅ Numerical for loops
 - ✅ String interning with content-based comparison
-- ✅ Table operations with proper string key handling
-- ✅ Basic standard library function registration
+- ✅ Basic table operations
+- ✅ Basic standard library functions (print, type, tostring)
 
-### Phase 2: Advanced Features (In Progress)
-- ⚠️ Generic for loops
-- ⚠️ Metamethod handling
-- ⚠️ Complete standard library implementation
-  - ✅ Basic functions (print, type, tostring, tonumber, assert)
-  - ⚠️ String library functions
-  - ⚠️ Table library functions
+### Phase 2: Function Implementation (Planned)
+- ❌ Function definitions and calls
+- ❌ Closures
+- ❌ Upvalue handling
+- ❌ Variable arguments
+- ❌ Tail call optimization 
+
+### Phase 3: Advanced Language Features (Future)
+- ❌ Generic for loops (pairs/ipairs)
+- ❌ Metamethod handling
+- ❌ Complete standard library
+  - ❌ Table library
+  - ❌ String library
   - ❌ Math library
-  - ❌ I/O library (may be limited for Redis)
 - ❌ Coroutines
-- ❌ Garbage collection
-- ❌ Comprehensive error handling
+- ❌ Error handling with traceback
 
-### Phase 3: Redis Integration (Planned)
-- ⚠️ EVAL/EVALSHA commands
+### Phase 4: Redis Integration & Optimization (Future)
+- ❌ EVAL/EVALSHA commands
 - ❌ Script caching
 - ❌ SCRIPT LOAD/FLUSH commands
 - ❌ Script timeout management
 - ❌ redis.call and redis.pcall functions
-
-### Phase 4: Performance Optimization (Future)
-- ❌ Bytecode optimization
-- ❌ Memory usage reduction
+- ❌ Memory usage optimization
 - ❌ Benchmarking against Lua 5.1

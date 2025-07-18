@@ -6,7 +6,7 @@
 
 use super::error::{LuaError, LuaResult};
 use super::codegen::{generate_bytecode, CompleteCompilationOutput, CompiledFunction, CompilationConstant, CompilationUpvalue};
-use std::collections::HashMap;
+use super::ast::{Statement, LocalDeclaration, Expression};
 
 // Re-export parser for convenience
 pub use super::parser::parse;
@@ -223,14 +223,12 @@ pub mod loader {
     use super::*;
     use super::super::error::LuaResult;
     use super::super::handle::{StringHandle, FunctionProtoHandle, TableHandle};
-    use super::super::transaction::HeapTransaction;
+    use super::super::refcell_heap::RefCellHeap;
     use super::super::value::{Value, FunctionProto, UpvalueInfo as VMUpvalueInfo};
     
-
-    
-    /// Load a compiled module into the heap
-    pub fn load_module<'a>(
-        tx: &mut HeapTransaction<'a>,
+    /// Load a compiled module into the heap using RefCellHeap
+    pub fn load_module(
+        heap: &RefCellHeap,
         module: &CompiledModule
     ) -> LuaResult<FunctionProtoHandle> {
         // VALIDATION: Before processing, check that the string table isn't empty
@@ -246,7 +244,7 @@ pub mod loader {
         // Step 1: Create all string handles
         let mut string_handles = Vec::with_capacity(module.strings.len());
         for s in &module.strings {
-            string_handles.push(tx.create_string(s)?);
+            string_handles.push(heap.create_string(s)?);
         }
         
         println!("DEBUG LOADER: Created {} string handles", string_handles.len());
@@ -342,7 +340,7 @@ pub mod loader {
             };
             
             // Create function prototype in heap
-            let proto_handle = tx.create_function_proto(temp_proto)?;
+            let proto_handle = heap.create_function_proto(temp_proto)?;
             println!("DEBUG LOADER:   Created prototype handle for proto {}", proto_idx);
             proto_handles.push(proto_handle);
             
@@ -357,7 +355,7 @@ pub mod loader {
             let proto_handle = proto_handles[i];
             
             // Get the current prototype 
-            let mut proto = tx.get_function_proto_copy(proto_handle)?;
+            let mut proto = heap.get_function_proto_copy(proto_handle)?;
             
             // Update constants that are FunctionProto or Table references
             for (j, constant) in constants.iter().enumerate() {
@@ -376,7 +374,7 @@ pub mod loader {
                     CompilationConstant::Table(entries) => {
                         println!("DEBUG LOADER:     Creating table const {} with {} entries", j, entries.len());
                         // Create the table constant
-                        let table_handle = create_table_constant(tx, entries, &string_handles, &proto_handles)?;
+                        let table_handle = create_table_constant(heap, entries, &string_handles, &proto_handles)?;
                         proto.constants[j] = Value::Table(table_handle);
                     },
                     _ => {
@@ -386,8 +384,7 @@ pub mod loader {
             }
             
             // Store the updated prototype
-            let updated_proto_handle = tx.replace_function_proto(proto_handle, proto)?;
-            proto_handles[i] = updated_proto_handle;
+            heap.replace_function_proto(proto_handle, proto)?;
         }
         
         // Step 3: Convert the main function
@@ -429,7 +426,7 @@ pub mod loader {
                     println!("DEBUG LOADER:     Creating table const {} with {} entries", 
                             i, entries.len());
                     // Create the table constant
-                    let table_handle = create_table_constant(tx, entries, &string_handles, &proto_handles)?;
+                    let table_handle = create_table_constant(heap, entries, &string_handles, &proto_handles)?;
                     Value::Table(table_handle)
                 },
             };
@@ -459,40 +456,40 @@ pub mod loader {
         };
         
         println!("DEBUG LOADER: Creating main function prototype");
-        tx.create_function_proto(proto)
+        heap.create_function_proto(proto)
     }
     
     /// Helper function to create a table constant with proper string interning
-    fn create_table_constant<'a>(
-        tx: &mut HeapTransaction<'a>,
+    fn create_table_constant(
+        heap: &RefCellHeap,
         entries: &[(CompilationConstant, CompilationConstant)],
         string_handles: &[StringHandle],
         proto_handles: &[FunctionProtoHandle],
     ) -> LuaResult<TableHandle> {
         // Create the table
-        let table_handle = tx.create_table()?;
+        let table_handle = heap.create_table()?;
         
         // Populate the table with entries
         for (key_const, value_const) in entries {
             // Convert key constant to Value
-            let key = constant_to_value(key_const, string_handles, proto_handles, tx)?;
+            let key = constant_to_value(key_const, string_handles, proto_handles, heap)?;
             
             // Convert value constant to Value
-            let value = constant_to_value(value_const, string_handles, proto_handles, tx)?;
+            let value = constant_to_value(value_const, string_handles, proto_handles, heap)?;
             
-            // Use the transaction's set_table_field which properly handles HashableValue
-            tx.set_table_field(table_handle, key, value)?;
+            // Set the field
+            heap.set_table_field(table_handle, &key, &value)?;
         }
         
         Ok(table_handle)
     }
     
     /// Helper to convert CompilationConstant to Value
-    fn constant_to_value<'a>(
+    fn constant_to_value(
         constant: &CompilationConstant,
         string_handles: &[StringHandle],
         proto_handles: &[FunctionProtoHandle],
-        tx: &mut HeapTransaction<'a>,
+        heap: &RefCellHeap,
     ) -> LuaResult<Value> {
         match constant {
             CompilationConstant::Nil => Ok(Value::Nil),
@@ -514,10 +511,71 @@ pub mod loader {
             },
             CompilationConstant::Table(entries) => {
                 // Recursively create table
-                let table = create_table_constant(tx, entries, string_handles, proto_handles)?;
+                let table = create_table_constant(heap, entries, string_handles, proto_handles)?;
                 Ok(Value::Table(table))
             },
         }
+    }
+}
+
+/// Initialize pre-compiled values using compiler infrastructure
+/// This prevents module dependency cycles while reusing compilation logic.
+pub(crate) fn compile_value_to_constant(value_expr: &str) -> Result<CompilationConstant, LuaError> {
+    eprintln!("DEBUG compile_value_to_constant: Compiling expression: {}", value_expr);
+    
+    let tokens = super::lexer::tokenize(value_expr)?;
+    let expr = super::parser::parse(value_expr)?.statements.first().and_then(|stmt| {
+        if let Statement::LocalDeclaration(LocalDeclaration { expressions, .. }) = stmt {
+            expressions.first().cloned()
+        } else {
+            None
+        }
+    }).unwrap_or(Expression::Nil);
+    
+    // Convert parsed expression to compilation constant
+    expr_to_constant(&expr)
+}
+
+// Helper functions
+fn expr_to_constant(expr: &super::ast::Expression) -> Result<CompilationConstant, LuaError> {
+    match expr {
+        super::ast::Expression::Nil => Ok(CompilationConstant::Nil),
+        super::ast::Expression::Boolean(b) => Ok(CompilationConstant::Boolean(*b)),
+        super::ast::Expression::Number(n) => Ok(CompilationConstant::Number(*n)),
+        super::ast::Expression::String(s) => {
+            // For standalone expressions, we can't intern strings
+            // This is a limitation of this approach
+            Err(LuaError::NotImplemented("String constants in compile_value_to_constant".to_string()))
+        }
+        super::ast::Expression::TableConstructor(tc) => {
+            let mut items = vec![];
+            
+            // Array fields
+            for field in &tc.fields {
+                match field {
+                    super::ast::TableField::List(expr) => {
+                        // For array part, index is explicit (1-based)
+                        let idx = items.len() + 1;
+                        let key = CompilationConstant::Number(idx as f64);
+                        let val = expr_to_constant(expr)?;
+                        items.push((key, val));
+                    },
+                    super::ast::TableField::Record { key, value } => {
+                        let key_const = CompilationConstant::String(0); // Fake string index
+                        let val = expr_to_constant(value)?;
+                        items.push((key_const, val));
+                    },
+                    super::ast::TableField::Index { key, value } => {
+                        let key_const = expr_to_constant(key)?;
+                        let val = expr_to_constant(value)?;
+                        items.push((key_const, val));
+                    }
+                }
+            }
+            
+            Ok(CompilationConstant::Table(items))
+        },
+        _ => Err(LuaError::NotImplemented(format!("Expression type {:?} in compile_value_to_constant", expr)))
     }
 }
 
