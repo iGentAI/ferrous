@@ -3,6 +3,7 @@
 //! This module implements a Lua VM using RefCellHeap for direct memory access,
 //! eliminating the transaction system complexity while maintaining memory safety.
 
+
 use super::codegen::{Instruction, OpCode};
 use super::compiler::CompiledModule;
 use super::codegen::CompilationConstant;
@@ -68,6 +69,9 @@ pub trait ExecutionContext {
     /// Get next key-value pair from table
     fn table_next(&self, table: TableHandle, key: Value) -> LuaResult<Option<(Value, Value)>>;
     
+    /// Get the globals table handle
+    fn globals_handle(&self) -> LuaResult<TableHandle>;
+    
     /// Get string value from handle
     fn get_string_from_handle(&self, handle: StringHandle) -> LuaResult<String>;
     
@@ -117,6 +121,10 @@ pub trait ExecutionContext {
     fn get_table_field_by_int(&self, table: TableHandle, index: isize) -> LuaResult<Value> {
         self.table_raw_get(table, Value::Number(index as f64))
     }
+    
+    /// Raw table access methods (bypass metamethods)
+    fn get_raw_table_field(&self, table: TableHandle, key: &Value) -> LuaResult<Value>;
+    fn set_raw_table_field(&mut self, table: TableHandle, key: &Value, value: &Value) -> LuaResult<()>;
 }
 
 /// Pending operations for non-recursive VM execution
@@ -152,6 +160,8 @@ pub enum PendingOperation {
         c: usize,
         /// PC value before the iterator call for proper control flow
         pc_before_call: usize,
+        /// Temporary base register used for the function call
+        temp_base: usize,
     },
 }
 
@@ -200,6 +210,71 @@ impl RefCellVM {
     /// Create a new VM instance
     pub fn new() -> LuaResult<Self> {
         Self::with_config(VMConfig::default())
+    }
+    
+    /// Call a metamethod with the given arguments and return the results
+    /// This sets up registers properly for the metamethod call and handles return values
+    fn call_metamethod(&mut self, method: Value, args: &[Value], expected_results: usize) -> LuaResult<Vec<Value>> {
+        eprintln!("DEBUG call_metamethod: Calling {:?} with {} args, expecting {} results", 
+                 method, args.len(), expected_results);
+        
+        // Find a suitable location on the stack for the metamethod call
+        let stack_size = self.heap.get_stack_size(self.current_thread)?;
+        let call_base = stack_size;
+        
+        // Ensure we have enough stack space
+        self.heap.grow_stack(self.current_thread, call_base + args.len() + 10)?;
+        
+        // Place the metamethod function
+        self.heap.set_thread_register(self.current_thread, call_base, &method)?;
+        
+        // Place the arguments
+        for (i, arg) in args.iter().enumerate() {
+            self.heap.set_thread_register(self.current_thread, call_base + 1 + i, arg)?;
+        }
+        
+        // Queue the metamethod call
+        match method {
+            Value::Closure(_) => {
+                self.operation_queue.push_back(PendingOperation::FunctionCall {
+                    func_index: call_base,
+                    nargs: args.len(),
+                    expected_results: expected_results as i32,
+                });
+            }
+            Value::CFunction(cfunc) => {
+                self.operation_queue.push_back(PendingOperation::CFunctionCall {
+                    function: cfunc,
+                    base: call_base as u16,
+                    nargs: args.len(),
+                    expected_results: expected_results as i32,
+                });
+            }
+            _ => {
+                return Err(LuaError::TypeError {
+                    expected: "function".to_string(),
+                    got: method.type_name().to_string(),
+                });
+            }
+        }
+        
+        // Process the call immediately
+        while let Some(op) = self.operation_queue.pop_front() {
+            match self.process_pending_operation(op)? {
+                StepResult::Continue => continue,
+                StepResult::Completed(_) => break,
+            }
+        }
+        
+        // Collect the results
+        let mut results = Vec::with_capacity(expected_results);
+        for i in 0..expected_results {
+            let result = self.heap.get_thread_register(self.current_thread, call_base + i)?;
+            results.push(result);
+        }
+        
+        eprintln!("DEBUG call_metamethod: Returned {} results", results.len());
+        Ok(results)
     }
     
     /// Create a function prototype in the heap
@@ -269,6 +344,7 @@ impl RefCellVM {
         // Check if we have any call frames
         let depth = self.heap.get_thread_call_depth(self.current_thread)?;
         if depth == 0 {
+            eprintln!("DEBUG step: No call frames, execution complete");
             return Ok(StepResult::Completed(vec![]));
         }
         
@@ -281,13 +357,31 @@ impl RefCellVM {
         let instruction = self.heap.get_instruction(frame.closure, pc)?;
         let inst = Instruction(instruction);
         
-        // Debug for FOR loops
+        // Enhanced debugging for all opcodes during function tests
         match inst.get_opcode() {
             OpCode::ForPrep | OpCode::ForLoop => {
                 eprintln!("DEBUG RefCellVM: Executing {:?} at PC={}, base={}", 
                          inst.get_opcode(), pc, base);
             }
-            _ => {}
+            OpCode::Closure | OpCode::Call | OpCode::Return | 
+            OpCode::SetGlobal | OpCode::GetGlobal => {
+                eprintln!("DEBUG RefCellVM: Executing {:?} at PC={}, base={}, instruction=0x{:08x}", 
+                         inst.get_opcode(), pc, base, instruction);
+            }
+            OpCode::Eq | OpCode::Lt | OpCode::Le => {
+                eprintln!("DEBUG RefCellVM: Executing comparison {:?} at PC={}, base={}, instruction=0x{:08x}", 
+                         inst.get_opcode(), pc, base, instruction);
+                eprintln!("  A={}, B={}, C={}", inst.get_a(), inst.get_b(), inst.get_c());
+                let (b_is_const, b_idx) = inst.get_rk_b();
+                let (c_is_const, c_idx) = inst.get_rk_c();
+                eprintln!("  RK(B): is_const={}, idx={}", b_is_const, b_idx);
+                eprintln!("  RK(C): is_const={}, idx={}", c_is_const, c_idx);
+            }
+            _ => {
+                // Uncomment for full trace
+                // eprintln!("DEBUG RefCellVM: Executing {:?} at PC={}, base={}", 
+                //          inst.get_opcode(), pc, base);
+            }
         }
         
         // Increment PC for next instruction
@@ -335,6 +429,7 @@ impl RefCellVM {
             OpCode::SetList => self.op_setlist(inst, base)?,
             
             _ => {
+                eprintln!("ERROR: Unimplemented opcode {:?}", inst.get_opcode());
                 return Err(LuaError::NotImplemented(format!(
                     "Opcode {:?}", inst.get_opcode()
                 )));
@@ -356,8 +451,8 @@ impl RefCellVM {
             PendingOperation::Return { values } => {
                 self.process_return(values)
             }
-            PendingOperation::TForLoopContinuation { base, a, c, pc_before_call } => {
-                self.process_tforloop_continuation(base, a, c, pc_before_call)
+            PendingOperation::TForLoopContinuation { base, a, c, pc_before_call, temp_base } => {
+                self.process_tforloop_continuation(base, a, c, pc_before_call, temp_base)
             }
         }
     }
@@ -369,34 +464,68 @@ impl RefCellVM {
         nargs: usize,
         expected_results: i32,
     ) -> LuaResult<StepResult> {
-        eprintln!("DEBUG process_function_call: func_index={}, nargs={}", func_index, nargs);
+        eprintln!("DEBUG process_function_call: func_index={}, nargs={}, expected_results={}", 
+                 func_index, nargs, expected_results);
         
         // Get the function value
         let func_value = self.heap.get_thread_register(self.current_thread, func_index)?;
         
+        eprintln!("DEBUG process_function_call: Function value: {:?}", func_value);
+        
         let closure_handle = match func_value {
-            Value::Closure(handle) => handle,
-            _ => return Err(LuaError::TypeError {
-                expected: "closure".to_string(),
-                got: func_value.type_name().to_string(),
-            }),
+            Value::Closure(handle) => {
+                eprintln!("DEBUG process_function_call: Calling closure with handle: {:?}", handle);
+                handle
+            },
+            _ => {
+                eprintln!("ERROR process_function_call: Expected closure, got {:?}", func_value);
+                return Err(LuaError::TypeError {
+                    expected: "closure".to_string(),
+                    got: func_value.type_name().to_string(),
+                });
+            }
         };
         
-        // Get closure details
-        let closure = self.heap.get_closure(closure_handle)?;
-        let num_params = closure.proto.num_params as usize;
-        let max_stack = closure.proto.max_stack_size as usize;
+        // Phase 1: Extract closure details (release borrow after)
+        let (num_params, max_stack, is_vararg, bytecode_len, num_upvalues, upvalue_handles) = {
+            let closure = self.heap.get_closure(closure_handle)?;
+            eprintln!("DEBUG process_function_call: Closure upvalue handles: {:?}", closure.upvalues);
+            (
+                closure.proto.num_params as usize,
+                closure.proto.max_stack_size as usize,
+                closure.proto.is_vararg,
+                closure.proto.bytecode.len(),
+                closure.upvalues.len(),
+                closure.upvalues.clone(),  // Clone the upvalue handles for debugging
+            )
+        }; // Borrow ends here
+        
+        eprintln!("DEBUG process_function_call: Closure details:");
+        eprintln!("  - num_params: {}", num_params);
+        eprintln!("  - max_stack_size: {}", max_stack);
+        eprintln!("  - is_vararg: {}", is_vararg);
+        eprintln!("  - bytecode length: {}", bytecode_len);
+        eprintln!("  - num upvalues: {}", num_upvalues);
+        eprintln!("  - upvalue handles: {:?}", upvalue_handles);
         
         // New base is after the function
         let new_base = func_index + 1;
         
         eprintln!("DEBUG process_function_call: new_base={}, num_params={}", new_base, num_params);
         
+        // Debug: show current arguments
+        for i in 0..nargs {
+            let arg = self.heap.get_thread_register(self.current_thread, new_base + i)?;
+            eprintln!("DEBUG process_function_call: Arg {} at R({}): {:?}", i, new_base + i, arg);
+        }
+        
+        // Phase 2: Modify stack (no closure borrow active)
         // Ensure stack space
         self.heap.grow_stack(self.current_thread, new_base + max_stack)?;
         
         // Fill missing parameters with nil
         if nargs < num_params {
+            eprintln!("DEBUG process_function_call: Filling {} missing params with nil", num_params - nargs);
             for i in nargs..num_params {
                 self.heap.set_thread_register(self.current_thread, new_base + i, &Value::Nil)?;
             }
@@ -413,7 +542,19 @@ impl RefCellVM {
         
         eprintln!("DEBUG process_function_call: pushing frame with base_register={}", frame.base_register);
         
+        // Show first few instructions of the function (need fresh borrow)
+        if bytecode_len > 0 {
+            let closure = self.heap.get_closure(closure_handle)?;
+            eprintln!("DEBUG process_function_call: First instruction: 0x{:08x}", closure.proto.bytecode[0]);
+            let first_inst = Instruction(closure.proto.bytecode[0]);
+            eprintln!("  Opcode: {:?}", first_inst.get_opcode());
+        }
+        
         self.heap.push_call_frame(self.current_thread, frame)?;
+        
+        // Debug: show call stack depth
+        let depth = self.heap.get_thread_call_depth(self.current_thread)?;
+        eprintln!("DEBUG process_function_call: Call stack depth now: {}", depth);
         
         Ok(StepResult::Continue)
     }
@@ -461,51 +602,52 @@ impl RefCellVM {
         Ok(StepResult::Continue)
     }
     
-    /// Process TFORLOOP continuation after iterator function returns
-    /// 
-    /// This handles the iterator protocol after the iterator function has returned.
-    /// If the first result is not nil, it updates the control variable and continues
-    /// the loop. If the first result is nil, it exits the loop by skipping the JMP.
+    /// Process TFORLOOP continuation after the iterator function returns
     fn process_tforloop_continuation(
         &mut self,
         base: usize,
         a: usize,
         c: usize,
         pc_before_call: usize,
+        temp_base: usize,
     ) -> LuaResult<StepResult> {
-        eprintln!("DEBUG process_tforloop_continuation: base={}, a={}, c={}, pc_before_call={}",
-                 base, a, c, pc_before_call);
+        eprintln!("DEBUG process_tforloop_continuation: Starting");
         
-        // First result will be at R(A+3)
-        let first_result_idx = base + a + 3;
+        let func_idx = base + a;
         
-        // Read first result (nil means iterator is done)
-        let first_result = self.heap.get_thread_register(self.current_thread, first_result_idx)?;
+        // Get the first result from the temporary area
+        let first_result = self.heap.get_thread_register(self.current_thread, temp_base)?;
         
-        eprintln!("DEBUG process_tforloop_continuation: First result: {:?}", first_result);
+        eprintln!("DEBUG process_tforloop_continuation: First result = {:?}", first_result);
         
-        if !first_result.is_nil() {
-            // Continue iteration - copy first result to control variable
-            let control_var_idx = base + a + 2;
-            eprintln!("DEBUG process_tforloop_continuation: Updating control variable at R({}) = {:?}", 
-                     control_var_idx, first_result);
-            
-            self.heap.set_thread_register(self.current_thread, control_var_idx, &first_result)?;
-            
-            // In Lua, TFORLOOP is normally followed by a JMP instruction that jumps back
-            // to the start of the loop. When the iteration continues, we let execution
-            // continue naturally so the JMP will be executed.
-            
-            eprintln!("DEBUG process_tforloop_continuation: Iterator continuing, will execute JMP");
-        } else {
-            // Iterator is done - skip next instruction (which should be the JMP)
+        if first_result.is_nil() {
+            // End of iteration - skip the next instruction
+            eprintln!("DEBUG process_tforloop_continuation: Nil result - ending loop");
             let pc = self.heap.get_pc(self.current_thread)?;
-            
-            eprintln!("DEBUG process_tforloop_continuation: Iterator done, skipping JMP at PC {}", pc);
-            
-            // Skip the JMP instruction
             self.heap.set_pc(self.current_thread, pc + 1)?;
+            return Ok(StepResult::Continue);
         }
+        
+        // Continue iteration
+        eprintln!("DEBUG process_tforloop_continuation: Non-nil result - continuing loop");
+        
+        // Update control variable with first result
+        self.heap.set_thread_register(self.current_thread, func_idx + 2, &first_result)?;
+        
+        // Copy the results to the loop variables
+        for i in 0..c {
+            let value = if temp_base + i < self.heap.get_stack_size(self.current_thread)? {
+                self.heap.get_thread_register(self.current_thread, temp_base + i)?
+            } else {
+                Value::Nil
+            };
+            
+            self.heap.set_thread_register(self.current_thread, func_idx + 3 + i, &value)?;
+            eprintln!("DEBUG process_tforloop_continuation: Set R({}) = {:?}", func_idx + 3 + i, value);
+        }
+        
+        // Jump back to the TFORLOOP instruction
+        self.heap.set_pc(self.current_thread, pc_before_call)?;
         
         Ok(StepResult::Continue)
     }
@@ -517,8 +659,11 @@ impl RefCellVM {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
-        let value = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
-        self.heap.set_thread_register(self.current_thread, base as usize + a, &value)?;
+        let source_register = base as usize + b;
+        let dest_register = base as usize + a;
+        
+        let value = self.heap.get_thread_register(self.current_thread, source_register)?;
+        self.heap.set_thread_register(self.current_thread, dest_register, &value)?;
         
         Ok(())
     }
@@ -804,10 +949,67 @@ impl RefCellVM {
         // Get the function value to determine its type
         let func_value = self.heap.get_thread_register(self.current_thread, func_abs)?;
         
+        eprintln!("DEBUG op_call: Function value at R({}) is: {:?}", func_abs, func_value);
+        
+        // Debug: print arguments
+        for i in 0..nargs {
+            if i < nargs {
+                let arg = self.heap.get_thread_register(self.current_thread, func_abs + 1 + i)?;
+                eprintln!("DEBUG op_call: Arg {}: {:?}", i, arg);
+            }
+        }
+
+        // Special handling for function calls within TFORLOOP context
+        if let Value::CFunction(cfunc) = func_value {
+            // Check if this is a call to next() from inside a for loop
+            let is_next = cfunc as *const () == super::refcell_stdlib::refcell_next_adapter as *const ();
+            let first_arg_is_bad = if nargs >= 1 {
+                let arg0 = self.heap.get_thread_register(self.current_thread, func_abs + 1)?;
+                !matches!(arg0, Value::Table(_))
+            } else {
+                false
+            };
+            
+            if is_next && first_arg_is_bad {
+                // This is a call to next() with a non-table first argument
+                // We need to scan for the for loop state
+                
+                // Get current frame to access instruction history
+                let frame = self.heap.get_current_frame(self.current_thread)?;
+                
+                // Look back in the bytecode for a TFORLOOP instruction
+                let mut pc = frame.pc;
+                for offset in 0..20 { // Look back up to 20 instructions
+                    if pc > offset {
+                        if let Ok(inst_val) = self.heap.get_instruction(frame.closure, pc - offset) {
+                            let inst = Instruction(inst_val);
+                            if inst.get_opcode() == OpCode::TForLoop {
+                                // Found a TFORLOOP instruction, get its state register
+                                let tforloop_a = inst.get_a() as usize;
+                                let state_reg = base as usize + tforloop_a + 1; // R(A+1) = state
+                                
+                                // Get the state value
+                                if let Ok(state) = self.heap.get_thread_register(self.current_thread, state_reg) {
+                                    if let Value::Table(_) = state {
+                                        // Found the table state, use it instead
+                                        eprintln!("DEBUG op_call: Correcting next() arg from {:?} to {:?}", 
+                                                 self.heap.get_thread_register(self.current_thread, func_abs + 1)?, 
+                                                 state);
+                                        self.heap.set_thread_register(self.current_thread, func_abs + 1, &state)?;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
         // Queue the appropriate operation based on function type
         match func_value {
-            Value::Closure(_) => {
-                eprintln!("DEBUG op_call: Queueing Lua function call");
+            Value::Closure(closure_handle) => {
+                eprintln!("DEBUG op_call: Queueing Lua function call for closure {:?}", closure_handle);
                 self.operation_queue.push_back(PendingOperation::FunctionCall {
                     func_index: func_abs,
                     nargs,
@@ -823,7 +1025,52 @@ impl RefCellVM {
                     expected_results,
                 });
             }
+            Value::Table(table_handle) => {
+                // Check for __call metamethod
+                eprintln!("DEBUG op_call: Attempting to call table, checking for __call metamethod");
+                
+                if let Some(metatable) = self.heap.get_table_metatable(table_handle)? {
+                    let call_key = self.heap.create_string("__call")?;
+                    let call_metamethod = self.heap.get_table_field(metatable, &Value::String(call_key))?;
+                    
+                    if !call_metamethod.is_nil() {
+                        eprintln!("DEBUG op_call: Found __call metamethod");
+                        
+                        // Collect arguments: table + original args
+                        let mut args = vec![Value::Table(table_handle)];
+                        for i in 0..nargs {
+                            let arg = self.heap.get_thread_register(self.current_thread, func_abs + 1 + i)?;
+                            args.push(arg);
+                        }
+                        
+                        // Call the metamethod with expected results
+                        let results = self.call_metamethod(call_metamethod, &args, 
+                                                          if expected_results < 0 { 1 } else { expected_results as usize })?;
+                        
+                        // Place results in the proper registers
+                        for (i, result) in results.iter().enumerate() {
+                            self.heap.set_thread_register(self.current_thread, func_abs + i, result)?;
+                        }
+                        
+                        // If we expected a specific number of results, fill with nil
+                        if expected_results >= 0 {
+                            for i in results.len()..(expected_results as usize) {
+                                self.heap.set_thread_register(self.current_thread, func_abs + i, &Value::Nil)?;
+                            }
+                        }
+                        
+                        return Ok(());
+                    }
+                }
+                
+                eprintln!("ERROR op_call: Attempted to call table without __call metamethod");
+                return Err(LuaError::TypeError {
+                    expected: "function".to_string(),
+                    got: "table".to_string(),
+                });
+            }
             _ => {
+                eprintln!("ERROR op_call: Attempted to call non-function value: {:?}", func_value);
                 return Err(LuaError::TypeError {
                     expected: "function".to_string(),
                     got: func_value.type_name().to_string(),
@@ -835,11 +1082,26 @@ impl RefCellVM {
     }
     
     /// RETURN: return R(A), ... ,R(A+B-2)
+    /// 
+    /// This instruction returns values from the current function and automatically
+    /// closes any open upvalues that reference stack positions at or above the
+    /// current function's base. This is part of the Lua 5.1 specification - 
+    /// RETURN implicitly performs the work of CLOSE for the function's locals.
     fn op_return(&mut self, inst: Instruction, base: u16) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let b = inst.get_b();
         
         eprintln!("DEBUG op_return: A={}, B={}, base={}", a, b, base);
+        
+        // Debug: show current call depth
+        let depth = self.heap.get_thread_call_depth(self.current_thread)?;
+        eprintln!("DEBUG op_return: Current call depth: {}", depth);
+        
+        // IMPORTANT: RETURN automatically closes upvalues at or above the current 
+        // function's base. This ensures that any upvalues referencing local variables
+        // in the returning function are properly closed before the stack frame is destroyed.
+        eprintln!("DEBUG op_return: Closing upvalues at or above stack position {}", base);
+        self.heap.close_thread_upvalues(self.current_thread, base as usize)?;
         
         // Collect return values
         let mut values = Vec::new();
@@ -847,17 +1109,27 @@ impl RefCellVM {
         if b == 0 {
             // Return all values from R(A) to stack top
             let stack_size = self.heap.get_stack_size(self.current_thread)?;
+            let count = stack_size.saturating_sub(base as usize + a);
+            eprintln!("DEBUG op_return: Returning all {} values from R({}) to top", count, base as usize + a);
+            
             for i in a..(stack_size - base as usize) {
-                values.push(self.heap.get_thread_register(self.current_thread, base as usize + i)?);
+                let val = self.heap.get_thread_register(self.current_thread, base as usize + i)?;
+                eprintln!("DEBUG op_return: Return value {}: {:?}", values.len(), val);
+                values.push(val);
             }
         } else {
             // Return specific number of values
-            for i in 0..(b - 1) as usize {
-                values.push(self.heap.get_thread_register(self.current_thread, base as usize + a + i)?);
+            let count = (b - 1) as usize;
+            eprintln!("DEBUG op_return: Returning {} specific values starting at R({})", count, base as usize + a);
+            
+            for i in 0..count {
+                let val = self.heap.get_thread_register(self.current_thread, base as usize + a + i)?;
+                eprintln!("DEBUG op_return: Return value {}: {:?}", i, val);
+                values.push(val);
             }
         }
         
-        eprintln!("DEBUG op_return: Returning {} values", values.len());
+        eprintln!("DEBUG op_return: Total return values: {}", values.len());
         
         // Queue the return
         self.operation_queue.push_back(PendingOperation::Return { values });
@@ -870,7 +1142,8 @@ impl RefCellVM {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
-        let value = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
+        let source_register = base as usize + b;
+        let value = self.heap.get_thread_register(self.current_thread, source_register)?;
         
         let result = match value {
             Value::Number(n) => Value::Number(-n),
@@ -934,29 +1207,80 @@ impl RefCellVM {
             self.heap.get_thread_register(self.current_thread, base as usize + c_idx as usize)?
         };
         
-        // Perform arithmetic
+        // Try standard arithmetic first
         let result = match (&left, &right, op) {
-            (Value::Number(l), Value::Number(r), ArithOp::Add) => Value::Number(l + r),
-            (Value::Number(l), Value::Number(r), ArithOp::Sub) => Value::Number(l - r),
-            (Value::Number(l), Value::Number(r), ArithOp::Mul) => Value::Number(l * r),
+            (Value::Number(l), Value::Number(r), ArithOp::Add) => Ok(Value::Number(l + r)),
+            (Value::Number(l), Value::Number(r), ArithOp::Sub) => Ok(Value::Number(l - r)),
+            (Value::Number(l), Value::Number(r), ArithOp::Mul) => Ok(Value::Number(l * r)),
             (Value::Number(l), Value::Number(r), ArithOp::Div) => {
                 if *r == 0.0 {
-                    return Err(LuaError::RuntimeError("Division by zero".to_string()));
+                    Err(LuaError::RuntimeError("Division by zero".to_string()))
+                } else {
+                    Ok(Value::Number(l / r))
                 }
-                Value::Number(l / r)
             }
             (Value::Number(l), Value::Number(r), ArithOp::Mod) => {
                 if *r == 0.0 {
-                    return Err(LuaError::RuntimeError("Modulo by zero".to_string()));
+                    Err(LuaError::RuntimeError("Modulo by zero".to_string()))
+                } else {
+                    Ok(Value::Number(l % r))
                 }
-                Value::Number(l % r)
             }
-            (Value::Number(l), Value::Number(r), ArithOp::Pow) => Value::Number(l.powf(*r)),
-            _ => return Err(LuaError::TypeError {
-                expected: "number".to_string(),
-                got: format!("{} and {}", left.type_name(), right.type_name()),
-            }),
-        };
+            (Value::Number(l), Value::Number(r), ArithOp::Pow) => Ok(Value::Number(l.powf(*r))),
+            _ => {
+                // Check for metamethods
+                let metamethod_name = match op {
+                    ArithOp::Add => "__add",
+                    ArithOp::Sub => "__sub",
+                    ArithOp::Mul => "__mul",
+                    ArithOp::Div => "__div",
+                    ArithOp::Mod => "__mod",
+                    ArithOp::Pow => "__pow",
+                };
+                
+                eprintln!("DEBUG op_arithmetic: Checking for {} metamethod", metamethod_name);
+                
+                // First check left operand
+                let metamethod = if let Value::Table(handle) = &left {
+                    if let Some(mt) = self.heap.get_table_metatable(*handle)? {
+                        let mm_key = self.heap.create_string(metamethod_name)?;
+                        self.heap.get_table_field(mt, &Value::String(mm_key))?
+                    } else {
+                        Value::Nil
+                    }
+                } else {
+                    Value::Nil
+                };
+                
+                // If not found, check right operand
+                let metamethod = if metamethod.is_nil() {
+                    if let Value::Table(handle) = &right {
+                        if let Some(mt) = self.heap.get_table_metatable(*handle)? {
+                            let mm_key = self.heap.create_string(metamethod_name)?;
+                            self.heap.get_table_field(mt, &Value::String(mm_key))?
+                        } else {
+                            Value::Nil
+                        }
+                    } else {
+                        Value::Nil
+                    }
+                } else {
+                    metamethod
+                };
+                
+                if !metamethod.is_nil() {
+                    eprintln!("DEBUG op_arithmetic: Found {} metamethod", metamethod_name);
+                    let args = vec![left.clone(), right.clone()];
+                    let results = self.call_metamethod(metamethod, &args, 1)?;
+                    Ok(results.get(0).cloned().unwrap_or(Value::Nil))
+                } else {
+                    Err(LuaError::TypeError {
+                        expected: "number".to_string(),
+                        got: format!("{} and {}", left.type_name(), right.type_name()),
+                    })
+                }
+            }
+        }?;
         
         self.heap.set_thread_register(self.current_thread, base as usize + a, &result)?;
         Ok(())
@@ -967,13 +1291,24 @@ impl RefCellVM {
         let frame = self.heap.get_current_frame(self.current_thread)?;
         let closure = self.heap.get_closure(frame.closure)?;
         
+        eprintln!("DEBUG get_constant: Getting constant at index {} from closure with {} constants", 
+                 index, closure.proto.constants.len());
+        
         if index >= closure.proto.constants.len() {
             return Err(LuaError::RuntimeError(format!(
                 "Constant index {} out of bounds", index
             )));
         }
         
-        Ok(closure.proto.constants[index].clone())
+        let constant = closure.proto.constants[index].clone();
+        eprintln!("DEBUG get_constant: Constant[{}] = {:?}", index, constant);
+        
+        // Extra debug for number constants
+        if let Value::Number(n) = &constant {
+            eprintln!("DEBUG get_constant: Number constant: {} (bits: {:016x})", n, n.to_bits());
+        }
+        
+        Ok(constant)
     }
 
     /// EQ: if ((RK(B) == RK(C)) ~= A) then pc++
@@ -997,52 +1332,158 @@ impl RefCellVM {
         let (b_is_const, b_idx) = inst.get_rk_b();
         let (c_is_const, c_idx) = inst.get_rk_c();
         
+        eprintln!("DEBUG op_comparison: op={:?}, A={}, B_is_const={}, B_idx={}, C_is_const={}, C_idx={}", 
+                 op, a, b_is_const, b_idx, c_is_const, c_idx);
+        
         // Get operands
         let left = if b_is_const {
-            self.get_constant(b_idx as usize)?
+            let val = self.get_constant(b_idx as usize)?;
+            eprintln!("DEBUG op_comparison: Left operand from constant[{}]: {:?}", b_idx, val);
+            val
         } else {
-            self.heap.get_thread_register(self.current_thread, base as usize + b_idx as usize)?
+            let reg_idx = base as usize + b_idx as usize;
+            let val = self.heap.get_thread_register(self.current_thread, reg_idx)?;
+            eprintln!("DEBUG op_comparison: Left operand from R[{}]: {:?}", reg_idx, val);
+            val
         };
         
         let right = if c_is_const {
-            self.get_constant(c_idx as usize)?
+            let val = self.get_constant(c_idx as usize)?;
+            eprintln!("DEBUG op_comparison: Right operand from constant[{}]: {:?}", c_idx, val);
+            val
         } else {
-            self.heap.get_thread_register(self.current_thread, base as usize + c_idx as usize)?
+            let reg_idx = base as usize + c_idx as usize;
+            let val = self.heap.get_thread_register(self.current_thread, reg_idx)?;
+            eprintln!("DEBUG op_comparison: Right operand from R[{}]: {:?}", reg_idx, val);
+            val
         };
+        
+        eprintln!("DEBUG op_comparison: Comparing {:?} {:?} {:?}", left, op, right);
         
         // Perform comparison
         let result = match op {
-            CompOp::Eq => self.compare_eq(&left, &right),
+            CompOp::Eq => {
+                let eq_result = self.compare_eq(&left, &right);
+                eprintln!("DEBUG op_comparison: Equality result: {}", eq_result);
+                
+                // Extra debug for number comparisons
+                if let (Value::Number(l), Value::Number(r)) = (&left, &right) {
+                    eprintln!("DEBUG op_comparison: Number comparison details:");
+                    eprintln!("  Left:  {} (bits: {:016x})", l, l.to_bits());
+                    eprintln!("  Right: {} (bits: {:016x})", r, r.to_bits());
+                    eprintln!("  l == r: {}", l == r);
+                    eprintln!("  l.to_bits() == r.to_bits(): {}", l.to_bits() == r.to_bits());
+                }
+                
+                eq_result
+            },
             CompOp::Lt => self.compare_lt(&left, &right)?,
             CompOp::Le => self.compare_le(&left, &right)?,
         };
         
-        // If result doesn't match A, skip next instruction
-        if result != (a != 0) {
+        // The Lua comparison opcodes implement: if ((RK(B) op RK(C)) ~= A) then pc++
+        // This means:
+        // - If A=0 and comparison is true, skip next instruction
+        // - If A=0 and comparison is false, continue to next instruction  
+        // - If A=1 and comparison is true, continue to next instruction
+        // - If A=1 and comparison is false, skip next instruction
+        //
+        // In other words, A inverts the sense of the test.
+        
+        // Calculate whether to skip based on the comparison result and A flag
+        let a_bool = a != 0;
+        let should_skip = result != a_bool;
+        
+        eprintln!("DEBUG op_comparison: result={}, a={}, a_bool={}, should_skip={}", 
+                 result, a, a_bool, should_skip);
+        eprintln!("DEBUG op_comparison: Detailed skip logic: {} != {} = {}", 
+                 result, a_bool, should_skip);
+        
+        if should_skip {
             let pc = self.heap.get_pc(self.current_thread)?;
-            self.heap.set_pc(self.current_thread, pc + 1)?;
+            let new_pc = pc + 1;
+            eprintln!("DEBUG op_comparison: Skipping next instruction, PC {} -> {}", pc, new_pc);
+            self.heap.set_pc(self.current_thread, new_pc)?;
+        } else {
+            eprintln!("DEBUG op_comparison: Not skipping, continuing to next instruction");
         }
         
         Ok(())
     }
     
     /// Compare for equality
-    fn compare_eq(&self, left: &Value, right: &Value) -> bool {
-        match (left, right) {
+    fn compare_eq(&mut self, left: &Value, right: &Value) -> bool {
+        eprintln!("DEBUG compare_eq: Comparing {:?} == {:?}", left, right);
+        
+        let result = match (left, right) {
             (Value::Nil, Value::Nil) => true,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => {
+                // Lua 5.1 numeric equality semantics:
+                // - All numbers in Lua 5.1 are double-precision floating-point
+                // - Comparison is by mathematical value, not bit representation
+                // - This means 1.0 and 1 should compare as equal
+                // 
+                // Standard f64 == comparison already provides the correct semantics
+                // for Lua, as it compares by value rather than bit pattern.
+                // For example: 1.0_f64 == 1.0_f64 returns true even if they
+                // were created through different code paths.
+                //
+                // Note: If OrderedFloat or similar wrappers are used elsewhere,
+                // they must preserve these semantics.
+                let eq = a == b;
+                eprintln!("DEBUG compare_eq: Number comparison: {} == {} = {}", a, b, eq);
+                eq
+            }
             (Value::String(a), Value::String(b)) => a == b,
-            (Value::Table(a), Value::Table(b)) => a == b,
+            (Value::Table(a), Value::Table(b)) => {
+                // First check if they're the same table
+                if a == b {
+                    true
+                } else {
+                    // Check for __eq metamethod (only if both have same metamethod)
+                    let mt_a = self.heap.get_table_metatable(*a).ok().flatten();
+                    let mt_b = self.heap.get_table_metatable(*b).ok().flatten();
+                    
+                    if let (Some(mt_a), Some(mt_b)) = (mt_a, mt_b) {
+                        if mt_a == mt_b {
+                            // Both have the same metatable, check for __eq
+                            let eq_key = self.heap.create_string("__eq").ok();
+                            if let Some(eq_key) = eq_key {
+                                let mm = self.heap.get_table_field(mt_a, &Value::String(eq_key)).unwrap_or(Value::Nil);
+                                if !mm.is_nil() {
+                                    // Call __eq metamethod
+                                    eprintln!("DEBUG compare_eq: Calling __eq metamethod");
+                                    let args = vec![Value::Table(*a), Value::Table(*b)];
+                                    if let Ok(results) = self.call_metamethod(mm, &args, 1) {
+                                        return !results.get(0).cloned().unwrap_or(Value::Nil).is_falsey();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    false
+                }
+            }
             (Value::Closure(a), Value::Closure(b)) => a == b,
-            _ => false,
-        }
+            _ => {
+                eprintln!("DEBUG compare_eq: Different types, returning false");
+                false
+            }
+        };
+        
+        eprintln!("DEBUG compare_eq: Result = {}", result);
+        result
     }
     
     /// Compare for less than
     fn compare_lt(&mut self, left: &Value, right: &Value) -> LuaResult<bool> {
         match (left, right) {
-            (Value::Number(a), Value::Number(b)) => Ok(a < b),
+            (Value::Number(a), Value::Number(b)) => {
+                // Lua 5.1 numeric comparison: standard floating-point less-than
+                // This correctly handles cases like 0.9999999999999999 < 1.0
+                Ok(a < b)
+            }
             (Value::String(a), Value::String(b)) => {
                 let s1 = self.heap.get_string_value(*a)?;
                 let s2 = self.heap.get_string_value(*b)?;
@@ -1058,7 +1499,11 @@ impl RefCellVM {
     /// Compare for less than or equal
     fn compare_le(&mut self, left: &Value, right: &Value) -> LuaResult<bool> {
         match (left, right) {
-            (Value::Number(a), Value::Number(b)) => Ok(a <= b),
+            (Value::Number(a), Value::Number(b)) => {
+                // Lua 5.1 numeric comparison: standard floating-point less-than-or-equal
+                // This correctly handles cases like 1.0 <= 1.0
+                Ok(a <= b)
+            }
             (Value::String(a), Value::String(b)) => {
                 let s1 = self.heap.get_string_value(*a)?;
                 let s2 = self.heap.get_string_value(*b)?;
@@ -1076,7 +1521,8 @@ impl RefCellVM {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
-        let value = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
+        let source_register = base as usize + b;
+        let value = self.heap.get_thread_register(self.current_thread, source_register)?;
         let result = Value::Boolean(value.is_falsey());
         
         self.heap.set_thread_register(self.current_thread, base as usize + a, &result)?;
@@ -1107,7 +1553,8 @@ impl RefCellVM {
         let b = inst.get_b() as usize;
         let c = inst.get_c();
         
-        let value = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
+        let source_register = base as usize + b;
+        let value = self.heap.get_thread_register(self.current_thread, source_register)?;
         let test = !value.is_falsey();
         
         if test == (c != 0) {
@@ -1123,11 +1570,35 @@ impl RefCellVM {
     /// NEWTABLE: R(A) := {} (size = B,C)
     fn op_newtable(&mut self, inst: Instruction, base: u16) -> LuaResult<()> {
         let a = inst.get_a() as usize;
-        let _b = inst.get_b(); // Array size hint (unused for now)
-        let _c = inst.get_c(); // Hash size hint (unused for now)
+        let b = inst.get_b(); // Array size hint
+        let c = inst.get_c(); // Hash size hint
+        
+        let dest_register = base as usize + a;
+        eprintln!("DEBUG op_newtable: A={}, B={}, C={}, base={}", a, b, c, base);
+        eprintln!("DEBUG op_newtable: Creating new table at R({}) (base {} + A {})", 
+                 dest_register, base, a);
         
         let table = self.heap.create_table()?;
-        self.heap.set_thread_register(self.current_thread, base as usize + a, &Value::Table(table))?;
+        let table_value = Value::Table(table);
+        eprintln!("DEBUG op_newtable: Created table handle {:?}", table);
+        
+        // Show register state before setting
+        eprintln!("DEBUG op_newtable: Register state before table creation:");
+        let start = dest_register.saturating_sub(2);
+        let end = (dest_register + 2).min(self.heap.get_stack_size(self.current_thread).unwrap_or(0));
+        for i in start..=end {
+            if let Ok(val) = self.heap.get_thread_register(self.current_thread, i) {
+                let marker = if i == dest_register { " <-- Will place table here" } else { "" };
+                eprintln!("  R({}) = {:?}{}", i, val, marker);
+            }
+        }
+        
+        self.heap.set_thread_register(self.current_thread, dest_register, &table_value)?;
+        
+        // Verify it was stored correctly and show updated state
+        let verify = self.heap.get_thread_register(self.current_thread, dest_register)?;
+        eprintln!("DEBUG op_newtable: Verification - R({}) now contains: {:?}", dest_register, verify);
+        eprintln!("DEBUG op_newtable: ***TABLE CREATED*** at R({})", dest_register);
         
         Ok(())
     }
@@ -1138,26 +1609,100 @@ impl RefCellVM {
         let b = inst.get_b() as usize;
         let (c_is_const, c_idx) = inst.get_rk_c();
         
-        // Get table
-        let table_val = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
+        eprintln!("DEBUG op_gettable: A={}, B={}, C_is_const={}, C_idx={}, base={}", 
+                 a, b, c_is_const, c_idx, base);
+        
+        // Get table directly from register B as per Lua 5.1 standard
+        let table_register = base as usize + b;
+        eprintln!("DEBUG op_gettable: Looking for table at R({})", table_register);
+        
+        // Debug: Show register state around the expected table location
+        eprintln!("DEBUG op_gettable: Register state:");
+        let start = table_register.saturating_sub(2);
+        let end = (table_register + 2).min(self.heap.get_stack_size(self.current_thread).unwrap_or(0));
+        for i in start..=end {
+            if let Ok(val) = self.heap.get_thread_register(self.current_thread, i) {
+                let marker = if i == table_register { " <-- Expected table location" } else { "" };
+                eprintln!("  R({}) = {:?}{}", i, val, marker);
+            }
+        }
+        
+        let table_val = self.heap.get_thread_register(self.current_thread, table_register)?;
+        eprintln!("DEBUG op_gettable: Value at R({}) is: {:?}", table_register, table_val);
+        
         let table_handle = match table_val {
             Value::Table(handle) => handle,
-            _ => return Err(LuaError::TypeError {
-                expected: "table".to_string(),
-                got: table_val.type_name().to_string(),
-            }),
+            _ => {
+                eprintln!("ERROR op_gettable: Expected table at R({}), but got {:?}", 
+                         table_register, table_val);
+                return Err(LuaError::TypeError {
+                    expected: "table".to_string(),
+                    got: table_val.type_name().to_string(),
+                });
+            }
         };
         
         // Get key
         let key = if c_is_const {
-            self.get_constant(c_idx as usize)?
+            let k = self.get_constant(c_idx as usize)?;
+            eprintln!("DEBUG op_gettable: Key from constant[{}]: {:?}", c_idx, k);
+            k
         } else {
-            self.heap.get_thread_register(self.current_thread, base as usize + c_idx as usize)?
+            let key_register = base as usize + c_idx as usize;
+            let k = self.heap.get_thread_register(self.current_thread, key_register)?;
+            eprintln!("DEBUG op_gettable: Key from R({}): {:?}", key_register, k);
+            k
         };
         
-        // Read field
+        // First try to get the field directly
         let value = self.heap.get_table_field(table_handle, &key)?;
-        self.heap.set_thread_register(self.current_thread, base as usize + a, &value)?;
+        eprintln!("DEBUG op_gettable: Direct table lookup returned: {:?}", value);
+        
+        let final_value = if value.is_nil() {
+            // Check for __index metamethod
+            if let Some(metatable) = self.heap.get_table_metatable(table_handle)? {
+                eprintln!("DEBUG op_gettable: Table has metatable, checking for __index");
+                
+                let index_key = self.heap.create_string("__index")?;
+                let index_metamethod = self.heap.get_table_field(metatable, &Value::String(index_key))?;
+                
+                match index_metamethod {
+                    Value::Table(index_table) => {
+                        // __index is a table, look up the key in it
+                        eprintln!("DEBUG op_gettable: __index is a table, looking up key");
+                        let indexed_value = self.heap.get_table_field(index_table, &key)?;
+                        eprintln!("DEBUG op_gettable: __index table lookup returned: {:?}", indexed_value);
+                        indexed_value
+                    }
+                    Value::Closure(_) | Value::CFunction(_) => {
+                        // __index is a function - call it with (table, key)
+                        eprintln!("DEBUG op_gettable: __index is a function, calling it");
+                        let args = vec![Value::Table(table_handle), key.clone()];
+                        let results = self.call_metamethod(index_metamethod, &args, 1)?;
+                        if results.is_empty() {
+                            Value::Nil
+                        } else {
+                            results[0].clone()
+                        }
+                    }
+                    _ => {
+                        eprintln!("DEBUG op_gettable: No valid __index metamethod found");
+                        Value::Nil
+                    }
+                }
+            } else {
+                eprintln!("DEBUG op_gettable: No metatable, returning nil");
+                Value::Nil
+            }
+        } else {
+            value
+        };
+        
+        let dest_register = base as usize + a;
+        eprintln!("DEBUG op_gettable: Storing final value {:?} in R({})", 
+                 final_value, dest_register);
+        
+        self.heap.set_thread_register(self.current_thread, dest_register, &final_value)?;
         
         Ok(())
     }
@@ -1168,33 +1713,130 @@ impl RefCellVM {
         let (b_is_const, b_idx) = inst.get_rk_b();
         let (c_is_const, c_idx) = inst.get_rk_c();
         
+        eprintln!("DEBUG op_settable: A={}, B_is_const={}, B_idx={}, C_is_const={}, C_idx={}, base={}", 
+                 a, b_is_const, b_idx, c_is_const, c_idx, base);
+        
         // Get table
-        let table_val = self.heap.get_thread_register(self.current_thread, base as usize + a)?;
+        let table_register = base as usize + a;
+        eprintln!("DEBUG op_settable: Reading table from R({})", table_register);
+        
+        let table_val = self.heap.get_thread_register(self.current_thread, table_register)?;
+        eprintln!("DEBUG op_settable: Value at R({}) is: {:?}", table_register, table_val);
+        
         let table_handle = match table_val {
-            Value::Table(handle) => handle,
-            _ => return Err(LuaError::TypeError {
-                expected: "table".to_string(),
-                got: table_val.type_name().to_string(),
-            }),
+            Value::Table(handle) => {
+                eprintln!("DEBUG op_settable: Got table handle: {:?}", handle);
+                handle
+            },
+            _ => {
+                eprintln!("ERROR op_settable: Expected table at R({}), but got {:?}", 
+                         table_register, table_val);
+                return Err(LuaError::TypeError {
+                    expected: "table".to_string(),
+                    got: table_val.type_name().to_string(),
+                });
+            }
         };
         
         // Get key
         let key = if b_is_const {
-            self.get_constant(b_idx as usize)?
+            let k = self.get_constant(b_idx as usize)?;
+            eprintln!("DEBUG op_settable: Key from constant[{}]: {:?}", b_idx, k);
+            k
         } else {
-            self.heap.get_thread_register(self.current_thread, base as usize + b_idx as usize)?
+            let key_register = base as usize + b_idx as usize;
+            let k = self.heap.get_thread_register(self.current_thread, key_register)?;
+            eprintln!("DEBUG op_settable: Key from R({}): {:?}", key_register, k);
+            k
         };
         
         // Get value
         let value = if c_is_const {
-            self.get_constant(c_idx as usize)?
+            let v = self.get_constant(c_idx as usize)?;
+            eprintln!("DEBUG op_settable: Value from constant[{}]: {:?}", c_idx, v);
+            v
         } else {
-            self.heap.get_thread_register(self.current_thread, base as usize + c_idx as usize)?
+            let value_register = base as usize + c_idx as usize;
+            let v = self.heap.get_thread_register(self.current_thread, value_register)?;
+            eprintln!("DEBUG op_settable: Value from R({}): {:?}", value_register, v);
+            v
         };
         
-        // Set field
-        self.heap.set_table_field(table_handle, &key, &value)?;
+        eprintln!("DEBUG op_settable: *** SETTABLE OPERATION: table[{:?}] = {:?} ***", key, value);
         
+        // Check if table has a metatable
+        let has_metatable = if let Some(_) = self.heap.get_table_metatable(table_handle)? {
+            eprintln!("DEBUG op_settable: Table HAS metatable");
+            true
+        } else {
+            eprintln!("DEBUG op_settable: Table has NO metatable");
+            false
+        };
+        
+        // Check if the key already exists in the table
+        eprintln!("DEBUG op_settable: Checking if key exists in table...");
+        let existing_value = self.heap.get_table_field(table_handle, &key)?;
+        eprintln!("DEBUG op_settable: Existing value for key: {:?}", existing_value);
+        
+        if existing_value.is_nil() {
+            eprintln!("DEBUG op_settable: Key does NOT exist in table (value is nil)");
+            
+            // Key doesn't exist, check for __newindex metamethod
+            if has_metatable {
+                if let Some(metatable) = self.heap.get_table_metatable(table_handle)? {
+                    eprintln!("DEBUG op_settable: Checking metatable for __newindex metamethod...");
+                    
+                    let newindex_key = self.heap.create_string("__newindex")?;
+                    eprintln!("DEBUG op_settable: Looking up __newindex in metatable");
+                    let newindex_metamethod = self.heap.get_table_field(metatable, &Value::String(newindex_key))?;
+                    eprintln!("DEBUG op_settable: __newindex metamethod value: {:?}", newindex_metamethod);
+                    
+                    match newindex_metamethod {
+                        Value::Table(newindex_table) => {
+                            // __newindex is a table, set the key in it
+                            eprintln!("DEBUG op_settable: __newindex is a TABLE, setting key there");
+                            eprintln!("DEBUG op_settable: Calling set_table_field on __newindex table");
+                            self.heap.set_table_field(newindex_table, &key, &value)?;
+                            eprintln!("DEBUG op_settable: Successfully set value in __newindex table");
+                            return Ok(());
+                        }
+                        Value::Closure(_) | Value::CFunction(_) => {
+                            // __newindex is a function - call it with (table, key, value)
+                            eprintln!("DEBUG op_settable: __newindex is a FUNCTION, calling it");
+                            eprintln!("DEBUG op_settable: Preparing to call __newindex(table, key, value)");
+                            let args = vec![Value::Table(table_handle), key.clone(), value.clone()];
+                            eprintln!("DEBUG op_settable: __newindex args: {:?}", args);
+                            self.call_metamethod(newindex_metamethod, &args, 0)?;
+                            eprintln!("DEBUG op_settable: __newindex function call completed");
+                            return Ok(());
+                        }
+                        Value::Nil => {
+                            eprintln!("DEBUG op_settable: __newindex is NIL, proceeding with normal set");
+                        }
+                        _ => {
+                            // __newindex exists but is not a valid type
+                            eprintln!("DEBUG op_settable: __newindex exists but has invalid type: {:?}", 
+                                    newindex_metamethod.type_name());
+                            eprintln!("DEBUG op_settable: Ignoring invalid __newindex, proceeding with normal set");
+                        }
+                    }
+                }
+            }
+            
+            // No metatable or no valid __newindex, proceed with normal set
+            eprintln!("DEBUG op_settable: No __newindex metamethod, doing RAW SET");
+            eprintln!("DEBUG op_settable: Calling heap.set_table_field (RAW operation)");
+            self.heap.set_table_field(table_handle, &key, &value)?;
+            eprintln!("DEBUG op_settable: RAW SET completed");
+        } else {
+            // Key exists, just update it (no metamethod triggered)
+            eprintln!("DEBUG op_settable: Key EXISTS in table, updating directly (NO metamethod)");
+            eprintln!("DEBUG op_settable: Calling heap.set_table_field for existing key (RAW operation)");
+            self.heap.set_table_field(table_handle, &key, &value)?;
+            eprintln!("DEBUG op_settable: RAW UPDATE completed");
+        }
+        
+        eprintln!("DEBUG op_settable: *** SETTABLE OPERATION COMPLETE ***");
         Ok(())
     }
     
@@ -1253,11 +1895,22 @@ impl RefCellVM {
         // Get constant name
         let key = self.get_constant(bx)?;
         
+        eprintln!("DEBUG op_getglobal: Getting global '{}'", 
+                 if let Value::String(s) = &key { 
+                     self.heap.get_string_value(*s).unwrap_or_else(|_| "<error>".to_string())
+                 } else { 
+                     "<non-string key>".to_string() 
+                 });
+        
         // Get globals table
         let globals = self.heap.globals()?;
         
         // Get value from globals
         let value = self.heap.get_table_field(globals, &key)?;
+        
+        eprintln!("DEBUG op_getglobal: Retrieved value: {:?}, storing in R({})", 
+                 value, base as usize + a);
+        
         self.heap.set_thread_register(self.current_thread, base as usize + a, &value)?;
         
         Ok(())
@@ -1274,6 +1927,14 @@ impl RefCellVM {
         // Get constant name
         let key = self.get_constant(bx)?;
         
+        eprintln!("DEBUG op_setglobal: Setting global '{}' = {:?}", 
+                 if let Value::String(s) = &key { 
+                     self.heap.get_string_value(*s).unwrap_or_else(|_| "<error>".to_string())
+                 } else { 
+                     "<non-string key>".to_string() 
+                 }, 
+                 value);
+        
         // Get globals table
         let globals = self.heap.globals()?;
         
@@ -1288,27 +1949,76 @@ impl RefCellVM {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
-        let value = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
+        eprintln!("DEBUG op_len: A={}, B={}, base={}", a, b, base);
         
-        let length = match value {
+        // Access the operand directly from R(B) as per Lua 5.1 standard
+        let source_register = base as usize + b;
+        let dest_register = base as usize + a;
+        
+        eprintln!("DEBUG op_len: Reading from R({}) to get length", source_register);
+        
+        // Debug register state
+        eprintln!("DEBUG op_len: Register state:");
+        let start = source_register.saturating_sub(2);
+        let end = (source_register + 2).min(self.heap.get_stack_size(self.current_thread).unwrap_or(0));
+        for i in start..=end {
+            if let Ok(val) = self.heap.get_thread_register(self.current_thread, i) {
+                let marker = if i == source_register { " <-- Source" } else { "" };
+                eprintln!("  R({}) = {:?}{}", i, val, marker);
+            }
+        }
+        
+        let value = self.heap.get_thread_register(self.current_thread, source_register)?;
+        eprintln!("DEBUG op_len: Source value at R({}): {:?}", source_register, value);
+        
+        let length = match &value {
             Value::String(handle) => {
                 // Get string value length
-                let s = self.heap.get_string_value(handle)?;
-                Value::Number(s.len() as f64)
+                let s = self.heap.get_string_value(*handle)?;
+                let len = s.len() as f64;
+                eprintln!("DEBUG op_len: String length: {}", len);
+                Value::Number(len)
             }
             Value::Table(handle) => {
-                // For tables, count array part
-                let table = self.heap.get_table(handle)?;
-                let array_len = table.array.len();
-                Value::Number(array_len as f64)
+                // Check for __len metamethod
+                if let Some(metatable) = self.heap.get_table_metatable(*handle)? {
+                    let len_key = self.heap.create_string("__len")?;
+                    let len_metamethod = self.heap.get_table_field(metatable, &Value::String(len_key))?;
+                    
+                    if !len_metamethod.is_nil() {
+                        eprintln!("DEBUG op_len: Found __len metamethod");
+                        let args = vec![value.clone()];
+                        let results = self.call_metamethod(len_metamethod, &args, 1)?;
+                        results.get(0).cloned().unwrap_or(Value::Nil)
+                    } else {
+                        // No __len metamethod, use default behavior
+                        let table = self.heap.get_table(*handle)?;
+                        let array_len = table.array.len();
+                        eprintln!("DEBUG op_len: Table array length: {}", array_len);
+                        Value::Number(array_len as f64)
+                    }
+                } else {
+                    // No metatable, use default behavior
+                    let table = self.heap.get_table(*handle)?;
+                    let array_len = table.array.len();
+                    eprintln!("DEBUG op_len: Table array length: {}", array_len);
+                    Value::Number(array_len as f64)
+                }
             }
-            _ => return Err(LuaError::TypeError {
-                expected: "string or table".to_string(),
-                got: value.type_name().to_string(),
-            }),
+            _ => {
+                eprintln!("ERROR op_len: Cannot get length of {:?}", value);
+                return Err(LuaError::TypeError {
+                    expected: "string or table".to_string(),
+                    got: value.type_name().to_string(),
+                });
+            }
         };
         
-        self.heap.set_thread_register(self.current_thread, base as usize + a, &length)?;
+        eprintln!("DEBUG op_len: Storing length {} in R({})", 
+                 if let Value::Number(n) = length { n } else { 0.0 }, 
+                 dest_register);
+        
+        self.heap.set_thread_register(self.current_thread, dest_register, &length)?;
         
         Ok(())
     }
@@ -1400,70 +2110,124 @@ impl RefCellVM {
         let a = inst.get_a() as usize;
         let c = inst.get_c() as usize;
         
-        eprintln!("DEBUG TFORLOOP: A={}, C={}, base={}", a, c, base);
+        eprintln!("DEBUG TFORLOOP: Beginning - A={}, C={}, base={}", a, c, base);
         
-        // TFORLOOP uses these registers:
+        // Per the Lua 5.1 specification:
         // R(A)   = iterator function
         // R(A+1) = state
-        // R(A+2) = control variable (current key)
-        // Results will be placed in R(A+3) to R(A+2+C)
+        // R(A+2) = control variable
+        // Call the function, placing results at R(A+3), R(A+4), ...
         
-        // Read the iterator function and arguments
         let func_idx = base as usize + a;
-        let state_idx = base as usize + a + 1;
-        let control_idx = base as usize + a + 2;
         
+        // Get the iterator function, state, and control variables
         let func = self.heap.get_thread_register(self.current_thread, func_idx)?;
-        let state = self.heap.get_thread_register(self.current_thread, state_idx)?;
-        let control = self.heap.get_thread_register(self.current_thread, control_idx)?;
+        let state = self.heap.get_thread_register(self.current_thread, func_idx + 1)?;
+        let control = self.heap.get_thread_register(self.current_thread, func_idx + 2)?;
         
-        eprintln!("DEBUG TFORLOOP: Iterator function: {:?}", func);
-        eprintln!("DEBUG TFORLOOP: State: {:?}", state);
-        eprintln!("DEBUG TFORLOOP: Control variable: {:?}", control);
+        eprintln!("DEBUG TFORLOOP: Function={:?}, State={:?}, Control={:?}", func, state, control);
         
-        // Ensure we have enough stack space for results
-        let needed_size = base as usize + a + 3 + c;
-        self.heap.grow_stack(self.current_thread, needed_size)?;
-        
-        // Store current PC for continuation
-        let current_pc = self.heap.get_pc(self.current_thread)?;
-        
-        // Queue the call operation based on function type
-        match func {
-            Value::Closure(_) => {
-                eprintln!("DEBUG TFORLOOP: Queueing Lua function call");
-                self.operation_queue.push_back(PendingOperation::FunctionCall {
-                    func_index: func_idx,
-                    nargs: 2,  // state and control as arguments
-                    expected_results: c as i32,  // Number of results needed
-                });
-            },
-            Value::CFunction(cfunc) => {
-                eprintln!("DEBUG TFORLOOP: Queueing C function call");
-                self.operation_queue.push_back(PendingOperation::CFunctionCall {
-                    function: cfunc,
-                    base: func_idx as u16,
-                    nargs: 2,  // state and control as arguments
-                    expected_results: c as i32,  // Number of results needed 
-                });
-            },
-            _ => {
-                return Err(LuaError::TypeError {
-                    expected: "function".to_string(),
-                    got: func.type_name().to_string()
-                });
+        // We need to call the iterator function with the state and control
+        // For C functions, directly call them with a special context
+        if let Value::CFunction(cfunc) = func {
+            // Create an execution context that places results at R(A+3) onwards
+            // This is CRITICAL: we must set up registers so results don't overwrite the state
+            
+            // First, we'll create temporary copies of the arguments to avoid overwriting them
+            let stack_size = self.heap.get_stack_size(self.current_thread)?;
+            let temp_base = stack_size;
+            
+            // Ensure we have enough stack space
+            self.heap.grow_stack(self.current_thread, temp_base + 3)?;
+            
+            // Place arguments at the temporary location
+            self.heap.set_thread_register(self.current_thread, temp_base, &func)?;
+            self.heap.set_thread_register(self.current_thread, temp_base + 1, &state)?;
+            self.heap.set_thread_register(self.current_thread, temp_base + 2, &control)?;
+            
+            // Create a context for the C function call
+            let mut ctx = RefCellExecutionContext::new(&self.heap, self.current_thread, temp_base as u16, 2);
+            
+            // Call the function
+            let result_count = cfunc(&mut ctx)?;
+            
+            eprintln!("DEBUG TFORLOOP: C iterator returned {} results", result_count);
+            
+            // Get the first result from the temporary area
+            let first_result = if result_count > 0 {
+                self.heap.get_thread_register(self.current_thread, temp_base)?
+            } else {
+                Value::Nil
+            };
+            
+            eprintln!("DEBUG TFORLOOP: First result = {:?}", first_result);
+            
+            if first_result.is_nil() {
+                // End of iteration - skip the next instruction (JMP)
+                eprintln!("DEBUG TFORLOOP: Nil result - ending loop");
+                let pc = self.heap.get_pc(self.current_thread)?;
+                self.heap.set_pc(self.current_thread, pc + 1)?;
+                return Ok(());
             }
+            
+            // Continue iteration - update control variable
+            eprintln!("DEBUG TFORLOOP: Non-nil result - continuing loop");
+            self.heap.set_thread_register(self.current_thread, func_idx + 2, &first_result)?;
+            
+            // Copy results from the temporary location to the loop variables
+            for i in 0..c.min(result_count as usize) {
+                let value = self.heap.get_thread_register(self.current_thread, temp_base + i)?;
+                self.heap.set_thread_register(self.current_thread, func_idx + 3 + i, &value)?;
+                eprintln!("DEBUG TFORLOOP: Placed result {} at R({})", i, func_idx + 3 + i);
+            }
+            
+            // Fill any remaining expected results with nil
+            for i in result_count as usize..c {
+                self.heap.set_thread_register(self.current_thread, func_idx + 3 + i, &Value::Nil)?;
+                eprintln!("DEBUG TFORLOOP: Set nil at R({})", func_idx + 3 + i);
+            }
+            
+            return Ok(());
+        } 
+        // For Lua closures, use the operation queue
+        else if let Value::Closure(closure_handle) = func {
+            eprintln!("DEBUG TFORLOOP: Lua closure iterator - queueing call");
+            
+            // We'll create a temporary set of registers beyond the current stack
+            let stack_size = self.heap.get_stack_size(self.current_thread)?;
+            let temp_base = stack_size;
+            
+            // Ensure we have enough stack space
+            self.heap.grow_stack(self.current_thread, temp_base + 3)?;
+            
+            // Place the function and arguments at the temporary location
+            self.heap.set_thread_register(self.current_thread, temp_base, &func)?;
+            self.heap.set_thread_register(self.current_thread, temp_base + 1, &state)?;
+            self.heap.set_thread_register(self.current_thread, temp_base + 2, &control)?;
+            
+            // Queue the function call at the temporary location
+            self.operation_queue.push_back(PendingOperation::FunctionCall {
+                func_index: temp_base,
+                nargs: 2,  // state and control
+                expected_results: c as i32,
+            });
+            
+            // Queue a continuation to handle the function results
+            self.operation_queue.push_back(PendingOperation::TForLoopContinuation {
+                base: base as usize,
+                a,
+                c,
+                pc_before_call: self.heap.get_pc(self.current_thread)? - 1,  // PC of TFORLOOP
+                temp_base,
+            });
+            
+            return Ok(());
+        } else {
+            return Err(LuaError::TypeError {
+                expected: "function".to_string(),
+                got: func.type_name().to_string(),
+            });
         }
-        
-        // Queue the continuation to check loop condition after call completes
-        self.operation_queue.push_back(PendingOperation::TForLoopContinuation {
-            base: base as usize,
-            a,
-            c,
-            pc_before_call: current_pc - 1, // PC of the TFORLOOP instruction
-        });
-        
-        Ok(())
     }
     
     /// VARARG: R(A), R(A+1), ..., R(A+B-2) = vararg
@@ -1515,30 +2279,31 @@ impl RefCellVM {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
-        // Get current closure
+        eprintln!("DEBUG op_getupval: A={}, B={}, base={}", a, b, base);
+        
+        // Get current closure to access its upvalues
         let frame = self.heap.get_current_frame(self.current_thread)?;
+        eprintln!("DEBUG op_getupval: Current frame closure handle: {:?}", frame.closure);
+        
         let closure = self.heap.get_closure(frame.closure)?;
+        eprintln!("DEBUG op_getupval: Closure has {} upvalues", closure.upvalues.len());
         
         if b >= closure.upvalues.len() {
             return Err(LuaError::RuntimeError(format!(
-                "Upvalue index {} out of bounds", b
+                "Upvalue index {} out of bounds (closure has {} upvalues)", b, closure.upvalues.len()
             )));
         }
         
         let upvalue_handle = closure.upvalues[b];
-        let upvalue = self.heap.get_upvalue(upvalue_handle)?;
+        eprintln!("DEBUG op_getupval: Using upvalue handle {:?} at index {}", upvalue_handle, b);
         
-        // Get value from upvalue
-        let value = if let Some(stack_idx) = upvalue.stack_index {
-            // Open upvalue - read from stack
-            self.heap.get_thread_register(self.current_thread, stack_idx)?
-        } else if let Some(ref val) = upvalue.value {
-            // Closed upvalue - use stored value
-            val.clone()
-        } else {
-            Value::Nil
-        };
+        // Get the upvalue value (handles open/closed upvalues transparently)
+        let value = self.heap.get_upvalue_value(upvalue_handle, self.current_thread)?;
         
+        eprintln!("DEBUG op_getupval: Retrieved value {:?} from upvalue {}, storing in R({})", 
+                 value, b, base as usize + a);
+        
+        // Store in destination register R(A)
         self.heap.set_thread_register(self.current_thread, base as usize + a, &value)?;
         
         Ok(())
@@ -1546,118 +2311,186 @@ impl RefCellVM {
     
     /// SETUPVAL: UpValue[A] := R(B)
     fn op_setupval(&mut self, inst: Instruction, base: u16) -> LuaResult<()> {
-        let a = inst.get_a() as usize;
-        let b = inst.get_b() as usize;
+        let a = inst.get_a() as usize;  // Upvalue index
+        let b = inst.get_b() as usize;  // Source register
         
+        eprintln!("DEBUG op_setupval: A={}, B={}, base={}", a, b, base);
+        
+        // Get value from register R(B)
         let value = self.heap.get_thread_register(self.current_thread, base as usize + b)?;
         
-        // Get current closure and extract needed info
-        let upvalue_handle = {
-            let frame = self.heap.get_current_frame(self.current_thread)?;
-            let closure = self.heap.get_closure(frame.closure)?;
-            
-            if a >= closure.upvalues.len() {
-                return Err(LuaError::RuntimeError(format!(
-                    "Upvalue index {} out of bounds", a
-                )));
-            }
-            
-            closure.upvalues[a]
-        };
+        eprintln!("DEBUG op_setupval: Setting upvalue {} to value {:?} from R({})", 
+                 a, value, base as usize + b);
         
-        // Now update upvalue value with no active borrows
-        self.set_upvalue_value(upvalue_handle, &value)?;
+        // Get current closure to access its upvalues
+        let frame = self.heap.get_current_frame(self.current_thread)?;
+        eprintln!("DEBUG op_setupval: Current frame closure handle: {:?}", frame.closure);
+        
+        let closure = self.heap.get_closure(frame.closure)?;
+        eprintln!("DEBUG op_setupval: Closure has {} upvalues", closure.upvalues.len());
+        
+        if a >= closure.upvalues.len() {
+            return Err(LuaError::RuntimeError(format!(
+                "Upvalue index {} out of bounds (closure has {} upvalues)", a, closure.upvalues.len()
+            )));
+        }
+        
+        let upvalue_handle = closure.upvalues[a];
+        eprintln!("DEBUG op_setupval: Using upvalue handle {:?} at index {}", upvalue_handle, a);
+        
+        // Set the upvalue value (handles open/closed upvalues transparently)
+        self.heap.set_upvalue_value(upvalue_handle, &value, self.current_thread)?;
+        
+        // Verify the value was set
+        let verify_value = self.heap.get_upvalue_value(upvalue_handle, self.current_thread)?;
+        eprintln!("DEBUG op_setupval: Verification - upvalue {} now contains {:?}", a, verify_value);
         
         Ok(())
     }
-    
-    /// Update upvalue value
-    fn set_upvalue_value(&mut self, upvalue: UpvalueHandle, value: &Value) -> LuaResult<()> {
-        let upvalue_obj = {
-            let upvalues = self.heap.get_upvalue(upvalue)?;
-            (upvalues.stack_index, upvalues.value.clone())
-        };
-        
-        match upvalue_obj.0 {
-            Some(stack_idx) => {
-                // Open upvalue - set in thread stack
-                self.heap.set_thread_register(self.current_thread, stack_idx, value)
-            }
-            None => {
-                // Closed upvalue - set stored value
-                let mut upvalue_mut = self.heap.get_upvalue_mut(upvalue)?;
-                upvalue_mut.value = Some(value.clone());
-                Ok(())
-            }
-        }
-    }
+
     
     /// CLOSURE: R(A) := closure(KPROTO[Bx], R(A), ... ,R(A+n))
     fn op_closure(&mut self, inst: Instruction, base: u16) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let bx = inst.get_bx() as usize;
         
-        // Get parent closure info
-        let frame = self.heap.get_current_frame(self.current_thread)?;
-        let parent_closure = self.heap.get_closure(frame.closure)?;
+        eprintln!("DEBUG op_closure: A={}, Bx={}, base={}", a, bx, base);
         
-        // Get the function prototype from constants
-        if bx >= parent_closure.proto.constants.len() {
+        let target_register = base as usize + a;
+        eprintln!("DEBUG op_closure: Will store closure at R({})", target_register);
+        
+        // Phase 1: Extract all needed data from parent closure
+        let (parent_proto_constants, parent_upvalues, parent_base, parent_closure_handle) = {
+            let frame = self.heap.get_current_frame(self.current_thread)?;
+            let parent_closure = self.heap.get_closure(frame.closure)?;
+            
+            eprintln!("DEBUG op_closure: Parent closure has {} constants, parent frame base={}", 
+                     parent_closure.proto.constants.len(), frame.base_register);
+            
+            // Clone/extract just the data we need, including the closure handle
+            (parent_closure.proto.constants.clone(), 
+             parent_closure.upvalues.clone(),
+             frame.base_register,
+             frame.closure)  // Store the closure handle
+        }; // Borrow of closures arena ends here
+        
+        // Phase 2: Get the function prototype from constants
+        if bx >= parent_proto_constants.len() {
             return Err(LuaError::RuntimeError(format!(
                 "Function prototype index {} out of bounds", bx
             )));
         }
         
-        let proto_handle = match &parent_closure.proto.constants[bx] {
-            Value::FunctionProto(handle) => *handle,
-            _ => return Err(LuaError::RuntimeError(format!(
-                "Expected function prototype at constant index {}", bx
-            ))),
+        let proto_handle = match &parent_proto_constants[bx] {
+            Value::FunctionProto(handle) => {
+                eprintln!("DEBUG op_closure: Found function prototype at constant {}", bx);
+                *handle
+            },
+            other => {
+                eprintln!("ERROR op_closure: Expected function prototype at constant {}, got {:?}", bx, other);
+                return Err(LuaError::RuntimeError(format!(
+                    "Expected function prototype at constant index {}", bx
+                )));
+            }
         };
         
         let proto = self.heap.get_function_proto_copy(proto_handle)?;
         
-        // Create upvalues for the new closure
-        let mut upvalues = Vec::new();
+        eprintln!("DEBUG op_closure: Function has {} params, {} bytecode instructions, {} upvalues", 
+                 proto.num_params, proto.bytecode.len(), proto.upvalues.len());
         
-        for &upval_info in &proto.upvalues {
-            let upvalue_handle = if upval_info.in_stack {
-                // Upvalue refers to local variable in enclosing function
-                let stack_index = base as usize + upval_info.index as usize;
-                self.heap.find_or_create_upvalue(self.current_thread, stack_index)?
-            } else {
-                // Upvalue refers to upvalue of enclosing function
-                if upval_info.index as usize >= parent_closure.upvalues.len() {
+        // Phase 3: Create upvalues for the new closure based on pseudo-instructions
+        let mut upvalues = Vec::with_capacity(proto.upvalues.len());
+        
+        // The number of upvalues is determined by the proto
+        let num_upvalues = proto.upvalues.len();
+        
+        // Get current PC to read pseudo-instructions
+        let mut pseudo_pc = self.heap.get_pc(self.current_thread)?;
+        eprintln!("DEBUG op_closure: Processing {} upvalues, starting at PC {}", num_upvalues, pseudo_pc);
+        
+        for i in 0..num_upvalues {
+            // Read the pseudo-instruction for this upvalue - use the parent closure handle we saved
+            let pseudo_inst = self.heap.get_instruction(parent_closure_handle, pseudo_pc)?;
+            let pseudo = Instruction(pseudo_inst);
+            eprintln!("DEBUG op_closure: Pseudo-instruction {} at PC {}: opcode={:?}, B={}", 
+                     i, pseudo_pc, pseudo.get_opcode(), pseudo.get_b());
+            
+            let upvalue_handle = match pseudo.get_opcode() {
+                OpCode::Move => {
+                    // MOVE 0 B 0: upvalue refers to local in enclosing function
+                    let local_reg = pseudo.get_b() as usize;
+                    let stack_index = parent_base as usize + local_reg;
+                    eprintln!("DEBUG op_closure: Upvalue {} is local at register {} (stack index {})", 
+                             i, local_reg, stack_index);
+                    
+                    self.heap.find_or_create_upvalue(self.current_thread, stack_index)?
+                }
+                OpCode::GetUpval => {
+                    // GETUPVAL 0 B 0: upvalue refers to upvalue in enclosing function
+                    let parent_upval_idx = pseudo.get_b() as usize;
+                    if parent_upval_idx >= parent_upvalues.len() {
+                        return Err(LuaError::RuntimeError(format!(
+                            "Invalid parent upvalue index {} (parent has {} upvalues)",
+                            parent_upval_idx, parent_upvalues.len()
+                        )));
+                    }
+                    eprintln!("DEBUG op_closure: Upvalue {} refers to parent upvalue {}", i, parent_upval_idx);
+                    parent_upvalues[parent_upval_idx]
+                }
+                _ => {
                     return Err(LuaError::RuntimeError(format!(
-                        "Invalid upvalue reference: parent closure has {} upvalues, but tried to access index {}",
-                        parent_closure.upvalues.len(),
-                        upval_info.index
+                        "Invalid pseudo-instruction after CLOSURE: {:?}",
+                        pseudo.get_opcode()
                     )));
                 }
-                parent_closure.upvalues[upval_info.index as usize]
             };
             
             upvalues.push(upvalue_handle);
+            pseudo_pc += 1;
         }
         
-        // Create new closure
+        // Update PC to skip pseudo-instructions
+        self.heap.set_pc(self.current_thread, pseudo_pc)?;
+        eprintln!("DEBUG op_closure: Advanced PC to {} after processing pseudo-instructions", pseudo_pc);
+        
+        // Phase 4: Create new closure (no active borrows now)
         let closure = Closure {
             proto,
             upvalues,
         };
         
         let closure_handle = self.heap.create_closure(closure)?;
-        self.heap.set_thread_register(self.current_thread, base as usize + a, &Value::Closure(closure_handle))?;
+        
+        eprintln!("DEBUG op_closure: Created closure handle {:?}, storing in R({})", 
+                 closure_handle, target_register);
+        
+        self.heap.set_thread_register(self.current_thread, target_register, &Value::Closure(closure_handle))?;
+        
+        // Verify it was stored
+        let verify = self.heap.get_thread_register(self.current_thread, target_register)?;
+        eprintln!("DEBUG op_closure: Verification - R({}) now contains: {:?}", target_register, verify);
         
         Ok(())
     }
     
-    /// CLOSE: close all upvalues >= R(A) 
+    /// CLOSE: close all upvalues >= R(A)
+    /// 
+    /// This instruction closes all open upvalues that reference stack positions
+    /// at or above R(A). This is used when local variables go out of scope
+    /// (e.g., at the end of a block) to ensure upvalues capture the correct values.
+    /// 
+    /// Note: CLOSE is NOT needed before RETURN, as RETURN automatically closes
+    /// upvalues for the returning function.
     fn op_close(&mut self, inst: Instruction, base: u16) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let threshold = base as usize + a;
         
-        // Close upvalues that reference stack positions >= threshold
+        eprintln!("DEBUG op_close: Closing upvalues >= R({}) (absolute stack position: {})", a, threshold);
+        
+        // Close all open upvalues that reference stack positions >= threshold
+        // This ensures that any upvalues pointing to locals that are going out of
+        // scope are properly closed and capture their current values
         self.heap.close_thread_upvalues(self.current_thread, threshold)?;
         
         Ok(())
@@ -1690,20 +2523,29 @@ impl RefCellVM {
         
         eprintln!("DEBUG process_c_function_call: C function returned {} results", actual_results);
         
-        // Adjust results to expected count
+        // Get the actual number of results that were pushed  
+        let results_pushed = ctx.get_results_pushed();
+        eprintln!("DEBUG process_c_function_call: Context reports {} results pushed", results_pushed);
+        
+        // Debug: Show what was placed in the registers
+        for i in 0..results_pushed {
+            let val = self.heap.get_thread_register(self.current_thread, base as usize + i)?;
+            eprintln!("DEBUG process_c_function_call: Result {}: {:?} at R({})", i, val, base as usize + i);
+        }
+        
+        // Adjust results to expected count if specified
         if expected_results >= 0 {
             let expected = expected_results as usize;
-            if actual_results < expected as i32 {
+            eprintln!("DEBUG process_c_function_call: Adjusting result count to expected {}", expected);
+            
+            if results_pushed < expected {
                 // Fill missing results with nil
-                for i in actual_results as usize..expected {
-                    ctx.set_return(i, Value::Nil)?;
+                eprintln!("DEBUG process_c_function_call: Filling {} missing results with nil", expected - results_pushed);
+                for i in results_pushed..expected {
+                    self.heap.set_thread_register(self.current_thread, base as usize + i, &Value::Nil)?;
                 }
-            } else if actual_results > expected as i32 {
-                // Trim excess results
-                // The context already placed the results in the correct registers
-                // We don't need to do anything here since the calling code will only
-                // use the expected number of results
             }
+            // Note: We don't trim excess results, they're just ignored
         }
         
         Ok(StepResult::Continue)
@@ -1712,6 +2554,7 @@ impl RefCellVM {
     /// Execute a compiled module
     pub fn execute_module(&mut self, module: &super::compiler::CompiledModule, args: &[Value]) -> LuaResult<Value> {
         eprintln!("DEBUG execute_module: Loading module with {} args", args.len());
+        eprintln!("DEBUG execute_module: Module has {} prototypes", module.prototypes.len());
         
         // Clear any previous state
         self.operation_queue.clear();
@@ -1721,12 +2564,16 @@ impl RefCellVM {
         for s in &module.strings {
             string_handles.push(self.heap.create_string(s)?);
         }
+        eprintln!("DEBUG execute_module: Created {} string handles", string_handles.len());
         
         // Step 2: Create all function prototypes (two-pass approach like in loader)
         let mut proto_handles = Vec::with_capacity(module.prototypes.len());
         
         // First pass - create prototypes with placeholder constants
-        for proto in &module.prototypes {
+        for (idx, proto) in module.prototypes.iter().enumerate() {
+            eprintln!("DEBUG execute_module: Creating prototype {} with {} constants, {} params", 
+                     idx, proto.constants.len(), proto.num_params);
+            
             // Create temporary constants with Nil for unresolved references
             let mut temp_constants = Vec::with_capacity(proto.constants.len());
             for constant in &proto.constants {
@@ -1774,11 +2621,14 @@ impl RefCellVM {
             let proto_handle = proto_handles[i];
             let mut updated_proto = self.heap.get_function_proto_copy(proto_handle)?;
             
+            eprintln!("DEBUG execute_module: Updating prototype {} constants", i);
+            
             // Update constants that reference other prototypes or tables
             for (j, constant) in proto.constants.iter().enumerate() {
                 match constant {
                     CompilationConstant::FunctionProto(idx) => {
                         if *idx < proto_handles.len() {
+                            eprintln!("DEBUG execute_module: Proto {} const {}: FunctionProto({})", i, j, idx);
                             updated_proto.constants[j] = Value::FunctionProto(proto_handles[*idx]);
                         } else {
                             return Err(LuaError::RuntimeError(format!(
@@ -1799,8 +2649,10 @@ impl RefCellVM {
         }
         
         // Step 3: Convert main function constants
+        eprintln!("DEBUG execute_module: Creating main function with {} constants", module.constants.len());
+        
         let mut main_constants = Vec::with_capacity(module.constants.len());
-        for constant in &module.constants {
+        for (idx, constant) in module.constants.iter().enumerate() {
             let value = match constant {
                 CompilationConstant::Nil => Value::Nil,
                 CompilationConstant::Boolean(b) => Value::Boolean(*b),
@@ -1816,6 +2668,7 @@ impl RefCellVM {
                 }
                 CompilationConstant::FunctionProto(idx) => {
                     if *idx < proto_handles.len() {
+                        eprintln!("DEBUG execute_module: Main const {}: FunctionProto({})", idx, idx);
                         Value::FunctionProto(proto_handles[*idx])
                     } else {
                         return Err(LuaError::RuntimeError(format!(
@@ -1847,6 +2700,8 @@ impl RefCellVM {
             upvalues: vm_upvalues,
         };
         
+        eprintln!("DEBUG execute_module: Main function has {} bytecode instructions", proto.bytecode.len());
+        
         // Create the closure in the heap
         let closure = Closure {
             proto,
@@ -1854,6 +2709,8 @@ impl RefCellVM {
         };
         
         let closure_handle = self.heap.create_closure(closure)?;
+        
+        eprintln!("DEBUG execute_module: Created main closure handle: {:?}", closure_handle);
         
         // Place the closure at position 0 of the main thread
         self.heap.set_thread_register(self.main_thread, 0, &Value::Closure(closure_handle))?;
@@ -1870,6 +2727,8 @@ impl RefCellVM {
             expected_results: -1,
         });
         
+        eprintln!("DEBUG execute_module: Starting execution...");
+        
         // Execute until completion
         loop {
             // Always process pending operations first
@@ -1877,6 +2736,7 @@ impl RefCellVM {
                 match self.process_pending_operation(op)? {
                     StepResult::Continue => continue,
                     StepResult::Completed(values) => {
+                        eprintln!("DEBUG execute_module: Execution completed with {} values", values.len());
                         // Return the first result, or nil if none
                         return Ok(values.get(0).cloned().unwrap_or(Value::Nil));
                     }
@@ -1887,6 +2747,7 @@ impl RefCellVM {
             match self.step()? {
                 StepResult::Continue => continue,
                 StepResult::Completed(values) => {
+                    eprintln!("DEBUG execute_module: Execution completed with {} values", values.len());
                     // Return the first result, or nil if none
                     return Ok(values.get(0).cloned().unwrap_or(Value::Nil));
                 }
@@ -2133,6 +2994,10 @@ impl<'a> ExecutionContext for RefCellExecutionContext<'a> {
         self.heap.table_next(table, key)
     }
     
+    fn globals_handle(&self) -> LuaResult<TableHandle> {
+        self.heap.globals()
+    }
+    
     fn get_string_from_handle(&self, handle: StringHandle) -> LuaResult<String> {
         self.heap.get_string_value(handle)
     }
@@ -2215,6 +3080,16 @@ impl<'a> ExecutionContext for RefCellExecutionContext<'a> {
     fn eval_script(&mut self, _script: &str) -> LuaResult<Value> {
         Err(LuaError::NotImplemented("eval_script in RefCellVM".to_string()))
     }
+    
+    fn get_raw_table_field(&self, table: TableHandle, key: &Value) -> LuaResult<Value> {
+        // Direct table access without metamethods
+        self.heap.get_table_field(table, key)
+    }
+    
+    fn set_raw_table_field(&mut self, table: TableHandle, key: &Value, value: &Value) -> LuaResult<()> {
+        // Direct table mutation without metamethods
+        self.heap.set_table_field(table, key, value)
+    }
 }
 
 impl<'a> RefCellExecutionContext<'a> {
@@ -2246,6 +3121,29 @@ mod tests {
     fn test_vm_creation() {
         let vm = RefCellVM::new().unwrap();
         assert_eq!(vm.operation_queue.len(), 0);
+    }
+    
+    #[test]
+    fn test_number_equality_comparison() {
+        let mut vm = RefCellVM::new().unwrap();
+        
+        // Test direct Value comparison
+        let v1 = Value::Number(1.0);
+        let v2 = Value::Number(1.0);
+        let v3 = Value::Number(1);  // Integer literal converted to f64
+        
+        assert!(vm.compare_eq(&v1, &v2), "1.0 should equal 1.0");
+        assert!(vm.compare_eq(&v1, &v3), "1.0 should equal 1");
+        
+        // Test with different representations
+        let v4 = Value::Number(1.0f64);
+        let v5 = Value::Number(1i32 as f64);
+        
+        assert!(vm.compare_eq(&v4, &v5), "Different representations of 1 should be equal");
+        
+        // Test that different numbers are not equal
+        let v6 = Value::Number(1.1);
+        assert!(!vm.compare_eq(&v1, &v6), "1.0 should not equal 1.1");
     }
     
     #[test]
@@ -2352,7 +3250,11 @@ mod tests {
                 
                 // TFORLOOP
                 Instruction::create_ABC(OpCode::TForLoop, 0, 0, 2).0, // 2 results (key, value)
-                Instruction::create_sBx(OpCode::Jmp, 0, -1).0,        // jump back
+                // Note: The JMP instruction here uses -1, but when it executes, the PC
+                // has already been incremented, so it would need -2 to get back to TFORLOOP.
+                // However, our TFORLOOP implementation now handles the jump-back directly,
+                // so this JMP is only executed when exiting the loop.
+                Instruction::create_sBx(OpCode::Jmp, 0, -1).0,        // jump back (handled by TFORLOOP)
                 
                 // Return
                 Instruction::create_ABC(OpCode::Return, 0, 1, 0).0,

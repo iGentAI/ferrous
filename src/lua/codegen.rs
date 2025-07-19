@@ -259,6 +259,9 @@ struct CodeGenContext {
     /// Local variable mapping (name -> register)
     locals: HashMap<String, u8>,
     
+    /// Upvalue name mapping (for tracking what each upvalue refers to)
+    upvalue_names: Vec<String>,
+    
     /// Next free register
     free_register: u8,
     
@@ -290,6 +293,7 @@ impl CodeGenContext {
                 debug_info: None,
             },
             locals: HashMap::new(),
+            upvalue_names: Vec::new(),
             free_register: 0,
             strings: Vec::new(),
             parent: None,
@@ -312,6 +316,7 @@ impl CodeGenContext {
                 debug_info: None,
             },
             locals: HashMap::new(),
+            upvalue_names: Vec::new(),
             free_register: 0,
             strings: Vec::new(), // Will be moved to parent later
             parent: None, // Will be set properly later
@@ -394,9 +399,27 @@ impl CodeGenContext {
     fn lookup_local(&self, name: &str) -> Option<u8> {
         self.locals.get(name).copied()
     }
+    
+    /// Debug helper to print register state
+    fn debug_register_state(&self, msg: &str, start: u8, count: u8) {
+        eprintln!("DEBUG register state - {}", msg);
+        eprintln!("  free_register: {}, max_stack: {}", self.free_register, self.current_function.max_stack_size);
+        eprintln!("  locals: {:?}", self.locals);
+        if start < 250 && count > 0 && count < 20 {
+            eprintln!("  Register range R({})..R({}):", start, start + count - 1);
+            for i in 0..count {
+                let reg = start + i;
+                let local_name = self.locals.iter()
+                    .find(|(_, &r)| r == reg)  
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("<temp>");
+                eprintln!("    R({}) = {}", reg, local_name);
+            }
+        }
+    }
 }
 
-/// Resolve an upvalue through parent contexts
+/// Resolve an upvalue through parent contexts with proper name tracking
 fn resolve_upvalue(ctx: &mut CodeGenContext, name: &str, parent: Option<&CodeGenContext>) -> Option<u8> {
     // If we have no parent, we can't have upvalues
     let parent_ctx = parent?;
@@ -404,11 +427,9 @@ fn resolve_upvalue(ctx: &mut CodeGenContext, name: &str, parent: Option<&CodeGen
     // First, check if the parent has this as a local
     if let Some(parent_local_reg) = parent_ctx.lookup_local(name) {
         // The parent has this variable as a local
-        // We need to create an upvalue that references the parent's local
-        
         // Check if we already have this upvalue
-        for (i, upval) in ctx.current_function.upvalues.iter().enumerate() {
-            if upval.in_stack && upval.index == parent_local_reg {
+        for (i, (upval, upval_name)) in ctx.current_function.upvalues.iter().zip(&ctx.upvalue_names).enumerate() {
+            if upval.in_stack && upval.index == parent_local_reg && upval_name == name {
                 return Some(i as u8);
             }
         }
@@ -419,13 +440,35 @@ fn resolve_upvalue(ctx: &mut CodeGenContext, name: &str, parent: Option<&CodeGen
             in_stack: true,
             index: parent_local_reg,
         });
+        ctx.upvalue_names.push(name.to_string());
         
         return Some(upval_idx);
     }
     
-    // If the parent doesn't have it as a local, check if it has it as an upvalue
-    // This would require recursively checking the parent's parent
-    // For now, we'll leave this unimplemented as the basic case should work
+    // If the parent doesn't have it as a local, check if parent has it as an upvalue
+    // by looking through parent's upvalue names
+    for (parent_upval_idx, parent_upval_name) in parent_ctx.upvalue_names.iter().enumerate() {
+        if parent_upval_name == name {
+            // Parent has this as an upvalue - we reference the parent's upvalue
+            
+            // Check if we already have this upvalue
+            for (i, (upval, upval_name)) in ctx.current_function.upvalues.iter().zip(&ctx.upvalue_names).enumerate() {
+                if !upval.in_stack && upval.index == parent_upval_idx as u8 && upval_name == name {
+                    return Some(i as u8);
+                }
+            }
+            
+            // Create a new upvalue referencing parent's upvalue
+            let upval_idx = ctx.current_function.upvalues.len() as u8;
+            ctx.current_function.upvalues.push(CompilationUpvalue {
+                in_stack: false,
+                index: parent_upval_idx as u8,
+            });
+            ctx.upvalue_names.push(name.to_string());
+            
+            return Some(upval_idx);
+        }
+    }
     
     None
 }
@@ -437,8 +480,12 @@ pub fn generate_bytecode(chunk: &Chunk) -> LuaResult<CompleteCompilationOutput> 
     // Compile the chunk
     compile_chunk(&mut ctx, chunk)?;
     
-    // If there's no explicit return, add a default return
-    if chunk.return_statement.is_none() && !ends_with_return(&chunk.statements) {
+    // Add implicit return if needed
+    // Check both for explicit return statement and if the last statement is a return
+    let has_explicit_return = chunk.return_statement.is_some() || ends_with_return(&chunk.statements);
+    
+    if !has_explicit_return {
+        // Add a default "return" with no values
         ctx.emit(Instruction::create_ABC(OpCode::Return, 0, 1, 0));
     }
     
@@ -580,7 +627,7 @@ fn compile_assignment_with_parent(
                     let value_reg = ctx.allocate_register()?;
                     compile_expression_to_register_with_parent(ctx, &assign.expressions[0], value_reg, parent)?;
                     
-                    ctx.emit(Instruction::create_ABC(OpCode::SetUpval, value_reg as u32, upval_idx as u32, 0));
+                    ctx.emit(Instruction::create_ABC(OpCode::SetUpval, upval_idx as u32, value_reg as u32, 0));
                     ctx.free_registers_to(value_reg);
                     return Ok(());
                 } else {
@@ -805,23 +852,38 @@ fn compile_table_constructor_with_parent(
         for (batch_idx, batch) in array_fields.chunks(FIELDS_PER_FLUSH).enumerate() {
             eprintln!("DEBUG: Processing SETLIST batch {} with {} elements", batch_idx + 1, batch.len());
             
-            // Reserve registers for the values
-            let base_value_reg = ctx.free_register;
+            // CRITICAL FIX: SETLIST requires array values to be in consecutive registers
+            // starting immediately after the table register
+            // Spec: R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
+            // This means values MUST be at R(A+1), R(A+2), ... R(A+B)
             
-            // Compile values into consecutive registers
-            for expr in batch {
-                let reg = ctx.allocate_register()?;
-                eprintln!("DEBUG: SETLIST batch {} - compiling value to register {}", batch_idx + 1, reg);
-                compile_expression_to_register_with_parent(ctx, expr, reg, parent)?;
+            // Save current free register state
+            let saved_free_reg = ctx.free_register;
+            
+            // Calculate where values must be placed
+            let values_start = target + 1;
+            
+            // Ensure we have stack space for the values
+            if values_start + batch.len() as u8 > ctx.current_function.max_stack_size {
+                ctx.current_function.max_stack_size = values_start + batch.len() as u8;
+            }
+            
+            // Compile values to the EXACT registers required by SETLIST
+            for (i, expr) in batch.iter().enumerate() {
+                let dest_reg = values_start + i as u8;
+                eprintln!("DEBUG: SETLIST batch {} - compiling value {} to REQUIRED register R({})", 
+                         batch_idx + 1, i, dest_reg);
+                
+                // Temporarily set free_register past our target to prevent interference
+                ctx.free_register = dest_reg + 1;
+                
+                compile_expression_to_register_with_parent(ctx, expr, dest_reg, parent)?;
             }
             
             // Emit SETLIST
             let c = batch_idx + 1; // C is 1-based batch index where (C-1)*FPF+1 is starting array index
-            eprintln!("DEBUG: Emitting SETLIST - R({})[{}..{}] = R({}..{})", 
-                     target, c*FIELDS_PER_FLUSH - FIELDS_PER_FLUSH + 1, 
-                     c*FIELDS_PER_FLUSH, 
-                     base_value_reg, 
-                     base_value_reg + batch.len() as u8 - 1);
+            eprintln!("DEBUG: Emitting SETLIST - R({}) with {} values at R({})..R({})", 
+                     target, batch.len(), values_start, values_start + batch.len() as u8 - 1);
                      
             ctx.emit(Instruction::create_ABC(
                 OpCode::SetList,
@@ -830,8 +892,9 @@ fn compile_table_constructor_with_parent(
                 c as u32            // C = batch index
             ));
             
-            // Free registers used for values
-            ctx.free_registers_to(base_value_reg);
+            // Restore free register to what it was before array processing
+            // This is safe because SETLIST has consumed the values
+            ctx.free_register = saved_free_reg;
         }
     }
     
@@ -855,15 +918,12 @@ fn compile_variable_to_register_with_parent(
     match var {
         Variable::Name(name) => {
             if let Some(reg) = ctx.lookup_local(name) {
-                // Local variable
                 if reg != target {
                     ctx.emit(Instruction::create_ABC(OpCode::Move, target as u32, reg as u32, 0));
                 }
             } else if let Some(upval_idx) = resolve_upvalue(ctx, name, parent) {
-                // Upvalue access
                 ctx.emit(Instruction::create_ABC(OpCode::GetUpval, target as u32, upval_idx as u32, 0));
             } else {
-                // Global variable
                 let string_idx = ctx.add_string(name);
                 let const_idx = ctx.add_constant(CompilationConstant::String(string_idx))?;
                 ctx.emit(Instruction::create_ABx(OpCode::GetGlobal, target as u32, const_idx));
@@ -873,51 +933,55 @@ fn compile_variable_to_register_with_parent(
             // Table member access: table.field
             eprintln!("DEBUG: compile_variable_to_register Member - target: {}, free_register: {}", target, ctx.free_register);
             
-            // Always allocate a new register for table to avoid potential corruption
+            // CRITICAL FIX: Compile table to a TEMPORARY register, not target!
+            // GETTABLE spec: R(A) := R(B)[RK(C)] where A is destination, B is table
+            let saved_free_register = ctx.free_register;
             let table_reg = ctx.allocate_register()?;
             
-            eprintln!("DEBUG: Using table_reg: {} for table expression", table_reg);
             compile_expression_to_register_with_parent(ctx, table, table_reg, parent)?;
             
             // Create string constant for the field name
             let field_idx = ctx.add_string(field);
             let field_const = ctx.add_constant(CompilationConstant::String(field_idx))?;
             
-            // GETTABLE: R(target) = table[field]
+            // GETTABLE: R(target) = R(table_reg)[field]
             eprintln!("DEBUG: Emitting GETTABLE - R({}) = R({})[const({})]", target, table_reg, field_const);
             ctx.emit(Instruction::create_ABC(
                 OpCode::GetTable,
                 target as u32,
-                table_reg as u32,
+                table_reg as u32,  // B = table_reg (table is in separate register)
                 Instruction::encode_constant(field_const)
             ));
             
             // Free temporary registers
-            ctx.free_registers_to(table_reg);
+            ctx.free_registers_to(saved_free_register);
         }
         Variable::Index { table, key } => {
             // Table index access: table[key]
             eprintln!("DEBUG: compile_variable_to_register Index - target: {}, free_register: {}", target, ctx.free_register);
             
-            // Always allocate new registers for table and key to avoid corruption
+            // CRITICAL FIX: Compile table to a TEMPORARY register, not target!
+            // GETTABLE spec: R(A) := R(B)[RK(C)] where A is destination, B is table
+            let saved_free_register = ctx.free_register;
             let table_reg = ctx.allocate_register()?;
+            
             compile_expression_to_register_with_parent(ctx, table, table_reg, parent)?;
             
-            // Allocate key register - must be after table register
+            // Allocate key register
             let key_reg = ctx.allocate_register()?;
             compile_expression_to_register_with_parent(ctx, key, key_reg, parent)?;
             
-            // GETTABLE: R(target) = table[key]
+            // GETTABLE: R(target) = R(table_reg)[key]
             eprintln!("DEBUG: Emitting GETTABLE - R({}) = R({})[R({})]", target, table_reg, key_reg);
             ctx.emit(Instruction::create_ABC(
                 OpCode::GetTable,
                 target as u32,
-                table_reg as u32,
+                table_reg as u32,  // B = table_reg (table is in separate register)
                 key_reg as u32
             ));
             
             // Free temporary registers
-            ctx.free_registers_to(table_reg);
+            ctx.free_registers_to(saved_free_register);
         }
     }
     
@@ -954,7 +1018,8 @@ fn compile_binary_op_with_parent(
             
             eprintln!("DEBUG: compile_binary_op {:?} - target: {}, free_register: {}", op, target, ctx.free_register);
             
-            // Always allocate new registers for operands to avoid corruption
+            let saved_free_register = ctx.free_register;
+            
             let left_reg = ctx.allocate_register()?;
             eprintln!("DEBUG: Compiling left operand to register {}", left_reg);
             compile_expression_to_register_with_parent(ctx, left, left_reg, parent)?;
@@ -963,105 +1028,119 @@ fn compile_binary_op_with_parent(
             eprintln!("DEBUG: Compiling right operand to register {}", right_reg);
             compile_expression_to_register_with_parent(ctx, right, right_reg, parent)?;
             
-            // Emit operation
             eprintln!("DEBUG: Emitting {:?} - R({}) = R({}) op R({})", opcode, target, left_reg, right_reg);
             ctx.emit(Instruction::create_ABC(opcode, target as u32, left_reg as u32, right_reg as u32));
             
-            // Free temporary registers
-            ctx.free_registers_to(left_reg);
+            ctx.free_registers_to(saved_free_register);
         }
         
         BinaryOperator::Concat => {
             eprintln!("DEBUG: compile_binary_op Concat - target: {}, free_register: {}", target, ctx.free_register);
-             
-            // Always allocate new registers for operands to avoid corruption
+            
             let left_reg = ctx.allocate_register()?;
             compile_expression_to_register_with_parent(ctx, left, left_reg, parent)?;
             
             let right_reg = ctx.allocate_register()?;
+            if right_reg != left_reg + 1 {
+                return Err(LuaError::CompileError(
+                    "CONCAT requires consecutive registers".to_string()
+                ));
+            }
             compile_expression_to_register_with_parent(ctx, right, right_reg, parent)?;
             
-            // Emit operation
             eprintln!("DEBUG: Emitting CONCAT - R({}) = R({})..R({})", target, left_reg, right_reg);
             ctx.emit(Instruction::create_ABC(OpCode::Concat, target as u32, left_reg as u32, right_reg as u32));
             
-            // Free temporary registers
             ctx.free_registers_to(left_reg);
         }
         
         BinaryOperator::Or => {
-            // Short-circuit OR: if left is true, use left, else use right
-            // First compile left operand to target
+            eprintln!("DEBUG: compile_binary_op OR - target: {}, free_register: {}", target, ctx.free_register);
+            
+            let initial_free_register = ctx.free_register;
+            
             compile_expression_to_register_with_parent(ctx, left, target, parent)?;
             
-            // TESTSET: if R(target) is truthy, skip next instruction, else R(target) := R(right_reg)
-            // We need to compile right first to a temp register
-            let skip_pc = ctx.current_pc();
-            // Placeholder TESTSET - will patch after compiling right
-            ctx.emit(Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 1)); // C=1 means test for truthy
+            let testset_pc = ctx.current_pc();
+            ctx.emit(Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 1));
             
-            // Compile right operand to target (only executed if left was falsey)
+            let jmp_pc = ctx.current_pc();
+            ctx.emit(Instruction::create_AsBx(OpCode::Jmp, 0, 0));
+            
             compile_expression_to_register_with_parent(ctx, right, target, parent)?;
             
-            // Patch the TESTSET instruction
-            ctx.current_function.bytecode[skip_pc] = Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 1).0;
+            let jmp_offset = (ctx.current_pc() - jmp_pc - 1) as i32;
+            ctx.current_function.bytecode[jmp_pc] = Instruction::create_AsBx(OpCode::Jmp, 0, jmp_offset).0;
             
-            ctx.free_registers_to(target + 1);
+            ctx.free_registers_to(initial_free_register.max(target + 1));
         }
         
         BinaryOperator::And => {
-            // Short-circuit AND: if left is false, use left, else use right
-            // First compile left operand to target
+            eprintln!("DEBUG: compile_binary_op AND - target: {}, free_register: {}", target, ctx.free_register);
+            
+            let initial_free_register = ctx.free_register;
+            
             compile_expression_to_register_with_parent(ctx, left, target, parent)?;
             
-            // TESTSET: if R(target) is falsey, skip next instruction, else R(target) := R(right_reg)
-            ctx.emit(Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 0)); // C=0 means test for falsey
+            let left_max_register = ctx.free_register;
             
-            // Compile right operand to target (only executed if left was truthy)
+            ctx.emit(Instruction::create_ABC(OpCode::TestSet, target as u32, target as u32, 0));
+            
+            let jmp_pc = ctx.current_pc();
+            ctx.emit(Instruction::create_AsBx(OpCode::Jmp, 0, 0));
+            
+            ctx.free_register = initial_free_register.max(left_max_register);
+            
             compile_expression_to_register_with_parent(ctx, right, target, parent)?;
             
-            ctx.free_registers_to(target + 1);
+            let jmp_offset = (ctx.current_pc() - jmp_pc - 1) as i32;
+            ctx.current_function.bytecode[jmp_pc] = Instruction::create_AsBx(OpCode::Jmp, 0, jmp_offset).0;
+            
+            ctx.free_register = initial_free_register.max(target + 1);
         }
         
         BinaryOperator::Eq | BinaryOperator::Ne | BinaryOperator::Lt | 
         BinaryOperator::Le | BinaryOperator::Gt | BinaryOperator::Ge => {
             eprintln!("DEBUG: compile_binary_op comparison {:?} - target: {}, free_register: {}", op, target, ctx.free_register);
             
-            // Always allocate new registers for operands to avoid corruption
+            let saved_free_register = ctx.free_register;
+            
             let left_reg = ctx.allocate_register()?;
             compile_expression_to_register_with_parent(ctx, left, left_reg, parent)?;
             
             let right_reg = ctx.allocate_register()?;
             compile_expression_to_register_with_parent(ctx, right, right_reg, parent)?;
             
-            // The comparison instructions work by skipping the next instruction if the test fails
-            let (opcode, invert) = match op {
-                BinaryOperator::Eq => (OpCode::Eq, false),
-                BinaryOperator::Ne => (OpCode::Eq, true), // NE is inverted EQ
-                BinaryOperator::Lt => (OpCode::Lt, false),
-                BinaryOperator::Le => (OpCode::Le, false),
-                BinaryOperator::Gt => (OpCode::Lt, true), // GT is inverted LT with swapped operands
-                BinaryOperator::Ge => (OpCode::Le, true), // GE is inverted LE with swapped operands
+            let opcode = match op {
+                BinaryOperator::Eq => OpCode::Eq,
+                BinaryOperator::Ne => OpCode::Eq,
+                BinaryOperator::Lt => OpCode::Lt,
+                BinaryOperator::Le => OpCode::Le,
+                BinaryOperator::Gt => OpCode::Lt,
+                BinaryOperator::Ge => OpCode::Le,
                 _ => unreachable!(),
             };
             
-            // For GT and GE, we need to swap operands
             let (left_op, right_op) = match op {
                 BinaryOperator::Gt | BinaryOperator::Ge => (right_reg as u32, left_reg as u32),
                 _ => (left_reg as u32, right_reg as u32),
             };
             
-            // Emit comparison (A = 1 if we want the test to succeed for true, 0 for false)
-            ctx.emit(Instruction::create_ABC(opcode, if invert { 0 } else { 1 }, left_op, right_op));
+            let a_flag = match op {
+                BinaryOperator::Ne => 1,
+                _ => 0,
+            };
             
-            // Load false (will be skipped if comparison matches expectation)
-            ctx.emit(Instruction::create_ABC(OpCode::LoadBool, target as u32, 0, 1)); // C=1 means skip next
+            eprintln!("DEBUG: Emitting {:?} with A={}, left_op=R({}), right_op=R({})", 
+                     opcode, a_flag, left_op, right_op);
             
-            // Load true
+            ctx.emit(Instruction::create_ABC(opcode, a_flag, left_op, right_op));
+            
+            ctx.emit(Instruction::create_ABC(OpCode::LoadBool, target as u32, 0, 1));
+            
             ctx.emit(Instruction::create_ABC(OpCode::LoadBool, target as u32, 1, 0));
             
-            // Free temporary registers
-            ctx.free_registers_to(left_reg);
+            ctx.free_registers_to(saved_free_register);
         }
         
         _ => return Err(LuaError::NotImplemented(format!("Binary operator: {:?}", op))),
@@ -1091,7 +1170,11 @@ fn compile_unary_op_with_parent(
     
     eprintln!("DEBUG: compile_unary_op {:?} - target: {}, free_register: {}", op, target, ctx.free_register);
     
-    // Always allocate a new register for the operand to avoid corruption
+    // CRITICAL FIX: Save free_register state
+    let saved_free_register = ctx.free_register;
+    
+    // All unary operations need the operand in a SEPARATE register!
+    // Spec for all unary ops: R(A) := op R(B) where A is destination, B is source
     let operand_reg = ctx.allocate_register()?;
     
     eprintln!("DEBUG: Compiling operand to register {}", operand_reg);
@@ -1100,8 +1183,8 @@ fn compile_unary_op_with_parent(
     eprintln!("DEBUG: Emitting {:?} - R({}) = op R({})", opcode, target, operand_reg);
     ctx.emit(Instruction::create_ABC(opcode, target as u32, operand_reg as u32, 0));
     
-    // Free temporary registers
-    ctx.free_registers_to(operand_reg);
+    // Free temporary registers back to saved position
+    ctx.free_registers_to(saved_free_register);
     
     Ok(())
 }
@@ -1121,11 +1204,24 @@ fn compile_function_call_with_parent(
     if let Some(method_name) = &call.method {
         // Method call - use SELF instruction
         
+        // SELF requires R(A) = method, R(A+1) = self (table copy)
+        // These MUST be consecutive registers!
+        
         // Allocate registers for function and self (must be consecutive)
         let func_reg = ctx.allocate_register()?;
         let self_reg = ctx.allocate_register()?; // This should be func_reg + 1
         
+        // Validate consecutive allocation
+        if self_reg != func_reg + 1 {
+            return Err(LuaError::CompileError(
+                "SELF opcode requires consecutive registers for method and self".to_string()
+            ));
+        }
+        
         debug_assert_eq!(self_reg, func_reg + 1, "SELF requires consecutive registers");
+        
+        eprintln!("DEBUG compile_function_call: Method call setup - func at R({}), self at R({})", 
+                 func_reg, self_reg);
         
         // Compile the table expression to get the object
         compile_expression_to_register_with_parent(ctx, &call.function, func_reg, parent)?;
@@ -1207,16 +1303,46 @@ fn compile_return_statement_with_parent(
     expressions: &[Expression],
     parent: Option<&CodeGenContext>
 ) -> LuaResult<()> {
+    // Save the base register for return values
     let base_reg = ctx.free_register;
     
+    // CRITICAL FIX: For complex return statements with nested expressions (like the AND chains)
+    // we need to better manage register allocation to prevent corruption
+    eprintln!("DEBUG: compile_return_statement - {} expressions, base_reg: {}", 
+             expressions.len(), base_reg);
+    
     // Compile return values
-    for expr in expressions {
-        let reg = ctx.allocate_register()?;
-        compile_expression_to_register_with_parent(ctx, expr, reg, parent)?;
+    for (i, expr) in expressions.iter().enumerate() {
+        // Save initial register state before each expression
+        let saved_free_register = ctx.free_register;
+        
+        // Compile the expression to its target register
+        let target_reg = base_reg + i as u8;
+        eprintln!("DEBUG: Compiling return expression {} to register {}", i, target_reg);
+        
+        // Ensure we allocate enough registers
+        while ctx.free_register <= target_reg {
+            ctx.allocate_register()?;
+        }
+        
+        compile_expression_to_register_with_parent(ctx, expr, target_reg, parent)?;
+        
+        // Restore free_register to prevent later expressions from corrupting registers
+        // but ensure we maintain the progress of free_register (max of the two)
+        ctx.free_register = saved_free_register.max(target_reg + 1);
     }
+    
+    // Ensure free_register is at least past all return values
+    if ctx.free_register < base_reg + expressions.len() as u8 {
+        ctx.free_register = base_reg + expressions.len() as u8;
+    }
+    
+    // NOTE: In Lua 5.1, RETURN automatically closes all upvalues for the 
+    // returning function's local variables. No explicit CLOSE is needed.
     
     // Emit RETURN instruction
     let nresults = expressions.len() as u32 + 1; // +1 because B includes base
+    eprintln!("DEBUG: Emitting RETURN - base: R({}), nresults: {}", base_reg, nresults);
     ctx.emit(Instruction::create_ABC(OpCode::Return, base_reg as u32, nresults, 0));
     
     Ok(())
@@ -1290,6 +1416,12 @@ fn compile_while_loop_with_parent(
     parent: Option<&CodeGenContext>
 ) -> LuaResult<()> {
     let loop_start = ctx.current_pc();
+    let saved_locals = ctx.locals.clone();
+    let loop_base_register = ctx.free_register;
+    
+    // Save break targets for this loop
+    let saved_break_targets = ctx.break_targets.clone();
+    ctx.break_targets.clear();
     
     // Compile condition
     let cond_reg = ctx.allocate_register()?;
@@ -1305,6 +1437,11 @@ fn compile_while_loop_with_parent(
     // Compile body
     compile_block_with_parent(ctx, body, parent)?;
     
+    // Before jumping back, close any upvalues for locals defined in the loop body
+    if ctx.locals.len() > saved_locals.len() {
+        emit_close_if_needed(ctx, loop_base_register);
+    }
+    
     // Jump back to start
     let jump_offset = -(ctx.current_pc() as i32 - loop_start as i32 + 1);
     ctx.emit(Instruction::create_AsBx(OpCode::Jmp, 0, jump_offset));
@@ -1312,6 +1449,16 @@ fn compile_while_loop_with_parent(
     // Patch jump for false condition
     let jump_offset = (ctx.current_pc() - jump_false - 1) as i32;
     ctx.current_function.bytecode[jump_false] = Instruction::create_AsBx(OpCode::Jmp, 0, jump_offset).0;
+    
+    // Patch break jumps
+    for break_target in &ctx.break_targets {
+        let jump_offset = (ctx.current_pc() - break_target - 1) as i32;
+        ctx.current_function.bytecode[*break_target] = Instruction::create_AsBx(OpCode::Jmp, 0, jump_offset).0;
+    }
+    
+    // Restore break targets and locals
+    ctx.break_targets = saved_break_targets;
+    ctx.locals = saved_locals;
     
     Ok(())
 }
@@ -1393,7 +1540,11 @@ fn compile_for_loop_with_parent(
     ctx.current_function.bytecode[forprep_pc] = 
         Instruction::create_AsBx(OpCode::ForPrep, loop_base as u32, prep_offset).0;
     
-    // 9. Restore locals and free register state
+    // 9. NOTE: In Lua 5.1, explicit CLOSE after FOR loops is not needed
+    // The loop variables go out of scope naturally, and any upvalues 
+    // referencing them will be closed when the containing function returns
+    
+    // 10. Restore locals and free register state
     ctx.locals = saved_locals;
     ctx.free_register = saved_free_register;
     
@@ -1479,8 +1630,10 @@ fn compile_for_in_loop_with_parent(
         }
     };
     
-    // Register loop variables as locals
+    // Register loop variables as locals - but save state first
     let saved_locals = ctx.locals.clone();
+    let loop_base_register = iter_func_reg;
+    
     for (i, var_name) in variables.iter().enumerate() {
         if let Some(reg) = var_regs.get(i) {
             ctx.add_local(var_name, *reg);
@@ -1502,6 +1655,14 @@ fn compile_for_in_loop_with_parent(
     
     // Compile the loop body
     compile_block_with_parent(ctx, body, parent)?;
+    
+    // NOTE: In Lua 5.1, the loop variables in a generic for loop have a special
+    // lifetime - they are only valid for one iteration. However, CLOSE is not 
+    // needed here because:
+    // 1. The loop variables are overwritten on each iteration by TFORLOOP
+    // 2. Any closures created in the loop body that capture loop variables
+    //    will have already created upvalues during the iteration
+    // 3. These upvalues will be closed when the containing function returns
     
     // Jump back to the start of the loop for the next iteration
     let loop_offset = -(ctx.current_pc() as i32 - loop_start as i32 + 1);
@@ -1526,16 +1687,53 @@ fn compile_block(ctx: &mut CodeGenContext, block: &Block) -> LuaResult<()> {
     compile_block_with_parent(ctx, block, None)
 }
 
+/// Check if a block needs CLOSE instruction for upvalues
+/// 
+/// CLOSE is needed when:
+/// - Local variables go out of scope (end of do-block, before break/continue)
+/// - NOT needed before RETURN (RETURN handles it automatically)
+fn needs_close_for_block(ctx: &CodeGenContext, block_base_register: u8) -> bool {
+    // Check if any locals defined at or after block_base_register exist
+    ctx.locals.values().any(|&reg| reg >= block_base_register)
+}
+
+/// Emit CLOSE instruction if needed for a block
+fn emit_close_if_needed(ctx: &mut CodeGenContext, block_base_register: u8) {
+    if needs_close_for_block(ctx, block_base_register) {
+        ctx.emit(Instruction::create_ABC(OpCode::Close, block_base_register as u32, 0, 0));
+    }
+}
+
 /// Compile a block with parent context
 fn compile_block_with_parent(
     ctx: &mut CodeGenContext, 
     block: &Block,
     parent: Option<&CodeGenContext>
 ) -> LuaResult<()> {
-    // TODO: Implement proper scoping
+    // Save the current register state to detect new locals
+    let block_base_register = ctx.free_register;
+    let saved_locals = ctx.locals.clone();
+    
+    // Compile all statements in the block
     for statement in &block.statements {
         compile_statement_with_parent(ctx, statement, parent)?;
     }
+    
+    // Check if we need to close upvalues for locals going out of scope
+    // This is only needed if:
+    // 1. We're not at the end of a function (no return statement follows)
+    // 2. Local variables were defined in this block that might be captured
+    
+    // Only emit CLOSE if this is a true block scope (do-end) that defines locals
+    // The needs_close_for_block function will check if any locals need closing
+    if ctx.locals.len() > saved_locals.len() {
+        // New locals were defined in this block
+        emit_close_if_needed(ctx, block_base_register);
+    }
+    
+    // Restore locals to remove block-local variables from scope
+    ctx.locals = saved_locals;
+    
     Ok(())
 }
 
@@ -1594,15 +1792,21 @@ fn compile_function_expression_with_parent(
     // Emit CLOSURE instruction to create the function at runtime
     ctx.emit(Instruction::create_ABx(OpCode::Closure, target as u32, const_idx));
     
-    // Emit instructions to set up upvalues if any
-    let num_upvalues = ctx.current_function.prototypes[proto_idx].upvalues.len();
-    for i in 0..num_upvalues {
-        let upval = ctx.current_function.prototypes[proto_idx].upvalues[i];
+    // Emit pseudo-instructions to set up upvalues if any
+    // These instructions tell the VM how to initialize each upvalue
+    
+    // First, collect the upvalue information to avoid borrowing conflicts
+    let upvalues: Vec<CompilationUpvalue> = ctx.current_function.prototypes[proto_idx].upvalues.clone();
+    
+    // Now emit the pseudo-instructions
+    for upval in upvalues {
         if upval.in_stack {
-            // MOVE: upvalue refers to a local variable in the enclosing function
+            // MOVE pseudo-instruction: upvalue refers to a local variable in the enclosing function
+            // Format: MOVE 0 B 0 where B is the register in the parent function
             ctx.emit(Instruction::create_ABC(OpCode::Move, 0, upval.index as u32, 0));
         } else {
-            // GETUPVAL: upvalue refers to an upvalue in the enclosing function
+            // GETUPVAL pseudo-instruction: upvalue refers to an upvalue in the enclosing function
+            // Format: GETUPVAL 0 B 0 where B is the upvalue index in the parent
             ctx.emit(Instruction::create_ABC(OpCode::GetUpval, 0, upval.index as u32, 0));
         }
     }

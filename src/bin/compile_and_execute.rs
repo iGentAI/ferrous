@@ -8,7 +8,8 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
-use ferrous::lua::{compile, LuaVM, Value};
+use ferrous::lua::{compile, Value};
+use ferrous::lua::refcell_vm::RefCellVM;
 
 fn main() {
     // Parse command line arguments
@@ -52,7 +53,7 @@ fn main() {
     println!("Running script...");
     
     // Create VM and initialize standard library
-    let mut vm = match LuaVM::new() {
+    let mut vm = match RefCellVM::new() {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("Error creating VM: {}", e);

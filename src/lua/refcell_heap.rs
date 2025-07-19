@@ -693,6 +693,37 @@ impl RefCellHeap {
             )))
     }
     
+    /// Get an instruction from the current frame at a specific PC
+    pub fn get_instruction_from_current_frame(&self, thread: ThreadHandle, pc: usize) -> LuaResult<u32> {
+        let thread_ref = self.threads.try_borrow()
+            .map_err(|_| LuaError::BorrowError("Failed to borrow threads arena".to_string()))?;
+        
+        let thread_obj = thread_ref.get(thread.0)
+            .ok_or(LuaError::InvalidHandle)?;
+        
+        if thread_obj.call_frames.is_empty() {
+            return Err(LuaError::RuntimeError("No active call frame".to_string()));
+        }
+        
+        let frame = thread_obj.call_frames.last().unwrap();
+        
+        let closure_ref = self.closures.try_borrow()
+            .map_err(|_| LuaError::BorrowError("Failed to borrow closures arena".to_string()))?;
+        
+        let closure = closure_ref.get(frame.closure.0)
+            .ok_or(LuaError::InvalidHandle)?;
+        
+        if pc >= closure.proto.bytecode.len() {
+            return Err(LuaError::RuntimeError(format!(
+                "PC {} out of bounds (bytecode size: {})",
+                pc, 
+                closure.proto.bytecode.len()
+            )));
+        }
+        
+        Ok(closure.proto.bytecode[pc])
+    }
+    
     // Upvalue operations
     
     /// Create an upvalue
@@ -750,10 +781,17 @@ impl RefCellHeap {
         if let Some(stack_index) = upvalue_obj.stack_index {
             // Open upvalue - get from thread stack
             drop(upvalues); // Release borrow
-            self.get_thread_register(thread, stack_index)
+            eprintln!("DEBUG get_upvalue_value: Getting open upvalue {:?} from stack index {}", upvalue, stack_index);
+            let value = self.get_thread_register(thread, stack_index)?;
+            eprintln!("DEBUG get_upvalue_value: Stack index {} contains: {:?}", stack_index, value);
+            Ok(value)
         } else {
             // Closed upvalue - get stored value
-            Ok(upvalue_obj.value.clone().unwrap_or(Value::Nil))
+            let value = upvalue_obj.value.clone().unwrap_or(Value::Nil);
+            eprintln!("DEBUG get_upvalue_value: Getting closed upvalue {:?} with stored value {:?}", upvalue, value);
+            eprintln!("DEBUG get_upvalue_value: Upvalue object state - stack_index: {:?}, value: {:?}", 
+                     upvalue_obj.stack_index, upvalue_obj.value);
+            Ok(value)
         }
     }
     
@@ -772,37 +810,115 @@ impl RefCellHeap {
         
         if let Some(stack_index) = stack_index {
             // Open upvalue - set in thread stack
+            eprintln!("DEBUG set_upvalue_value: Setting open upvalue {:?} at stack index {} to {:?}", upvalue, stack_index, value);
             self.set_thread_register(thread, stack_index, value)
         } else {
             // Closed upvalue - set stored value
+            eprintln!("DEBUG set_upvalue_value: Setting closed upvalue {:?} to stored value {:?}", upvalue, value);
             let mut upvalues = self.upvalues.try_borrow_mut()
                 .map_err(|_| LuaError::BorrowError("Failed to borrow upvalues arena for writing".to_string()))?;
             
             let upvalue_obj = upvalues.get_mut(upvalue.0)
                 .ok_or(LuaError::InvalidHandle)?;
             
+            // Debug: Show state before and after
+            eprintln!("DEBUG set_upvalue_value: Before - upvalue state: stack_index={:?}, value={:?}", 
+                     upvalue_obj.stack_index, upvalue_obj.value);
+            
             upvalue_obj.value = Some(value.clone());
+            
+            eprintln!("DEBUG set_upvalue_value: After - upvalue state: stack_index={:?}, value={:?}", 
+                     upvalue_obj.stack_index, upvalue_obj.value);
+            
             Ok(())
         }
     }
     
+    /// Close any upvalues that point to a specific stack index
+    /// This is called by the CLOSE opcode to ensure upvalues capture the current value
+    /// before the register is potentially overwritten
+    pub fn close_upvalues_at_index(&self, thread: ThreadHandle, index: usize) -> LuaResult<()> {
+        eprintln!("DEBUG close_upvalues_at_index: Checking for upvalues at stack index {}", index);
+        
+        // Phase 1: Find upvalues pointing to this specific index
+        let to_close = {
+            let threads = self.threads.try_borrow()
+                .map_err(|_| LuaError::BorrowError("Failed to borrow threads arena".to_string()))?;
+            
+            let thread_obj = threads.get(thread.0)
+                .ok_or(LuaError::InvalidHandle)?;
+            
+            let mut to_close = Vec::new();
+            
+            for &upvalue_handle in &thread_obj.open_upvalues {
+                let upvalues = self.upvalues.try_borrow()
+                    .map_err(|_| LuaError::BorrowError("Failed to borrow upvalues arena".to_string()))?;
+                
+                if let Some(upvalue) = upvalues.get(upvalue_handle.0) {
+                    if let Some(stack_idx) = upvalue.stack_index {
+                        if stack_idx == index {
+                            // Get the value from stack
+                            drop(upvalues);
+                            let value = thread_obj.stack.get(index).cloned().unwrap_or(Value::Nil);
+                            eprintln!("DEBUG close_upvalues_at_index: Found upvalue {:?} at target index {} with value {:?}", upvalue_handle, index, value);
+                            to_close.push((upvalue_handle, value));
+                        }
+                    }
+                }
+            }
+            
+            to_close
+        };
+        
+        // Phase 2: Close the identified upvalues
+        for (upvalue_handle, value) in &to_close {
+            eprintln!("DEBUG close_upvalues_at_index: Closing upvalue {:?} at index {} with value {:?}", upvalue_handle, index, value);
+            self.close_upvalue(*upvalue_handle, value)?;
+        }
+        
+        // Phase 3: Update thread's open upvalues list
+        if !to_close.is_empty() {
+            let mut threads = self.threads.try_borrow_mut()
+                .map_err(|_| LuaError::BorrowError("Failed to borrow threads arena for writing".to_string()))?;
+            
+            let thread_obj = threads.get_mut(thread.0)
+                .ok_or(LuaError::InvalidHandle)?;
+            
+            // Remove closed upvalues from the list
+            thread_obj.open_upvalues.retain(|&handle| {
+                !to_close.iter().any(|(closed_handle, _)| closed_handle == &handle)
+            });
+        }
+        
+        Ok(())
+    }
+
     /// Close an upvalue
     pub fn close_upvalue(&self, upvalue: UpvalueHandle, value: &Value) -> LuaResult<()> {
+        eprintln!("Closing upvalue {:?} with value {:?}", upvalue, value);
         let mut upvalues = self.upvalues.try_borrow_mut()
             .map_err(|_| LuaError::BorrowError("Failed to borrow upvalues arena for writing".to_string()))?;
         
         let upvalue_obj = upvalues.get_mut(upvalue.0)
             .ok_or(LuaError::InvalidHandle)?;
         
+        let old_stack_index = upvalue_obj.stack_index;
         upvalue_obj.stack_index = None;
         upvalue_obj.value = Some(value.clone());
+        
+        if let Some(idx) = old_stack_index {
+            eprintln!("Upvalue {:?} closed from stack index {}", upvalue, idx);
+        }
+        
         Ok(())
     }
     
     /// Find or create an upvalue for a given stack index
     pub fn find_or_create_upvalue(&self, thread: ThreadHandle, stack_index: usize) -> LuaResult<UpvalueHandle> {
+        eprintln!("DEBUG find_or_create_upvalue: Looking for upvalue at stack index {}", stack_index);
+        
         // Phase 1: Check stack bounds and get open upvalues
-        let open_upvalues = {
+        let (open_upvalues, current_value) = {
             let threads = self.threads.try_borrow()
                 .map_err(|_| LuaError::BorrowError("Failed to borrow threads arena".to_string()))?;
             
@@ -816,7 +932,11 @@ impl RefCellHeap {
                 )));
             }
             
-            thread_obj.open_upvalues.clone()
+            let value = thread_obj.stack[stack_index].clone();
+            eprintln!("DEBUG find_or_create_upvalue: Value at stack index {}: {:?}", stack_index, value);
+            eprintln!("DEBUG find_or_create_upvalue: Thread has {} open upvalues", thread_obj.open_upvalues.len());
+            
+            (thread_obj.open_upvalues.clone(), value)
         };
         
         // Phase 2: Search for existing upvalue
@@ -826,7 +946,9 @@ impl RefCellHeap {
             
             if let Some(upvalue) = upvalues.get(upvalue_handle.0) {
                 if let Some(idx) = upvalue.stack_index {
+                    eprintln!("DEBUG find_or_create_upvalue: Checking upvalue {:?} at stack index {}", upvalue_handle, idx);
                     if idx == stack_index {
+                        eprintln!("DEBUG find_or_create_upvalue: Found existing upvalue {:?} for stack index {}", upvalue_handle, stack_index);
                         return Ok(upvalue_handle);
                     }
                 }
@@ -834,12 +956,14 @@ impl RefCellHeap {
         }
         
         // Phase 3: Create new upvalue
+        eprintln!("DEBUG find_or_create_upvalue: Creating new upvalue for stack index {} (value: {:?})", stack_index, current_value);
         let new_upvalue = Upvalue {
             stack_index: Some(stack_index),
             value: None,
         };
         
         let upvalue_handle = self.create_upvalue(new_upvalue)?;
+        eprintln!("DEBUG find_or_create_upvalue: Created new upvalue {:?} for stack index {}", upvalue_handle, stack_index);
         
         // Phase 4: Add to thread's open upvalues list
         let mut threads = self.threads.try_borrow_mut()
@@ -863,12 +987,15 @@ impl RefCellHeap {
             .unwrap_or(thread_obj.open_upvalues.len());
         
         thread_obj.open_upvalues.insert(insert_pos, upvalue_handle);
+        eprintln!("DEBUG find_or_create_upvalue: Added upvalue {:?} to open upvalues list at position {}", upvalue_handle, insert_pos);
         
         Ok(upvalue_handle)
     }
     
     /// Close all upvalues at or above the given stack index
     pub fn close_thread_upvalues(&self, thread: ThreadHandle, threshold: usize) -> LuaResult<()> {
+        eprintln!("close_thread_upvalues: Closing upvalues at or above stack index {}", threshold);
+        
         // Phase 1: Collect upvalues to close
         let (to_close, keep_open) = {
             let threads = self.threads.try_borrow()
@@ -876,6 +1003,8 @@ impl RefCellHeap {
             
             let thread_obj = threads.get(thread.0)
                 .ok_or(LuaError::InvalidHandle)?;
+            
+            eprintln!("Thread currently has {} open upvalues", thread_obj.open_upvalues.len());
             
             let mut to_close = Vec::new();
             let mut keep_open = Vec::new();
@@ -890,20 +1019,23 @@ impl RefCellHeap {
                             // Get the value from stack
                             drop(upvalues);
                             let value = thread_obj.stack.get(idx).cloned().unwrap_or(Value::Nil);
+                            eprintln!("Will close upvalue {:?} at stack index {} with value {:?}", upvalue_handle, idx, value);
                             to_close.push((upvalue_handle, value));
                         } else {
+                            eprintln!("Keeping upvalue {:?} at stack index {} (below threshold)", upvalue_handle, idx);
                             keep_open.push(upvalue_handle);
                         }
                     }
                 }
             }
             
+            eprintln!("Closing {} upvalues, keeping {} open", to_close.len(), keep_open.len());
             (to_close, keep_open)
         };
         
         // Phase 2: Close the upvalues
-        for (upvalue_handle, value) in to_close {
-            self.close_upvalue(upvalue_handle, &value)?;
+        for (upvalue_handle, value) in &to_close {
+            self.close_upvalue(*upvalue_handle, value)?;
         }
         
         // Phase 3: Update thread's open upvalues list
@@ -914,6 +1046,46 @@ impl RefCellHeap {
             .ok_or(LuaError::InvalidHandle)?;
         
         thread_obj.open_upvalues = keep_open;
+        eprintln!("Thread now has {} open upvalues", thread_obj.open_upvalues.len());
+        
+        Ok(())
+    }
+    
+    /// Debug method to dump upvalue state
+    pub fn debug_upvalue_state(&self, handle: UpvalueHandle) -> LuaResult<()> {
+        let upvalues = self.upvalues.try_borrow()
+            .map_err(|_| LuaError::BorrowError("Failed to borrow upvalues arena".to_string()))?;
+        
+        if let Some(upvalue) = upvalues.get(handle.0) {
+            eprintln!("DEBUG UPVALUE STATE for {:?}:", handle);
+            eprintln!("  - stack_index: {:?}", upvalue.stack_index);
+            eprintln!("  - value: {:?}", upvalue.value);
+            eprintln!("  - is_open: {}", upvalue.stack_index.is_some());
+        } else {
+            eprintln!("DEBUG UPVALUE STATE: Invalid handle {:?}", handle);
+        }
+        
+        Ok(())
+    }
+    
+    /// Verify upvalue persistence by reading it twice
+    pub fn verify_upvalue_persistence(&self, handle: UpvalueHandle, thread: ThreadHandle) -> LuaResult<()> {
+        eprintln!("DEBUG verify_upvalue_persistence: Checking handle {:?}", handle);
+        
+        // Read value twice to ensure it's consistent
+        let value1 = self.get_upvalue_value(handle, thread)?;
+        let value2 = self.get_upvalue_value(handle, thread)?;
+        
+        eprintln!("DEBUG verify_upvalue_persistence: First read: {:?}", value1);
+        eprintln!("DEBUG verify_upvalue_persistence: Second read: {:?}", value2);
+        
+        // Debug the internal state
+        self.debug_upvalue_state(handle)?;
+        
+        if !matches!((&value1, &value2), (Value::Number(a), Value::Number(b)) if a == b) &&
+           value1 != value2 {
+            eprintln!("WARNING: Upvalue values are inconsistent!");
+        }
         
         Ok(())
     }
@@ -1060,12 +1232,34 @@ impl RefCellHeap {
                 // __index is a table, access it directly
                 self.get_table_field(mm_table, key)
             },
-            Value::Closure(_) => {
+            Value::Closure(_) | Value::CFunction(_) => {
                 // __index is a function - would need to be called by VM
-                // For now, just return nil
+                // Return a special marker that the VM can recognize to trigger the call
+                // For now, just return nil as function calls need VM context
                 Ok(Value::Nil)
             },
             _ => Ok(Value::Nil),
+        }
+    }
+    
+    /// Check if a table has a specific metamethod
+    pub fn table_has_metamethod(&self, table: TableHandle, method_name: &str) -> LuaResult<bool> {
+        if let Some(metatable) = self.get_table_metatable(table)? {
+            let method_key = self.create_string(method_name)?;
+            let method = self.get_table_field(metatable, &Value::String(method_key))?;
+            Ok(!method.is_nil())
+        } else {
+            Ok(false)
+        }
+    }
+    
+    /// Get a metamethod from a table
+    pub fn get_table_metamethod(&self, table: TableHandle, method_name: &str) -> LuaResult<Value> {
+        if let Some(metatable) = self.get_table_metatable(table)? {
+            let method_key = self.create_string(method_name)?;
+            self.get_table_field(metatable, &Value::String(method_key))
+        } else {
+            Ok(Value::Nil)
         }
     }
     
