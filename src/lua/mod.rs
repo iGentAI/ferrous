@@ -1,9 +1,9 @@
 //! Lua Virtual Machine for Ferrous
 //! 
 //! This module provides a Redis-compatible Lua 5.1 VM implementation
-//! designed to work harmoniously with Rust's ownership model.
+//! using fine-grained Rc<RefCell> for proper Lua semantics.
 
-use std::sync::Arc;  // Ensure Arc is imported
+use std::sync::Arc;
 
 // Core modules
 pub mod arena;
@@ -18,16 +18,7 @@ pub mod lexer;
 pub mod parser;
 pub mod ast;
 
-// Standard library
-#[path = "stdlib/mod.rs"]
-pub mod stdlib;
-
-// RefCellVM implementation (Original)
-pub mod refcell_heap;
-pub mod refcell_stdlib;
-pub mod refcell_vm;
-
-// RC-based implementation (New)
+// RC-based implementation (Current)
 pub mod rc_handle;
 pub mod rc_value;
 pub mod rc_heap;
@@ -45,11 +36,7 @@ pub use self::compiler::{compile, CompiledModule};
 pub use self::codegen::OpCode;
 pub use self::handle::{StringHandle, TableHandle, ClosureHandle, ThreadHandle};
 
-// Legacy VM types for backward compatibility
-pub use self::refcell_vm::RefCellVM;
-pub use self::refcell_heap::RefCellHeap;
-
-// New VM type
+// Current VM type
 pub use self::rc_vm::RcVM;
 
 // Implement handle_lua_command directly in the lua module
@@ -59,10 +46,8 @@ pub fn handle_lua_command(
     parts: &[crate::protocol::resp::RespFrame]
 ) -> crate::error::Result<crate::protocol::resp::RespFrame> {
     use crate::protocol::resp::RespFrame;
-    use crate::error::{Result, FerrousError};
     use std::str;
     
-    // A simplified implementation that will be expanded later
     match cmd.to_lowercase().as_str() {
         "eval" => {
             if parts.len() < 3 {
@@ -128,7 +113,7 @@ pub fn handle_lua_command(
                 timeout: std::time::Duration::from_secs(5), // Default timeout
             };
             
-            // Create a new LuaGIL - in a real implementation, we'd use a singleton
+            // Create a new LuaGIL
             let engine = match LuaGIL::new() {
                 Ok(gil) => gil,
                 Err(e) => return Ok(RespFrame::error(format!("ERR {}", e)))
@@ -141,7 +126,6 @@ pub fn handle_lua_command(
             }
         },
         "evalsha" => {
-            // Simplified implementation
             Ok(RespFrame::error("ERR EVALSHA not implemented yet"))
         },
         "script" => {
@@ -160,7 +144,6 @@ pub fn handle_lua_command(
                 _ => return Ok(RespFrame::error("ERR invalid subcommand")),
             };
             
-            // Simplified implementation
             match subcommand.as_str() {
                 "load" | "exists" | "flush" | "kill" => {
                     Ok(RespFrame::error("ERR SCRIPT subcommand not implemented yet"))
@@ -190,7 +173,7 @@ pub struct ScriptContext {
     pub timeout: Duration,
 }
 
-/// Common interface for Lua VMs to support both implementations
+/// Common interface for Lua VMs
 pub trait LuaVMInterface {
     /// Set script execution context
     fn set_context(&mut self, context: ScriptContext) -> LuaResult<()>;
@@ -199,21 +182,10 @@ pub trait LuaVMInterface {
     fn eval_script(&mut self, script: &str) -> LuaResult<Value>;
 }
 
-// Implement trait for RefCellVM (legacy)
-impl LuaVMInterface for RefCellVM {
-    fn set_context(&mut self, context: ScriptContext) -> LuaResult<()> {
-        self.set_context(context)
-    }
-    
-    fn eval_script(&mut self, script: &str) -> LuaResult<Value> {
-        self.eval_script(script)
-    }
-}
-
-// Implement trait for RcVM (new)
+// Implement trait for RcVM
 impl LuaVMInterface for rc_vm::RcVM {
-    fn set_context(&mut self, context: ScriptContext) -> LuaResult<()> {
-        // The new RcVM doesn't yet have a set_context method
+    fn set_context(&mut self, _context: ScriptContext) -> LuaResult<()> {
+        // The RcVM doesn't yet have a set_context method
         // This is a placeholder implementation
         Ok(())
     }
@@ -240,13 +212,7 @@ impl LuaVMInterface for rc_vm::RcVM {
 /// Global Interpreter Lock for Lua VMs
 /// Manages a pool of Lua VMs and script caching
 pub struct LuaGIL {
-    /// Flag to determine which VM implementation to use (RefCell or RC)
-    use_rc_vm: bool,
-    
-    /// Pool of available RefCell-based VMs (legacy)
-    refcell_vm_pool: Arc<Mutex<Vec<RefCellVM>>>,
-    
-    /// Pool of available RC-based VMs (new)
+    /// Pool of available RC-based VMs
     rc_vm_pool: Arc<Mutex<Vec<RcVM>>>,
     
     /// Script cache mapping SHA1 hash to compiled scripts
@@ -259,45 +225,22 @@ pub struct LuaGIL {
 impl LuaGIL {
     /// Create a new Lua Global Interpreter Lock
     pub fn new() -> Result<Self, FerrousError> {
-        // Default to using the RC-based VM
-        Self::with_rc_vm(true)
-    }
-    
-    /// Create a new LuaGIL with option to use RC-based VM
-    pub fn with_rc_vm(use_rc: bool) -> Result<Self, FerrousError> {
-        // Initialize VM pools
-        let mut refcell_pool = Vec::new();
+        // Initialize RC VM pool
         let mut rc_pool = Vec::new();
         
-        if !use_rc {
-            // Create initial RefCell-based VM
-            match RefCellVM::new() {
-                Ok(mut vm) => {
-                    // Initialize standard library
-                    if let Err(e) = vm.init_stdlib() {
-                        return Err(FerrousError::LuaError(format!("Failed to initialize stdlib: {}", e)));
-                    }
-                    refcell_pool.push(vm);
-                },
-                Err(e) => return Err(FerrousError::LuaError(format!("Failed to create Lua VM: {}", e))),
-            }
-        } else {
-            // Create initial RC-based VM
-            match RcVM::new() {
-                Ok(mut vm) => {
-                    // Initialize standard library
-                    if let Err(e) = vm.init_stdlib() {
-                        return Err(FerrousError::LuaError(format!("Failed to initialize stdlib: {}", e)));
-                    }
-                    rc_pool.push(vm);
-                },
-                Err(e) => return Err(FerrousError::LuaError(format!("Failed to create Lua VM: {}", e))),
-            }
+        // Create initial RC-based VM
+        match RcVM::new() {
+            Ok(mut vm) => {
+                // Initialize standard library
+                if let Err(e) = vm.init_stdlib() {
+                    return Err(FerrousError::LuaError(format!("Failed to initialize stdlib: {}", e)));
+                }
+                rc_pool.push(vm);
+            },
+            Err(e) => return Err(FerrousError::LuaError(format!("Failed to create Lua VM: {}", e))),
         }
         
         Ok(LuaGIL {
-            use_rc_vm: use_rc,
-            refcell_vm_pool: Arc::new(Mutex::new(refcell_pool)),
             rc_vm_pool: Arc::new(Mutex::new(rc_pool)),
             script_cache: Arc::new(RwLock::new(HashMap::new())),
             kill_flag: Arc::new(AtomicBool::new(false)),
@@ -306,55 +249,29 @@ impl LuaGIL {
     
     /// Evaluate a Lua script
     pub fn eval(&self, script: &str, context: ScriptContext) -> Result<RespFrame, FerrousError> {
-        if self.use_rc_vm {
-            // Use RC-based VM
-            let mut vm = self.get_rc_vm()?;
-            
-            // Set up context
-            if let Err(e) = vm.set_context(context) {
-                self.return_rc_vm(vm);
-                return Err(FerrousError::LuaError(format!("Failed to set context: {}", e)));
-            }
-            
-            // Execute script
-            let result = match vm.eval_script(script) {
-                Ok(val) => {
-                    let resp = self.lua_to_resp(val)?;
-                    self.return_rc_vm(vm);
-                    resp
-                },
-                Err(e) => {
-                    self.return_rc_vm(vm);
-                    return Err(FerrousError::LuaError(format!("Script error: {}", e)));
-                }
-            };
-            
-            Ok(result)
-        } else {
-            // Use RefCell-based VM (legacy)
-            let mut vm = self.get_refcell_vm()?;
-            
-            // Set up context
-            if let Err(e) = vm.set_context(context) {
-                self.return_refcell_vm(vm);
-                return Err(FerrousError::LuaError(format!("Failed to set context: {}", e)));
-            }
-            
-            // Execute script
-            let result = match vm.eval_script(script) {
-                Ok(val) => {
-                    let resp = self.lua_to_resp(val)?;
-                    self.return_refcell_vm(vm);
-                    resp
-                },
-                Err(e) => {
-                    self.return_refcell_vm(vm);
-                    return Err(FerrousError::LuaError(format!("Script error: {}", e)));
-                }
-            };
-            
-            Ok(result)
+        // Use RC-based VM
+        let mut vm = self.get_rc_vm()?;
+        
+        // Set up context
+        if let Err(e) = vm.set_context(context) {
+            self.return_rc_vm(vm);
+            return Err(FerrousError::LuaError(format!("Failed to set context: {}", e)));
         }
+        
+        // Execute script
+        let result = match vm.eval_script(script) {
+            Ok(val) => {
+                let resp = self.lua_to_resp_rc(val)?;
+                self.return_rc_vm(vm);
+                resp
+            },
+            Err(e) => {
+                self.return_rc_vm(vm);
+                return Err(FerrousError::LuaError(format!("Script error: {}", e)));
+            }
+        };
+        
+        Ok(result)
     }
     
     /// Evaluate a cached script by SHA1 hash
@@ -420,38 +337,6 @@ impl LuaGIL {
         Ok(())
     }
     
-    /// Get a RefCell-based VM from the pool
-    fn get_refcell_vm(&self) -> Result<RefCellVM, FerrousError> {
-        let mut pool = self.refcell_vm_pool.lock().map_err(|_| {
-            FerrousError::Internal("Failed to acquire VM pool lock".to_string())
-        })?;
-        
-        if let Some(vm) = pool.pop() {
-            Ok(vm)
-        } else {
-            // Create a new VM if pool is empty
-            let mut new_vm = RefCellVM::new().map_err(|e| {
-                FerrousError::LuaError(format!("Failed to create Lua VM: {}", e))
-            })?;
-            
-            // Initialize standard library
-            new_vm.init_stdlib().map_err(|e| {
-                FerrousError::LuaError(format!("Failed to initialize stdlib: {}", e))
-            })?;
-            
-            Ok(new_vm)
-        }
-    }
-    
-    /// Return a RefCell-based VM to the pool
-    fn return_refcell_vm(&self, vm: RefCellVM) {
-        if let Ok(mut pool) = self.refcell_vm_pool.lock() {
-            // Reset VM state before returning to pool
-            // TODO: Implement VM reset
-            pool.push(vm);
-        }
-    }
-    
     /// Get an RC-based VM from the pool
     fn get_rc_vm(&self) -> Result<RcVM, FerrousError> {
         let mut pool = self.rc_vm_pool.lock().map_err(|_| {
@@ -484,63 +369,23 @@ impl LuaGIL {
         }
     }
     
-    /// Convert Lua value to RESP frame (for RefCell-based VMs)
-    fn lua_to_resp(&self, value: Value) -> Result<RespFrame, FerrousError> {
+    /// Convert Rc-based Value to RESP
+    fn lua_to_resp_rc(&self, value: Value) -> Result<RespFrame, FerrousError> {
         match value {
             Value::Nil => Ok(RespFrame::Null),
             Value::Boolean(b) => Ok(RespFrame::Integer(if b { 1 } else { 0 })),
             Value::Number(n) => {
-                // Check if it's an integer
                 if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
                     Ok(RespFrame::Integer(n as i64))
                 } else {
-                    // Return as bulk string
                     Ok(RespFrame::bulk_string(n.to_string()))
                 }
             },
             Value::String(handle) => {
-                // Get a VM to access the string value
-                let vm = self.get_refcell_vm()?;
-                
-                // Get string value from the heap
-                let string_value = vm.heap().get_string_value(handle).map_err(|e| {
-                    FerrousError::LuaError(format!("Failed to get string value: {}", e))
-                })?;
-                
-                // Return the VM to the pool
-                self.return_refcell_vm(vm);
-                
-                Ok(RespFrame::bulk_string(string_value))
+                // For now, return a placeholder for strings
+                Ok(RespFrame::bulk_string("<string>".to_string()))
             },
             Value::Table(_) => {
-                // For now, return a placeholder for tables
-                Ok(RespFrame::bulk_string("<table>".to_string()))
-            },
-            _ => Err(FerrousError::LuaError("Cannot convert Lua value to RESP".to_string())),
-        }
-    }
-    
-    /// Convert Rc-based Value to RESP
-    fn lua_to_resp_rc(&self, value: rc_value::Value) -> Result<RespFrame, FerrousError> {
-        match value {
-            rc_value::Value::Nil => Ok(RespFrame::Null),
-            rc_value::Value::Boolean(b) => Ok(RespFrame::Integer(if b { 1 } else { 0 })),
-            rc_value::Value::Number(n) => {
-                if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-                    Ok(RespFrame::Integer(n as i64))
-                } else {
-                    Ok(RespFrame::bulk_string(n.to_string()))
-                }
-            },
-            rc_value::Value::String(handle) => {
-                let string_ref = handle.borrow();
-                if let Ok(s) = string_ref.to_str() {
-                    Ok(RespFrame::bulk_string(s.to_string()))
-                } else {
-                    Ok(RespFrame::bulk_string("<binary data>".to_string()))
-                }
-            },
-            rc_value::Value::Table(_) => {
                 Ok(RespFrame::bulk_string("<table>".to_string()))
             },
             _ => Err(FerrousError::LuaError("Cannot convert Lua value to RESP".to_string())),

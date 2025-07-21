@@ -103,7 +103,7 @@ pub enum LuaError {
     NotImplemented(String),
     InternalError(String),
     
-    // RefCell borrow error (for RefCellHeap)
+    // RefCell borrow error (for RC RefCell heap)
     BorrowError(String),
     
     // Script execution control

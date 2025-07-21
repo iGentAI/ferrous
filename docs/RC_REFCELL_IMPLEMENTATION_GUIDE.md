@@ -6,10 +6,10 @@ This guide outlines a detailed implementation strategy for migrating the Ferrous
 
 ## 1. Current Architecture Issues
 
-The current RefCellVM implementation uses a global-level RefCell wrapper around the entire heap:
+The current RC RefCell VM implementation uses a global-level RefCell wrapper around the entire heap:
 
 ```rust
-pub struct RefCellHeap {
+pub struct RC RefCell heap {
     // Arena for string storage
     strings: RefCell<Arena<LuaString>>,
     
@@ -140,7 +140,7 @@ impl Closure {
 The heap becomes a registry of interned values and objects:
 
 ```rust
-pub struct RcRefCellHeap {
+pub struct RcRC RefCell heap {
     // String interning cache 
     string_cache: RefCell<HashMap<Vec<u8>, StringHandle>>,
     
@@ -159,7 +159,7 @@ pub struct RcRefCellHeap {
 ### 3.4 Update Value Creation Functions
 
 ```rust
-impl RcRefCellHeap {
+impl RcRC RefCell heap {
     // Create a string with interning
     pub fn create_string(&self, s: &str) -> LuaResult<StringHandle> {
         // Check cache
@@ -589,6 +589,6 @@ Once the Rc<RefCell> migration is complete, these additional features become eas
 
 ## Conclusion
 
-The migration to Rc<RefCell> resolves fundamental issues in the current RefCellVM implementation, particularly around closures and upvalues. While it requires significant code changes, it provides a more robust and Lua-semantics-compatible architecture that will resolve all current runtime panics and borrow checker issues.
+The migration to Rc<RefCell> resolves fundamental issues in the current RC RefCell VM implementation, particularly around closures and upvalues. While it requires significant code changes, it provides a more robust and Lua-semantics-compatible architecture that will resolve all current runtime panics and borrow checker issues.
 
 The key to success is a methodical, phased approach with comprehensive testing at each stage. Once complete, this architecture will provide a solid foundation for implementing the remaining Lua features and passing all tests.
