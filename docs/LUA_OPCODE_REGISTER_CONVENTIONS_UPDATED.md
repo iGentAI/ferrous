@@ -1,4 +1,4 @@
-# Lua 5.1 Opcode Register Conventions
+# Lua 5.1 Opcode Register Conventions (Updated)
 
 ## Table of Contents
 
@@ -21,7 +21,8 @@
    - [Advanced Operations](#advanced-operations)
 5. [Metamethod Support](#metamethod-support)
 6. [Transaction-Based Implementation](#transaction-based-implementation)
-7. [Register Window History](#register-window-history)
+7. [Rc<RefCell> Migration Strategy](#rcrefcell-migration-strategy)
+8. [Register Window History](#register-window-history)
 
 ## Introduction
 
@@ -294,8 +295,6 @@ R(A+1) := R(B)
 R(A) := R(B)[RK(C)]
 ```
 
-**Special Notes**: Sets up standard method call layout
-
 ---
 
 ### Arithmetic Operations
@@ -317,10 +316,10 @@ All arithmetic operations follow the same pattern:
 - **MOD (16)**: `R(A) := RK(B) % RK(C)`
 - **POW (17)**: `R(A) := RK(B) ^ RK(C)`
 
-**Metamethod Support**: Triggers __add, __sub, __mul, __div, __mod, __pow respectively if operands are not numbers
+**Metamethod Support**: Triggers __add, __sub, __mul, __div, __mod, __pow if operands are not numbers
 
 **Error Handling**:
-- Type errors if operands not numbers and no metamethod
+- Type errors if operands not numbers and no metamethods
 - Division by zero for DIV and MOD
 
 ---
@@ -373,7 +372,7 @@ All arithmetic operations follow the same pattern:
 
 **Type Behavior**:
 - String: byte length
-- Table: array part length (highest integer key)
+- Table: array part length (highest integer key) or __len metamethod
 
 **Metamethod Support**: Triggers __len for tables
 
@@ -395,7 +394,7 @@ All arithmetic operations follow the same pattern:
 **Special Behavior**:
 - Concatenates all values from R(B) to R(C) inclusive
 - Numbers are converted to strings
-- Other types trigger __concat metamethod or cause type error
+- Other types cause type error or trigger __concat metamethod
 - Creates new string in heap
 
 ---
@@ -432,7 +431,7 @@ All arithmetic operations follow the same pattern:
 - **LT (24)**: `if ((RK(B) < RK(C)) ~= A) then pc++`
 - **LE (25)**: `if ((RK(B) <= RK(C)) ~= A) then pc++`
 
-**Metamethod Support**: Triggers __eq, __lt, __le respectively if operands are not numbers/strings
+**Metamethod Support**: Triggers __eq, __lt, __le if operands are not numbers/strings
 
 **Usage Pattern**:
 ```lua
@@ -499,10 +498,8 @@ R(A+2): <arg2>        ...
 ...                   R(A+C-2): <resultN>
 ```
 
-**Metamethod Support**: May trigger __call if R(A) is not a function
-
 **Transaction Requirements**:
-1. Validate function type
+1. Validate function type (may trigger __call metamethod)
 2. Queue appropriate operation (Lua/C function)
 3. Set up new call frame for Lua functions
 
@@ -539,7 +536,7 @@ return R(A), ... ,R(A+B-2)
 ```
 
 **Frame Cleanup**:
-- **CRITICAL**: Must close all open upvalues >= base before popping frame
+- Close all open upvalues >= base before popping frame
 - Pops current call frame
 - Places results at calling function's position
 - Restores previous frame's PC
@@ -556,13 +553,13 @@ return R(A), ... ,R(A+B-2)
 - **R(A)**: Internal loop index (input/output)
 - **R(A+1)**: Limit value (input)
 - **R(A+2)**: Step value (input)
-- **R(A+3)**: User variable (NOT modified by FORPREP)
-- **sBx**: Jump offset to FORLOOP instruction
+- **R(A+3)**: User variable (not modified by FORPREP)
+- **sBx**: Jump offset to loop end
 
 **Operation**:
 ```
-R(A) -= R(A+2);  -- subtract step from initial value
-pc += sBx;       -- ALWAYS jump to FORLOOP
+R(A) -= R(A+2);  -- prepare index
+pc += sBx;       -- always jump to FORLOOP
 ```
 
 **Register Layout**:
@@ -570,15 +567,15 @@ pc += sBx;       -- ALWAYS jump to FORLOOP
 R(A):   internal index (modified by VM)
 R(A+1): limit (constant during loop)
 R(A+2): step (constant during loop) 
-R(A+3): user variable (set by FORLOOP only)
+R(A+3): user variable (set by FORLOOP, not FORPREP)
 ```
 
-**Critical Implementation Notes**: 
-- FORPREP **always** jumps to FORLOOP - there is no conditional
-- FORPREP **never** modifies R(A+3)
-- The jump target (pc + sBx) points to the FORLOOP instruction
+**Critical Implementation Note**: 
+- FORPREP always jumps to FORLOOP (sBx points over loop body)
+- FORPREP never modifies R(A+3). Only FORLOOP should update the user-visible variable.
+- The official Lua 5.1 implementation always performs the jump
 
-**Compiler Requirements**: These 4 registers must be allocated consecutively
+**Compiler Requirements**: These 4 registers must be allocated consecutively before any expression compilation, and the compiler must ensure they are not corrupted by operations in the loop body.
 
 ---
 
@@ -595,17 +592,17 @@ R(A+3): user variable (set by FORLOOP only)
 
 **Operation**:
 ```
-R(A) += R(A+2);  -- increment internal counter by step
+R(A) += R(A+2);  -- increment internal counter
 if (step > 0 ? R(A) <= R(A+1) : R(A) >= R(A+1)) then
     R(A+3) := R(A);  -- update user-visible variable
-    pc += sBx;       -- jump back (sBx is negative)
+    pc += sBx;       -- jump back to start (sBx is negative)
 end
 ```
 
-**Critical Implementation Notes**: 
-- Must handle both positive and negative steps correctly
-- Only updates R(A+3) when continuing the loop
-- sBx is negative (jumps backwards)
+**Critical Implementation Note**: 
+- FORLOOP handles both positive and negative steps
+- FORLOOP only updates the user variable R(A+3) when the loop continues
+- This is the only opcode that should write to R(A+3) in a numeric for loop
 
 ---
 
@@ -622,20 +619,22 @@ end
 
 **Operation**:
 ```
-R(A+3), ..., R(A+2+C) := R(A)(R(A+1), R(A+2));  -- Call iterator
-if R(A+3) ~= nil then  -- First result determines continuation
-    R(A+2) := R(A+3);  -- Update control variable
+R(A+3), ..., R(A+2+C) := R(A)(R(A+1), R(A+2));  -- Call iterator with state and control
+if R(A+3) ~= nil then  -- First result determines if iteration continues
+    R(A+2) := R(A+3);  -- Update control variable to first result for next iteration
 else
-    pc++;  -- Skip next instruction (the JMP back)
+    pc++;  -- Skip next instruction (the JMP back to loop start)
 end
 ```
 
 **Iterator Protocol**: 
-- Iterator takes (state, control) as arguments
-- Returns nil to signal end of iteration
-- First return value becomes new control variable
+The Lua 5.1 iterator protocol works as follows:
+1. Iterator function takes two args: state and control variable
+2. Iterator returns nil when iteration is complete
+3. First return value becomes the new control variable for next iteration
+4. For pairs/ipairs, this means (key, value) where key becomes the control
 
-**Compiler-VM Coordination**: Registers must be allocated consecutively
+**Compiler-VM Coordination**: The compiler must ensure the registers for iterator function, state, control variable, and loop variables are allocated consecutively and preserved throughout the loop body.
 
 ---
 
@@ -654,7 +653,7 @@ end
 **Upvalue Capture**:
 - Following instructions specify upvalue sources
 - Uses MOVE or GETUPVAL pseudo-instructions
-- Creates shared upvalue objects between closures
+- Creates upvalue objects as needed (shared between closures)
 
 ---
 
@@ -676,13 +675,11 @@ end
 **Purpose**: Write upvalue
 
 **Register Usage**:
-- **A**: Upvalue index in current closure (NOT a register)
+- **A**: Upvalue index in current closure
 - **R(B)**: Source register (input)
 - **C**: Unused
 
 **Operation**: `UpValue[A] := R(B)`
-
-**Note**: A is an upvalue index, not a register index
 
 ---
 
@@ -700,7 +697,6 @@ end
 **Use Cases**:
 - Before leaving scope with local variables
 - Before RETURN when locals might be captured
-- Critical for proper upvalue semantics
 
 ---
 
@@ -718,7 +714,7 @@ end
 **Operation**: 
 ```
 for i = 1, B do
-    R(A)[C*FPF + i] := R(A+i)  -- FPF = 50 (Fields Per Flush)
+    R(A)[C*FPF + i] := R(A+i)  -- Where FPF (Fields Per Flush) = 50 in Lua 5.1
 end
 ```
 
@@ -726,7 +722,7 @@ end
 - If **B = 0**, use all values up to stack top
 - If **C = 0**, next instruction contains the real C value (>255)
 
-**Implementation Note**: FPF (Fields Per Flush) = 50 in Lua 5.1
+**Implementation Note**: This opcode efficiently implements array initialization for tables. The FPF constant (50) is defined in the Lua 5.1 source as `LFIELDS_PER_FLUSH`.
 
 ---
 
@@ -745,7 +741,7 @@ end
 
 ## Metamethod Support
 
-Lua 5.1 operations support metamethods for user-defined behavior:
+Many Lua 5.1 operations support metamethods to allow user-defined behavior for custom types:
 
 ### Arithmetic Metamethods
 - **__add**: Addition (ADD opcode)
@@ -771,7 +767,7 @@ Lua 5.1 operations support metamethods for user-defined behavior:
 - **__call**: Function call on non-function values (CALL opcode)
 - **__tostring**: String conversion (used by tostring function)
 
-Metamethods are queued as operations in non-recursive execution model.
+Metamethods are queued as operations to maintain non-recursive execution.
 
 ## Transaction-Based Implementation
 
@@ -847,6 +843,88 @@ impl<'a> HeapTransaction<'a> {
 3. **Clone on Read**: Always clone values when reading
 4. **Queue Complex Operations**: Don't execute recursively
 5. **Validate All Handles**: Check handle validity before use
+
+## Rc<RefCell> Migration Strategy
+
+### Current Issues with RefCellVM
+
+The current RefCellVM implementation uses a global RefCell for the entire heap, causing runtime panics when:
+- Multiple borrows overlap (e.g., reading while holding a mutable borrow)
+- Shared mutable state (upvalues) is accessed from multiple closures
+- Complex operations need interleaved access patterns
+
+### Migration to Per-Object Rc<RefCell>
+
+To resolve these issues, migrate to fine-grained Rc<RefCell> for individual objects:
+
+#### 1. Refactor Type Definitions
+
+```rust
+// Upvalues become independently borrowable
+type UpvalueHandle = Rc<RefCell<UpvalueState>>;
+enum UpvalueState {
+    Open { stack_index: usize },
+    Closed { value: Value },
+}
+
+// Tables become independently borrowable
+type TableHandle = Rc<RefCell<TableInner>>;
+struct TableInner {
+    array: Vec<Value>,
+    hash: HashMap<HashableValue, Value>,
+    metatable: Option<TableHandle>,
+}
+
+// Threads become independently borrowable
+type ThreadHandle = Rc<RefCell<LuaThread>>;
+struct LuaThread {
+    stack: Vec<Value>,
+    frames: Vec<CallFrame>,
+    open_upvalues: Vec<UpvalueHandle>,
+}
+
+// Closures contain shared upvalue references
+struct Closure {
+    proto: FunctionProtoHandle,
+    upvalues: Vec<UpvalueHandle>, // Rc allows sharing
+}
+```
+
+#### 2. Update Access Patterns
+
+```rust
+// Instead of global borrow
+let closure = self.heap.get_closure(handle)?; // borrows entire heap
+
+// Use local borrow
+let closure_rc = self.closures.get(handle).clone();
+let closure = closure_rc.borrow(); // only borrows this closure
+
+// For upvalue access
+let upvalue_rc = closure.upvalues[idx].clone();
+let upvalue = upvalue_rc.borrow();
+match &*upvalue {
+    UpvalueState::Open { stack_index } => {
+        let thread = self.current_thread.borrow();
+        thread.stack[*stack_index].clone()
+    }
+    UpvalueState::Closed { value } => value.clone(),
+}
+```
+
+#### 3. Benefits
+
+- **No Global Lock**: Each object borrows independently
+- **Safe Upvalue Sharing**: Multiple closures can share upvalues via Rc
+- **Reduced Conflicts**: Operations can borrow different objects simultaneously
+- **Clear Ownership**: Rc makes sharing explicit
+
+#### 4. Implementation Priority
+
+1. **Upvalues First**: Most critical for closure functionality
+2. **Tables Next**: Enable independent table operations
+3. **Threads**: Allow concurrent access to different threads
+4. **Retain Queuing**: Keep non-recursive execution model
 
 ## Register Window History
 

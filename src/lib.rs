@@ -24,8 +24,8 @@ pub use config::Config;
 pub use lua::LuaGIL;
 
 // Re-export VM types from the lua module
-pub use lua::LuaVM;
-pub use lua::LuaHeap;
+pub use lua::RefCellVM as LuaVM;
+pub use lua::refcell_heap::RefCellHeap as LuaHeap;
 pub use lua::Value;
 pub use lua::compile;
 pub use lua::handle::TableHandle;
