@@ -9,7 +9,7 @@ use std::convert::TryFrom;
 
 use super::error::{LuaError, LuaResult};
 use super::rc_value::{
-    Value, Table, StringHandle, TableHandle,
+    Value, Table, StringHandle, TableHandle, UpvalueState, ClosureHandle,
 };
 use super::rc_vm::{ExecutionContext, RcVM};
 
@@ -57,6 +57,10 @@ fn init_base_lib(vm: &mut RcVM, globals: &TableHandle) -> LuaResult<()> {
         ("next", base_next as super::rc_value::CFunction),
         ("pairs", base_pairs as super::rc_value::CFunction),
         ("ipairs", base_ipairs as super::rc_value::CFunction),
+        ("pcall", base_pcall as super::rc_value::CFunction),
+        ("xpcall", base_xpcall as super::rc_value::CFunction),
+        ("getfenv", base_getfenv as super::rc_value::CFunction),
+        ("setfenv", base_setfenv as super::rc_value::CFunction),
     ];
     
     for (name, func) in functions.iter() {
@@ -126,28 +130,14 @@ fn init_table_lib(vm: &mut RcVM, globals: &TableHandle) -> LuaResult<()> {
 /// Prints the given values to stdout.
 fn base_print(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     let nargs = ctx.arg_count();
-    
+    let mut output_parts = Vec::with_capacity(nargs);
+
     for i in 0..nargs {
-        if i > 0 {
-            print!("\t");
-        }
         let value = ctx.get_arg(i)?;
-        
-        match &value {
-            Value::String(handle) => {
-                let string_handle = handle.borrow();
-                if let Ok(s) = string_handle.to_str() {
-                    print!("{}", s);
-                } else {
-                    print!("(binary data)");
-                }
-            },
-            _ => {
-                print!("{}", value);
-            }
-        }
+        output_parts.push(format!("{}", value));
     }
-    println!();
+
+    println!("{}", output_parts.join("\t"));
     
     Ok(0) // No return values
 }
@@ -209,7 +199,7 @@ fn base_tostring(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
                     
                     // Call the metamethod
                     // This would normally be handled by the VM
-                    let s = format!("<table: {:p}>", Rc::as_ptr(table));
+                    let s = format!("table: {:p}", Rc::as_ptr(table));
                     let string_handle = ctx.create_string(&s)?;
                     ctx.push_result(Value::String(string_handle))?;
                     return Ok(1);
@@ -217,7 +207,7 @@ fn base_tostring(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
             }
             
             // No metamethod, use default representation
-            let s = format!("<table: {:p}>", Rc::as_ptr(table));
+            let s = format!("table: {:p}", Rc::as_ptr(table));
             let string_handle = ctx.create_string(&s)?;
             ctx.push_result(Value::String(string_handle))?;
         },
@@ -488,7 +478,7 @@ fn base_rawset(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     
     // Set the raw value
     let mut table_mut = table.borrow_mut();
-    table_mut.set_field(key, value)?;
+    table_mut.set_field(key.clone(), value.clone())?;
     
     // Return the table
     ctx.push_result(Value::Table(Rc::clone(table)))?;
@@ -522,49 +512,61 @@ fn base_select(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     if ctx.arg_count() < 1 {
         return Err(LuaError::RuntimeError("select expects at least 1 argument".to_string()));
     }
-    
+
     let index_arg = ctx.get_arg(0)?;
-    
+
     match index_arg {
         Value::String(handle) => {
             let string_ref = handle.borrow();
             if let Ok(s) = string_ref.to_str() {
                 if s == "#" {
-                    // Return argument count
+                    // Return argument count (excluding the index arg itself)
                     ctx.push_result(Value::Number((ctx.arg_count() - 1) as f64))?;
                     return Ok(1);
                 }
             }
-            
-            return Err(LuaError::RuntimeError("invalid argument to select".to_string()));
+            Err(LuaError::RuntimeError("bad argument #1 to 'select' (string '#' expected)".to_string()))
         },
         Value::Number(n) => {
-            let index = if n.fract() == 0.0 && n > 0.0 {
-                n as usize
-            } else {
-                return Err(LuaError::RuntimeError("index must be a positive integer".to_string()));
-            };
-            
-            // Return all arguments from index onward
-            let start_idx = index;
-            let count = ctx.arg_count();
-            
-            if start_idx > count {
-                // No values to return
+            if n.fract() != 0.0 {
+                return Err(LuaError::RuntimeError("bad argument #1 to 'select' (number has no integer representation)".to_string()));
+            }
+            let index = n as i64;
+            let n_varargs = (ctx.arg_count() - 1) as i64;
+
+            let start_idx;
+            if index > 0 {
+                start_idx = index;
+            } else if index < 0 {
+                // Negative index is relative to the end of the varargs.
+                // e.g. -1 is the last vararg.
+                start_idx = n_varargs + index + 1;
+            } else { // index == 0
+                return Err(LuaError::RuntimeError("bad argument #1 to 'select' (index out of range)".to_string()));
+            }
+
+            if start_idx < 1 || start_idx > n_varargs {
+                // Index is out of bounds, return no values.
                 return Ok(0);
             }
             
-            for i in start_idx..count {
-                ctx.push_result(ctx.get_arg(i)?)?;
+            // The first vararg is at C-function argument index 1.
+            // A Lua vararg index `k` corresponds to C-function argument index `k`.
+            let num_to_return = n_varargs - start_idx + 1;
+            
+            for i in 0..num_to_return {
+                // get_arg is 0-based. The vararg we want, which is the `start_idx`-th
+                // vararg, is at C-function argument index `start_idx`.
+                ctx.push_result(ctx.get_arg((start_idx + i) as usize)?)?;
             }
             
-            return Ok((count - start_idx) as i32);
+            Ok(i32::try_from(num_to_return).unwrap_or(i32::MAX))
         },
         _ => {
-            return Err(LuaError::TypeError {
+            Err(LuaError::TypeError {
                 expected: "number or '#'".to_string(),
                 got: index_arg.type_name().to_string(),
-            });
+            })
         }
     }
 }
@@ -578,7 +580,7 @@ fn base_next(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     
     let table_val = ctx.get_arg(0)?;
     
-    // Check first argument is a table
+    // Check first argument is a table - error immediately if not
     let table = match table_val {
         Value::Table(ref handle) => handle,
         _ => {
@@ -589,14 +591,14 @@ fn base_next(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         }
     };
     
-    // Get current key
+    // Get current key - nil means start from beginning
     let key = if ctx.arg_count() > 1 {
         ctx.get_arg(1)?
     } else {
         Value::Nil
     };
     
-    // Get next key-value pair
+    // Use the table_next implementation from ExecutionContext
     match ctx.table_next(&table, &key)? {
         Some((next_key, next_value)) => {
             // Return key and value
@@ -605,12 +607,107 @@ fn base_next(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
             Ok(2) // Two return values
         },
         None => {
-            // End of iteration
+            // End of iteration - return nil
             ctx.push_result(Value::Nil)?;
             Ok(1) // One return value (nil)
         }
     }
 }
+
+/// getfenv(f) -> environment
+/// Returns the environment of the given function.
+fn base_getfenv(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
+    // For simplicity, this implementation only supports getfenv(f) where f is a function.
+    // Lua 5.1 also supports integer levels, which are more complex to implement here.
+    if ctx.arg_count() < 1 {
+        // In Lua 5.1, getfenv() with no args is getfenv(1).
+        // For now, we require an argument as level-based access is not implemented.
+        return Err(LuaError::RuntimeError("getfenv expects 1 argument".to_string()));
+    }
+
+    let func_val = ctx.get_arg(0)?;
+    let env = match func_val {
+        Value::Closure(closure) => {
+            let closure_ref = closure.borrow();
+            if closure_ref.upvalues.is_empty() {
+                // No upvalues, so no environment. Fallback to globals.
+                let globals = ctx.globals_handle()?;
+                Value::Table(globals)
+            } else {
+                // The first upvalue is always _ENV.
+                let env_upvalue = &closure_ref.upvalues[0];
+                // This safely gets the value whether the upvalue is open (on the stack)
+                // or closed, by delegating to the VM/heap.
+                ctx.get_upvalue_value(env_upvalue)?
+            }
+        },
+        Value::CFunction(_) => {
+            // C functions share the global environment.
+            let globals = ctx.globals_handle()?;
+            Value::Table(globals)
+        }
+        _ => return Err(LuaError::TypeError {
+            expected: "function".to_string(),
+            got: func_val.type_name().to_string(),
+        })
+    };
+
+    ctx.push_result(env)?;
+    Ok(1)
+}
+
+/// setfenv(f, table) -> function
+/// Sets the environment for the given function.
+fn base_setfenv(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
+    if ctx.arg_count() < 2 {
+        return Err(LuaError::RuntimeError("setfenv expects 2 arguments".to_string()));
+    }
+
+    let func_val = ctx.get_arg(0)?;
+    let env_val = ctx.get_arg(1)?;
+
+    // Per Lua 5.1 spec, arg 2 must be a table.
+    if !matches!(&env_val, Value::Table(_)) {
+        return Err(LuaError::TypeError {
+            expected: "table".to_string(),
+            got: env_val.type_name().to_string(),
+        });
+    }
+    
+    // Per Lua 5.1 spec, arg 1 can be a function or a stack level.
+    // We only support the function variant for now.
+    let closure = match &func_val {
+        Value::Closure(c) => c,
+        // C functions cannot have their environment changed. The call is a no-op
+        // and returns the function per Lua 5.1 behavior.
+        Value::CFunction(_) => {
+            ctx.push_result(func_val.clone())?;
+            return Ok(1);
+        }
+        _ => return Err(LuaError::TypeError {
+            expected: "function".to_string(),
+            got: func_val.type_name().to_string(),
+        })
+    };
+
+    let closure_ref = closure.borrow();
+    if closure_ref.upvalues.is_empty() {
+        // This is an error in Lua 5.1
+        return Err(LuaError::RuntimeError("cannot set environment of a function with no upvalues".to_string()));
+    }
+
+    // The first upvalue is always _ENV.
+    let env_upvalue = &closure_ref.upvalues[0];
+    // This safely sets the value whether the upvalue is open (on the stack) or closed.
+    ctx.set_upvalue_value(env_upvalue, env_val)?;
+    
+    drop(closure_ref);
+
+    // setfenv returns the function.
+    ctx.push_result(func_val.clone())?;
+    Ok(1)
+}
+
 
 /// pairs(t) -> iter_func, t, nil
 /// Returns three values that allow iteration over a table's key-value pairs.
@@ -621,23 +718,13 @@ fn base_pairs(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     
     let table_val = ctx.get_arg(0)?;
     
-    // Check argument is a table
-    match table_val {
-        Value::Table(_) => {},
-        _ => {
-            return Err(LuaError::TypeError {
-                expected: "table".to_string(),
-                got: table_val.type_name().to_string(),
-            });
-        }
-    }
-    
-    // Get the next function
+    // Get the next function from globals
     let globals = ctx.globals_handle()?;
     let next_key = ctx.create_string("next")?;
     let next_fn = ctx.get_table_field(&globals, &Value::String(next_key))?;
     
     // Return the iterator triplet: next, table, nil
+    // Don't type-check here - let the error happen during iteration per Lua 5.1
     ctx.push_result(next_fn)?;
     ctx.push_result(table_val)?;
     ctx.push_result(Value::Nil)?;
@@ -654,21 +741,11 @@ fn base_ipairs(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     
     let table_val = ctx.get_arg(0)?;
     
-    // Check argument is a table
-    match table_val {
-        Value::Table(_) => {},
-        _ => {
-            return Err(LuaError::TypeError {
-                expected: "table".to_string(),
-                got: table_val.type_name().to_string(),
-            });
-        }
-    }
-    
     // Get the ipairs iterator function
     let ipairs_iter = Value::CFunction(ipairs_iter as super::rc_value::CFunction);
     
     // Return the iterator triplet: ipairs_iter, table, 0
+    // Don't type-check here - let the error happen during iteration per Lua 5.1
     ctx.push_result(ipairs_iter)?;
     ctx.push_result(table_val)?;
     ctx.push_result(Value::Number(0.0))?;
@@ -711,29 +788,74 @@ fn ipairs_iter(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         }
     };
     
-    // Get next index
+    // Get next index - only consider array part for ipairs
     let next_index = index + 1;
     
-    // Get value at next index
-    let next_key = Value::Number(next_index as f64);
-    let table_ref = table.borrow();
+    // Check array part and collect result before dropping borrow
+    let result = {
+        let table_ref = table.borrow();
+        if next_index <= table_ref.array_len() && next_index > 0 {
+            if let Some(value) = table_ref.array.get(next_index - 1) {
+                if !value.is_nil() {
+                    // Return index, value pair
+                    Some((Value::Number(next_index as f64), value.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
     
-    if let Some(value) = table_ref.get_field(&next_key) {
-        if value.is_nil() {
+    // Now we can safely use the result without borrowing conflicts
+    match result {
+        Some((key, value)) => {
+            ctx.push_result(key)?;
+            ctx.push_result(value)?;
+            Ok(2)
+        },
+        None => {
             // End of iteration
             ctx.push_result(Value::Nil)?;
-            return Ok(1);
+            Ok(1)
         }
-        
-        // Return index, value pair
-        ctx.push_result(next_key)?;
-        ctx.push_result(value)?;
-        return Ok(2);
-    } else {
-        // End of iteration
-        ctx.push_result(Value::Nil)?;
-        return Ok(1);
     }
+}
+
+/// pcall(f, ...) -> status, ...
+/// Calls function f in protected mode.
+fn base_pcall(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
+    if ctx.arg_count() < 1 {
+        return Err(LuaError::RuntimeError("pcall expects at least 1 argument".to_string()));
+    }
+
+    let func = ctx.get_arg(0)?;
+    let mut args = Vec::with_capacity(ctx.arg_count() - 1);
+    for i in 1..ctx.arg_count() {
+        args.push(ctx.get_arg(i)?);
+    }
+
+    // Queue the protected call through the context
+    ctx.pcall(func, args)?;
+    Ok(-1) // Special return indicating operation was queued
+}
+
+/// xpcall(f, err) -> status, ...
+/// Calls function f in protected mode with a custom error handler.
+fn base_xpcall(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
+    if ctx.arg_count() < 2 {
+        return Err(LuaError::RuntimeError("xpcall expects 2 arguments".to_string()));
+    }
+
+    let func = ctx.get_arg(0)?;
+    let err_handler = ctx.get_arg(1)?;
+
+    // Queue the protected call with error handler
+    ctx.xpcall(func, err_handler)?;
+    Ok(-1) // Special return indicating operation was queued
 }
 
 //
@@ -779,20 +901,32 @@ fn string_sub(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     let j = if ctx.arg_count() > 2 {
         ctx.get_number_arg(2)? as isize
     } else {
-        -1
+        -1 // Default to end of string
     };
     
-    // Convert to 0-based indices
-    let len = s.len();
-    let start = if i < 0 { (len as isize + i) } else { i - 1 };
-    let end = if j < 0 { (len as isize + j + 1) } else { j };
+    // Convert to 0-based indices following Lua 5.1 specification exactly
+    let len = s.len() as isize;
+    let start = if i < 0 { 
+        (len + i).max(0)
+    } else { 
+        (i - 1).max(0).min(len)
+    };
     
-    // Clamp indices
-    let start = start.max(0).min(len as isize) as usize;
-    let end = end.max(start as isize).min(len as isize) as usize;
+    let end = if j < 0 { 
+        (len + j + 1).max(start).min(len)
+    } else { 
+        j.max(start).min(len) 
+    };
     
     // Extract substring
-    let substring = &s[start..end];
+    let start = start as usize;
+    let end = end as usize;
+    
+    let substring = if start < s.len() && start <= end {
+        &s[start..end]
+    } else {
+        ""
+    };
     
     // Return substring
     let string_handle = ctx.create_string(substring)?;
@@ -863,10 +997,10 @@ fn table_insert(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         let pos_val = ctx.get_arg(1)?;
         let pos = match pos_val {
             Value::Number(n) => {
-                if n.fract() != 0.0 || n < 1.0 {
-                    return Err(LuaError::RuntimeError("position must be a positive integer".to_string()));
+                if n.fract() != 0.0 {
+                    return Err(LuaError::RuntimeError("position must be an integer".to_string()));
                 }
-                n as usize
+                n as i64
             },
             _ => {
                 return Err(LuaError::TypeError {
@@ -878,38 +1012,28 @@ fn table_insert(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         
         (pos, ctx.get_arg(2)?)
     } else {
-        // table.insert(t, value)
-        let mut table_mut = table.borrow_mut();
-        let pos = table_mut.array_len() + 1;
-        drop(table_mut);
+        // table.insert(t, value) - append to end
+        let table_ref = table.borrow();
+        let pos = table_ref.array_len() as i64 + 1;
+        drop(table_ref);
         
         (pos, ctx.get_arg(1)?)
     };
     
-    // Perform the insertion
-    {
-        let mut table_mut = table.borrow_mut();
-        
-        // Get array length
-        let len = table_mut.array_len();
-        
-        if pos <= len + 1 {
-            // Insert in array part
-            if pos <= len {
-                // Shift elements up
-                table_mut.array.insert(pos - 1, value);
-            } else {
-                // Append to end
-                table_mut.array.push(value);
-            }
-        } else {
-            // Insert beyond end of array
-            while table_mut.array.len() < pos - 1 {
-                table_mut.array.push(Value::Nil);
-            }
-            table_mut.array.push(value);
-        }
+    // Validate position bounds per Lua 5.1 specification
+    let table_ref = table.borrow();
+    let len = table_ref.array_len() as i64;
+    
+    if pos < 1 || pos > len + 1 {
+        drop(table_ref);
+        return Err(LuaError::RuntimeError("position out of bounds".to_string()));
     }
+    
+    drop(table_ref);
+    
+    // Set the value using table field access
+    let key = Value::Number(pos as f64);
+    ctx.set_table_field(table, key, value)?;
     
     Ok(0) // No return values
 }
@@ -939,10 +1063,10 @@ fn table_remove(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         let pos_val = ctx.get_arg(1)?;
         match pos_val {
             Value::Number(n) => {
-                if n.fract() != 0.0 || n < 1.0 {
-                    return Err(LuaError::RuntimeError("position must be a positive integer".to_string()));
+                if n.fract() != 0.0 {
+                    return Err(LuaError::RuntimeError("position must be an integer".to_string()));
                 }
-                n as usize
+                n as i64
             },
             _ => {
                 return Err(LuaError::TypeError {
@@ -952,37 +1076,30 @@ fn table_remove(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
             }
         }
     } else {
+        // Remove from end
         let table_ref = table.borrow();
-        table_ref.array_len()
+        table_ref.array_len() as i64
     };
     
-    // Remove the element
-    let removed = {
-        let mut table_mut = table.borrow_mut();
-        
-        // Get array length
-        let len = table_mut.array_len();
-        
-        if pos <= len {
-            // Remove from array part
-            let value = table_mut.array.remove(pos - 1);
-            Some(value)
-        } else {
-            // Out of bounds
-            None
-        }
-    };
+    // Check bounds and get value to return
+    let table_ref = table.borrow();
+    let len = table_ref.array_len() as i64;
     
-    // Return the removed value
-    match removed {
-        Some(value) => {
-            ctx.push_result(value)?;
-            Ok(1) // One return value
-        },
-        None => {
-            ctx.push_result(Value::Nil)?;
-            Ok(1) // One return value (nil)
-        }
+    if pos >= 1 && pos <= len {
+        let key = Value::Number(pos as f64);
+        let removed = table_ref.get_field(&key).unwrap_or(Value::Nil);
+        drop(table_ref);
+        
+        // Remove by setting to nil
+        ctx.set_table_field(table, key, Value::Nil)?;
+        
+        ctx.push_result(removed)?;
+        Ok(1) // One return value
+    } else {
+        // Invalid position - return nil per Lua 5.1 behavior
+        drop(table_ref);
+        ctx.push_result(Value::Nil)?;
+        Ok(1) // One return value (nil)
     }
 }
 
@@ -1093,44 +1210,4 @@ fn table_concat(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     ctx.push_result(Value::String(string_handle))?;
     
     Ok(1) // One return value
-}
-
-// Extension traits for RcVM
-pub trait RcVMExt {
-    /// Create a string
-    fn create_string(&self, s: &str) -> LuaResult<StringHandle>;
-    
-    /// Create a table
-    fn create_table(&self) -> LuaResult<TableHandle>;
-    
-    /// Get table field
-    fn get_table_field(&self, table: &TableHandle, key: &Value) -> LuaResult<Value>;
-    
-    /// Set table field
-    fn set_table_field(&self, table: &TableHandle, key: &Value, value: &Value) -> LuaResult<()>;
-    
-    /// Get globals table
-    fn globals(&self) -> LuaResult<TableHandle>;
-}
-
-impl RcVMExt for RcVM {
-    fn create_string(&self, s: &str) -> LuaResult<StringHandle> {
-        self.heap.create_string(s)
-    }
-    
-    fn create_table(&self) -> LuaResult<TableHandle> {
-        Ok(self.heap.create_table())
-    }
-    
-    fn get_table_field(&self, table: &TableHandle, key: &Value) -> LuaResult<Value> {
-        self.heap.get_table_field(table, key)
-    }
-    
-    fn set_table_field(&self, table: &TableHandle, key: &Value, value: &Value) -> LuaResult<()> {
-        self.heap.set_table_field(table, key, value)
-    }
-    
-    fn globals(&self) -> LuaResult<TableHandle> {
-        Ok(self.heap.globals())
-    }
 }

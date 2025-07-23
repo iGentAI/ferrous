@@ -5,12 +5,44 @@
 
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
 
 use super::error::{LuaError, LuaResult};
+
+thread_local! {
+    /// A set of raw pointers to heap-allocated values (tables, closures, etc.)
+    /// that are currently being visited by a Debug::fmt call to prevent recursion.
+    static DEBUG_SEEN: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// An RAII guard to manage adding/removing pointers from the DEBUG_SEEN set.
+struct SeenGuard {
+    ptr: usize,
+    is_new: bool,
+}
+
+impl SeenGuard {
+    /// Creates a new guard. Inserts the pointer into the seen set.
+    /// `is_new` will be true if the pointer was not already in the set.
+    fn new(ptr: usize) -> Self {
+        let is_new = DEBUG_SEEN.with(|seen| seen.borrow_mut().insert(ptr));
+        SeenGuard { ptr, is_new }
+    }
+}
+
+impl Drop for SeenGuard {
+    fn drop(&mut self) {
+        // Only remove the pointer if this guard was the one that added it.
+        if self.is_new {
+            DEBUG_SEEN.with(|seen| {
+                seen.borrow_mut().remove(&self.ptr);
+            });
+        }
+    }
+}
 
 /// Type representing a C function callable from Lua
 pub type CFunction = fn(&mut dyn super::rc_vm::ExecutionContext) -> LuaResult<i32>;
@@ -25,7 +57,7 @@ pub type UserDataHandle = Rc<RefCell<UserData>>;
 pub type FunctionProtoHandle = Rc<FunctionProto>;
 
 /// Main Lua value type
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Value {
     /// Nil value
     Nil,
@@ -59,6 +91,78 @@ pub enum Value {
     
     /// Pending metamethod call (for non-recursive metamethod resolution)
     PendingMetamethod(Box<Value>),
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Nil => write!(f, "Nil"),
+            Value::Boolean(b) => f.debug_tuple("Boolean").field(b).finish(),
+            Value::Number(n) => f.debug_tuple("Number").field(n).finish(),
+            Value::String(s) => {
+                if let Ok(string_ref) = s.try_borrow() {
+                    write!(f, "String({:?})", &*string_ref)
+                } else {
+                    write!(f, "String(<borrowed>)")
+                }
+            },
+            Value::Table(t) => {
+                let ptr = Rc::as_ptr(t) as usize;
+                let guard = SeenGuard::new(ptr);
+                if guard.is_new {
+                    if let Ok(table_ref) = t.try_borrow() {
+                        f.debug_tuple("Table").field(&*table_ref).finish()
+                    } else {
+                        write!(f, "Table(<borrowed>)")
+                    }
+                } else {
+                    write!(f, "Table(<recursive>)")
+                }
+            },
+            Value::Closure(c) => {
+                let ptr = Rc::as_ptr(c) as usize;
+                let guard = SeenGuard::new(ptr);
+                if guard.is_new {
+                    if let Ok(closure_ref) = c.try_borrow() {
+                        f.debug_tuple("Closure").field(&*closure_ref).finish()
+                    } else {
+                        write!(f, "Closure(<borrowed>)")
+                    }
+                } else {
+                    write!(f, "Closure(<recursive>)")
+                }
+            },
+            Value::Thread(t) => {
+                f.debug_tuple("Thread").field(t).finish()
+            },
+            Value::CFunction(c) => {
+                f.debug_tuple("CFunction").field(&(*c as *const ())).finish()
+            },
+            Value::UserData(u) => {
+                let ptr = Rc::as_ptr(u) as usize;
+                let guard = SeenGuard::new(ptr);
+                if guard.is_new {
+                    if let Ok(userdata_ref) = u.try_borrow() {
+                        f.debug_tuple("UserData").field(&*userdata_ref).finish()
+                    } else {
+                        write!(f, "UserData(<borrowed>)")
+                    }
+                } else {
+                    write!(f, "UserData(<recursive>)")
+                }
+            },
+            Value::FunctionProto(p) => {
+                let ptr = Rc::as_ptr(p) as usize;
+                let guard = SeenGuard::new(ptr);
+                if guard.is_new {
+                    f.debug_tuple("FunctionProto").field(&**p).finish()
+                } else {
+                    write!(f, "FunctionProto(<recursive>)")
+                }
+            },
+            Value::PendingMetamethod(val) => f.debug_tuple("PendingMetamethod").field(val).finish(),
+        }
+    }
 }
 
 impl Value {
@@ -138,14 +242,20 @@ impl fmt::Display for Value {
                     write!(f, "{}", n)
                 }
             }
-            Value::String(_) => write!(f, "<string>"),
-            Value::Table(_) => write!(f, "<table>"),
-            Value::Closure(_) => write!(f, "<function>"),
-            Value::CFunction(_) => write!(f, "<C function>"),
-            Value::Thread(_) => write!(f, "<thread>"),
-            Value::UserData(_) => write!(f, "<userdata>"),
-            Value::FunctionProto(_) => write!(f, "<function prototype>"),
-            Value::PendingMetamethod(_) => write!(f, "<pending metamethod>"),
+            Value::String(s) => {
+                let s_ref = s.borrow();
+                match s_ref.to_str() {
+                    Ok(str_slice) => write!(f, "{}", str_slice),
+                    Err(_) => write!(f, "<binary string>"),
+                }
+            },
+            Value::Table(t) => write!(f, "table: {:p}", Rc::as_ptr(t)),
+            Value::Closure(c) => write!(f, "function: {:p}", Rc::as_ptr(c)),
+            Value::CFunction(c) => write!(f, "function: {:p}", *c),
+            Value::Thread(t) => write!(f, "thread: {:p}", Rc::as_ptr(t)),
+            Value::UserData(u) => write!(f, "userdata: {:p}", Rc::as_ptr(u)),
+            Value::FunctionProto(p) => write!(f, "function: {:p}", Rc::as_ptr(p)),
+            Value::PendingMetamethod(val) => write!(f, "pending metamethod for {}", val.type_name()),
         }
     }
 }
@@ -206,9 +316,9 @@ impl Hash for Value {
             Value::Boolean(b) => b.hash(state),
             Value::Number(n) => OrderedFloat(*n).hash(state),
             Value::String(s) => {
-                // Use the content hash for consistent behavior
+                // Use bytes directly to ensure consistency with PartialEq
                 let string_ref = s.borrow();
-                string_ref.content_hash.hash(state);
+                string_ref.bytes.hash(state);
             },
             Value::Table(t) => {
                 // Use pointer identity
@@ -355,7 +465,7 @@ impl Hash for OrderedFloat {
 }
 
 /// Hashable value for table keys
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum HashableValue {
     /// Nil value
     Nil,
@@ -368,6 +478,23 @@ pub enum HashableValue {
     
     /// String value with cached content hash
     String(StringHandle),
+}
+
+impl fmt::Debug for HashableValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HashableValue::Nil => write!(f, "Nil"),
+            HashableValue::Boolean(b) => f.debug_tuple("Boolean").field(b).finish(),
+            HashableValue::Number(n) => f.debug_tuple("Number").field(&n.0).finish(),
+            HashableValue::String(s) => {
+                if let Ok(string_ref) = s.try_borrow() {
+                    write!(f, "String({:?})", &*string_ref)
+                } else {
+                    write!(f, "String(<borrowed>)")
+                }
+            },
+        }
+    }
 }
 
 impl HashableValue {
@@ -430,16 +557,16 @@ impl Hash for HashableValue {
             HashableValue::Boolean(b) => b.hash(state),
             HashableValue::Number(n) => n.hash(state),
             HashableValue::String(s) => {
-                // String hashing uses content hash
+                // Use bytes directly to ensure consistency with PartialEq
                 let string_ref = s.borrow();
-                string_ref.content_hash.hash(state);
+                string_ref.bytes.hash(state);
             },
         }
     }
 }
 
 /// Lua table representation
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Table {
     /// Array part of the table
     pub array: Vec<Value>,
@@ -449,6 +576,16 @@ pub struct Table {
     
     /// Optional metatable
     pub metatable: Option<TableHandle>,
+}
+
+impl fmt::Debug for Table {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Table")
+            .field("array", &self.array)
+            .field("map", &self.map)
+            .field("metatable", &self.metatable)
+            .finish()
+    }
 }
 
 impl Table {
@@ -480,60 +617,137 @@ impl Table {
         self.metatable = metatable;
     }
     
-    /// Get the length of the array part
+    /// Get the length of the array part following Lua 5.1 semantics
+    /// In Lua 5.1, #t is the highest integer index i such that t[i] != nil and t[i+1] == nil
     pub fn array_len(&self) -> usize {
-        self.array.len()
+        if self.array.is_empty() {
+            return 0;
+        }
+        if self.array.last().map_or(true, |v| !v.is_nil()) {
+            return self.array.len();
+        }
+        // Binary search for the last non-nil element (the "border")
+        let mut high = self.array.len();
+        let mut low = 0;
+        while low < high {
+            let mid = high - (high - low) / 2;
+            if self.array[mid - 1].is_nil() {
+                high = mid - 1;
+            } else {
+                low = mid;
+            }
+        }
+        low
     }
     
-    /// Get a field from the table
+    /// Get a field from the table (raw get, no metamethods).
+    /// Distinguishes between a key not being present (`None`) and a key being present with a `nil` value (`Some(Value::Nil)`).
     pub fn get_field(&self, key: &Value) -> Option<Value> {
-        // Try array optimization for integer keys
+        // Handle numeric keys which might access the array part.
         if let Value::Number(n) = key {
-            if n.fract() == 0.0 && *n > 0.0 && *n <= self.array.len() as f64 {
-                let idx = *n as usize;
-                return Some(self.array[idx - 1].clone());
+            // Check for integer value suitable for 1-based indexing.
+            if n.fract() == 0.0 && *n >= 1.0 {
+                let index = *n as usize;
+                // If the index is within the bounds of our array part, the array is authoritative.
+                if index > 0 && index <= self.array.len() {
+                    // The key is in the array part. Return its value, which might be Some(Nil).
+                    return Some(self.array[index - 1].clone());
+                }
+            }
+        }
+
+        // For non-integer numbers, strings, or integers outside the array part, check the map.
+        match HashableValue::from_value(key) {
+            Ok(hashable) => self.map.get(&hashable).cloned(),
+            Err(_) => None, // Key is not a hashable type.
+        }
+    }
+    
+    /// Gets a mutable reference to a value in the table by key.
+    /// This is crucial for the two-phase commit pattern for circular references.
+    pub fn get_field_mut(&mut self, key: &Value) -> Option<&mut Value> {
+        // Attempt to find in the array part first for integer keys
+        if let Value::Number(n) = key {
+            if n.fract() == 0.0 && *n >= 1.0 {
+                let index = *n as usize;
+                if index > 0 && index <= self.array.len() {
+                    // Lua indices are 1-based
+                    return self.array.get_mut(index - 1);
+                }
             }
         }
         
-        // For other keys, try to convert to hashable
+        // Fall back to the map part
         match HashableValue::from_value(key) {
-            Ok(hashable) => self.map.get(&hashable).cloned(),
+            Ok(hashable) => self.map.get_mut(&hashable),
             Err(_) => None,
         }
     }
     
     /// Set a field in the table
     pub fn set_field(&mut self, key: Value, value: Value) -> LuaResult<()> {
+        eprintln!("DEBUG Table::set_field: Called with key={:?}, value={:?}", key, value);
+        eprintln!("DEBUG Table::set_field: Current state - array.len()={}, map.len()={}", 
+                 self.array.len(), self.map.len());
+        
         // Try array optimization for integer keys
         if let Value::Number(n) = &key {
+            eprintln!("DEBUG Table::set_field: Key is Number({})", n);
             if n.fract() == 0.0 && *n > 0.0 {
                 let idx = *n as usize;
-                if idx <= self.array.len() {
+                eprintln!("DEBUG Table::set_field: Integer key, index={}, array.len()={}", idx, self.array.len());
+                
+                if idx > 0 && idx <= self.array.len() {
+                    eprintln!("DEBUG Table::set_field: Setting array[{}] = {:?}", idx - 1, value);
                     self.array[idx - 1] = value;
+                    eprintln!("DEBUG Table::set_field: Array assignment complete");
                     return Ok(());
                 } else if idx == self.array.len() + 1 {
+                    eprintln!("DEBUG Table::set_field: Appending to array at index {}", idx - 1);
                     self.array.push(value);
+                    eprintln!("DEBUG Table::set_field: Array append complete");
                     return Ok(());
-                } else if idx <= self.array.len() * 2 {
+                } else if idx > 0 && idx <= self.array.capacity() && idx < 10000 { // Heuristic to avoid huge allocations
+                    eprintln!("DEBUG Table::set_field: Resizing array from {} to {}", self.array.len(), idx);
                     // Fill gaps with nil
-                    while self.array.len() < idx - 1 {
-                        self.array.push(Value::Nil);
-                    }
-                    self.array.push(value);
+                    self.array.resize(idx, Value::Nil);
+                    self.array[idx - 1] = value;
+                    eprintln!("DEBUG Table::set_field: Array resize and assignment complete");
                     return Ok(());
                 }
-                // For very sparse arrays, use the hash part
+                eprintln!("DEBUG Table::set_field: Array path not taken, falling through to map");
+                // For very sparse arrays, fall through to use the hash part
+            } else {
+                eprintln!("DEBUG Table::set_field: Non-integer number key, using map");
             }
+        } else {
+            eprintln!("DEBUG Table::set_field: Non-number key, using map");
         }
         
         // For other keys, convert to hashable
+        eprintln!("DEBUG Table::set_field: Converting key to HashableValue");
         let hashable = HashableValue::from_value(&key)?;
+        eprintln!("DEBUG Table::set_field: HashableValue conversion successful: {:?}", hashable);
+        
         if value.is_nil() {
-            self.map.remove(&hashable);
+            eprintln!("DEBUG Table::set_field: Value is nil, removing from map");
+            let removed = self.map.remove(&hashable);
+            eprintln!("DEBUG Table::set_field: Remove result: {:?}", removed.is_some());
         } else {
-            self.map.insert(hashable, value);
+            eprintln!("DEBUG Table::set_field: Inserting into map: {:?} => {:?}", hashable, value);
+            let previous = self.map.insert(hashable.clone(), value.clone());
+            eprintln!("DEBUG Table::set_field: Map insert complete, previous value: {:?}", previous.is_some());
+            
+            // VERIFICATION: Immediately check if we can retrieve the value
+            if let Some(verification_value) = self.map.get(&hashable) {
+                eprintln!("DEBUG Table::set_field: VERIFICATION SUCCESS - retrieved: {:?}", verification_value);
+            } else {
+                eprintln!("DEBUG Table::set_field: VERIFICATION FAILED - key not found in map immediately after insert!");
+            }
         }
         
+        eprintln!("DEBUG Table::set_field: Final state - array.len()={}, map.len()={}", 
+                 self.array.len(), self.map.len());
         Ok(())
     }
 }
@@ -708,13 +922,22 @@ pub struct UpvalueInfo {
 }
 
 /// Function closure
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Closure {
     /// Function prototype
     pub proto: FunctionProtoHandle,
     
     /// Captured upvalues
     pub upvalues: Vec<UpvalueHandle>,
+}
+
+impl fmt::Debug for Closure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Closure")
+            .field("proto", &self.proto)
+            .field("upvalues", &self.upvalues)
+            .finish()
+    }
 }
 
 /// Thread status
@@ -790,6 +1013,15 @@ pub struct CallFrame {
     
     /// Variable arguments for this frame (if the function is vararg)
     pub varargs: Option<Vec<Value>>,
+    
+    /// Is this call protected (pcall/xpcall)?
+    pub is_protected: bool,
+    
+    /// Error handler for xpcall
+    pub xpcall_handler: Option<Value>,
+    
+    /// Result base for protected calls
+    pub result_base: usize,
 }
 
 /// Userdata type

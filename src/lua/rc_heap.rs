@@ -231,58 +231,167 @@ impl RcHeap {
     
     /// Get table field with metamethod support
     pub fn get_table_field(&self, table: &TableHandle, key: &Value) -> LuaResult<Value> {
-        // First try direct access
-        let table_ref = table.borrow();
-        
-        if let Some(value) = table_ref.get_field(key) {
-            return Ok(value);
-        }
-        
-        // Check for __index metamethod
-        let metatable_opt = if let Some(ref metatable) = table_ref.metatable {
-            Some(Rc::clone(metatable))
-        } else {
-            None
-        };
-        
-        // Release table borrow before accessing metatable
-        drop(table_ref);
-        
-        // If we have a metatable, check for __index
-        if let Some(metatable) = metatable_opt {
-            // Get the __index metamethod
+        let mut current_table = Rc::clone(table);
+        for _ in 0..100 { // Loop to handle table-based __index, with a cycle guard
+            let table_ref = current_table.borrow();
+    
+            // Step 1: Try direct access in the current table.
+            if let Some(value) = table_ref.get_field(key) {
+                // ALWAYS return if the key is present, even if value is nil
+                // This is the correct Lua 5.1 specification behavior
+                return Ok(value);
+            }
+    
+            // Key was NOT present in table. Proceed to check the metatable.
+            let metatable = match &table_ref.metatable {
+                Some(mt) => mt.clone(),
+                // No metatable, so the search ends here.
+                None => return Ok(Value::Nil),
+            };
+    
+            // Drop the borrow on the current table before we might borrow the metatable.
+            drop(table_ref);
+    
+            // Step 3: Check for the __index metamethod within the metatable.
             let mt_ref = metatable.borrow();
             let index_key = Value::String(Rc::clone(&self.metamethod_names.index));
+            let index_mm = mt_ref.get_field(&index_key);
             
-            if let Some(index_mm) = mt_ref.get_field(&index_key) {
-                // Handle based on metamethod type
-                match index_mm {
-                    Value::Table(index_table) => {
-                        // If __index is a table, look up key in that table
-                        drop(mt_ref);
-                        let index_table_ref = index_table.borrow();
-                        if let Some(value) = index_table_ref.get_field(key) {
-                            return Ok(value);
-                        }
-                    },
-                    Value::Closure(_) | Value::CFunction(_) => {
-                        // If __index is a function, it will be called by the VM
-                        drop(mt_ref);
-                        // Return a special value that tells the VM to call the metamethod
-                        return Ok(Value::PendingMetamethod(Box::new(index_mm)));
-                    },
-                    _ => {}
+            // Drop the borrow on the metatable.
+            drop(mt_ref);
+
+            match index_mm {
+                // __index is not present or is nil. The search ends.
+                None | Some(Value::Nil) => return Ok(Value::Nil),
+
+                Some(Value::Table(index_table)) => {
+                    // __index is a table. Continue the search in this new table.
+                    current_table = index_table;
+                    // The `for` loop will continue to the next iteration.
+                },
+                Some(func @ Value::Closure(_)) | Some(func @ Value::CFunction(_)) => {
+                    // __index is a function. The VM must call it.
+                    // Return a special value to signal this to the VM execution loop.
+                    return Ok(Value::PendingMetamethod(Box::new(func)));
+                },
+                // __index is some other value (number, string, etc.). Return it directly.
+                Some(other) => return Ok(other),
+            }
+        }
+    
+        // If we hit the loop limit, it's a potential infinite __index loop.
+        Err(LuaError::RuntimeError("__index chain too deep".to_string()))
+    }
+    
+    /// Get table field without metamethod support (raw operation)
+    pub fn raw_get_table_field(&self, table: &TableHandle, key: &Value) -> Value {
+        let table_ref = table.borrow();
+        table_ref.get_field(key).unwrap_or(Value::Nil)
+    }
+
+    /// Set table field with metamethod support (WITH COMPREHENSIVE DEBUGGING)
+    /// Returns a metamethod function if one needs to be called by the VM.
+    pub fn set_table_field(&self, table: &TableHandle, key: &Value, value: &Value) -> LuaResult<Option<Value>> {
+        eprintln!("DEBUG HEAP set_table_field: Called with key={:?}, value={:?}", key, value);
+        
+        let mut current_table = table.clone();
+        for iteration in 0..100 { // Loop to handle table-based __newindex
+            eprintln!("DEBUG HEAP set_table_field: Iteration {} of metamethod chain on table {:p}", iteration, Rc::as_ptr(&current_table));
+            
+            let table_ref = current_table.borrow();
+
+            // Lua 5.1: __newindex is only invoked if the key does NOT exist in the table. An existing nil is NOT a trigger.
+            if table_ref.get_field(key).is_some() {
+                eprintln!("DEBUG HEAP set_table_field: Key exists, doing raw set on current table");
+                drop(table_ref); // Release borrow before mutable borrow
+                self.set_table_field_raw_with_alias_check(&current_table, key, value)?;
+                return Ok(None); // No metamethod call needed
+            }
+
+            eprintln!("DEBUG HEAP set_table_field: Key not found, checking for metatable");
+
+            let metatable = match table_ref.metatable() {
+                Some(mt) => mt.clone(),
+                None => {
+                    eprintln!("DEBUG HEAP set_table_field: No metatable, doing raw set on current table");
+                    drop(table_ref);
+                    self.set_table_field_raw_with_alias_check(&current_table, key, value)?;
+                    return Ok(None);
+                }
+            };
+            
+            drop(table_ref); // Release borrow
+
+            let mt_ref = metatable.borrow();
+            let newindex_key = Value::String(self.metamethod_names.newindex.clone());
+            let newindex_mm = mt_ref.get_field(&newindex_key).unwrap_or(Value::Nil);
+            eprintln!("DEBUG HEAP set_table_field: __newindex metamethod: {:?}", newindex_mm.type_name());
+            drop(mt_ref);
+
+            match newindex_mm {
+                Value::Table(newindex_table) => {
+                    eprintln!("DEBUG HEAP set_table_field: __newindex is a table, restarting logic on it");
+                    current_table = newindex_table;
+                    continue; // Continue loop with the new table
+                },
+                func @ Value::Closure(_) | func @ Value::CFunction(_) => {
+                    eprintln!("DEBUG HEAP set_table_field: __newindex is a function, returning for VM to call");
+                    return Ok(Some(func));
+                },
+                _ => {
+                    eprintln!("DEBUG HEAP set_table_field: __newindex is nil or non-function, doing raw set on current table");
+                    self.set_table_field_raw_with_alias_check(&current_table, key, value)?;
+                    return Ok(None);
                 }
             }
         }
         
-        // No value found
-        Ok(Value::Nil)
+        eprintln!("DEBUG HEAP set_table_field: ERROR - __newindex chain too deep");
+        Err(LuaError::RuntimeError("__newindex chain too deep".to_string()))
     }
-    
-    pub fn set_table_field(&self, table: &TableHandle, key: &Value, value: &Value) -> LuaResult<()> {
-        let mut table_mut = table.borrow_mut();
-        table_mut.set_field(key.clone(), value.clone())
+
+    /// Helper function for raw set operations that includes the two-phase commit logic.
+    /// This is the core architectural solution for circular reference borrow conflicts.
+    fn set_table_field_raw_with_alias_check(&self, table: &TableHandle, key: &Value, value: &Value) -> LuaResult<()> {
+        eprintln!("DEBUG HEAP: Entering set_table_field_raw_with_alias_check");
+        eprintln!("DEBUG HEAP: Checking for self-assignment aliasing case");
+        
+        // Check for the aliasing case: table[key] = table
+        if let Value::Table(value_table) = value {
+            if Rc::ptr_eq(table, value_table) {
+                eprintln!("DEBUG HEAP: SELF-ASSIGNMENT DETECTED! Using two-phase commit pattern");
+                
+                // Self-assignment detected. Use the two-phase commit pattern.
+                // Phase 1: Insert a temporary placeholder. This avoids the borrow conflict.
+                eprintln!("DEBUG HEAP: Phase 1 - Inserting placeholder");
+                {
+                    let mut table_mut = table.borrow_mut();
+                    // Use Boolean(false) as placeholder instead of Nil to avoid removal logic
+                    table_mut.set_field(key.clone(), Value::Boolean(false))?;
+                    eprintln!("DEBUG HEAP: Phase 1 complete - placeholder inserted");
+                }
+
+                // Phase 2: Replace the placeholder with the actual self-referential value.
+                eprintln!("DEBUG HEAP: Phase 2 - Replacing placeholder with actual value");
+                {
+                    let mut table_mut = table.borrow_mut();
+                    if let Some(placeholder_ref) = table_mut.get_field_mut(key) {
+                        *placeholder_ref = value.clone();
+                        eprintln!("DEBUG HEAP: Phase 2 complete - self-reference established");
+                    } else {
+                        eprintln!("DEBUG HEAP: ERROR - Phase 2 failed: placeholder not found");
+                        return Err(LuaError::RuntimeError("Internal VM error: two-phase set failed".to_string()));
+                    }
+                }
+
+                eprintln!("DEBUG HEAP: Two-phase commit successful for self-assignment");
+                return Ok(());
+            }
+        }
+
+        eprintln!("DEBUG HEAP: No self-assignment detected, performing standard raw set");
+        // Default case: No self-assignment detected, perform a standard raw set.
+        self.set_table_field_raw(table, key, value)
     }
     
     /// Set table field without metamethod support (raw operation)
@@ -555,7 +664,43 @@ impl RcHeap {
     
     /// Set upvalue value
     pub fn set_upvalue_value(&self, upvalue: &UpvalueHandle, value: Value) -> LuaResult<()> {
-        // Simple implementation without excess debug logging
+        // Check for the aliasing case: upvalue.value = closure_that_captured(upvalue)
+        let is_aliased = if let Value::Closure(closure_handle) = &value {
+            // We only need to check if we are setting a closed upvalue.
+            // If it's open, we're writing to the stack, which is safe.
+            if let UpvalueState::Closed { .. } = *upvalue.borrow() {
+                let closure_ref = closure_handle.borrow();
+                closure_ref.upvalues.iter().any(|uv_in_closure| Rc::ptr_eq(upvalue, uv_in_closure))
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if is_aliased {
+            // Aliasing detected: Use the two-phase commit pattern.
+            // Phase 1: Set a temporary placeholder.
+            {
+                let mut uv_mut = upvalue.borrow_mut();
+                if let UpvalueState::Closed { value: ref mut v } = &mut *uv_mut {
+                    // Using Boolean(false) as a placeholder.
+                    *v = Value::Boolean(false);
+                }
+                // Note: if the upvalue was open, is_aliased would be false.
+            }
+
+            // Phase 2: Replace the placeholder with the actual self-referential value.
+            {
+                let mut uv_mut = upvalue.borrow_mut();
+                if let UpvalueState::Closed { value: ref mut v } = &mut *uv_mut {
+                    *v = value;
+                }
+            }
+            return Ok(());
+        }
+    
+        // Default case: No self-assignment detected, perform a standard set.
         let mut uv_ref = upvalue.borrow_mut();
         
         match &mut *uv_ref {

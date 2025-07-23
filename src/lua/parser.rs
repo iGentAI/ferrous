@@ -13,6 +13,8 @@ pub struct Parser {
     tokens: Vec<TokenWithLocation>,
     /// Current token position
     current: usize,
+    /// Current loop depth (for validating break statements)
+    loop_depth: usize,
 }
 
 impl Parser {
@@ -21,6 +23,7 @@ impl Parser {
         Parser {
             tokens,
             current: 0,
+            loop_depth: 0,
         }
     }
     
@@ -180,8 +183,14 @@ impl Parser {
         // Parse "do"
         self.consume(Token::Do, "Expected 'do' after while condition")?;
         
+        // Increment loop depth
+        self.loop_depth += 1;
+        
         // Parse body
         let body = self.block()?;
+        
+        // Decrement loop depth
+        self.loop_depth -= 1;
         
         // Parse end
         self.consume(Token::End, "Expected 'end' after while block")?;
@@ -194,8 +203,14 @@ impl Parser {
     
     /// Parse a repeat statement
     fn repeat_statement(&mut self) -> LuaResult<Statement> {
+        // Increment loop depth
+        self.loop_depth += 1;
+        
         // Parse body
         let body = self.block()?;
+        
+        // Decrement loop depth
+        self.loop_depth -= 1;
         
         // Parse until
         self.consume(Token::Until, "Expected 'until' after repeat block")?;
@@ -241,7 +256,13 @@ impl Parser {
             
             self.consume(Token::Do, "Expected 'do' after for limits")?;
             
+            // Increment loop depth
+            self.loop_depth += 1;
+            
             let body = self.block()?;
+            
+            // Decrement loop depth
+            self.loop_depth -= 1;
             
             self.consume(Token::End, "Expected 'end' after for block")?;
             
@@ -272,7 +293,13 @@ impl Parser {
             
             self.consume(Token::Do, "Expected 'do' after for iterators")?;
             
+            // Increment loop depth
+            self.loop_depth += 1;
+            
             let body = self.block()?;
+            
+            // Decrement loop depth
+            self.loop_depth -= 1;
             
             self.consume(Token::End, "Expected 'end' after for block")?;
             
@@ -422,6 +449,15 @@ impl Parser {
     
     /// Parse a break statement
     fn break_statement(&mut self) -> LuaResult<Statement> {
+        if self.loop_depth == 0 {
+            let token = self.peek_token().clone();
+            return Err(LuaError::SyntaxError {
+                message: "break statement outside of loop".to_string(),
+                line: token.line,
+                column: token.column,
+            });
+        }
+        
         // Optional semicolon after break
         self.match_token(Token::Semicolon);
         

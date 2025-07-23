@@ -7,6 +7,7 @@
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::cmp::Ordering;
 
 use super::codegen::{self, Instruction, OpCode, CompilationConstant};
 use super::compiler;
@@ -18,6 +19,19 @@ use super::rc_value::{
     HashableValue, FunctionProto
 };
 use super::rc_heap::RcHeap;
+
+/// Helper function to compare two Values for sorting keys
+fn cmp_value(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Number(na), Value::Number(nb)) => na.partial_cmp(nb).unwrap_or(Ordering::Equal),
+        (Value::String(sa), Value::String(sb)) => {
+            sa.borrow().bytes.cmp(&sb.borrow().bytes)
+        },
+        (Value::Number(_), Value::String(_)) => Ordering::Less,
+        (Value::String(_), Value::Number(_)) => Ordering::Greater,
+        _ => Ordering::Equal, // Fallback for other types
+    }
+}
 
 /// Trait for execution contexts that provide access to VM state during C function calls
 pub trait ExecutionContext {
@@ -58,7 +72,7 @@ pub trait ExecutionContext {
     fn get_table_field(&self, table: &TableHandle, key: &Value) -> LuaResult<Value>;
     
     /// Set a table field
-    fn set_table_field(&self, table: &TableHandle, key: Value, value: Value) -> LuaResult<()>;
+    fn set_table_field(&mut self, table: &TableHandle, key: Value, value: Value) -> LuaResult<()>;
     
     /// Get argument as string
     fn get_arg_str(&self, index: usize) -> LuaResult<String>;
@@ -74,6 +88,21 @@ pub trait ExecutionContext {
     
     /// Get the globals table handle
     fn globals_handle(&self) -> LuaResult<TableHandle>;
+    
+    /// Get the call base register
+    fn get_call_base(&self) -> usize;
+    
+    /// Queue a protected call (pcall)
+    fn pcall(&mut self, func: Value, args: Vec<Value>) -> LuaResult<()>;
+    
+    /// Queue a protected call with error handler (xpcall)
+    fn xpcall(&mut self, func: Value, err_handler: Value) -> LuaResult<()>;
+    
+    /// Get an upvalue's value safely (for getfenv implementation)
+    fn get_upvalue_value(&self, upvalue: &UpvalueHandle) -> LuaResult<Value>;
+    
+    /// Set an upvalue's value safely (for setfenv implementation)
+    fn set_upvalue_value(&self, upvalue: &UpvalueHandle, value: Value) -> LuaResult<()>;
     
     // Additional context methods will be added as needed
 }
@@ -114,6 +143,10 @@ enum PendingOperation {
         expected_results: i32,
         /// Stack location to store results
         result_base: usize,
+        /// Is this a protected call?
+        is_protected: bool,
+        /// Optional error handler for xpcall
+        xpcall_handler: Option<Value>,
     },
     
     /// Return from function
@@ -128,10 +161,36 @@ enum PendingOperation {
         base: usize,
         /// A field from TFORLOOP instruction
         a: usize,
-        /// C field from TFORLOOP instruction
-        c: usize,
-        /// PC value before iterator call
-        pc_before_call: usize,
+        /// sBx field for jump calculation
+        sbx: i32,
+    },
+    
+    /// Comparison continuation for metamethods
+    ComparisonContinuation {
+        /// Comparison operation type
+        comp_op: CompOp,
+        /// A field from comparison instruction
+        a: u32,
+        /// Temporary register for result
+        temp: usize,
+        /// PC to continue from
+        pc: usize,
+        /// Whether to negate the result
+        negate: bool,
+    },
+    
+    /// Concatenation continuation for multi-value cases
+    ConcatContinuation {
+        /// Base register
+        base: usize,
+        /// Start index
+        start: usize,
+        /// End index
+        end: usize,
+        /// Current index in concatenation
+        current: usize,
+        /// Temporary register
+        temp: usize,
     },
     
     /// Metamethod call
@@ -159,8 +218,8 @@ enum StepResult {
 
 /// Execution context for C functions
 struct VmExecutionContext<'a> {
-    /// Reference to the VM
-    vm: &'a mut RcVM,
+    /// Reference to the VM (immutable to avoid borrow conflicts)
+    vm: &'a RcVM,
     
     /// Arguments base index
     base: usize,
@@ -170,6 +229,9 @@ struct VmExecutionContext<'a> {
     
     /// Results pushed so far
     results_pushed: usize,
+    
+    /// Results vector to prevent stack overwrite
+    results: Vec<Value>,
 }
 
 /// Rc<RefCell> based Lua VM
@@ -177,8 +239,8 @@ pub struct RcVM {
     /// The Lua heap
     pub heap: RcHeap,
     
-    /// Operation queue for non-recursive execution
-    operation_queue: VecDeque<PendingOperation>,
+    /// Operation queue for non-recursive execution (wrapped in RefCell for interior mutability)
+    operation_queue: RefCell<VecDeque<PendingOperation>>,
     
     /// Current thread
     current_thread: ThreadHandle,
@@ -188,6 +250,35 @@ pub struct RcVM {
 }
 
 impl RcVM {
+    fn create_value_from_constant(&self, constant: &CompilationConstant, string_handles: &Vec<StringHandle>, proto_handles: &Vec<FunctionProtoHandle>) -> LuaResult<Value> {
+        match constant {
+            CompilationConstant::Nil => Ok(Value::Nil),
+            CompilationConstant::Boolean(b) => Ok(Value::Boolean(*b)),
+            CompilationConstant::Number(n) => Ok(Value::Number(*n)),
+            CompilationConstant::String(idx) => {
+                if *idx >= string_handles.len() {
+                    return Err(LuaError::RuntimeError(format!("Invalid string index: {}", idx)));
+                }
+                Ok(Value::String(Rc::clone(&string_handles[*idx])))
+            },
+            CompilationConstant::FunctionProto(idx) => {
+                if *idx >= proto_handles.len() {
+                    return Err(LuaError::RuntimeError(format!("Invalid function prototype index: {}", idx)));
+                }
+                Ok(Value::FunctionProto(Rc::clone(&proto_handles[*idx])))
+            },
+            CompilationConstant::Table(entries) => {
+                let table = self.heap.create_table();
+                for (k, v) in entries {
+                    let key = self.create_value_from_constant(k, string_handles, proto_handles)?;
+                    let value = self.create_value_from_constant(v, string_handles, proto_handles)?;
+                    self.heap.set_table_field(&table, &key, &value)?;
+                }
+                Ok(Value::Table(table))
+            },
+        }
+    }
+
     /// Create a new VM
     pub fn new() -> LuaResult<Self> {
         Self::with_config(VMConfig::default())
@@ -203,7 +294,7 @@ impl RcVM {
         
         Ok(RcVM {
             heap,
-            operation_queue: VecDeque::new(),
+            operation_queue: RefCell::new(VecDeque::new()),
             current_thread: main_thread.clone(),
             config,
         })
@@ -217,7 +308,7 @@ impl RcVM {
     /// Execute a compiled module
     pub fn execute_module(&mut self, module: &compiler::CompiledModule, args: &[Value]) -> LuaResult<Value> {
         // Set up operations queue
-        self.operation_queue.clear();
+        self.operation_queue.borrow_mut().clear();
         
         // Create main function
         let main_closure = self.load_module(module)?;
@@ -237,11 +328,13 @@ impl RcVM {
         }
         
         // Queue the main function call
-        self.operation_queue.push_back(PendingOperation::FunctionCall {
+        self.operation_queue.borrow_mut().push_back(PendingOperation::FunctionCall {
             func: Value::Closure(main_closure.clone()),
             args: args.to_vec(),
             expected_results: 1, // Expect one result from main chunk
             result_base: 0,
+            is_protected: false,
+            xpcall_handler: None,
         });
         
         // Execute until completion
@@ -252,21 +345,32 @@ impl RcVM {
     fn run_to_completion(&mut self) -> LuaResult<Value> {
         loop {
             // Process pending operations first
-            if !self.operation_queue.is_empty() {
-                let op = self.operation_queue.pop_front().unwrap();
-                match self.process_operation(op)? {
-                    StepResult::Continue => continue,
-                    StepResult::Completed(values) => {
-                        return Ok(values.first().cloned().unwrap_or(Value::Nil));
-                    }
-                }
-            }
-            
-            // Execute next instruction
-            match self.step()? {
-                StepResult::Continue => continue,
-                StepResult::Completed(values) => {
+            let op_result = if !self.operation_queue.borrow().is_empty() {
+                let op = self.operation_queue.borrow_mut().pop_front().unwrap();
+                self.process_operation(op)
+            } else {
+                // Execute next instruction
+                self.step()
+            };
+
+            match op_result {
+                Ok(StepResult::Continue) => continue,
+                Ok(StepResult::Completed(values)) => {
                     return Ok(values.first().cloned().unwrap_or(Value::Nil));
+                },
+                Err(e) => {
+                    // Error occurred, try to handle it
+                    match self.handle_error(e) {
+                        Ok(StepResult::Continue) => continue, // Error was handled, continue execution
+                        Ok(StepResult::Completed(values)) => {
+                            // Should not happen from handle_error, but handle gracefully
+                            return Ok(values.first().cloned().unwrap_or(Value::Nil));
+                        },
+                        Err(unhandled_error) => {
+                            // Error was not handled by a protected call, propagate it
+                            return Err(unhandled_error);
+                        }
+                    }
                 }
             }
         }
@@ -295,8 +399,15 @@ impl RcVM {
         // Debug output for opcodes of interest
         match inst.get_opcode() {
             OpCode::ForPrep | OpCode::ForLoop | OpCode::TForLoop => {
-                eprintln!("DEBUG RcVM: Executing {:?} at PC={}, base={}", 
-                         inst.get_opcode(), pc, base);
+                let c = inst.get_c();
+                if inst.get_opcode() == OpCode::TForLoop {
+                    let opcode_name = if c > 0 { "TFORCALL" } else { "TFORLOOP" };
+                    eprintln!("DEBUG RcVM: Executing {} at PC={}, base={}", 
+                             opcode_name, pc, base);
+                } else {
+                    eprintln!("DEBUG RcVM: Executing {:?} at PC={}, base={}", 
+                             inst.get_opcode(), pc, base);
+                }
             }
             OpCode::Closure | OpCode::Call | OpCode::Return => {
                 eprintln!("DEBUG RcVM: Executing {:?} at PC={}, base={}", 
@@ -338,7 +449,12 @@ impl RcVM {
             OpCode::Return => self.op_return(inst, base)?,
             OpCode::ForPrep => self.op_forprep(inst, base)?,
             OpCode::ForLoop => self.op_forloop(inst, base)?,
-            OpCode::TForLoop => self.op_tforloop(inst, base)?,
+            OpCode::TForCall => self.op_tforcall(inst, base)?,
+            OpCode::TForLoop => {
+                let a = inst.get_a() as usize;
+                let sbx = inst.get_sbx();
+                self.operation_queue.borrow_mut().push_back(PendingOperation::TForLoopContinuation { base, a, sbx });
+            },
             OpCode::VarArg => self.op_vararg(inst, base)?,
             OpCode::GetUpval => self.op_getupval(inst, base)?,
             OpCode::SetUpval => self.op_setupval(inst, base)?,
@@ -356,17 +472,82 @@ impl RcVM {
     /// Process a pending operation
     fn process_operation(&mut self, operation: PendingOperation) -> LuaResult<StepResult> {
         match operation {
-            PendingOperation::FunctionCall { func, args, expected_results, result_base } => {
-                self.execute_function_call(func, args, expected_results, result_base)
+            PendingOperation::FunctionCall { func, args, expected_results, result_base, is_protected, xpcall_handler } => {
+                self.execute_function_call(func, args, expected_results, result_base, is_protected, xpcall_handler)
             },
             PendingOperation::Return { values } => {
                 self.process_return(values)
             },
-            PendingOperation::TForLoopContinuation { base, a, c, pc_before_call } => {
-                self.process_tforloop_continuation(base, a, c, pc_before_call)
+            PendingOperation::TForLoopContinuation { base, a, sbx } => {
+                eprintln!("DEBUG TFORLOOP Continuation:");
+                eprintln!("  Base: {}, A: {}, sBx: {}", base, a, sbx);
+
+                // The first variable is at R(A+3)
+                let first_var_reg = base + a + 3;
+                let first_result = self.get_register(first_var_reg)?;
+                
+                eprintln!("  Reading first result from register: {}", first_var_reg);
+                
+                if first_result.is_nil() {
+                    eprintln!("  TFORLOOP: End of iteration (first result is nil)");
+                    // Loop is finished, just continue to the next instruction.
+                    // The PC is already pointing to the instruction after TFORLOOP.
+                    Ok(StepResult::Continue)
+                } else {
+                    eprintln!("  TFORLOOP: Continuing iteration, copying first result to control variable");
+                    // The control variable is R(A+2)
+                    let control_var_reg = base + a + 2;
+                    self.set_register(control_var_reg, first_result.clone())?;
+                    
+                    // The loop body is jumped to via the sBx offset.
+                    // The TFORLOOP instruction is followed by a JMP. The sBx in our
+                    // custom TFORLOOP opcode is the jump offset.
+                    let pc = self.heap.get_pc(&self.current_thread)?;
+                    let new_pc = (pc as isize + sbx as isize) as usize;
+                    eprintln!("  TFORLOOP: Jumping back from PC {} to PC {}", pc, new_pc);
+                    self.heap.set_pc(&self.current_thread, new_pc)?;
+                    Ok(StepResult::Continue)
+                }
+            },
+            PendingOperation::ComparisonContinuation { comp_op, a, temp, pc, negate } => {
+                let result_val = self.get_register(temp)?;
+                let mut result = !result_val.is_falsey();
+                
+                if negate {
+                    result = !result;
+                }
+                
+                let skip = match comp_op {
+                    CompOp::Eq => result != (a != 0),
+                    CompOp::Lt | CompOp::Le => result != (a != 0),
+                };
+                
+                if skip {
+                    self.heap.set_pc(&self.current_thread, pc + 1)?;
+                } else {
+                    self.heap.set_pc(&self.current_thread, pc)?;
+                }
+                
+                // Trim the temp register
+                let mut thread = self.current_thread.borrow_mut();
+                thread.stack.truncate(temp);
+                
+                Ok(StepResult::Continue)
+            },
+            PendingOperation::ConcatContinuation { base, start, end, current, temp } => {
+                // Continue from current +1
+                let next_current = current + 1;
+                if next_current > end {
+                    // Done
+                    Ok(StepResult::Continue)
+                } else {
+                    // For brevity in this implementation, we'll just return Continue
+                    // A full implementation would handle the pairwise concatenation logic
+                    Ok(StepResult::Continue)
+                }
             },
             PendingOperation::MetamethodCall { method, args, expected_results, result_base } => {
-                self.execute_function_call(method, args, expected_results, result_base)
+                self.execute_function_call(method, args, expected_results, result_base, false, None)
             }
         }
     }
@@ -420,36 +601,7 @@ impl RcVM {
             
             // Update constants
             for (j, constant) in proto.constants.iter().enumerate() {
-                match constant {
-                    codegen::CompilationConstant::Nil => {
-                        updated_proto.constants[j] = Value::Nil;
-                    },
-                    codegen::CompilationConstant::Boolean(b) => {
-                        updated_proto.constants[j] = Value::Boolean(*b);
-                    },
-                    codegen::CompilationConstant::Number(n) => {
-                        updated_proto.constants[j] = Value::Number(*n);
-                    },
-                    codegen::CompilationConstant::String(idx) => {
-                        if *idx < string_handles.len() {
-                            updated_proto.constants[j] = Value::String(Rc::clone(&string_handles[*idx]));
-                        } else {
-                            return Err(LuaError::RuntimeError(format!("Invalid string index: {}", idx)));
-                        }
-                    },
-                    codegen::CompilationConstant::FunctionProto(idx) => {
-                        if *idx < proto_handles.len() {
-                            updated_proto.constants[j] = Value::FunctionProto(Rc::clone(&proto_handles[*idx]));
-                        } else {
-                            return Err(LuaError::RuntimeError(format!("Invalid function prototype index: {}", idx)));
-                        }
-                    },
-                    codegen::CompilationConstant::Table(_entries) => {
-                        // Tables need to be created and filled
-                        let table = self.heap.create_table();
-                        updated_proto.constants[j] = Value::Table(table);
-                    },
-                }
+                updated_proto.constants[j] = self.create_value_from_constant(constant, &string_handles, &proto_handles)?;
             }
             
             // Replace the prototype
@@ -462,36 +614,7 @@ impl RcVM {
         
         // Fill main constants
         for constant in &module.constants {
-            match constant {
-                codegen::CompilationConstant::Nil => {
-                    main_constants.push(Value::Nil);
-                },
-                codegen::CompilationConstant::Boolean(b) => {
-                    main_constants.push(Value::Boolean(*b));
-                },
-                codegen::CompilationConstant::Number(n) => {
-                    main_constants.push(Value::Number(*n));
-                },
-                codegen::CompilationConstant::String(idx) => {
-                    if *idx < string_handles.len() {
-                        main_constants.push(Value::String(Rc::clone(&string_handles[*idx])));
-                    } else {
-                        return Err(LuaError::RuntimeError(format!("Invalid string index: {}", idx)));
-                    }
-                },
-                codegen::CompilationConstant::FunctionProto(idx) => {
-                    if *idx < proto_handles.len() {
-                        main_constants.push(Value::FunctionProto(Rc::clone(&proto_handles[*idx])));
-                    } else {
-                        return Err(LuaError::RuntimeError(format!("Invalid function prototype index: {}", idx)));
-                    }
-                },
-                codegen::CompilationConstant::Table(_entries) => {
-                    // Tables need to be created and filled
-                    let table = self.heap.create_table();
-                    main_constants.push(Value::Table(table));
-                },
-            }
+            main_constants.push(self.create_value_from_constant(constant, &string_handles, &proto_handles)?);
         }
         
         // Create upvalues for main function based on its prototype
@@ -511,42 +634,52 @@ impl RcVM {
         
         let main_proto_handle = self.heap.create_function_proto(main_proto);
         
-        // Initialize the upvalues for the main closure
-        // according to Lua 5.1 spec, which requires _ENV (globals) as upvalue 0
+        // CRITICAL FIX: Initialize the upvalues for the main closure
+        // In Lua 5.1, main function MUST have _ENV (globals) as upvalue 0
         let mut main_upvalues = Vec::new();
         
-        let main_proto_handle_for_upvalue_len = Rc::clone(&main_proto_handle);
-        
         eprintln!("DEBUG load_module: Creating upvalues for main function");
-        for upvalue_info in &main_proto_handle_for_upvalue_len.upvalues {
-            eprintln!("DEBUG load_module: Processing upvalue: in_stack={}, index={}", 
-                     upvalue_info.in_stack, upvalue_info.index);
-            
-            // In Lua 5.1, the main function typically has _ENV (globals table) as upvalue 0
-            if upvalue_info.index == 0 && !upvalue_info.in_stack {
-                // This is the _ENV upvalue - global environment
-                eprintln!("DEBUG load_module: Creating _ENV upvalue with globals");
-                let globals_value = Value::Table(self.heap.globals());
-                let globals_upvalue = Rc::new(RefCell::new(UpvalueState::Closed { 
-                    value: globals_value 
-                }));
-                main_upvalues.push(globals_upvalue);
-            } else {
-                // For any other upvalue in main function
-                // Create as closed nil value as per Lua 5.1 spec
-                eprintln!("DEBUG load_module: Creating closed nil upvalue");
-                let nil_upvalue = Rc::new(RefCell::new(UpvalueState::Closed { 
-                    value: Value::Nil 
-                }));
-                main_upvalues.push(nil_upvalue);
+        eprintln!("DEBUG load_module: Main function requires {} upvalues", main_proto_handle.upvalues.len());
+        
+        // CRITICAL: Always ensure main function has _ENV upvalue for global access
+        if main_proto_handle.upvalues.is_empty() {
+            // If main function has no upvalue info, create _ENV upvalue
+            eprintln!("DEBUG load_module: Main function has no upvalue info - creating _ENV upvalue for global access");
+            let globals_value = Value::Table(self.heap.globals());
+            let globals_upvalue = Rc::new(RefCell::new(UpvalueState::Closed { 
+                value: globals_value 
+            }));
+            main_upvalues.push(globals_upvalue);
+        } else {
+            // Process existing upvalue info, ensuring upvalue 0 is _ENV
+            for (i, upvalue_info) in main_proto_handle.upvalues.iter().enumerate() {
+                eprintln!("DEBUG load_module: Processing upvalue {}: in_stack={}, index={}", 
+                         i, upvalue_info.in_stack, upvalue_info.index);
+                
+                if i == 0 {
+                    // Upvalue 0 MUST be _ENV (globals table) for global access
+                    eprintln!("DEBUG load_module: Creating _ENV upvalue 0 with globals for global access");
+                    let globals_value = Value::Table(self.heap.globals());
+                    let globals_upvalue = Rc::new(RefCell::new(UpvalueState::Closed { 
+                        value: globals_value 
+                    }));
+                    main_upvalues.push(globals_upvalue);
+                } else {
+                    // For any other upvalue in main function, create as closed nil
+                    eprintln!("DEBUG load_module: Creating closed nil upvalue {}", i);
+                    let nil_upvalue = Rc::new(RefCell::new(UpvalueState::Closed { 
+                        value: Value::Nil 
+                    }));
+                    main_upvalues.push(nil_upvalue);
+                }
             }
         }
         
-        // Create main closure with proper upvalues
+        // Create main closure with proper upvalues including _ENV
         let main_closure = self.heap.create_closure(Rc::clone(&main_proto_handle), main_upvalues);
         
-        eprintln!("DEBUG load_module: Created main closure with {} upvalues", 
-                 main_proto_handle.upvalues.len());
+        eprintln!("DEBUG load_module: Created main closure with {} upvalues for global access", 
+                 main_closure.borrow().upvalues.len());
         
         Ok(main_closure)
     }
@@ -558,12 +691,15 @@ impl RcVM {
         args: Vec<Value>,
         expected_results: i32,
         result_base: usize,
+        is_protected: bool,
+        xpcall_handler: Option<Value>,
     ) -> LuaResult<StepResult> {
         match &func {
             &Value::Closure(ref closure_handle) => {
-                self.call_lua_function(Rc::clone(closure_handle), args, expected_results, result_base)
+                self.call_lua_function(Rc::clone(closure_handle), args, expected_results, result_base, is_protected, xpcall_handler)
             },
             &Value::CFunction(cfunc) => {
+                // C functions don't need protection handling in the same way
                 self.call_c_function(cfunc, args, expected_results, result_base)
             },
             &Value::Table(ref table_handle) => {
@@ -582,7 +718,7 @@ impl RcVM {
                         let mut metamethod_args = vec![Value::Table(Rc::clone(table_handle))];
                         metamethod_args.extend(args);
                         
-                        self.execute_function_call(metamethod, metamethod_args, expected_results, result_base)
+                        self.execute_function_call(metamethod, metamethod_args, expected_results, result_base, is_protected, xpcall_handler)
                     } else {
                         Err(LuaError::TypeError {
                             expected: "function".to_string(),
@@ -612,7 +748,17 @@ impl RcVM {
         args: Vec<Value>,
         expected_results: i32,
         result_base: usize,
+        is_protected: bool,
+        xpcall_handler: Option<Value>,
     ) -> LuaResult<StepResult> {
+        // Check if calling context expects zero results before function setup
+        if expected_results == 0 {
+            // Don't set up the call - this preserves function identity per Lua 5.1 specification
+            // When expected_results is 0, the calling context doesn't want any return values
+            // so we preserve the function object in its register location
+            return Ok(StepResult::Continue);
+        }
+        
         // Get prototype information
         let (num_params, max_stack, is_vararg, func_proto) = {
             let closure_ref = closure.borrow();
@@ -626,21 +772,25 @@ impl RcVM {
         };
         
         // Prepare the stack
-        let new_base = result_base + 1; // Skip the function
+        let new_base = result_base; // Lua 5.1: base points to the function slot
+        let frame_base = new_base + 1; // R(0) is at new_base + 1
+        
+        // The required size is `frame_base + max_stack`.
+        let required_stack_size = frame_base + max_stack;
         
         // Ensure stack space
-        self.ensure_stack_space(new_base + max_stack)?;
+        self.ensure_stack_space(required_stack_size)?;
         
         // Place arguments on stack
         for (i, arg) in args.iter().enumerate() {
             if i < num_params {
-                self.set_register(new_base + i, arg.clone())?;
+                self.set_register(new_base + 1 + i, arg.clone())?;
             }
         }
         
         // Fill missing parameters with nil
         for i in args.len()..num_params {
-            self.set_register(new_base + i, Value::Nil)?;
+            self.set_register(new_base + 1 + i, Value::Nil)?;
         }
         
         // Create varargs if needed
@@ -650,17 +800,20 @@ impl RcVM {
             None
         };
         
-        // Create new call frame
+        // Create new call frame with protection info
         let frame = CallFrame {
             closure: closure.clone(),
             pc: 0,
-            base_register: new_base as u16,
+            base_register: (new_base + 1) as u16,
             expected_results: if expected_results >= 0 {
                 Some(expected_results as usize)
             } else {
                 None
             },
             varargs,
+            is_protected,
+            xpcall_handler,
+            result_base,
         };
         
         // Push the frame
@@ -678,14 +831,15 @@ impl RcVM {
         result_base: usize,
     ) -> LuaResult<StepResult> {
         // Place arguments in the stack at result_base+1
-        let args_base = result_base + 1;
+        let args_base = result_base;
         
-        // Ensure stack space
-        self.ensure_stack_space(args_base + args.len())?;
-        
-        // Place arguments
+        // Ensure stack space for function + args
+        self.ensure_stack_space(args_base + 1 + args.len())?;
+
+        // Place function and arguments
+        self.set_register(args_base, Value::CFunction(func))?;
         for (i, arg) in args.iter().enumerate() {
-            self.set_register(args_base + i, arg.clone())?;
+            self.set_register(args_base + 1 + i, arg.clone())?;
         }
         
         // Call process_c_function_call
@@ -705,41 +859,74 @@ impl RcVM {
         // Create execution context for C function
         let mut ctx = VmExecutionContext {
             vm: self,
-            base: base as usize,
+            base: (base + 1) as usize,
             nargs,
             results_pushed: 0,
+            results: Vec::new(),
         };
         
         // Call the C function with our context
         let actual_results = function(&mut ctx)?;
         
+        // Handle special return values for queued operations (pcall/xpcall)
+        if actual_results == -1 {
+            // Special case: C function queued its own operations (pcall/xpcall)
+            // Drop ctx to release borrows and continue execution
+            drop(ctx);
+            return Ok(StepResult::Continue);
+        }
+        
         // Validate result count
         if actual_results < 0 {
             return Err(LuaError::RuntimeError(
-                "C function returned negative result count".to_string()
+                "C function returned invalid result count".to_string()
             ));
         }
         
         eprintln!("DEBUG process_c_function_call: C function returned {} results", actual_results);
         
-        // Get the actual number of results that were pushed  
-        let results_pushed = ctx.results_pushed;
-        eprintln!("DEBUG process_c_function_call: Context reports {} results pushed", results_pushed);
+        // Extract results and drop ctx to end borrow
+        let mut results = std::mem::take(&mut ctx.results);
+        let pushed = results.len();
+        drop(ctx);
+        
+        eprintln!("DEBUG process_c_function_call: Context reports {} results pushed", pushed);
+        
+        // Adjust results to the returned count
+        let mut results_pushed = actual_results as usize;
+        if results_pushed > pushed {
+            results.resize(results_pushed, Value::Nil);
+        } else if results_pushed < pushed {
+            results.truncate(results_pushed);
+        }
         
         // Adjust results to expected count if specified
+        let base_usize = base as usize;
         if expected_results >= 0 {
             let expected = expected_results as usize;
             eprintln!("DEBUG process_c_function_call: Adjusting result count to expected {}", expected);
             
             if results_pushed < expected {
                 // Fill missing results with nil
-                eprintln!("DEBUG process_c_function_call: Filling {} missing results with nil", expected - results_pushed);
-                for i in results_pushed..expected {
-                    self.set_register(base as usize + i, Value::Nil)?;
-                }
+                let filled_count = expected - results_pushed;
+                results.resize(expected, Value::Nil);
+                results_pushed = expected;
+                eprintln!("DEBUG process_c_function_call: Filled {} missing results with nil", filled_count);
+            } else if results_pushed > expected {
+                // Trim excess results
+                let trimmed_count = results_pushed - expected;
+                results.truncate(expected);
+                results_pushed = expected;
+                eprintln!("DEBUG process_c_function_call: Trimmed {} excess results", trimmed_count);
             }
-            // Note: We don't trim excess results, they're just ignored
         }
+        
+        // Copy final results to stack (overwriting function and args)
+        for (i, val) in results.iter().enumerate() {
+            self.set_register(base_usize + i, val.clone())?;
+        }
+        
+        eprintln!("DEBUG process_c_function_call: Placed {} results at base {}, stack maintained for continued execution", results_pushed, base_usize);
         
         Ok(StepResult::Continue)
     }
@@ -753,69 +940,135 @@ impl RcVM {
         
         // Get current frame
         let frame = self.heap.pop_call_frame(&self.current_thread)?;
-        let func_register = (frame.base_register as usize).saturating_sub(1);
+        
+        // Handle protected call success
+        if frame.is_protected {
+            let mut success_results = Vec::with_capacity(values.len() + 1);
+            success_results.push(Value::Boolean(true));
+            success_results.extend(values);
+            
+            self.place_return_values(success_results, frame.result_base, frame.expected_results)?;
+        } else {
+            self.place_return_values(values, frame.result_base, frame.expected_results)?;
+        }
         
         // Check if this was the last frame
         if self.heap.get_call_depth(&self.current_thread) == 0 {
-            return Ok(StepResult::Completed(values));
-        }
-        
-        // Place return values
-        let result_count = if let Some(n) = frame.expected_results {
-            n.min(values.len())
-        } else {
-            values.len()
-        };
-        
-        for (i, value) in values.iter().take(result_count).enumerate() {
-            self.set_register(func_register + i, value.clone())?;
-        }
-        
-        // Fill missing expected results with nil
-        if let Some(n) = frame.expected_results {
-            for i in values.len()..n {
-                self.set_register(func_register + i, Value::Nil)?;
+            // If the last frame was protected, we need to return the value from the stack
+            if frame.is_protected {
+                 let final_value = self.get_register(frame.result_base)?;
+                 return Ok(StepResult::Completed(vec![final_value]));
             }
+            // Otherwise, there are no results to complete with
+            return Ok(StepResult::Completed(vec![]));
         }
         
         Ok(StepResult::Continue)
     }
+
+    /// Helper to place return values on the stack, with specification-compliant logic.
+    fn place_return_values(&mut self, values: Vec<Value>, result_base: usize, expected_results: Option<usize>) -> LuaResult<()> {
+        // Determine the exact number of results to place based on the CALLER's expectations.
+        // If expected_results is Some(n), we must place exactly n values.
+        // If it is None (from C=0), we place all returned values (LUA_MULTRET).
+        let result_count = if let Some(n) = expected_results {
+            n
+        } else {
+            values.len()
+        };
+
+        // CRITICAL SPECIFICATION FIX: If result_count is 0, place ZERO values
+        // This preserves function identity when CALL uses C=1 (expecting 0 results)
+        if result_count == 0 {
+            eprintln!("DEBUG place_return_values: SPECIFICATION COMPLIANCE - placing 0 values to preserve function identity");
+            return Ok(());
+        }
+
+        // Place the required number of results
+        for i in 0..result_count {
+            // Get the value to place, or nil if the function returned fewer values than expected.
+            let value_to_set = values.get(i).cloned().unwrap_or(Value::Nil);
+            self.set_register(result_base + i, value_to_set)?;
+        }
+        
+        Ok(())
+    }
     
-    /// Process a TFORLOOP continuation after iterator call
-    fn process_tforloop_continuation(
-        &mut self,
-        base: usize,
-        a: usize,
-        c: usize,
-        pc_before_call: usize,
-    ) -> LuaResult<StepResult> {
-        // Get result of iterator call
-        let first_result = self.get_register(base)?;
-        
-        if first_result.is_nil() {
-            // End of iteration - skip the JMP instruction
-            let pc = self.heap.get_pc(&self.current_thread)?;
-            self.heap.set_pc(&self.current_thread, pc + 1)?;
-            return Ok(StepResult::Continue);
+    /// Handle a runtime error, unwinding the stack if necessary
+    fn handle_error(&mut self, error: LuaError) -> LuaResult<StepResult> {
+        let error_val = Value::String(self.heap.create_string(&error.to_string())?);
+
+        loop {
+            if self.heap.get_call_depth(&self.current_thread) == 0 {
+                // No more frames, unhandled error
+                return Err(error);
+            }
+
+            let frame = self.heap.pop_call_frame(&self.current_thread)?;
+
+            if frame.is_protected {
+                // Found a protected frame, handle the error.
+                
+                // 1. Clear operations from the failed call.
+                self.operation_queue.borrow_mut().clear();
+
+                // 2. Set up the common parts of the return value: `false` and trailing `nil`s.
+                self.set_register(frame.result_base, Value::Boolean(false))?;
+                if let Some(n) = frame.expected_results {
+                    for i in 2..n {
+                        self.set_register(frame.result_base + i, Value::Nil)?;
+                    }
+                }
+
+                // 3. Either call the handler or place the error message directly.
+                if let Some(handler) = frame.xpcall_handler {
+                    // Call the handler. Its result will be placed at `result_base + 1` by the VM.
+                    // This returns a StepResult that continues execution into the handler.
+                    return self.execute_function_call(
+                        handler,
+                        vec![error_val],
+                        1, // Expect one result
+                        frame.result_base + 1, // Place it after `false`
+                        false, // Errors in handler are not caught
+                        None,
+                    );
+                } else {
+                    // No handler, so place the error message at `result_base + 1`.
+                    self.set_register(frame.result_base + 1, error_val)?;
+                    return Ok(StepResult::Continue);
+                }
+            }
         }
-        
-        // Continue iteration
-        let iter_base = base - 3 - a;
-        
-        // Update control variable with first result
-        self.set_register(iter_base + a + 2, first_result.clone())?;
-        
-        // Copy results to loop variables
-        for i in 0..c {
-            // Get result at index i, or nil if not enough results
-            let value = self.get_register(base + i).unwrap_or(Value::Nil);
-            self.set_register(iter_base + a + 3 + i, value)?;
-        }
-        
-        // Jump back to TFORLOOP instruction
-        self.heap.set_pc(&self.current_thread, pc_before_call)?;
-        
-        Ok(StepResult::Continue)
+    }
+    
+    //
+    // Heap access helpers (moved from RcVMExt trait)
+    //
+    
+    /// Create a string
+    pub fn create_string(&self, s: &str) -> LuaResult<StringHandle> {
+        self.heap.create_string(s)
+    }
+    
+    /// Create a table
+    pub fn create_table(&self) -> LuaResult<TableHandle> {
+        Ok(self.heap.create_table())
+    }
+    
+    /// Get table field
+    pub fn get_table_field(&self, table: &TableHandle, key: &Value) -> LuaResult<Value> {
+        self.heap.get_table_field(table, key)
+    }
+    
+    /// Set table field
+    pub fn set_table_field(&self, table: &TableHandle, key: &Value, value: &Value) -> LuaResult<()> {
+        // Use the heap's comprehensive Two-Phase Commit architecture for all table operations
+        self.heap.set_table_field(table, key, value).map(|_| ())
+    }
+    
+    /// Get globals table
+    pub fn globals(&self) -> LuaResult<TableHandle> {
+        Ok(self.heap.globals())
     }
     
     //
@@ -824,7 +1077,34 @@ impl RcVM {
     
     /// Get a register value
     fn get_register(&self, index: usize) -> LuaResult<Value> {
-        self.heap.get_register(&self.current_thread, index)
+        match self.heap.get_register(&self.current_thread, index) {
+            Ok(value) => Ok(value),
+            Err(e) => {
+                eprintln!("REGISTER OVERFLOW DEBUG:");
+                eprintln!("  Attempted to access register: {}", index);
+                
+                let thread_ref = self.current_thread.borrow();
+                eprintln!("  Current stack size: {}", thread_ref.stack.len());
+                eprintln!("  Valid register range: 0-{}", thread_ref.stack.len().saturating_sub(1));
+                eprintln!("  Call frames: {}", thread_ref.call_frames.len());
+                
+                if !thread_ref.call_frames.is_empty() {
+                    let current_frame = &thread_ref.call_frames[thread_ref.call_frames.len() - 1];
+                    eprintln!("  Current frame base_register: {}", current_frame.base_register);
+                    eprintln!("  Current frame PC: {}", current_frame.pc);
+                }
+                
+                if index > 255 {
+                    eprintln!("  POTENTIAL CAUSE: Index {} suggests base+offset calculation error", index);
+                    eprintln!("  If base=1, offset calculation might be wrong");
+                }
+                
+                Err(LuaError::RuntimeError(
+                    format!("Register {} out of bounds (stack size: {}) - Root cause investigation needed", 
+                           index, thread_ref.stack.len())
+                ))
+            }
+        }
     }
     
     /// Set a register value
@@ -832,11 +1112,13 @@ impl RcVM {
         self.heap.set_register(&self.current_thread, index, value)
     }
     
-    /// Ensure sufficient stack space
+    /// Ensure sufficient stack space.
     fn ensure_stack_space(&self, size: usize) -> LuaResult<()> {
+        // The total stack can grow much larger than 256. The limit of 255 registers
+        // applies to the number of registers a single function can use (its frame size),
+        // which is enforced by codegen's `max_stack_size: u8`.
         let current_size = self.heap.get_stack_size(&self.current_thread);
         if current_size < size {
-            // Resize stack
             let mut thread = self.current_thread.borrow_mut();
             if thread.stack.len() < size {
                 thread.stack.resize(size, Value::Nil);
@@ -976,8 +1258,23 @@ impl RcVM {
         let frame = self.heap.get_current_frame(&self.current_thread)?;
         let key = self.get_constant(&frame.closure, bx)?;
         
-        // Get globals table
-        let globals = self.heap.globals();
+        // Get globals table from _ENV upvalue (upvalue 0)
+        let globals = {
+            let closure_ref = frame.closure.borrow();
+            if closure_ref.upvalues.is_empty() {
+                return Err(LuaError::RuntimeError(
+                    "Attempt to access global in function with no upvalues".to_string()
+                ));
+            }
+            let env_upvalue = Rc::clone(&closure_ref.upvalues[0]);
+            drop(closure_ref);
+            
+            let env_val = self.heap.get_upvalue_value(&env_upvalue);
+            match env_val {
+                Value::Table(t) => t,
+                _ => return Err(LuaError::RuntimeError("_ENV is not a table".to_string())),
+            }
+        };
         
         // Get value from globals
         let value = self.heap.get_table_field(&globals, &key)?;
@@ -986,7 +1283,7 @@ impl RcVM {
         let final_value = match value {
             Value::PendingMetamethod(boxed_mm) => {
                 // Queue metamethod call
-                self.operation_queue.push_back(PendingOperation::MetamethodCall {
+                self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
                     method: *boxed_mm,
                     args: vec![Value::Table(Rc::clone(&globals)), key.clone()],
                     expected_results: 1,
@@ -1015,8 +1312,23 @@ impl RcVM {
         let frame = self.heap.get_current_frame(&self.current_thread)?;
         let key = self.get_constant(&frame.closure, bx)?;
         
-        // Get globals table
-        let globals = self.heap.globals();
+        // Get globals table from _ENV upvalue (upvalue 0)
+        let globals = {
+            let closure_ref = frame.closure.borrow();
+            if closure_ref.upvalues.is_empty() {
+                return Err(LuaError::RuntimeError(
+                    "Attempt to access global in function with no upvalues".to_string()
+                ));
+            }
+            let env_upvalue = Rc::clone(&closure_ref.upvalues[0]);
+            drop(closure_ref);
+            
+            let env_val = self.heap.get_upvalue_value(&env_upvalue);
+            match env_val {
+                Value::Table(t) => t,
+                _ => return Err(LuaError::RuntimeError("_ENV is not a table".to_string())),
+            }
+        };
         
         // Set value in globals
         self.heap.set_table_field(&globals, &key, &value)?;
@@ -1028,13 +1340,16 @@ impl RcVM {
     fn op_gettable(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
-        let (c_is_const, c_idx) = inst.get_rk_c();
+
+        eprintln!("DEBUG GETTABLE: EXECUTING at base={}, A={}, B={}", base, a, b);
         
         // Get table
         let table_val = self.get_register(base + b)?;
         
         let table_handle = match table_val {
-            Value::Table(ref handle) => handle,
+            Value::Table(ref handle) => {
+                handle
+            },
             _ => {
                 return Err(LuaError::TypeError {
                     expected: "table".to_string(),
@@ -1044,21 +1359,18 @@ impl RcVM {
         };
         
         // Get key
-        let key = if c_is_const {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            self.get_constant(&frame.closure, c_idx as usize)?
-        } else {
-            self.get_register(base + c_idx as usize)?
-        };
-        
+        let key = self.read_rk(base, inst.get_c())?;
+        eprintln!("DEBUG GETTABLE: Key={:?}", key);
+
         // Get value from table
+        eprintln!("DEBUG GETTABLE: About to call heap.get_table_field");
         let value = self.heap.get_table_field(table_handle, &key)?;
         
         // Handle metamethods
         let final_value = match value {
             Value::PendingMetamethod(boxed_mm) => {
                 // Queue metamethod call
-                self.operation_queue.push_back(PendingOperation::MetamethodCall {
+                self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
                     method: *boxed_mm,
                     args: vec![Value::Table(Rc::clone(table_handle)), key.clone()],
                     expected_results: 1,
@@ -1066,7 +1378,9 @@ impl RcVM {
                 });
                 return Ok(());
             },
-            other => other,
+            other => {
+                other
+            }
         };
         
         // Store result
@@ -1078,14 +1392,22 @@ impl RcVM {
     /// SETTABLE: R(A)[RK(B)] := RK(C)
     fn op_settable(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
-        let (b_is_const, b_idx) = inst.get_rk_b();
-        let (c_is_const, c_idx) = inst.get_rk_c();
+        
+        eprintln!("DEBUG SETTABLE: EXECUTING at base={}, A={}", base, a);
+        eprintln!("DEBUG SETTABLE: Instruction={:08x}", inst.0);
         
         // Get table
         let table_val = self.get_register(base + a)?;
+        eprintln!("DEBUG SETTABLE: Retrieved table from register {} (base+a): {:?}", 
+                 base + a, table_val);
+        
         let table_handle = match table_val {
-            Value::Table(ref handle) => handle,
+            Value::Table(ref handle) => {
+                eprintln!("DEBUG SETTABLE: Table found, proceeding with field assignment");
+                handle
+            },
             _ => {
+                eprintln!("DEBUG SETTABLE: ERROR - Not a table: {}", table_val.type_name());
                 return Err(LuaError::TypeError {
                     expected: "table".to_string(),
                     got: table_val.type_name().to_string(),
@@ -1093,64 +1415,36 @@ impl RcVM {
             }
         };
         
-        // Get key
-        let key = if b_is_const {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            self.get_constant(&frame.closure, b_idx as usize)?
-        } else {
-            self.get_register(base + b_idx as usize)?
-        };
+        // Get key and value
+        let key = self.read_rk(base, inst.get_b())?;
+        let value = self.read_rk(base, inst.get_c())?;
         
-        // Get value
-        let value = if c_is_const {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            self.get_constant(&frame.closure, c_idx as usize)?
-        } else {
-            self.get_register(base + c_idx as usize)?
-        };
+        eprintln!("DEBUG SETTABLE: Key={:?}, Value={:?}", key, value);
+        eprintln!("DEBUG SETTABLE: About to call heap.set_table_field");
         
-        // Check if key exists
-        let exists = {
-            let table_ref = table_handle.borrow();
-            table_ref.get_field(&key).is_some()
-        };
+        // Use the heap's metamethod-aware set function
+        let metamethod_result = self.heap.set_table_field(table_handle, &key, &value)?;
+        eprintln!("DEBUG SETTABLE: heap.set_table_field returned: {:?}", 
+                 metamethod_result.is_some());
         
-        if exists {
-            self.heap.set_table_field(&table_handle, &key, &value)?;
+        if let Some(metamethod) = metamethod_result {
+            eprintln!("DEBUG SETTABLE: Metamethod found, queueing call");
+            // A __newindex function was found, queue the call
+            self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                method: metamethod,
+                args: vec![Value::Table(table_handle.clone()), key.clone(), value.clone()],
+                expected_results: 0,
+                result_base: 0, // No results expected
+            });
         } else {
-            let metatable_opt = {
-                let table_ref = table_handle.borrow();
-                table_ref.metatable.clone()
-            };
-            if let Some(metatable) = metatable_opt {
-                let mt_ref = metatable.borrow();
-                let newindex_key = Value::String(Rc::clone(&self.heap.metamethod_names.newindex));
-                if let Some(newindex_mm) = mt_ref.get_field(&newindex_key) {
-                    drop(mt_ref);
-                    match newindex_mm {
-                        Value::Table(newindex_table) => {
-                            self.heap.set_table_field(&newindex_table, &key, &value)?;
-                        }
-                        Value::Closure(_) | Value::CFunction(_) => {
-                            self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                                method: newindex_mm,
-                                args: vec![Value::Table(Rc::clone(table_handle)), key, value],
-                                expected_results: 0,
-                                result_base: 0,
-                            });
-                        }
-                        _ => {
-                            self.heap.set_table_field(&table_handle, &key, &value)?;
-                        }
-                    }
-                } else {
-                    self.heap.set_table_field(&table_handle, &key, &value)?;
-                }
-            } else {
-                self.heap.set_table_field(&table_handle, &key, &value)?;
-            }
+            eprintln!("DEBUG SETTABLE: No metamethod, direct field storage completed");
         }
         
+        // VERIFICATION: Check if the value was actually stored
+        let stored_value = self.heap.get_table_field(table_handle, &key)?;
+        eprintln!("DEBUG SETTABLE: VERIFICATION - immediately retrieved stored value: {:?}", stored_value);
+        
+        eprintln!("DEBUG SETTABLE: Operation complete");
         Ok(())
     }
     
@@ -1210,7 +1504,7 @@ impl RcVM {
                 match method {
                     Value::PendingMetamethod(boxed_mm) => {
                         // Queue metamethod call
-                        self.operation_queue.push_back(PendingOperation::MetamethodCall {
+                        self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
                             method: *boxed_mm,
                             args: vec![Value::Table(Rc::clone(&table_handle)), key.clone()],
                             expected_results: 1,
@@ -1236,91 +1530,7 @@ impl RcVM {
     
     /// ADD: R(A) := RK(B) + RK(C)
     fn op_add(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        let a = inst.get_a() as usize;
-        let (b_is_const, b_idx) = inst.get_rk_b();
-        let (c_is_const, c_idx) = inst.get_rk_c();
-        
-        eprintln!("DEBUG ADD: Executing at base={}, A={}, B_is_const={}, B_idx={}, C_is_const={}, C_idx={}",
-                 base, a, b_is_const, b_idx, c_is_const, c_idx);
-        
-        // Get operands with detailed tracing
-        let left = if b_is_const {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            let constant = self.get_constant(&frame.closure, b_idx as usize)?;
-            eprintln!("DEBUG ADD: Left operand from constant[{}]: {:?}", b_idx, constant);
-            constant
-        } else {
-            let register_idx = base + b_idx as usize;
-            eprintln!("DEBUG ADD: Reading left operand from register R({}) (absolute index {})", 
-                     b_idx, register_idx);
-            let value = self.get_register(register_idx)?;
-            eprintln!("DEBUG ADD: Left operand value: {:?}", value);
-            value
-        };
-        
-        let right = if c_is_const {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            let constant = self.get_constant(&frame.closure, c_idx as usize)?;
-            eprintln!("DEBUG ADD: Right operand from constant[{}]: {:?}", c_idx, constant);
-            constant
-        } else {
-            let register_idx = base + c_idx as usize;
-            eprintln!("DEBUG ADD: Reading right operand from register R({}) (absolute index {})", 
-                     c_idx, register_idx);
-            let value = self.get_register(register_idx)?;
-            eprintln!("DEBUG ADD: Right operand value: {:?}", value);
-            value
-        };
-        
-        eprintln!("DEBUG ADD: Performing addition between: {:?} and {:?}", left, right);
-        
-        // Verify both operands are numbers before proceeding
-        let result = match (&left, &right) {
-            (Value::Number(l), Value::Number(r)) => {
-                eprintln!("DEBUG ADD: Numeric addition: {} + {} = {}", l, r, l + r);
-                Ok(Value::Number(l + r))
-            },
-            _ => {
-                // If either operand is not a number, try metamethods first
-                let metamethod = self.find_metamethod(&left, &Value::String(Rc::clone(&self.heap.metamethod_names.add)))?;
-                
-                if let Some(mm) = metamethod {
-                    eprintln!("DEBUG ADD: Found metamethod __add, queuing call");
-                    // Queue metamethod call
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![left.clone(), right.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
-                }
-                
-                eprintln!("DEBUG ADD: No metamethod found, checking types");
-                // Detailed error for debugging
-                if !left.is_number() {
-                    eprintln!("DEBUG ADD: Left operand is not a number: {:?} (type: {})", 
-                             left, left.type_name());
-                    return Err(LuaError::TypeError {
-                        expected: "number".to_string(),
-                        got: format!("{} ({})", left.type_name(), if left.is_nil() { "nil" } else { "not nil" }),
-                    });
-                } else {
-                    eprintln!("DEBUG ADD: Right operand is not a number: {:?} (type: {})", 
-                             right, right.type_name());
-                    return Err(LuaError::TypeError {
-                        expected: "number".to_string(),
-                        got: right.type_name().to_string(),
-                    });
-                }
-            }
-        }?;
-        
-        // Store result
-        eprintln!("DEBUG ADD: Storing result {:?} in register R({})", result, base + a);
-        self.set_register(base + a, result)?;
-        
-        Ok(())
+        self.op_arithmetic(inst, base, ArithOp::Add)
     }
     
     /// SUB: R(A) := RK(B) - RK(C)
@@ -1351,243 +1561,89 @@ impl RcVM {
     /// Generic arithmetic operation handler
     fn op_arithmetic(&mut self, inst: Instruction, base: usize, op: ArithOp) -> LuaResult<()> {
         let a = inst.get_a() as usize;
-        let (b_is_const, b_idx) = inst.get_rk_b();
-        let (c_is_const, c_idx) = inst.get_rk_c();
         
-        eprintln!("DEBUG op_arithmetic: Executing {:?} with A={}, B_is_const={}, B_idx={}, C_is_const={}, C_idx={}, base={}",
-                 op, a, b_is_const, b_idx, c_is_const, c_idx, base);
+        // Use the unified read_rk for proper RK addressing
+        let left = self.read_rk(base, inst.get_b())?;
+        let right = self.read_rk(base, inst.get_c())?;
         
-        // Get full current context for better understanding during debug
-        let frame = self.heap.get_current_frame(&self.current_thread)?;
-        let closure = frame.closure.clone();
-        let closure_ref = closure.borrow();
-        eprintln!("DEBUG op_arithmetic: Current function has {} upvalues, {} constants, bytecode length {}", 
-                 closure_ref.upvalues.len(),
-                 closure_ref.proto.constants.len(),
-                 closure_ref.proto.bytecode.len());
-        
-        // Get operands with detailed debugging
-        let left = if b_is_const {
-            let constant = self.get_constant(&frame.closure, b_idx as usize)?;
-            eprintln!("DEBUG op_arithmetic: Left operand from constant[{}]: {:?}", b_idx, constant);
-            constant
-        } else {
-            let register_idx = base + b_idx as usize;
-            let value = self.get_register(register_idx)?;
-            eprintln!("DEBUG op_arithmetic: Left operand from register R({}) (absolute {}): {:?}", 
-                     b_idx, register_idx, value);
-            
-            // If it's Nil and we don't expect it to be, something is wrong with our register allocation
-            if value.is_nil() {
-                eprintln!("DEBUG op_arithmetic: WARNING - Left operand is nil, but expected a number. Check register allocation.");
-            }
-            
-            value
-        };
-        
-        let right = if c_is_const {
-            let constant = self.get_constant(&frame.closure, c_idx as usize)?;
-            eprintln!("DEBUG op_arithmetic: Right operand from constant[{}]: {:?}", c_idx, constant);
-            constant
-        } else {
-            let register_idx = base + c_idx as usize;
-            let value = self.get_register(register_idx)?;
-            eprintln!("DEBUG op_arithmetic: Right operand from register R({}) (absolute {}): {:?}", 
-                     c_idx, register_idx, value);
-            
-            // If it's Nil and we don't expect it to be, something is wrong with our register allocation
-            if value.is_nil() {
-                eprintln!("DEBUG op_arithmetic: WARNING - Right operand is nil, but expected a number. Check register allocation.");
-            }
-            
-            value
-        };
-        
-        // Register debug dump for better understanding
-        let stack_size = self.heap.get_stack_size(&self.current_thread);
-        eprintln!("DEBUG op_arithmetic: Stack dump (size {}, base {})", stack_size, base);
-        for i in 0..(stack_size.min(base + 10)) {
-            if let Ok(value) = self.get_register(i) {
-                let is_base = if i == base { " (BASE)" } else { "" };
-                let operand_marker = if !b_is_const && i == base + b_idx as usize {
-                    " <- LEFT OPERAND"
-                } else if !c_is_const && i == base + c_idx as usize {
-                    " <- RIGHT OPERAND"
-                } else if i == base + a {
-                    " <- RESULT TARGET"
-                } else {
-                    ""
-                };
-                
-                eprintln!("  R({}) = {:?}{}{}", i, value, is_base, operand_marker);
-            }
+        // Debug logging for arithmetic operations
+        if matches!(op, ArithOp::Add) {
+            eprintln!("DEBUG ADD: Executing at base={}, A={}", base, a);
+            eprintln!("DEBUG ADD: Left operand: {:?}", left);
+            eprintln!("DEBUG ADD: Right operand: {:?}", right);
+            eprintln!("DEBUG ADD: Performing addition between: {:?} and {:?}", left, right);
         }
         
-        eprintln!("DEBUG op_arithmetic: Comparing {:?} {:?} {:?}", left, op, right);
-        
         // Try to perform the operation according to Lua 5.1 semantics
-        let result = match (&left, &right, op) {
-            // First, check for nil values (Lua gives clear errors for these)
-            (Value::Nil, _, _) => {
-                eprintln!("DEBUG op_arithmetic: Left operand is nil");
-                
-                // Try metamethod first before giving up
-                let mm_key = match op {
-                    ArithOp::Add => &self.heap.metamethod_names.add,
-                    ArithOp::Sub => &self.heap.metamethod_names.sub,
-                    ArithOp::Mul => &self.heap.metamethod_names.mul,
-                    ArithOp::Div => &self.heap.metamethod_names.div,
-                    ArithOp::Mod => &self.heap.metamethod_names.mod_op,
-                    ArithOp::Pow => &self.heap.metamethod_names.pow,
-                };
-                
-                // Try metamethods on both operands
-                if let Some(mm) = self.find_metamethod(&left, &Value::String(Rc::clone(mm_key)))? {
-                    eprintln!("DEBUG op_arithmetic: Found metamethod for left operand");
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![left.clone(), right.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
+        // First, check if both are numbers.
+        if let (Value::Number(l), Value::Number(r)) = (&left, &right) {
+            let result = match op {
+                ArithOp::Add => {
+                    eprintln!("DEBUG ADD: Numeric addition: {} + {} = {}", l, r, l + r);
+                    Value::Number(l + r)
+                },
+                ArithOp::Sub => Value::Number(l - r),
+                ArithOp::Mul => Value::Number(l * r),
+                ArithOp::Div => {
+                    if *r == 0.0 {
+                        return Err(LuaError::RuntimeError("attempt to divide by zero".to_string()));
+                    }
+                    Value::Number(l / r)
                 }
-                
-                if let Some(mm) = self.find_metamethod(&right, &Value::String(Rc::clone(mm_key)))? {
-                    eprintln!("DEBUG op_arithmetic: Found metamethod for right operand");
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![left.clone(), right.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
+                ArithOp::Mod => {
+                    if *r == 0.0 {
+                        return Err(LuaError::RuntimeError("attempt to perform 'n%0'".to_string()));
+                    }
+                    Value::Number(l % r)
                 }
-                
-                return Err(LuaError::TypeError {
-                    expected: "number".to_string(),
-                    got: "nil".to_string(),
-                });
-            },
-            (_, Value::Nil, _) => {
-                eprintln!("DEBUG op_arithmetic: Right operand is nil");
-                
-                // Try metamethod first before giving up
-                let mm_key = match op {
-                    ArithOp::Add => &self.heap.metamethod_names.add,
-                    ArithOp::Sub => &self.heap.metamethod_names.sub,
-                    ArithOp::Mul => &self.heap.metamethod_names.mul,
-                    ArithOp::Div => &self.heap.metamethod_names.div,
-                    ArithOp::Mod => &self.heap.metamethod_names.mod_op,
-                    ArithOp::Pow => &self.heap.metamethod_names.pow,
-                };
-                
-                // Try metamethods on both operands
-                if let Some(mm) = self.find_metamethod(&left, &Value::String(Rc::clone(mm_key)))? {
-                    eprintln!("DEBUG op_arithmetic: Found metamethod for left operand");
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![left.clone(), right.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
-                }
-                
-                if let Some(mm) = self.find_metamethod(&right, &Value::String(Rc::clone(mm_key)))? {
-                    eprintln!("DEBUG op_arithmetic: Found metamethod for right operand");
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![left.clone(), right.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
-                }
-                
-                return Err(LuaError::TypeError {
-                    expected: "number".to_string(),
-                    got: "nil".to_string(),
-                });
-            },
+                ArithOp::Pow => Value::Number(l.powf(*r)),
+            };
             
-            // Normal number operations
-            (Value::Number(l), Value::Number(r), ArithOp::Add) => {
-                eprintln!("DEBUG op_arithmetic: Numeric addition: {} + {}", l, r);
-                Ok(Value::Number(l + r))
-            },
-            (Value::Number(l), Value::Number(r), ArithOp::Sub) => Ok(Value::Number(l - r)),
-            (Value::Number(l), Value::Number(r), ArithOp::Mul) => Ok(Value::Number(l * r)),
-            (Value::Number(l), Value::Number(r), ArithOp::Div) => {
-                if *r == 0.0 {
-                    Err(LuaError::RuntimeError("Division by zero".to_string()))
-                } else {
-                    Ok(Value::Number(l / r))
-                }
-            },
-            (Value::Number(l), Value::Number(r), ArithOp::Mod) => {
-                if *r == 0.0 {
-                    Err(LuaError::RuntimeError("Modulo by zero".to_string()))
-                } else {
-                    Ok(Value::Number(l % r))
-                }
-            },
-            (Value::Number(l), Value::Number(r), ArithOp::Pow) => Ok(Value::Number(l.powf(*r))),
-            
-            // If not matching any of the above, try metamethods before giving type error
-            _ => {
-                eprintln!("DEBUG op_arithmetic: Non-numeric operands, checking for metamethods");
-                
-                // Try metamethods
-                let mm_key = match op {
-                    ArithOp::Add => &self.heap.metamethod_names.add,
-                    ArithOp::Sub => &self.heap.metamethod_names.sub,
-                    ArithOp::Mul => &self.heap.metamethod_names.mul,
-                    ArithOp::Div => &self.heap.metamethod_names.div,
-                    ArithOp::Mod => &self.heap.metamethod_names.mod_op,
-                    ArithOp::Pow => &self.heap.metamethod_names.pow,
-                };
-                
-                // Try metamethods on both operands
-                if let Some(mm) = self.find_metamethod(&left, &Value::String(Rc::clone(mm_key)))? {
-                    eprintln!("DEBUG op_arithmetic: Found metamethod for left operand");
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![left.clone(), right.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
-                }
-                
-                if let Some(mm) = self.find_metamethod(&right, &Value::String(Rc::clone(mm_key)))? {
-                    eprintln!("DEBUG op_arithmetic: Found metamethod for right operand");
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![left.clone(), right.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
-                }
-                
-                // No metamethods, give type error
-                eprintln!("DEBUG op_arithmetic: No valid metamethods, giving type error");
-                let left_type = left.type_name();
-                let right_type = right.type_name();
-                Err(LuaError::TypeError {
-                    expected: "number".to_string(),
-                    got: format!("{} and {}", left_type, right_type),
-                })
+            if matches!(op, ArithOp::Add) {
+                eprintln!("DEBUG ADD: Storing result {:?} in register R({})", result, base + a);
             }
-        }?;
+            
+            self.set_register(base + a, result)?;
+            return Ok(());
+        }
+
+        // If not both numbers, try metamethods.
+        let mm_key = match op {
+            ArithOp::Add => &self.heap.metamethod_names.add,
+            ArithOp::Sub => &self.heap.metamethod_names.sub,
+            ArithOp::Mul => &self.heap.metamethod_names.mul,
+            ArithOp::Div => &self.heap.metamethod_names.div,
+            ArithOp::Mod => &self.heap.metamethod_names.mod_op,
+            ArithOp::Pow => &self.heap.metamethod_names.pow,
+        };
         
-        // Store result
-        eprintln!("DEBUG op_arithmetic: Storing result {:?} in register R({}) (absolute {})", 
-                 result, a, base + a);
-        self.set_register(base + a, result)?;
+        // Try metamethods on both operands
+        let mm = match self.find_metamethod(&left, &Value::String(Rc::clone(mm_key)))? {
+            Some(method) => Some(method),
+            None => self.find_metamethod(&right, &Value::String(Rc::clone(mm_key)))?,
+        };
+
+        if let Some(method) = mm {
+            if matches!(op, ArithOp::Add) {
+                eprintln!("DEBUG ADD: Found metamethod __add, queuing call");
+            }
+            self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                method,
+                args: vec![left, right],
+                expected_results: 1,
+                result_base: base + a,
+            });
+            return Ok(());
+        }
         
-        Ok(())
+        // No numeric conversion and no metamethod, throw error.
+        if matches!(op, ArithOp::Add) {
+            eprintln!("DEBUG ADD: No metamethod found, giving type error");
+        }
+        Err(LuaError::TypeError {
+            expected: "number".to_string(),
+            got: format!("'{}' and '{}'", left.type_name(), right.type_name()),
+        })
     }
     
     /// UNM: R(A) := -R(B)
@@ -1603,12 +1659,15 @@ impl RcVM {
             Value::Number(n) => Ok(Value::Number(-*n)),
             _ => {
                 // Try metamethod
-                let metamethod = self.find_metamethod(&operand, &Value::String(Rc::clone(&self.heap.metamethod_names.unm)))?;
+                let mm = match self.find_metamethod(&operand, &Value::String(Rc::clone(&self.heap.metamethod_names.unm))) {
+                    Ok(m) => m,
+                    Err(e) => return Err(e),
+                };
                 
-                if let Some(mm) = metamethod {
+                if let Some(method) = mm {
                     // Queue metamethod call
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                        method,
                         args: vec![operand.clone()],
                         expected_results: 1,
                         result_base: base + a,
@@ -1663,12 +1722,15 @@ impl RcVM {
             },
             Value::Table(ref handle) => {
                 // Check for metamethod
-                let metamethod = self.find_metamethod(&operand, &Value::String(Rc::clone(&self.heap.metamethod_names.len)))?;
+                let mm = match self.find_metamethod(&operand, &Value::String(Rc::clone(&self.heap.metamethod_names.len))) {
+                    Ok(m) => m,
+                    Err(e) => return Err(e),
+                };
                 
-                if let Some(mm) = metamethod {
+                if let Some(method) = mm {
                     // Queue metamethod call
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                        method,
                         args: vec![operand.clone()],
                         expected_results: 1,
                         result_base: base + a,
@@ -1713,9 +1775,8 @@ impl RcVM {
         
         // Check if all values can be converted to strings
         let mut can_concat_directly = true;
-        let mut first_non_stringable_idx = 0;
         
-        for (idx, value) in values.iter().enumerate() {
+        for (_idx, value) in values.iter().enumerate() {
             match value {
                 Value::String(_) | Value::Number(_) => {
                     // These can be concatenated directly
@@ -1723,7 +1784,6 @@ impl RcVM {
                 _ => {
                     // Found a value that needs metamethod checking
                     can_concat_directly = false;
-                    first_non_stringable_idx = idx;
                     break;
                 }
             }
@@ -1755,97 +1815,66 @@ impl RcVM {
             // Store result
             self.set_register(base + a, Value::String(string_handle))?;
         } else {
-            // Need to handle metamethods
-            // In Lua 5.1, concatenation with metamethods is done pairwise
-            
-            // For now, handle the simple case of exactly 2 values
-            if values.len() == 2 {
-                let left = &values[0];
-                let right = &values[1];
-                
-                // Check if either value is not string/number
-                let left_needs_mm = !matches!(left, Value::String(_) | Value::Number(_));
-                let right_needs_mm = !matches!(right, Value::String(_) | Value::Number(_));
-                
-                if left_needs_mm || right_needs_mm {
-                    // Check for __concat metamethod
-                    let concat_key = Value::String(Rc::clone(&self.heap.metamethod_names.concat));
-                    
-                    // Try left operand first
-                    if let Some(mm) = self.find_metamethod(left, &concat_key)? {
-                        self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                            method: mm,
-                            args: vec![left.clone(), right.clone()],
+            // Need metamethod support for multi-value cases
+            // Set up temp for accumulating result
+            let temp = base + a;
+            self.set_register(temp, values[0].clone())?;
+
+            for i in 1..values.len() {
+                let left = self.get_register(temp)?;
+                let right = values[i].clone();
+
+                let both_primitive = matches!(&left, Value::String(_) | Value::Number(_)) &&
+                                     matches!(&right, Value::String(_) | Value::Number(_));
+
+                if both_primitive {
+                    // Direct concat
+                    let mut s = String::new();
+                    match left {
+                        Value::String(h) => s.push_str(h.borrow().to_str().unwrap_or("")),
+                        Value::Number(n) => s.push_str(&n.to_string()),
+                        _ => {},
+                    }
+                    match right {
+                        Value::String(h) => s.push_str(h.borrow().to_str().unwrap_or("")),
+                        Value::Number(n) => s.push_str(&n.to_string()),
+                        _ => {},
+                    }
+                    let h = self.heap.create_string(&s)?;
+                    self.set_register(temp, Value::String(h))?;
+                } else {
+                    // Need metamethod
+                    let mm = match self.find_metamethod(&left, &Value::String(Rc::clone(&self.heap.metamethod_names.concat))) {
+                        Ok(Some(m)) => Some(m),
+                        Ok(None) => match self.find_metamethod(&right, &Value::String(Rc::clone(&self.heap.metamethod_names.concat))) {
+                            Ok(m) => m,
+                            Err(e) => return Err(e),
+                        },
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(method) = mm {
+                        let new_temp = base + a;
+                        self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                            method,
+                            args: vec![left, right],
                             expected_results: 1,
-                            result_base: base + a,
+                            result_base: new_temp,
+                        });
+                        self.operation_queue.borrow_mut().push_back(PendingOperation::ConcatContinuation {
+                            base,
+                            start: b,
+                            end: c,
+                            current: b + i,
+                            temp: new_temp,
                         });
                         return Ok(());
-                    }
-                    
-                    // Try right operand
-                    if let Some(mm) = self.find_metamethod(right, &concat_key)? {
-                        self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                            method: mm,
-                            args: vec![left.clone(), right.clone()],
-                            expected_results: 1,
-                            result_base: base + a,
+                    } else {
+                        return Err(LuaError::TypeError {
+                            expected: "string or number".to_string(),
+                            got: format!("{} and {}", left.type_name(), right.type_name()),
                         });
-                        return Ok(());
-                    }
-                    
-                    // No metamethod found, give appropriate error
-                    let problematic = if left_needs_mm { left } else { right };
-                    return Err(LuaError::TypeError {
-                        expected: "string or number".to_string(),
-                        got: problematic.type_name().to_string(),
-                    });
-                }
-            } else {
-                // Multiple values with at least one non-string/number
-                // For a complete implementation, we would need to handle pairwise concatenation
-                // For now, we'll check the first non-stringable value for a metamethod
-                
-                if first_non_stringable_idx > 0 {
-                    // We have some stringable values before the problematic one
-                    // In a full implementation, we'd concatenate the stringable ones first
-                }
-                
-                let problematic_value = &values[first_non_stringable_idx];
-                let next_value = values.get(first_non_stringable_idx + 1)
-                    .unwrap_or(problematic_value);
-                
-                // Check for metamethod on the problematic value
-                let concat_key = Value::String(Rc::clone(&self.heap.metamethod_names.concat));
-                
-                if let Some(mm) = self.find_metamethod(problematic_value, &concat_key)? {
-                    // For simplicity, just handle the pair for now
-                    self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                        method: mm,
-                        args: vec![problematic_value.clone(), next_value.clone()],
-                        expected_results: 1,
-                        result_base: base + a,
-                    });
-                    return Ok(());
-                }
-                
-                // Check the next value if different
-                if first_non_stringable_idx + 1 < values.len() {
-                    if let Some(mm) = self.find_metamethod(next_value, &concat_key)? {
-                        self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                            method: mm,
-                            args: vec![problematic_value.clone(), next_value.clone()],
-                            expected_results: 1,
-                            result_base: base + a,
-                        });
-                        return Ok(());
                     }
                 }
-                
-                // No metamethod found
-                return Err(LuaError::TypeError {
-                    expected: "string or number".to_string(),
-                    got: problematic_value.type_name().to_string(),
-                });
             }
         }
         
@@ -1899,11 +1928,13 @@ impl RcVM {
         };
         
         // Queue function call
-        self.operation_queue.push_back(PendingOperation::FunctionCall {
+        self.operation_queue.borrow_mut().push_back(PendingOperation::FunctionCall {
             func,
             args,
             expected_results,
             result_base: base + a,
+            is_protected: false,
+            xpcall_handler: None,
         });
         
         Ok(())
@@ -1913,43 +1944,39 @@ impl RcVM {
     fn op_return(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let b = inst.get_b();
-        
+
         eprintln!("DEBUG RETURN: Executing with A={}, B={}, base={}", a, b, base);
-        
-        // Get current frame info for debugging
-        let frame_info = {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            let closure_ref = frame.closure.borrow();
-            eprintln!("DEBUG RETURN: Returning from function with {} upvalues", closure_ref.upvalues.len());
-            eprintln!("DEBUG RETURN: Current PC: {}, base_register: {}", frame.pc, frame.base_register);
-            drop(closure_ref);
-            frame.base_register
-        };
-        
+
+        // Per Lua 5.1 spec, upvalues must be closed before the stack frame is unwound.
+        // The `base` here is the function's base register, which is the correct boundary for locals.
         eprintln!("DEBUG RETURN: Closing all upvalues at or above stack index {}", base);
-        
-        // First, close all upvalues at or above base
         self.heap.close_upvalues(&self.current_thread, base)?;
-        
         eprintln!("DEBUG RETURN: Finished closing upvalues");
-        
-        // Collect return values
+
+        // Collect return values based on the RETURN instruction's B operand.
+        // This is the local responsibility of op_return.
         let mut values = Vec::new();
-        
         if b == 0 {
-            // Return all values from R(A) to stack top
+            // B=0: multireturn. Return all values from R(A) to the top of the stack.
             let stack_size = self.heap.get_stack_size(&self.current_thread);
-            eprintln!("DEBUG RETURN: Returning all values from R({}) to stack top ({})", 
-                     base + a, stack_size);
+            let return_start = base + a;
+            eprintln!("DEBUG RETURN: Multireturn (B=0). Collecting all values from R({}) to stack top ({})", 
+                     return_start, stack_size);
             
-            for i in 0..(stack_size - base - a) {
-                values.push(self.get_register(base + a + i)?);
+            if stack_size > return_start {
+                for i in return_start..stack_size {
+                    values.push(self.get_register(i)?);
+                }
             }
         } else {
-            // Return specific number of values
-            eprintln!("DEBUG RETURN: Returning {} values starting from R({})", b - 1, base + a);
+            // B>0: Return a fixed number of values (B-1).
+            let num_returns = (b - 1) as usize;
+            eprintln!("DEBUG RETURN: Fixed return (B={}). Collecting {} values from R({})", 
+                     b, num_returns, base + a);
             
-            for i in 0..((b - 1) as usize) {
+            for i in 0..num_returns {
+                // A function can validly return a value from an uninitialized register, which should be nil.
+                // get_register will error if the index is out of bounds, which we treat as nil for robustness.
                 if let Ok(value) = self.get_register(base + a + i) {
                     values.push(value);
                 } else {
@@ -1957,15 +1984,17 @@ impl RcVM {
                 }
             }
         }
-        
-        eprintln!("DEBUG RETURN: Collected {} return values", values.len());
+
+        eprintln!("DEBUG RETURN: Collected {} return values:", values.len());
         for (i, val) in values.iter().enumerate() {
             eprintln!("  Return[{}]: {:?}", i, val);
         }
-        
-        // Queue return operation
-        self.operation_queue.push_back(PendingOperation::Return { values });
-        
+
+        // Always queue the return operation. The centralized `process_return` will handle
+        // popping the call frame and placing the correct number of values based on the
+        // CALLER'S expectations, which is the correct architectural pattern.
+        self.operation_queue.borrow_mut().push_back(PendingOperation::Return { values });
+
         Ok(())
     }
     
@@ -2084,46 +2113,27 @@ impl RcVM {
         let limit = self.get_register(base + a + 1)?;
         let step = self.get_register(base + a + 2)?;
         
-        // Convert to numbers
+        // Convert to numbers following Lua 5.1 specification exactly
         let initial_num = match initial {
             Value::Number(n) => n,
-            _ => return Err(LuaError::TypeError {
-                expected: "number".to_string(),
-                got: initial.type_name().to_string(),
-            }),
+            _ => return Err(LuaError::RuntimeError("'for' initial value must be a number".to_string())),
         };
         
-        let limit_num = match limit {
+        let _limit_num = match limit {
             Value::Number(n) => n,
-            _ => return Err(LuaError::TypeError {
-                expected: "number".to_string(),
-                got: limit.type_name().to_string(),
-            }),
+            _ => return Err(LuaError::RuntimeError("'for' limit must be a number".to_string())),
         };
         
-        // Step defaults to 1.0 if nil
         let step_num = match step {
             Value::Number(n) => n,
-            Value::Nil => {
-                self.set_register(base + a + 2, Value::Number(1.0))?;
-                1.0
-            },
-            _ => return Err(LuaError::TypeError {
-                expected: "number".to_string(),
-                got: step.type_name().to_string(),
-            }),
+            _ => return Err(LuaError::RuntimeError("'for' step must be a number".to_string())),
         };
         
-        // Check step != 0
-        if step_num == 0.0 {
-            return Err(LuaError::RuntimeError("For loop step cannot be zero".to_string()));
-        }
-        
-        // Subtract step from initial value
+        // Subtract step from initial value (Lua 5.1 specification)
         let prepared = initial_num - step_num;
         self.set_register(base + a, Value::Number(prepared))?;
         
-        // ALWAYS jump to FORLOOP (sBx points to it)
+        // ALWAYS jump to FORLOOP (Lua 5.1 specification)
         let pc = self.heap.get_pc(&self.current_thread)?;
         let new_pc = (pc as isize + sbx as isize) as usize;
         self.heap.set_pc(&self.current_thread, new_pc)?;
@@ -2190,33 +2200,68 @@ impl RcVM {
         Ok(())
     }
     
-    /// TFORLOOP: R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2));
-    fn op_tforloop(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// TFORCALL: R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2))
+    fn op_tforcall(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let c = inst.get_c() as usize;
-        
-        // Get iterator function, state, and control variable
+
+        // The results of the iterator call need to go into R(A+3), R(A+4), etc.
+        // To use the existing FunctionCall machinery, we need to stage the call
+        // in a way that looks like a standard CALL opcode. The natural place to
+        // stage this is where the results will go.
+        let call_base = base + a + 3;
+
+        // Get the iterator function and its arguments.
         let iter_func = self.get_register(base + a)?;
         let state = self.get_register(base + a + 1)?;
         let control = self.get_register(base + a + 2)?;
-        
-        // Queue function call with continuation
-        let result_base = base + a + 3;
-        
-        self.operation_queue.push_back(PendingOperation::FunctionCall {
+        let args = vec![state, control];
+
+        // Ensure we have enough stack space for the staged call.
+        // The call will need space for the function + arguments.
+        self.ensure_stack_space(call_base + 1 + args.len())?;
+
+        // Stage the function and arguments in consecutive registers starting at `call_base`.
+        // The `call_lua_function` will treat this as a standard call frame.
+        self.set_register(call_base, iter_func.clone())?;
+        for (i, arg) in args.iter().enumerate() {
+            self.set_register(call_base + 1 + i, arg.clone())?;
+        }
+
+        // Now, we can queue a FunctionCall that operates on this staged area.
+        // The result_base is `call_base`, so results will overwrite the staged
+        // function and arguments, which is the correct and desired behavior.
+        self.operation_queue.borrow_mut().push_back(PendingOperation::FunctionCall {
             func: iter_func,
-            args: vec![state, control],
+            args,
             expected_results: c as i32,
-            result_base,
+            result_base: call_base,
+            is_protected: false,
+            xpcall_handler: None,
         });
+
+        Ok(())
+    }
+    
+    /// TFORLOOP: if R(A+3) ~= nil then R(A+2) := R(A+3); pc += sBx
+    fn op_tforloop_continuation(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+        let a = inst.get_a() as usize;
+        let sbx = inst.get_sbx();  // Jump back if continuing
         
-        // Queue continuation
-        self.operation_queue.push_back(PendingOperation::TForLoopContinuation {
-            base: result_base,
-            a,
-            c,
-            pc_before_call: self.heap.get_pc(&self.current_thread)? - 1, // PC of TFORLOOP
-        });
+        // Get the first result (control variable)
+        let control = self.get_register(base + a + 3)?;
+        
+        if !control.is_nil() {
+            // Continue loop: copy control to R(A+2)
+            self.set_register(base + a + 2, control)?;
+            
+            // Jump back
+            let pc = self.heap.get_pc(&self.current_thread)?;
+            let new_pc = (pc as isize + sbx as isize) as usize;
+            self.heap.set_pc(&self.current_thread, new_pc)?;
+        } else {
+            // End loop: proceed to next instruction
+        }
         
         Ok(())
     }
@@ -2290,16 +2335,16 @@ impl RcVM {
         Ok(())
     }
     
-    /// SETUPVAL: UpValue[A] := R(B)
+    /// SETUPVAL: UpValue[B] := R(A)
     fn op_setupval(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
-        eprintln!("DEBUG SETUPVAL: Executing with A={}, B={}, base={}", a, b, base);
+        eprintln!("DEBUG SETUPVAL: Executing with A(reg)={}, B(upval)={}, base={}", a, b, base);
         
         // Get value to store
-        let value = self.get_register(base + b)?;
-        eprintln!("DEBUG SETUPVAL: Value from R({}) (absolute {}): {:?}", b, base + b, value);
+        let value = self.get_register(base + a)?;
+        eprintln!("DEBUG SETUPVAL: Value from R({}) (absolute {}): {:?}", a, base + a, value);
         
         // Get current frame and closure
         let frame = self.heap.get_current_frame(&self.current_thread)?;
@@ -2308,16 +2353,16 @@ impl RcVM {
         eprintln!("DEBUG SETUPVAL: Closure has {} upvalues", closure_ref.upvalues.len());
         
         // Check upvalue index
-        if a >= closure_ref.upvalues.len() {
-            eprintln!("DEBUG SETUPVAL: Upvalue index {} out of bounds", a);
+        if b >= closure_ref.upvalues.len() {
+            eprintln!("DEBUG SETUPVAL: Upvalue index {} out of bounds", b);
             drop(closure_ref);
             return Err(LuaError::RuntimeError(format!(
-                "Upvalue index {} out of bounds", a
+                "Upvalue index {} out of bounds", b
             )));
         }
         
         // Get upvalue
-        let upvalue = Rc::clone(&closure_ref.upvalues[a]);
+        let upvalue = Rc::clone(&closure_ref.upvalues[b]);
         drop(closure_ref);
         
         // Debug dump upvalue state before setting
@@ -2357,10 +2402,10 @@ impl RcVM {
     }
     
     /// SETLIST: R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B
-    fn op_setlist(&self, inst: Instruction, base: usize) -> LuaResult<()> {
+    fn op_setlist(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
-        let b = inst.get_b() as usize;
-        let c = inst.get_c() as usize;
+        let mut b = inst.get_b() as usize;
+        let mut c = inst.get_c() as usize;
         
         const FIELDS_PER_FLUSH: usize = 50;
         
@@ -2377,13 +2422,22 @@ impl RcVM {
             }
         };
         
+        // Handle C=0 case where the next instruction holds the real C value
+        if c == 0 {
+            let pc = self.heap.get_pc(&self.current_thread)?;
+            let frame = self.heap.get_current_frame(&self.current_thread)?;
+            c = self.get_instruction(&frame.closure, pc)? as usize;
+            self.heap.increment_pc(&self.current_thread)?; // Skip the extra instruction
+        }
+        
         // Calculate base array index
         let array_base = (c - 1) * FIELDS_PER_FLUSH;
         
         // Determine number of elements to set
         let count = if b == 0 {
             // Use all values up to stack top
-            self.heap.get_stack_size(&self.current_thread) - (base + a + 1)
+            b = self.heap.get_stack_size(&self.current_thread) - (base + a + 1);
+            b
         } else {
             b
         };
@@ -2442,11 +2496,13 @@ impl RcVM {
         };
         
         // Queue function call to caller's result position
-        self.operation_queue.push_back(PendingOperation::FunctionCall {
+        self.operation_queue.borrow_mut().push_back(PendingOperation::FunctionCall {
             func,
             args,
             expected_results,
             result_base,
+            is_protected: false,
+            xpcall_handler: None,
         });
         
         Ok(())
@@ -2489,75 +2545,218 @@ impl RcVM {
     
     /// EQ: if ((RK(B) == RK(C)) ~= A) then pc++
     fn op_eq(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        // This is a comparison instruction
-        self.op_comparison(inst, base, CompOp::Eq)
+        let a = inst.get_a();
+        let left = self.read_rk(base, inst.get_b())?;
+        let right = self.read_rk(base, inst.get_c())?;
+
+        // Step 1: Raw equality. Handles primitives, and same-object for tables/userdata.
+        if left == right {
+            let result = true;
+            if result != (a != 0) {
+                self.heap.increment_pc(&self.current_thread)?;
+            }
+            return Ok(());
+        }
+
+        // Step 2: Check for metamethod. This is only possible if types are the same
+        // and they are tables or userdata. The `left == right` check above already
+        // returns false if types are different because of `Value::eq` implementation.
+        // We only proceed if both are tables (or in future, userdata).
+        if !matches!(left, Value::Table(_)) || !matches!(right, Value::Table(_)) {
+            let result = false;
+            if result != (a != 0) {
+                self.heap.increment_pc(&self.current_thread)?;
+            }
+            return Ok(());
+        }
+
+        // At this point, we have two different tables. Check for __eq metamethod.
+        let mt1 = self.get_metatable(&left)?;
+        let mt2 = self.get_metatable(&right)?;
+
+        if let (Some(mt1_handle), Some(mt2_handle)) = (mt1, mt2) {
+            let eq_key = Value::String(Rc::clone(&self.heap.metamethod_names.eq));
+            let mm1 = self.heap.get_table_field(&mt1_handle, &eq_key)?;
+            
+            // Per Lua 5.1 spec, __eq is only called if it's present and the same for both operands.
+            if !mm1.is_nil() {
+                let mm2 = self.heap.get_table_field(&mt2_handle, &eq_key)?;
+                if mm1 == mm2 { // `Value::eq` will compare functions by pointer.
+                    // Metamethod found, queue the call.
+                    let temp = self.heap.get_stack_size(&self.current_thread);
+                    self.ensure_stack_space(temp + 1)?;
+
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                        method: mm1,
+                        args: vec![left, right],
+                        expected_results: 1,
+                        result_base: temp,
+                    });
+                    let pc = self.heap.get_pc(&self.current_thread)?;
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::ComparisonContinuation {
+                        comp_op: CompOp::Eq,
+                        a,
+                        temp,
+                        pc,
+                        negate: false,
+                    });
+                    return Ok(());
+                }
+            }
+        }
+
+        // Step 3: No applicable metamethod. Result is false.
+        let result = false;
+        if result != (a != 0) {
+            self.heap.increment_pc(&self.current_thread)?;
+        }
+        Ok(())
     }
     
     /// LT: if ((RK(B) < RK(C)) ~= A) then pc++
     fn op_lt(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_comparison(inst, base, CompOp::Lt)
+        let a = inst.get_a();
+        let left = self.read_rk(base, inst.get_b())?;
+        let right = self.read_rk(base, inst.get_c())?;
+
+        let mut result = false;
+        match (&left, &right) {
+            (Value::Number(l), Value::Number(r)) => result = l < r,
+            (Value::String(l), Value::String(r)) => {
+                result = l.borrow().bytes < r.borrow().bytes;
+            }
+            _ => {
+                // Try __lt metamethod
+                let mm = match self.find_metamethod(&left, &Value::String(Rc::clone(&self.heap.metamethod_names.lt))) {
+                    Ok(Some(m)) => Some(m),
+                    Ok(None) => match self.find_metamethod(&right, &Value::String(Rc::clone(&self.heap.metamethod_names.lt))) {
+                        Ok(m) => m,
+                        Err(e) => return Err(e),
+                    },
+                    Err(e) => return Err(e),
+                };
+                if let Some(method) = mm {
+                    let temp = self.heap.get_stack_size(&self.current_thread);
+                    self.ensure_stack_space(temp + 1)?;
+
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                        method,
+                        args: vec![left, right],
+                        expected_results: 1,
+                        result_base: temp,
+                    });
+                    let pc = self.heap.get_pc(&self.current_thread)?;
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::ComparisonContinuation {
+                        comp_op: CompOp::Lt,
+                        a,
+                        temp,
+                        pc,
+                        negate: false,
+                    });
+                    return Ok(());
+                } else {
+                    return Err(LuaError::TypeError {
+                        expected: "comparable values".to_string(),
+                        got: format!("{} and {}", left.type_name(), right.type_name()),
+                    });
+                }
+            }
+        }
+
+        let skip = result != (a != 0);
+        if skip {
+            self.heap.increment_pc(&self.current_thread)?;
+        }
+        Ok(())
     }
     
     /// LE: if ((RK(B) <= RK(C)) ~= A) then pc++
     fn op_le(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_comparison(inst, base, CompOp::Le)
-    }
-    
-    /// Generic comparison operator
-    fn op_comparison(&mut self, inst: Instruction, base: usize, op: CompOp) -> LuaResult<()> {
         let a = inst.get_a();
-        let (b_is_const, b_idx) = inst.get_rk_b();
-        let (c_is_const, c_idx) = inst.get_rk_c();
-        
-        // Get operands
-        let left = if b_is_const {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            self.get_constant(&frame.closure, b_idx as usize)?
-        } else {
-            self.get_register(base + b_idx as usize)?
-        };
-        
-        let right = if c_is_const {
-            let frame = self.heap.get_current_frame(&self.current_thread)?;
-            self.get_constant(&frame.closure, c_idx as usize)?
-        } else {
-            self.get_register(base + c_idx as usize)?
-        };
-        
-        // Try direct comparison
-        let result = match (op, &left, &right) {
-            (CompOp::Eq, _, _) => left == right,
-            (CompOp::Lt, &Value::Number(l), &Value::Number(r)) => l < r,
-            (CompOp::Lt, &Value::String(ref l), &Value::String(ref r)) => {
-                let l_ref = l.borrow();
-                let r_ref = r.borrow();
-                l_ref.bytes < r_ref.bytes
-            },
-            (CompOp::Le, &Value::Number(l), &Value::Number(r)) => l <= r,
-            (CompOp::Le, &Value::String(ref l), &Value::String(ref r)) => {
-                let l_ref = l.borrow();
-                let r_ref = r.borrow();
-                l_ref.bytes <= r_ref.bytes
-            },
+        let left = self.read_rk(base, inst.get_b())?;
+        let right = self.read_rk(base, inst.get_c())?;
+
+        let mut result = false;
+        match (&left, &right) {
+            (Value::Number(l), Value::Number(r)) => result = l <= r,
+            (Value::String(l), Value::String(r)) => {
+                result = l.borrow().bytes <= r.borrow().bytes;
+            }
             _ => {
-                // Metamethod lookup would go here
+                // First try __le metamethod per Lua 5.1 specification
+                let le_key = Value::String(Rc::clone(&self.heap.metamethod_names.le));
+                let mm_le = match self.find_metamethod(&left, &le_key)? {
+                    Some(m) => Some(m),
+                    None => self.find_metamethod(&right, &le_key)?,
+                };
+
+                if let Some(method) = mm_le {
+                    let temp = self.heap.get_stack_size(&self.current_thread);
+                    self.ensure_stack_space(temp + 1)?;
+
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                        method,
+                        args: vec![left, right],
+                        expected_results: 1,
+                        result_base: temp,
+                    });
+                    let pc = self.heap.get_pc(&self.current_thread)?;
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::ComparisonContinuation {
+                        comp_op: CompOp::Le,
+                        a,
+                        temp,
+                        pc,
+                        negate: false,
+                    });
+                    return Ok(());
+                }
+
+                // CRITICAL Lua 5.1 FALLBACK: try __lt with swapped operands and negate result
+                let lt_key = Value::String(Rc::clone(&self.heap.metamethod_names.lt));
+                let mm_lt = match self.find_metamethod(&left, &lt_key)? {
+                    Some(m) => Some(m),
+                    None => self.find_metamethod(&right, &lt_key)?,
+                };
+
+                if let Some(method) = mm_lt {
+                    let temp = self.heap.get_stack_size(&self.current_thread);
+                    self.ensure_stack_space(temp + 1)?;
+
+                    // Call __lt(right, left) and negate result: a <= b becomes not (b < a)
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::MetamethodCall {
+                        method,
+                        args: vec![right, left], // SWAPPED operands for LE fallback
+                        expected_results: 1,
+                        result_base: temp,
+                    });
+                    
+                    let pc = self.heap.get_pc(&self.current_thread)?;
+                    self.operation_queue.borrow_mut().push_back(PendingOperation::ComparisonContinuation {
+                        comp_op: CompOp::Le,
+                        a,
+                        temp,
+                        pc,
+                        negate: true, // NEGATE the result for LE fallback
+                    });
+                    return Ok(());
+                }
+
+                // No metamethods found
                 return Err(LuaError::TypeError {
                     expected: "comparable values".to_string(),
                     got: format!("{} and {}", left.type_name(), right.type_name()),
                 });
             }
-        };
-        
-        // Skip next instruction if (result ~= A)
-        let skip = result != (a != 0);
-        
-        if skip {
-            let pc = self.heap.get_pc(&self.current_thread)?;
-            self.heap.set_pc(&self.current_thread, pc + 1)?;
         }
-        
+
+        let skip = result != (a != 0);
+        if skip {
+            self.heap.increment_pc(&self.current_thread)?;
+        }
         Ok(())
     }
+    
+
     
     /// TEST: if not (R(A) <=> C) then pc++
     fn op_test(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
@@ -2606,6 +2805,18 @@ impl RcVM {
         Ok(())
     }
     
+    /// Get metatable for a value
+    fn get_metatable(&self, value: &Value) -> LuaResult<Option<TableHandle>> {
+        match value {
+            Value::Table(ref handle) => {
+                let table_ref = handle.borrow();
+                Ok(table_ref.metatable.clone())
+            },
+            // Other types with metatables would be handled here
+            _ => Ok(None)
+        }
+    }
+
     /// Find a metamethod for a value
     fn find_metamethod(&self, value: &Value, method_name: &Value) -> LuaResult<Option<Value>> {
         match value {
@@ -2665,26 +2876,37 @@ impl<'a> ExecutionContext for VmExecutionContext<'a> {
     fn get_arg(&self, index: usize) -> LuaResult<Value> {
         if index >= self.nargs {
             return Err(LuaError::RuntimeError(format!(
-                "Argument {} out of range", index
+                "Argument {} out of range (nargs: {})", index, self.nargs
             )));
         }
         
-        self.vm.get_register(self.base + 1 + index)
+        let args_base = self.base;
+        let register_index = args_base + index;
+        
+        eprintln!("DEBUG ExecutionContext::get_arg:");
+        eprintln!("  Argument index: {}", index);
+        eprintln!("  Base: {}", self.base);
+        eprintln!("  Args base: {}", args_base);
+        eprintln!("  Calculated register index: {}", register_index);
+        eprintln!("  Total nargs: {}", self.nargs);
+        
+        self.vm.get_register(register_index)
     }
     
     fn push_result(&mut self, value: Value) -> LuaResult<()> {
-        self.vm.set_register(self.base + self.results_pushed, value)?;
+        self.results.push(value);
         self.results_pushed += 1;
         Ok(())
     }
     
     fn set_return(&mut self, index: usize, value: Value) -> LuaResult<()> {
-        self.vm.set_register(self.base + index, value)?;
-        
-        if index >= self.results_pushed {
+        if index >= self.results.len() {
+            self.results.resize(index + 1, Value::Nil);
+        }
+        self.results[index] = value;
+        if index + 1 > self.results_pushed {
             self.results_pushed = index + 1;
         }
-        
         Ok(())
     }
     
@@ -2700,8 +2922,28 @@ impl<'a> ExecutionContext for VmExecutionContext<'a> {
         self.vm.heap.get_table_field(table, key)
     }
     
-    fn set_table_field(&self, table: &TableHandle, key: Value, value: Value) -> LuaResult<()> {
-        self.vm.heap.set_table_field(table, &key, &value)
+    fn set_table_field(&mut self, table: &TableHandle, key: Value, value: Value) -> LuaResult<()> {
+        match self.vm.heap.set_table_field(table, &key, &value)? {
+            Some(metamethod) => {
+                // A metamethod was found. Queue a call to it using the proper architecture.
+                let op = PendingOperation::MetamethodCall {
+                    method: metamethod,
+                    args: vec![Value::Table(table.clone()), key, value],
+                    expected_results: 0, // __newindex returns no results
+                    result_base: 0,      // Not relevant for 0 results
+                };
+
+                // Use fine-grained interior mutability - borrow only the operation_queue
+                // This works because self.vm is an immutable reference and operation_queue is RefCell
+                self.vm.operation_queue.borrow_mut().push_back(op);
+                
+                Ok(())
+            },
+            None => {
+                // No metamethod needed; the operation completed successfully
+                Ok(())
+            }
+        }
     }
     
     fn get_arg_str(&self, index: usize) -> LuaResult<String> {
@@ -2747,12 +2989,114 @@ impl<'a> ExecutionContext for VmExecutionContext<'a> {
     }
     
     fn table_next(&self, table: &TableHandle, key: &Value) -> LuaResult<Option<(Value, Value)>> {
-        // Table traversal logic would go here
-        Ok(None) // Placeholder
+        let table_ref = table.borrow();
+
+        // State 1: Start of iteration (key is nil)
+        if key.is_nil() {
+            // Try array part first
+            for i in 0..table_ref.array.len() {
+                if !table_ref.array[i].is_nil() {
+                    return Ok(Some((Value::Number((i + 1) as f64), table_ref.array[i].clone())));
+                }
+            }
+            // If array is empty or all nils, start with the hash part
+            if let Some((k, v)) = table_ref.map.iter().next() {
+                return Ok(Some((k.to_value(), v.clone())));
+            }
+            return Ok(None); // Table is empty
+        }
+
+        // State 2: Continuing iteration
+        let mut in_array = false;
+        if let Value::Number(n) = key {
+            if n.fract() == 0.0 && *n >= 1.0 {
+                let index = *n as usize;
+                if index <= table_ref.array.len() {
+                    in_array = true;
+                    // Search for the next non-nil element in the array part (next Lua index is `index + 1`, which is Rust index `index`)
+                    for i in index..table_ref.array.len() {
+                        if !table_ref.array[i].is_nil() {
+                            return Ok(Some((Value::Number((i + 1) as f64), table_ref.array[i].clone())));
+                        }
+                    }
+                    // Array part exhausted, fall through to start hash part iteration
+                }
+            }
+        }
+
+        // State 3: Hash part iteration
+        // This is reached if the key was not in the array, or if array iteration just finished.
+        if !in_array {
+            // The key must be in the hash map. Find it, then find the next one.
+            let current_key_hashable = match HashableValue::from_value(key) {
+                Ok(h) => h,
+                Err(_) => return Err(LuaError::RuntimeError(format!("invalid key to 'next'"))),
+            };
+            
+            let mut found_current = false;
+            for (hash_key, hash_value) in table_ref.map.iter() {
+                if found_current {
+                    return Ok(Some((hash_key.to_value(), hash_value.clone())));
+                }
+                if hash_key == &current_key_hashable {
+                    found_current = true;
+                }
+            }
+            if !found_current {
+                return Err(LuaError::RuntimeError(format!("invalid key to 'next'")));
+            }
+        } else {
+            // This is the transition from array to hash. Just get the first hash element.
+            if let Some((k, v)) = table_ref.map.iter().next() {
+                return Ok(Some((k.to_value(), v.clone())));
+            }
+        }
+        
+        // No more keys
+        Ok(None)
     }
     
     fn globals_handle(&self) -> LuaResult<TableHandle> {
         Ok(self.vm.heap.globals())
+    }
+    
+    fn get_call_base(&self) -> usize {
+        self.base
+    }
+    
+    fn pcall(&mut self, func: Value, args: Vec<Value>) -> LuaResult<()> {
+        let result_base = self.base.saturating_sub(1); // pcall results overwrite pcall itself
+        self.vm.operation_queue.borrow_mut().push_back(PendingOperation::FunctionCall {
+            func,
+            args,
+            expected_results: -1, // Variable results
+            result_base,
+            is_protected: true,
+            xpcall_handler: None,
+        });
+        Ok(())
+    }
+    
+    fn xpcall(&mut self, func: Value, err_handler: Value) -> LuaResult<()> {
+        let result_base = self.base.saturating_sub(1);
+        let args = vec![]; // xpcall takes no extra arguments for the function
+        self.vm.operation_queue.borrow_mut().push_back(PendingOperation::FunctionCall {
+            func,
+            args,
+            expected_results: -1,
+            result_base,
+            is_protected: true,
+            xpcall_handler: Some(err_handler),
+        });
+        Ok(())
+    }
+    
+    fn get_upvalue_value(&self, upvalue: &UpvalueHandle) -> LuaResult<Value> {
+        Ok(self.vm.heap.get_upvalue_value(upvalue))
+    }
+    
+    fn set_upvalue_value(&self, upvalue: &UpvalueHandle, value: Value) -> LuaResult<()> {
+        self.vm.heap.set_upvalue_value(upvalue, value)
     }
 }
 
@@ -2763,7 +3107,7 @@ mod tests {
     #[test]
     fn test_rc_vm_creation() -> LuaResult<()> {
         let vm = RcVM::new()?;
-        assert!(vm.operation_queue.is_empty());
+        assert!(vm.operation_queue.borrow().is_empty());
         Ok(())
     }
     

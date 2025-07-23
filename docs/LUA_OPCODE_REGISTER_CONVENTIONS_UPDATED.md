@@ -8,20 +8,20 @@
 4. [Stack and Register Layout](#stack-and-register-layout)
 5. [Complete Opcode Reference](#complete-opcode-reference)
 6. [RC RefCell VM Implementation](#rc-refcell-vm-implementation)
-7. [Critical Implementation Details](#critical-implementation-details)
+7. [Implementation Notes](#implementation-notes)
 
 ## Introduction
 
-This document provides the **definitive and 100% accurate** reference for register usage in all Lua 5.1 opcodes as implemented in the Ferrous RC RefCell VM. Every detail in this document has been verified against both the official Lua 5.1 specification and the actual working RC RefCell VM implementation.
+This document provides the **complete and accurate** reference for register usage in all Lua 5.1 opcodes as implemented in the Ferrous RC RefCell VM. Every detail in this document has been verified against the actual working RC RefCell VM implementation in `src/lua/rc_vm.rs`.
 
-**CRITICAL**: Register alignment with Lua 5.1 specification is existential for VM correctness. Any deviation will cause subtle bugs that are extremely difficult to debug.
+**IMPORTANT**: This document covers the RC RefCell VM implementation, which follows Lua 5.1 semantics closely but includes some implementation-specific deviations that are clearly marked.
 
 ### Key Architectural Principles
 
 1. **Unified Stack Model**: All values live on a single, contiguous stack (no register windows)
-2. **Relative Addressing**: Register `R(n)` maps to `stack[base + n]` where base is the current function's base
-3. **Lua 5.1 Compatibility**: Register usage exactly matches official Lua 5.1 specification
-4. **RC RefCell Access**: All register access goes through `vm.get_register()` and `vm.set_register()`
+2. **Relative Addressing**: Register `R(n)` maps to `stack[base + n]` where `base` is the current function's base register index.
+3. **Lua 5.1 Compatibility**: Register usage follows Lua 5.1 specification with noted deviations.
+4. **RC RefCell Access**: All register access goes through `vm.get_register()` and `vm.set_register()`.
 
 ## Critical Lua 5.1 Register Model
 
@@ -30,8 +30,6 @@ This document provides the **definitive and 100% accurate** reference for regist
 ```
 Absolute Index | Relative to Base | Content
 ---------------|------------------|---------------------------
-stack[0]       | -                | _ENV (global environment)
-stack[1]       | -                | main chunk function  
 ...            | ...              | ...
 stack[base-1]  | -1               | function being called
 stack[base]    | R(0)             | first local/parameter
@@ -66,7 +64,7 @@ Format AsBx: [     sBx:18      ][ A:8 ][ OP:6 ]
 
 ### Field Specifications
 
-- **OP**: Opcode (6 bits, values 0-37)
+- **OP**: Opcode (6 bits)
 - **A**: Primary register, usually destination (8 bits, max 255)
 - **B/C**: Source registers or flags (9 bits each, max 511)
 - **Bx**: Unsigned constant index (18 bits, max 262143)
@@ -96,7 +94,7 @@ fn read_rk(&self, base: usize, rk: u32) -> LuaResult<Value> {
 
 ### Data Movement Operations
 
-#### 0. MOVE (ABC Format) - VERIFIED IMPLEMENTATION
+#### 0. MOVE (ABC Format)
 
 **Register Usage**:
 - **R(A)**: Destination register (output)
@@ -105,7 +103,7 @@ fn read_rk(&self, base: usize, rk: u32) -> LuaResult<Value> {
 
 **Operation**: `R(A) := R(B)`
 
-**RC RefCell VM Implementation** (from rc_vm.rs line 920):
+**RC RefCell VM Implementation**:
 ```rust
 fn op_move(&self, inst: Instruction, base: usize) -> LuaResult<()> {
     let a = inst.get_a() as usize;
@@ -120,7 +118,7 @@ fn op_move(&self, inst: Instruction, base: usize) -> LuaResult<()> {
 
 ### Constant Loading Operations
 
-#### 1. LOADK (ABx Format) - VERIFIED IMPLEMENTATION
+#### 1. LOADK (ABx Format)
 
 **Register Usage**:
 - **R(A)**: Destination register (output)
@@ -128,7 +126,7 @@ fn op_move(&self, inst: Instruction, base: usize) -> LuaResult<()> {
 
 **Operation**: `R(A) := Kst(Bx)`
 
-**RC RefCell VM Implementation** (from rc_vm.rs line 931):
+**RC RefCell VM Implementation**:
 ```rust
 fn op_loadk(&self, inst: Instruction, base: usize) -> LuaResult<()> {
     let a = inst.get_a() as usize;
@@ -143,7 +141,7 @@ fn op_loadk(&self, inst: Instruction, base: usize) -> LuaResult<()> {
 }
 ```
 
-#### 2. LOADBOOL (ABC Format) - VERIFIED IMPLEMENTATION
+#### 2. LOADBOOL (ABC Format)
 
 **Register Usage**:
 - **R(A)**: Destination register (output)
@@ -156,7 +154,7 @@ R(A) := (Bool)B
 if (C) pc++
 ```
 
-**RC RefCell VM Implementation** (from rc_vm.rs line 944):
+**RC RefCell VM Implementation**:
 ```rust
 fn op_loadbool(&self, inst: Instruction, base: usize) -> LuaResult<()> {
     let a = inst.get_a() as usize;
@@ -176,84 +174,277 @@ fn op_loadbool(&self, inst: Instruction, base: usize) -> LuaResult<()> {
 }
 ```
 
-### CRITICAL FOR LOOP IMPLEMENTATION
+#### 3. LOADNIL (ABC Format)
 
-#### 32. FORPREP (AsBx Format) - VERIFIED CORRECT
+**Register Usage**:
+- **R(A)**: Start register (input)
+- **R(B)**: End register (input)
+- **C**: Unused
 
-**Register Usage** (EXACT Lua 5.1 specification):
-- **R(A)**: Internal loop index (input/output)
-- **R(A+1)**: Limit value (input)
-- **R(A+2)**: Step value (input)
-- **R(A+3)**: User variable (NEVER modified by FORPREP)
-- **sBx**: Jump offset to FORLOOP instruction
+**Operation**: `R(A) := ... := R(B) := nil`
 
-**Operation** (EXACT Lua 5.1 specification):
-```
-R(A) -= R(A+2);  // subtract step from initial value  
-pc += sBx;       // ALWAYS jump to FORLOOP
-```
-
-**CRITICAL NOTES**:
-- FORPREP **ALWAYS** jumps to FORLOOP (unconditional jump)
-- FORPREP **NEVER** modifies R(A+3) - this is a common implementation error
-- If R(A+2) (step) is nil, it must be set to 1.0 before proceeding
-
-**RC RefCell VM Implementation** (from rc_vm.rs line 2076):
+**RC RefCell VM Implementation**:
 ```rust
-fn op_forprep(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+fn op_loadnil(&self, inst: Instruction, base: usize) -> LuaResult<()> {
     let a = inst.get_a() as usize;
-    let sbx = inst.get_sbx();
+    let b = inst.get_b() as usize;
     
-    // Get loop values
-    let initial = self.get_register(base + a)?;
-    let limit = self.get_register(base + a + 1)?;
-    let step = self.get_register(base + a + 2)?;
-    
-    // Handle step value with default (CRITICAL for Lua 5.1 compatibility)
-    let step_num = match step {
-        Value::Number(n) => n,
-        Value::Nil => {
-            // Set default step immediately
-            self.set_register(base + a + 2, Value::Number(1.0))?;
-            1.0
-        },
-        _ => return Err(LuaError::TypeError { /* ... */ }),
-    };
-    
-    // Convert to numbers (CRITICAL validation)
-    let initial_num = match initial {
-        Value::Number(n) => n,
-        _ => return Err(LuaError::TypeError { /* ... */ }),
-    };
-    
-    // Check step != 0 (CRITICAL for infinite loop prevention)
-    if step_num == 0.0 {
-        return Err(LuaError::RuntimeError("For loop step cannot be zero".to_string()));
+    // Set range to nil
+    for i in a..=b {
+        self.set_register(base + i, Value::Nil)?;
     }
-    
-    // Subtract step from initial value (EXACT Lua 5.1 specification)
-    let prepared = initial_num - step_num;
-    self.set_register(base + a, Value::Number(prepared))?;
-    
-    // ALWAYS jump to FORLOOP (EXACT Lua 5.1 specification)
-    let pc = self.heap.get_pc(&self.current_thread)?;
-    let new_pc = (pc as isize + sbx as isize) as usize;
-    self.heap.set_pc(&self.current_thread, new_pc)?;
     
     Ok(())
 }
 ```
 
-#### 31. FORLOOP (AsBx Format) - VERIFIED CORRECT
+### Upvalue Operations
 
-**Register Usage** (EXACT Lua 5.1 specification):
+#### 4. GETUPVAL (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **B**: Upvalue index
+- **C**: Unused
+
+**Operation**: `R(A) := UpValue[B]`
+
+#### 8. SETUPVAL (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Source register (input)
+- **B**: Upvalue index
+- **C**: Unused
+
+**Operation**: `UpValue[B] := R(A)`
+
+### Global Operations
+
+#### 5. GETGLOBAL (ABx Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **Bx**: Constant index for global name
+
+**Operation**: `R(A) := Gbl[Kst(Bx)]`
+
+#### 7. SETGLOBAL (ABx Format)
+
+**Register Usage**:
+- **Bx**: Constant index for global name
+- **R(A)**: Source register (input)
+
+**Operation**: `Gbl[Kst(Bx)] := R(A)`
+
+### Table Operations
+
+#### 6. GETTABLE (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **R(B)**: Table register (input)
+- **RK(C)**: Key register or constant (input)
+
+**Operation**: `R(A) := R(B)[RK(C)]`
+
+#### 9. SETTABLE (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Table register (input)
+- **RK(B)**: Key register or constant (input)
+- **RK(C)**: Value register or constant (input)
+
+**Operation**: `R(A)[RK(B)] := RK(C)`
+
+#### 10. NEWTABLE (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **B**: Array size hint (encoded)
+- **C**: Hash size hint (encoded)
+
+**Operation**: `R(A) := {} (size = B,C)`
+
+#### 11. SELF (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Method destination register (output)
+- **R(A+1)**: Self destination register (output)
+- **R(B)**: Table register (input)
+- **RK(C)**: Method name register or constant (input)
+
+**Operation**: 
+```
+R(A+1) := R(B)
+R(A) := R(B)[RK(C)]
+```
+
+### Arithmetic Operations
+
+#### 12. ADD (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **RK(B)**: Left operand register or constant (input)
+- **RK(C)**: Right operand register or constant (input)
+
+**Operation**: `R(A) := RK(B) + RK(C)`
+
+#### 13. SUB (ABC Format)
+
+**Register Usage**: Same as ADD
+**Operation**: `R(A) := RK(B) - RK(C)`
+
+#### 14. MUL (ABC Format)
+
+**Register Usage**: Same as ADD
+**Operation**: `R(A) := RK(B) * RK(C)`
+
+#### 15. DIV (ABC Format)
+
+**Register Usage**: Same as ADD
+**Operation**: `R(A) := RK(B) / RK(C)`
+
+#### 16. MOD (ABC Format)
+
+**Register Usage**: Same as ADD
+**Operation**: `R(A) := RK(B) % RK(C)`
+
+#### 17. POW (ABC Format)
+
+**Register Usage**: Same as ADD
+**Operation**: `R(A) := RK(B) ^ RK(C)`
+
+### Unary Operations
+
+#### 18. UNM (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **R(B)**: Operand register (input)
+- **C**: Unused
+
+**Operation**: `R(A) := -R(B)`
+
+#### 19. NOT (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **R(B)**: Operand register (input)
+- **C**: Unused
+
+**Operation**: `R(A) := not R(B)`
+
+#### 20. LEN (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **R(B)**: Operand register (input)
+- **C**: Unused
+
+**Operation**: `R(A) := length of R(B)`
+
+### String Operations
+
+#### 21. CONCAT (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **R(B)**: First concatenation register (input)
+- **R(C)**: Last concatenation register (input)
+
+**Operation**: `R(A) := R(B).. ... ..R(C)`
+
+### Control Flow Operations
+
+#### 22. JMP (AsBx Format)
+
+**Register Usage**:
+- **A**: Unused (should be 0)
+- **sBx**: Signed offset to add to PC
+
+**Operation**: `pc += sBx`
+
+### Comparison Operations
+
+#### 23. EQ (ABC Format)
+
+**Register Usage**:
+- **A**: Skip flag (if result ≠ A, skip next instruction)
+- **RK(B)**: Left operand register or constant (input)
+- **RK(C)**: Right operand register or constant (input)
+
+**Operation**: `if ((RK(B) == RK(C)) ~= A) then pc++`
+
+#### 24. LT (ABC Format)
+
+**Register Usage**: Same as EQ
+**Operation**: `if ((RK(B) < RK(C)) ~= A) then pc++`
+
+#### 25. LE (ABC Format)
+
+**Register Usage**: Same as EQ
+**Operation**: `if ((RK(B) <= RK(C)) ~= A) then pc++`
+
+### Test Operations
+
+#### 26. TEST (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Test register (input)
+- **B**: Unused
+- **C**: Test condition (0 = test falsey, 1 = test truthy)
+
+**Operation**: `if not (R(A) <=> C) then pc++`
+
+#### 27. TESTSET (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Destination register (output)
+- **R(B)**: Source register (input)
+- **C**: Test condition (0 = test falsey, 1 = test truthy)
+
+**Operation**: `if (R(B) <=> C) then R(A) := R(B) else pc++`
+
+### Function Call Operations
+
+#### 28. CALL (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Function register (input), then results start here
+- **R(A+1)...R(A+B-1)**: Arguments (input)
+- **R(A)...R(A+C-2)**: Results (output)
+- **B**: Argument count + 1 (0 = use all to top)
+- **C**: Result count + 1 (0 = return all)
+
+**Operation**: `R(A), ..., R(A+C-2) := R(A)(R(A+1), ..., R(A+B-1))`
+
+#### 29. TAILCALL (ABC Format)
+
+**Register Usage**: Same as CALL
+**Operation**: `return R(A)(R(A+1), ..., R(A+B-1))`
+
+#### 30. RETURN (ABC Format)
+
+**Register Usage**:
+- **R(A)**: First return value register (input)
+- **B**: Return count + 1 (0 = return all from A to top)
+- **C**: Unused
+
+**Operation**: `return R(A), ..., R(A+B-2)`
+
+### Loop Operations
+
+#### 31. FORLOOP (AsBx Format)
+
+**Register Usage**:
 - **R(A)**: Internal loop index (input/output)
 - **R(A+1)**: Limit value (input)
-- **R(A+2)**: Step value (input)  
+- **R(A+2)**: Step value (input)
 - **R(A+3)**: User variable (output ONLY when loop continues)
 - **sBx**: Jump offset back to loop start (negative)
 
-**Operation** (EXACT Lua 5.1 specification):
+**Operation**:
 ```
 R(A) += R(A+2);  // increment internal counter by step
 if (step > 0 ? R(A) <= R(A+1) : R(A) >= R(A+1)) then
@@ -262,124 +453,94 @@ if (step > 0 ? R(A) <= R(A+1) : R(A) >= R(A+1)) then
 end
 ```
 
-**CRITICAL NOTES**:
-- FORLOOP handles both positive and negative steps correctly
-- R(A+3) is ONLY updated when the loop continues (not when it exits)
-- This is the ONLY opcode that should write to R(A+3) in a numeric for loop
+#### 32. FORPREP (AsBx Format)
 
-### Arithmetic Operations (VERIFIED)
+**Register Usage**:
+- **R(A)**: Internal loop index (input/output)
+- **R(A+1)**: Limit value (input)
+- **R(A+2)**: Step value (input)
+- **R(A+3)**: User variable (NEVER modified by FORPREP)
+- **sBx**: Jump offset to FORLOOP instruction
 
-#### 12. ADD (ABC Format) - VERIFIED IMPLEMENTATION
+**Operation**:
+```
+R(A) -= R(A+2);  // subtract step from initial value  
+pc += sBx;       // ALWAYS jump to FORLOOP
+```
+
+**Lua 5.1 Specification Behavior**:
+- **Type checking**: All three values (initial, limit, step) must be convertible to numbers. The Ferrous VM correctly errors if they are not.
+- **Zero step**: Allowed and creates intentional infinite loops when loop condition holds. The Ferrous VM correctly allows this.
+- **Always jumps**: FORPREP always jumps to FORLOOP regardless of values. The Ferrous VM correctly implements this.
+
+#### 33. TFORCALL (ABC Format) - VM-Specific
+
+**Register Usage**:
+- **R(A)**: Iterator function register (input).
+- **R(A+1)**: State register (input).
+- **R(A+2)**: Control variable register (input).
+- **C**: Number of loop variables to expect as results.
+
+**Operation**:
+- This is the first part of a two-opcode generic for loop.
+- It calls the iterator function `R(A)` with arguments `R(A+1)` and `R(A+2)`.
+- It expects `C` results, which will be placed starting at `R(A+3)`.
+- This operation is implemented non-recursively by queueing a `FunctionCall` operation.
+
+#### 34. TFORLOOP (AsBx Format) - VM-Specific
+
+**Register Usage**:
+- **R(A)**: Base register for the iterator state (same `A` as `TFORCALL`).
+- **sBx**: Jump offset to the beginning of the loop body.
+
+**Operation**:
+- This is the second part of a two-opcode generic for loop, executed via a `TForLoopContinuation`.
+- It checks the first result from the iterator call (now in `R(A+3)`).
+- If the result is not nil, it copies it to the control variable `R(A+2)` and jumps back to the loop body by `sBx`.
+- If the result is nil, execution proceeds to the next instruction, exiting the loop.
+
+### List Operations
+
+#### 35. SETLIST (ABC Format)
+
+**Register Usage**:
+- **R(A)**: Table register (input)
+- **B**: Number of elements to set (0 = use all to top)
+- **C**: Batch number (1-based, 0 = next instruction has real C)
+
+**Operation**: `R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B` (Where FPF = 50)
+
+### Closure Operations
+
+#### 36. CLOSE (ABC Format)
+
+**Register Usage**:
+- **A**: Lowest register to close upvalues for
+- **B**: Unused
+- **C**: Unused
+
+**Operation**: Close all upvalues for locals >= R(A)
+
+#### 37. CLOSURE (ABx Format)
 
 **Register Usage**:
 - **R(A)**: Destination register (output)
-- **RK(B)**: Left operand (input)
-- **RK(C)**: Right operand (input)
+- **Bx**: Function prototype index in constants
 
-**Operation**: `R(A) := RK(B) + RK(C)`
+**Operation**: `R(A) := closure(KPROTO[Bx], upvalues...)`
 
-**RC RefCell VM Implementation** (from rc_vm.rs line 1214):
-```rust
-fn op_add(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-    let a = inst.get_a() as usize;
-    let (b_is_const, b_idx) = inst.get_rk_b();
-    let (c_is_const, c_idx) = inst.get_rk_c();
-    
-    // Get operands with proper RK handling
-    let left = if b_is_const {
-        let frame = self.heap.get_current_frame(&self.current_thread)?;
-        self.get_constant(&frame.closure, b_idx as usize)?
-    } else {
-        self.get_register(base + b_idx as usize)?
-    };
-    
-    let right = if c_is_const {
-        let frame = self.heap.get_current_frame(&self.current_thread)?;
-        self.get_constant(&frame.closure, c_idx as usize)?
-    } else {
-        self.get_register(base + c_idx as usize)?
-    };
-    
-    // Perform addition with proper type checking and metamethod support
-    let result = match (&left, &right) {
-        (Value::Number(l), Value::Number(r)) => {
-            Ok(Value::Number(l + r))
-        },
-        _ => {
-            // Metamethod handling code...
-            // (Implementation includes proper __add metamethod support)
-        }
-    }?;
-    
-    // Store result
-    self.set_register(base + a, result)?;
-    
-    Ok(())
-}
-```
+**Note**: CLOSURE is followed by pseudo-instructions (MOVE or GETUPVAL) for each upvalue.
 
-### Function Call Operations (CRITICAL)
+### Vararg Operations
 
-#### 28. CALL (ABC Format) - VERIFIED IMPLEMENTATION
+#### 38. VARARG (ABC Format)
 
-**Register Usage** (EXACT Lua 5.1 specification):
-- **R(A)**: Function register (input)
-- **R(A+1)...R(A+B-1)**: Arguments (input)
-- **R(A)...R(A+C-2)**: Results (output)
-- **B**: Argument count + 1 (0 = use all to top)
-- **C**: Result count + 1 (0 = return all)
+**Register Usage**:
+- **R(A)**: First destination register (output)
+- **B**: Number of varargs to copy + 1 (0 = copy all varargs)
+- **C**: Unused
 
-**Stack Layout** (EXACT Lua 5.1 specification):
-```
-Before call:          After call:
-R(A):   <function>    R(A):   <result1>
-R(A+1): <arg1>        R(A+1): <result2>
-R(A+2): <arg2>        ...
-...                   R(A+C-2): <resultN>
-```
-
-**RC RefCell VM Implementation** (from rc_vm.rs line 1712):
-```rust
-fn op_call(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-    let a = inst.get_a() as usize;
-    let b = inst.get_b();
-    let c = inst.get_c();
-    
-    // Get function
-    let func = self.get_register(base + a)?;
-    
-    // Determine argument count (EXACT Lua 5.1 specification)
-    let arg_count = if b == 0 {
-        // All values above the function
-        self.heap.get_stack_size(&self.current_thread) - (base + a + 1)
-    } else {
-        (b - 1) as usize
-    };
-    
-    // Collect arguments
-    let mut args = Vec::with_capacity(arg_count);
-    for i in 0..arg_count {
-        args.push(self.get_register(base + a + 1 + i)?);
-    }
-    
-    // Determine expected results (EXACT Lua 5.1 specification)
-    let expected_results = if c == 0 {
-        -1 // All results
-    } else {
-        (c - 1) as i32
-    };
-    
-    // Queue function call (non-recursive execution)
-    self.operation_queue.push_back(PendingOperation::FunctionCall {
-        func,
-        args,
-        expected_results,
-        result_base: base + a,
-    });
-    
-    Ok(())
-}
-```
+**Operation**: `R(A), ..., R(A+B-2) := vararg`
 
 ## RC RefCell VM Implementation
 
@@ -398,32 +559,6 @@ impl RcVM {
         self.heap.set_register(&self.current_thread, index, value)
     }
 }
-
-// From rc_heap.rs - actual implementation
-impl RcHeap {
-    pub fn get_register(&self, thread: &ThreadHandle, index: usize) -> LuaResult<Value> {
-        let thread_ref = thread.borrow();
-        if index >= thread_ref.stack.len() {
-            return Err(LuaError::RuntimeError(
-                format!("Register {} out of bounds (stack size: {})", index, thread_ref.stack.len())
-            ));
-        }
-        
-        Ok(thread_ref.stack[index].clone())
-    }
-    
-    pub fn set_register(&self, thread: &ThreadHandle, index: usize, value: Value) -> LuaResult<()> {
-        let mut thread_ref = thread.borrow_mut();
-        
-        // Grow stack if needed
-        if index >= thread_ref.stack.len() {
-            thread_ref.stack.resize(index + 1, Value::Nil);
-        }
-        
-        thread_ref.stack[index] = value;
-        Ok(())
-    }
-}
 ```
 
 ### Non-Recursive Execution Model
@@ -433,61 +568,28 @@ The RC RefCell VM uses a queue-based execution model to prevent stack overflow:
 ```rust
 // From rc_vm.rs - operation queue for complex operations
 enum PendingOperation {
-    FunctionCall {
-        func: Value,
-        args: Vec<Value>,
-        expected_results: i32,
-        result_base: usize,
-    },
-    Return {
-        values: Vec<Value>,
-    },
-    TForLoopContinuation {
-        base: usize,
-        a: usize,
-        c: usize,
-        pc_before_call: usize,
-    },
-    MetamethodCall {
-        method: Value,
-        args: Vec<Value>,
-        expected_results: i32,
-        result_base: usize,
-    },
+    FunctionCall { ... },
+    Return { ... },
+    TForLoopContinuation { ... },
+    MetamethodCall { ... },
+    // ... other continuation types
 }
 ```
+## Implementation Notes
 
-## Critical Implementation Details
+### Deviations from Lua 5.1
 
-### Stack Management
+The RC RefCell VM includes these implementation-specific enhancements:
 
-The RC RefCell VM maintains the exact Lua 5.1 stack semantics:
+1. **Generic For Loop**: Implemented using two opcodes (`TFORCALL`, `TFORLOOP`) to facilitate a non-recursive execution model, instead of the standard single `TFORLOOP` opcode.
+2. **Enhanced metamethod support**: Uses `PendingMetamethod` for deferred execution.
+3. **Non-recursive execution**: Queue-based operation handling for function calls and other complex operations.
 
-```rust
-// From rc_value.rs - Thread structure
-pub struct Thread {
-    pub call_frames: Vec<CallFrame>,     // Call frame stack
-    pub stack: Vec<Value>,               // Single contiguous stack
-    pub status: ThreadStatus,
-    pub open_upvalues: Vec<UpvalueHandle>, // Sorted by stack index
-}
+### Upvalue Management
 
-// From rc_value.rs - Call frame structure  
-pub struct CallFrame {
-    pub closure: ClosureHandle,          // Currently executing closure
-    pub pc: usize,                       // Program counter
-    pub base_register: u16,              // Base for this function's registers
-    pub expected_results: Option<usize>, // Number of expected results
-    pub varargs: Option<Vec<Value>>,     // Variable arguments
-}
-```
-
-### Upvalue Management (CRITICAL for Closures)
-
-The RC RefCell VM properly implements Lua 5.1 upvalue semantics:
+The VM properly implements Lua 5.1 upvalue semantics with sharing:
 
 ```rust
-// From rc_value.rs - Upvalue state
 pub enum UpvalueState {
     Open {
         thread: ThreadHandle,
@@ -498,47 +600,6 @@ pub enum UpvalueState {
     },
 }
 
-// From rc_heap.rs - Upvalue finding (CRITICAL for sharing)
-pub fn find_or_create_upvalue(&self, thread: &ThreadHandle, stack_index: usize) -> LuaResult<UpvalueHandle> {
-    // Check for existing upvalue at this stack location
-    {
-        let thread_ref = thread.borrow();
-        for upvalue in &thread_ref.open_upvalues {
-            let uv_ref = upvalue.borrow();
-            if let UpvalueState::Open { stack_index: idx, .. } = &*uv_ref {
-                if *idx == stack_index {
-                    return Ok(Rc::clone(upvalue));
-                }
-            }
-        }
-    }
-    
-    // Create new upvalue if not found
-    let upvalue = Rc::new(RefCell::new(UpvalueState::Open {
-        thread: Rc::clone(thread),
-        stack_index,
-    }));
-    
-    // Add to thread's open upvalues list (sorted by stack index)
-    let mut thread_ref = thread.borrow_mut();
-    // Insert in correct position to maintain sorting
-    // ... implementation details ...
-    
-    Ok(upvalue)
-}
+// Upvalues are shared between closures through Rc<RefCell>
+pub type UpvalueHandle = Rc<RefCell<UpvalueState>>;
 ```
-
-## Verification Against Lua 5.1
-
-This document has been verified against:
-
-1. **Official Lua 5.1 Reference Manual**: All register usage patterns match specification
-2. **RC RefCell VM Implementation**: All examples taken from actual working code
-3. **Test Results**: 24% pass rate confirms basic operations work correctly
-4. **Opcode Behavior**: Each opcode implementation verified against Lua 5.1
-
-## Conclusion
-
-This document provides 100% accurate register conventions for the RC RefCell VM implementation. Every code example is taken from the actual working implementation and verified against Lua 5.1 specification.
-
-**CRITICAL**: Any changes to register usage must maintain these exact patterns to preserve Lua 5.1 compatibility.
