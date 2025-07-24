@@ -108,15 +108,6 @@ pub enum LuaError {
     
     // Script execution control
     ScriptKilled,
-    
-    /// Metamethod call request (used for dispatching metamethod calls in rc_vm)
-    /// This is not a true error, but a signal to dispatch a metamethod call
-    MetamethodCall {
-        /// Method name to call
-        method: String,
-        /// Parameters to pass to the method
-        params: Vec<super::value::Value>,
-    },
 }
 
 impl std::fmt::Display for LuaError {
@@ -181,10 +172,6 @@ impl std::fmt::Display for LuaError {
             LuaError::BorrowError(msg) => write!(f, "borrow error: {}", msg),
             
             LuaError::ScriptKilled => write!(f, "script killed by user"),
-            
-            LuaError::MetamethodCall { method, .. } => {
-                write!(f, "metamethod call request: {}", method)
-            },
         }
     }
 }

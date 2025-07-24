@@ -64,36 +64,28 @@ pub fn get_table_field(&self, table: &TableHandle, key: &Value) -> LuaResult<Val
 }
 ```
 
-### 3. Non-Recursive Execution Pattern
+### 3. Direct Execution Pattern (**UPDATED ARCHITECTURE**)
 
-**CORRECT Pattern** - Queue operations instead of recursive calls:
+**CORRECT Pattern** - Execute operations immediately instead of queueing:
 
 ```rust
-// From rc_vm.rs - correct non-recursive pattern
-fn op_call(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+// From rc_vm.rs - correct direct execution pattern
+fn op_call(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
     let func = self.get_register(base + a)?;
     let args = collect_arguments(/* ... */)?;
     
-    // CORRECT: Queue operation instead of calling directly
-    self.operation_queue.push_back(PendingOperation::FunctionCall {
-        func,
-        args,
-        expected_results,
-        result_base: base + a,
-    });
-    
-    Ok(())
+    // CORRECT: Execute function directly
+    self.execute_function_call(func, args, expected_results, result_base, false, None)
 }
 ```
 
-**ANTI-PATTERN** - Never make recursive calls:
+**ANTI-PATTERN** - Never queue operations for later processing:
 ```rust
-// WRONG - Don't do this
+// WRONG - Queue-based execution has been eliminated
 fn op_call(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
     let func = self.get_register(base + a)?;
-    // WRONG - This would cause stack overflow
-    let result = self.execute_function(func, args)?;
-    self.set_register(base + a, result)?;
+    // WRONG - Queueing eliminated to prevent temporal state separation
+    self.operation_queue.push_back(PendingOperation::FunctionCall { ... });
     Ok(())
 }
 ```
@@ -152,8 +144,7 @@ fn op_add(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         (Value::Nil, _) | (_, Value::Nil) => {
             // CORRECT: Try metamethods first
             if let Some(mm) = self.find_metamethod(&left, &add_key)? {
-                self.queue_metamethod_call(mm, vec![left, right]);
-                return Ok(());
+                return self.execute_metamethod_call(mm, vec![left, right]);
             }
             
             // CORRECT: Provide specific error message
@@ -230,14 +221,9 @@ fn op_gettable(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
     // CORRECT: Handle metamethod results
     let final_value = match value {
         Value::PendingMetamethod(boxed_mm) => {
-            // Queue metamethod call
-            self.operation_queue.push_back(PendingOperation::MetamethodCall {
-                method: *boxed_mm,
-                args: vec![Value::Table(Rc::clone(table_handle)), key.clone()],
-                expected_results: 1,
-                result_base: base + a,
-            });
-            return Ok(());
+            // Execute metamethod call directly
+            return self.execute_metamethod_call(*boxed_mm, 
+                vec![Value::Table(Rc::clone(table_handle)), key.clone()]);
         },
         other => other,
     };
@@ -341,11 +327,11 @@ let thread = self.current_thread.borrow();
 let value = thread.stack[index]; // DANGEROUS - no bounds checking
 ```
 
-### ❌ Recursive Function Calls
+### ❌ Queue-Based Operations
 ```rust
-// WRONG - Never make recursive calls
+// WRONG - Never queue operations for later processing
 fn execute_func(&mut self, func: Value) -> LuaResult<Value> {
-    self.execute_func(inner_func)?; // WRONG - causes stack overflow
+    self.operation_queue.push_back(operation); // WRONG - causes temporal state separation
 }
 ```
 
@@ -366,9 +352,9 @@ let value = self.get_register(index).unwrap(); // WRONG - can panic
 
 1. **Always use VM register methods** - Never access stack directly
 2. **Use two-phase borrowing** - Extract handles before making new borrows
-3. **Queue complex operations** - Maintain non-recursive execution
+3. **Execute operations immediately** - Maintain direct execution principles
 4. **Handle all error cases** - Provide meaningful error messages
 5. **Follow Lua 5.1 specification exactly** - Especially for FOR loops and function calls
 6. **Test with actual Lua scripts** - Verify behavior against known results
 
-This document provides the definitive patterns for the RC RefCell VM implementation. Following these patterns ensures correct Lua 5.1 behavior and prevents common pitfalls.
+This document provides the definitive patterns for the direct execution VM implementation. Following these patterns ensures correct Lua 5.1 behavior and prevents temporal state separation issues.

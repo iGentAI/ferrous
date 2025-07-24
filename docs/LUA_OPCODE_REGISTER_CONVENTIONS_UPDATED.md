@@ -561,29 +561,15 @@ impl RcVM {
 }
 ```
 
-### Non-Recursive Execution Model
-
-The RC RefCell VM uses a queue-based execution model to prevent stack overflow:
-
-```rust
-// From rc_vm.rs - operation queue for complex operations
-enum PendingOperation {
-    FunctionCall { ... },
-    Return { ... },
-    TForLoopContinuation { ... },
-    MetamethodCall { ... },
-    // ... other continuation types
-}
-```
 ## Implementation Notes
 
 ### Deviations from Lua 5.1
 
 The RC RefCell VM includes these implementation-specific enhancements:
 
-1. **Generic For Loop**: Implemented using two opcodes (`TFORCALL`, `TFORLOOP`) to facilitate a non-recursive execution model, instead of the standard single `TFORLOOP` opcode.
-2. **Enhanced metamethod support**: Uses `PendingMetamethod` for deferred execution.
-3. **Non-recursive execution**: Queue-based operation handling for function calls and other complex operations.
+1. **Generic For Loop**: Implemented using direct TFORCALL/TFORLOOP execution to eliminate temporal state separation issues that occurred with queue-based processing.
+2. **Enhanced metamethod support**: Uses direct metamethod execution for immediate processing.
+3. **Direct execution model**: Unified Frame-based execution eliminates the need for operation queuing.
 
 ### Upvalue Management
 

@@ -959,8 +959,8 @@ pub enum ThreadStatus {
 /// Lua thread (coroutine)
 #[derive(Clone)]
 pub struct Thread {
-    /// Call frames
-    pub call_frames: Vec<CallFrame>,
+    /// Execution frames (normal calls and, in the future, continuations)
+    pub call_frames: Vec<Frame>,
     
     /// Value stack
     pub stack: Vec<Value>,
@@ -1001,27 +1001,70 @@ impl Thread {
 pub struct CallFrame {
     /// Closure being executed
     pub closure: ClosureHandle,
-    
     /// Program counter
     pub pc: usize,
-    
     /// Base register in stack
     pub base_register: u16,
-    
     /// Number of expected results
     pub expected_results: Option<usize>,
-    
     /// Variable arguments for this frame (if the function is vararg)
     pub varargs: Option<Vec<Value>>,
-    
     /// Is this call protected (pcall/xpcall)?
     pub is_protected: bool,
-    
     /// Error handler for xpcall
     pub xpcall_handler: Option<Value>,
-    
     /// Result base for protected calls
     pub result_base: usize,
+}
+
+/// ---------------------------------------------------------------------------
+/// Unified execution-frame abstraction
+///
+/// The Frame enum provides a unified execution model that completely eliminates
+/// the temporal state separation issues. All operations now execute directly
+/// using the Frame-based architecture with no queue dependencies.
+/// ---------------------------------------------------------------------------
+
+/// A single entry on the VM's execution stack.
+#[derive(Debug, Clone)]
+pub enum Frame {
+    /// A normal Lua call frame (wraps the original `CallFrame` struct).
+    Call(CallFrame),
+
+    /// A continuation frame used to resume a previously suspended VM
+    /// operation (for example after a metamethod call or cooperative
+    /// yield).  During the transition period this is intentionally very
+    /// lightweight – additional state can be threaded through the
+    /// opaque `state` field without touching the public surface.
+    Continuation(ContinuationFrame),
+}
+
+/// Placeholder structure for continuation frames.
+///
+/// This supports the unified Frame architecture that eliminated all queue infrastructure.
+/// The Frame-based execution model provides direct execution without temporal state separation.
+/// This structure is available for future use but current implementation uses direct execution.
+#[derive(Debug, Clone)]
+pub struct ContinuationFrame {
+    /// Program-counter to jump to when the continuation is resumed.
+    pub resume_pc: usize,
+
+    /// State payload for suspended operations. With the elimination of the queue system,
+    /// this provides a foundation for future features requiring state preservation.
+    pub state: ContinuationState,
+}
+
+/// Continuation state for the queue-free execution model.
+///
+/// With the complete elimination of queue infrastructure, this supports the direct
+/// execution model while providing flexibility for future enhancements.
+#[derive(Debug, Clone)]
+pub enum ContinuationState {
+    /// The continuation has been created but not yet executed.
+    Pending,
+    /// The continuation finished and produced return values for direct processing.
+    /// This replaces the old queue-based return value handling with immediate processing.
+    Completed(Vec<Value>),
 }
 
 /// Userdata type

@@ -12,7 +12,7 @@ use super::error::{LuaError, LuaResult};
 use super::rc_value::{
     Value, LuaString, Table, Closure, Thread, UpvalueState, UserData, FunctionProto,
     StringHandle, TableHandle, ClosureHandle, ThreadHandle, UpvalueHandle, UserDataHandle, 
-    FunctionProtoHandle, HashableValue, UpvalueInfo, CallFrame, ThreadStatus
+    FunctionProtoHandle, HashableValue, UpvalueInfo, CallFrame, ThreadStatus, Frame
 };
 
 /// Pre-interned common strings for metamethods
@@ -614,7 +614,14 @@ impl RcHeap {
                     // Dump call stack info for debugging
                     eprintln!("DEBUG get_upvalue_value: Thread has {} call frames", thread_ref.call_frames.len());
                     for (i, frame) in thread_ref.call_frames.iter().enumerate() {
-                        eprintln!("  Frame[{}]: PC={}, base_register={}", i, frame.pc, frame.base_register);
+                        match frame {
+                            Frame::Call(cf) => {
+                                eprintln!("  Frame[{}]: PC={}, base_register={}", i, cf.pc, cf.base_register);
+                            }
+                            Frame::Continuation(_) => {
+                                eprintln!("  Frame[{}]: Continuation", i);
+                            }
+                        }
                     }
                     
                     return Value::Nil;
@@ -751,52 +758,65 @@ impl RcHeap {
     /// Push a call frame to a thread
     pub fn push_call_frame(&self, thread: &ThreadHandle, frame: CallFrame) -> LuaResult<()> {
         let mut thread_ref = thread.borrow_mut();
-        thread_ref.call_frames.push(frame);
+        thread_ref.call_frames.push(Frame::Call(frame));
         Ok(())
     }
     
     /// Pop a call frame from a thread
     pub fn pop_call_frame(&self, thread: &ThreadHandle) -> LuaResult<CallFrame> {
         let mut thread_ref = thread.borrow_mut();
-        thread_ref.call_frames.pop()
-            .ok_or(LuaError::RuntimeError("No call frames to pop".to_string()))
+        match thread_ref.call_frames.pop() {
+            Some(Frame::Call(cf)) => Ok(cf),
+            Some(_) => Err(LuaError::RuntimeError("Attempted to pop non-call frame".into())),
+            None => Err(LuaError::RuntimeError("No call frames to pop".into())),
+        }
     }
     
     /// Get the current call frame from a thread
     pub fn get_current_frame(&self, thread: &ThreadHandle) -> LuaResult<CallFrame> {
         let thread_ref = thread.borrow();
-        thread_ref.call_frames.last()
-            .cloned()
-            .ok_or(LuaError::RuntimeError("No active call frames".to_string()))
+        thread_ref
+            .call_frames
+            .last()
+            .and_then(|f| match f {
+                Frame::Call(cf) => Some(cf.clone()),
+                _ => None,
+            })
+            .ok_or(LuaError::RuntimeError("No active call frames".into()))
     }
     
     /// Get the program counter of the current frame
     pub fn get_pc(&self, thread: &ThreadHandle) -> LuaResult<usize> {
         let thread_ref = thread.borrow();
-        thread_ref.call_frames.last()
-            .map(|frame| frame.pc)
+        thread_ref
+            .call_frames
+            .last()
+            .and_then(|f| match f {
+                Frame::Call(cf) => Some(cf.pc),
+                _ => None,
+            })
             .ok_or(LuaError::RuntimeError("No active call frames".to_string()))
     }
     
     /// Set the program counter of the current frame
     pub fn set_pc(&self, thread: &ThreadHandle, pc: usize) -> LuaResult<()> {
         let mut thread_ref = thread.borrow_mut();
-        if let Some(frame) = thread_ref.call_frames.last_mut() {
+        if let Some(Frame::Call(frame)) = thread_ref.call_frames.last_mut() {
             frame.pc = pc;
             Ok(())
         } else {
-            Err(LuaError::RuntimeError("No active call frames".to_string()))
+            Err(LuaError::RuntimeError("No active call frames".into()))
         }
     }
     
     /// Increment the program counter of the current frame
     pub fn increment_pc(&self, thread: &ThreadHandle) -> LuaResult<()> {
         let mut thread_ref = thread.borrow_mut();
-        if let Some(frame) = thread_ref.call_frames.last_mut() {
+        if let Some(Frame::Call(frame)) = thread_ref.call_frames.last_mut() {
             frame.pc += 1;
             Ok(())
         } else {
-            Err(LuaError::RuntimeError("No active call frames".to_string()))
+            Err(LuaError::RuntimeError("No active call frames".into()))
         }
     }
     
@@ -847,7 +867,11 @@ impl RcHeap {
     /// Get the call frame depth
     pub fn get_call_depth(&self, thread: &ThreadHandle) -> usize {
         let thread_ref = thread.borrow();
-        thread_ref.call_frames.len()
+        thread_ref
+            .call_frames
+            .iter()
+            .filter(|f| matches!(f, Frame::Call(_)))
+            .count()
     }
 }
 
