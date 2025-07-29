@@ -88,14 +88,14 @@ impl Default for CompilerConfig {
     }
 }
 
-/// Helper function to collect and remap all nested prototypes
-fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunction>, Vec<CompilationConstant>) {
+/// Helper function to collect and remap all nested prototypes with unified string coordination
+fn collect_and_remap_prototypes_with_strings(main: &CompiledFunction, original_strings: &[String]) -> (Vec<CompiledFunction>, Vec<CompilationConstant>, Vec<String>) {
     // First, collect all prototypes with their positions in a tree structure
     #[derive(Debug)]
     struct ProtoInfo {
         proto: CompiledFunction,
         parent_idx: Option<usize>,
-        local_idx: usize,  // Index in parent's prototype list
+        local_idx: usize,
     }
     
     let mut all_protos = Vec::new();
@@ -123,7 +123,7 @@ fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunctio
         });
     }
     
-    // Build index mapping: (parent_idx, local_idx) -> global_idx
+    // Build function prototype index mapping: (parent_idx, local_idx) -> global_idx
     let mut index_map = std::collections::HashMap::new();
     
     // Main function's prototypes
@@ -139,28 +139,102 @@ fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunctio
             index_map.insert((Some(parent), info.local_idx), i);
         }
     }
+
+    // Build unified string pool
+    let mut unified_strings_map = std::collections::HashMap::<String, usize>::new();
+    let mut unified_strings_list = Vec::<String>::new();
     
-    // Now remap all FunctionProto constants in each prototype
+    // Helper to add string to unified pool and return new index
+    let mut add_unified_string = |s: &str| -> usize {
+        if let Some(&index) = unified_strings_map.get(s) {
+            return index;
+        }
+        let index = unified_strings_list.len();
+        unified_strings_map.insert(s.to_string(), index);
+        unified_strings_list.push(s.to_string());
+        index
+    };
+
+    // Start with original compilation strings
+    for original_string in original_strings {
+        add_unified_string(original_string);
+    }
+
+    // Collect and add all strings from all prototype constants
+    fn collect_strings_recursive(constants: &[CompilationConstant], original_strings: &[String], add_string: &mut dyn FnMut(&str) -> usize) {
+        for constant in constants {
+            match constant {
+                CompilationConstant::String(idx) => {
+                    if *idx < original_strings.len() {
+                        add_string(&original_strings[*idx]);
+                    }
+                }
+                CompilationConstant::Table(entries) => {
+                    for (k, v) in entries {
+                        collect_strings_recursive(&[k.clone()], original_strings, add_string);
+                        collect_strings_recursive(&[v.clone()], original_strings, add_string);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Collect strings from main function constants
+    collect_strings_recursive(&main.constants, original_strings, &mut add_unified_string);
+
+    // Collect strings from all prototype constants
+    for info in &all_protos {
+        collect_strings_recursive(&info.proto.constants, original_strings, &mut add_unified_string);
+    }
+    
+    // Helper to remap string constants using unified pool
+    fn remap_constants(constants: &mut Vec<CompilationConstant>, original_strings: &[String], string_map: &std::collections::HashMap<String, usize>) {
+        for constant in constants {
+            match constant {
+                CompilationConstant::String(old_idx) => {
+                    if *old_idx < original_strings.len() {
+                        let string_value = &original_strings[*old_idx];
+                        if let Some(&new_idx) = string_map.get(string_value) {
+                            *constant = CompilationConstant::String(new_idx);
+                        }
+                    }
+                }
+                CompilationConstant::Table(entries) => {
+                    for (k, v) in entries {
+                        let mut temp_constants = vec![k.clone(), v.clone()];
+                        remap_constants(&mut temp_constants, original_strings, string_map);
+                        *k = temp_constants[0].clone();
+                        *v = temp_constants[1].clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    // Remap all constants and prototypes
     let mut remapped_protos = Vec::new();
     for (current_global_idx, info) in all_protos.iter().enumerate() {
         let mut proto = info.proto.clone();
         
-        // Remap constants for this prototype
+        // Remap function prototype constants
         for constant in &mut proto.constants {
             if let CompilationConstant::FunctionProto(local_idx) = constant {
-                // This constant refers to a child of the current prototype
                 let global_idx = match index_map.get(&(Some(current_global_idx), *local_idx)) {
                     Some(idx) => *idx,
                     None => {
-                        // This is a critical error in our understanding, but we'll handle it gracefully
                         println!("WARNING: Failed to remap function prototype index {} for prototype {}", 
                                 *local_idx, current_global_idx);
-                        continue; // Keep the old index as a fallback
+                        continue;
                     }
                 };
                 *constant = CompilationConstant::FunctionProto(global_idx);
             }
         }
+        
+        // Remap string constants using unified pool
+        remap_constants(&mut proto.constants, original_strings, &unified_strings_map);
         
         // Clear the nested prototypes as they're now in the flat list
         proto.prototypes = Vec::new();
@@ -169,21 +243,25 @@ fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunctio
     
     // Remap main function's constants
     let mut main_constants = main.constants.clone();
+    
+    // Remap function prototypes in main constants
     for constant in &mut main_constants {
         if let CompilationConstant::FunctionProto(local_idx) = constant {
             let global_idx = match index_map.get(&(None, *local_idx)) {
                 Some(idx) => *idx,
                 None => {
-                    // This is a critical error in our understanding, but we'll handle it gracefully
                     println!("WARNING: Failed to remap main function prototype index {}", *local_idx);
-                    continue; // Keep the old index as a fallback
+                    continue;
                 }
             };
             *constant = CompilationConstant::FunctionProto(global_idx);
         }
     }
     
-    (remapped_protos, main_constants)
+    // Remap string constants in main function
+    remap_constants(&mut main_constants, original_strings, &unified_strings_map);
+    
+    (remapped_protos, main_constants, unified_strings_list)
 }
 
 /// Compile Lua source code into a module
@@ -199,13 +277,13 @@ pub fn compile_with_config(source: &str, config: &CompilerConfig) -> LuaResult<C
     // Generate bytecode
     let output = generate_bytecode(&ast)?;
     
-    // Collect and remap nested prototypes to ensure indices are correct
-    let (all_prototypes, main_constants) = collect_and_remap_prototypes(&output.main);
+    // Collect and remap nested prototypes with unified string coordination
+    let (all_prototypes, main_constants, unified_strings) = collect_and_remap_prototypes_with_strings(&output.main, &output.strings);
     
     println!("DEBUG COMPILER: Compilation complete - main bytecode: {}, total prototypes: {}, strings: {}", 
-             output.main.bytecode.len(), all_prototypes.len(), output.strings.len());
+             output.main.bytecode.len(), all_prototypes.len(), unified_strings.len());
     
-    // Convert the compilation output to a compiled module
+    // Convert the compilation output to a compiled module with unified strings
     Ok(CompiledModule {
         bytecode: output.main.bytecode,
         constants: main_constants,
@@ -213,7 +291,7 @@ pub fn compile_with_config(source: &str, config: &CompilerConfig) -> LuaResult<C
         is_vararg: output.main.is_vararg,
         max_stack_size: output.main.max_stack_size,
         upvalues: output.main.upvalues,
-        strings: output.strings,
+        strings: unified_strings,
         prototypes: all_prototypes,
         source_name: config.source_name.clone(),
     })

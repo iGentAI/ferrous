@@ -430,19 +430,53 @@ impl RcHeap {
             eprintln!("DEBUG find_or_create_upvalue: Checking {} existing open upvalues", 
                      thread_ref.open_upvalues.len());
             
+            // Get current call frame context for scoping
+            let current_frame_base = if !thread_ref.call_frames.is_empty() {
+                if let super::rc_value::Frame::Call(ref frame) = thread_ref.call_frames.last().unwrap() {
+                    frame.base_register as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            
+            // Only look for upvalues that are within current lexical scope
+            // (i.e., not from previous completed function calls)
             for (i, upvalue) in thread_ref.open_upvalues.iter().enumerate() {
-                let uv_ref = upvalue.borrow();
-                if let UpvalueState::Open { stack_index: idx, .. } = &*uv_ref {
-                    eprintln!("DEBUG find_or_create_upvalue: Open upvalue[{}] points to stack index {}", i, idx);
-                    if *idx == stack_index {
-                        eprintln!("DEBUG find_or_create_upvalue: Found existing upvalue for stack index {}", 
-                                 stack_index);
-                        return Ok(Rc::clone(upvalue));
+                if let Ok(uv_ref) = upvalue.try_borrow() {
+                    if let UpvalueState::Open { stack_index: idx, .. } = &*uv_ref {
+                        eprintln!(
+                            "DEBUG find_or_create_upvalue: Open upvalue[{}] points to stack index {} (current frame base: {})",
+                            i, idx, current_frame_base
+                        );
+                        
+                        // Only reuse upvalues that are within current call frame
+                        // This ensures closure independence across different function calls
+                        if *idx == stack_index && *idx >= current_frame_base {
+                            eprintln!(
+                                "DEBUG find_or_create_upvalue: Found existing upvalue for stack index {} within same frame",
+                                stack_index
+                            );
+                            return Ok(Rc::clone(upvalue));
+                        } else if *idx == stack_index {
+                            eprintln!(
+                                "DEBUG find_or_create_upvalue: Upvalue at stack index {} is from previous frame - creating independent upvalue",
+                                stack_index
+                            );
+                        }
                     }
+                } else {
+                    // The up-value is currently mutably borrowed – skip it for
+                    // now but continue the scan to honour Lua's sharing rule.
+                    eprintln!(
+                        "DEBUG find_or_create_upvalue: Skipping upvalue[{}] – already mutably borrowed",
+                        i
+                    );
                 }
             }
             
-            eprintln!("DEBUG find_or_create_upvalue: No existing upvalue found, will create new one");
+            eprintln!("DEBUG find_or_create_upvalue: No existing upvalue found in current scope, will create new one");
         }
         
         // Create a new upvalue

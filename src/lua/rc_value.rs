@@ -970,6 +970,13 @@ pub struct Thread {
     
     /// Open upvalues list (sorted by stack index, highest first)
     pub open_upvalues: Vec<UpvalueHandle>,
+
+    /// Logical top of the stack (Lua's `L->top`).
+    ///
+    /// This decouples *visible* register space from the physical backing
+    /// vector length, allowing the VM to adjust `top` on function
+    /// boundaries without destroying values that reside above it.
+    pub top: usize,
 }
 
 // Custom Debug implementation for Thread to break circular references
@@ -992,6 +999,7 @@ impl Thread {
             stack: Vec::new(),
             status: ThreadStatus::Normal,
             open_upvalues: Vec::new(),
+            top: 0,
         }
     }
 }
@@ -1015,6 +1023,8 @@ pub struct CallFrame {
     pub xpcall_handler: Option<Value>,
     /// Result base for protected calls
     pub result_base: usize,
+    /// Fixed frame top limit (base + maxstacksize)
+    pub frame_top: usize,
 }
 
 /// ---------------------------------------------------------------------------

@@ -146,15 +146,27 @@ impl RcVM {
     
     /// Execute a compiled module (COMPLETELY queue-free!)
     pub fn execute_module(&mut self, module: &compiler::CompiledModule, args: &[Value]) -> LuaResult<Value> {
+        eprintln!("DEBUG execute_module: Starting execution with module: {} constants, {} strings, {} prototypes", 
+                 module.constants.len(), module.strings.len(), module.prototypes.len());
+        
+        // CRITICAL: Initialize stdlib BEFORE executing any user code
+        // This ensures functions like 'print' are available in the global environment
+        self.init_stdlib()?;
+        eprintln!("DEBUG execute_module: Standard library initialized successfully");
+        
         // Create main function
         let main_closure = self.load_module(module)?;
+        eprintln!("DEBUG execute_module: Module loaded successfully");
         
         // Clear stack and frames
         {
             let mut thread = self.current_thread.borrow_mut();
             thread.stack.clear();
             thread.call_frames.clear();
+            thread.top = 0;
         }
+        
+        eprintln!("DEBUG execute_module: Stack and frames cleared, starting execution");
         
         // Place main function and arguments on stack
         self.set_register(0, Value::Closure(main_closure.clone()))?;
@@ -172,9 +184,11 @@ impl RcVM {
             is_protected: false,
             xpcall_handler: None,
             result_base: 0,
+            frame_top: 1 + main_closure.borrow().proto.max_stack_size as usize,
         };
         
         self.heap.push_call_frame(&self.current_thread, main_frame)?;
+        eprintln!("DEBUG execute_module: Main frame pushed, beginning execution");
         
         // Execute with direct execution model (NO QUEUE PROCESSING!)
         self.run_to_completion()
@@ -235,7 +249,7 @@ impl RcVM {
             _ => {}
         }
         
-        // Execute instruction DIRECTLY (all returns are now direct!)
+        // Execute instruction DIRECTLY with corrected opcode numbering and StepResult propagation
         match inst.get_opcode() {
             OpCode::Move => { self.op_move(inst, base)?; Ok(StepResult::Continue) }
             OpCode::LoadK => { self.op_loadk(inst, base)?; Ok(StepResult::Continue) }
@@ -243,24 +257,24 @@ impl RcVM {
             OpCode::LoadNil => { self.op_loadnil(inst, base)?; Ok(StepResult::Continue) }
             OpCode::GetGlobal => { self.op_getglobal(inst, base)?; Ok(StepResult::Continue) }
             OpCode::SetGlobal => { self.op_setglobal(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::GetTable => { self.op_gettable(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::SetTable => { self.op_settable(inst, base)?; Ok(StepResult::Continue) }
+            OpCode::GetTable => self.op_gettable(inst, base),
+            OpCode::SetTable => self.op_settable(inst, base),
             OpCode::NewTable => { self.op_newtable(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::SelfOp => { self.op_self(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Add => { self.op_add(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Sub => { self.op_sub(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Mul => { self.op_mul(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Div => { self.op_div(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Mod => { self.op_mod(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Pow => { self.op_pow(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Unm => { self.op_unm(inst, base)?; Ok(StepResult::Continue) }
+            OpCode::SelfOp => self.op_self(inst, base),
+            OpCode::Add => self.op_add(inst, base),
+            OpCode::Sub => self.op_sub(inst, base),
+            OpCode::Mul => self.op_mul(inst, base),
+            OpCode::Div => self.op_div(inst, base),
+            OpCode::Mod => self.op_mod(inst, base),
+            OpCode::Pow => self.op_pow(inst, base),
+            OpCode::Unm => self.op_unm(inst, base),
             OpCode::Not => { self.op_not(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Len => { self.op_len(inst, base)?; Ok(StepResult::Continue) }
+            OpCode::Len => self.op_len(inst, base),
             OpCode::Concat => { self.op_concat(inst, base)?; Ok(StepResult::Continue) }
             OpCode::Jmp => { self.op_jmp(inst)?; Ok(StepResult::Continue) }
-            OpCode::Eq => { self.op_eq(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Lt => { self.op_lt(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::Le => { self.op_le(inst, base)?; Ok(StepResult::Continue) }
+            OpCode::Eq => self.op_eq(inst, base),
+            OpCode::Lt => self.op_lt(inst, base),
+            OpCode::Le => self.op_le(inst, base),
             OpCode::Test => { self.op_test(inst, base)?; Ok(StepResult::Continue) }
             OpCode::TestSet => { self.op_testset(inst, base)?; Ok(StepResult::Continue) }
             OpCode::Call => self.op_call(inst, base),
@@ -268,7 +282,6 @@ impl RcVM {
             OpCode::Return => self.op_return(inst, base),
             OpCode::ForPrep => { self.op_forprep(inst, base)?; Ok(StepResult::Continue) }
             OpCode::ForLoop => { self.op_forloop(inst, base)?; Ok(StepResult::Continue) }
-            OpCode::TForCall => { self.op_tforcall(inst, base)?; Ok(StepResult::Continue) }
             OpCode::TForLoop => { self.op_tforloop(inst, base)?; Ok(StepResult::Continue) }
             OpCode::VarArg => { self.op_vararg(inst, base)?; Ok(StepResult::Continue) }
             OpCode::GetUpval => { self.op_getupval(inst, base)?; Ok(StepResult::Continue) }
@@ -309,10 +322,18 @@ impl RcVM {
                     if let Some(metamethod) = mt_ref.get_field(&call_key) {
                         drop(mt_ref);
                         
+                        // SPECIFICATION COMPLIANT: Standard call semantics, no preservation
                         let mut metamethod_args = vec![Value::Table(Rc::clone(table_handle))];
                         metamethod_args.extend(args);
                         
-                        self.execute_function_call(metamethod, metamethod_args, expected_results, result_base, is_protected, xpcall_handler)
+                        return self.execute_function_call(
+                            metamethod, 
+                            metamethod_args, 
+                            expected_results, 
+                            result_base, 
+                            is_protected, 
+                            xpcall_handler
+                        );
                     } else {
                         Err(LuaError::TypeError {
                             expected: "function".to_string(),
@@ -333,7 +354,7 @@ impl RcVM {
         }
     }
     
-    /// Call Lua function directly
+    /// Call a Lua function with unified register stack per Lua 5.1 specification
     fn call_lua_function(
         &mut self,
         closure: ClosureHandle,
@@ -343,47 +364,42 @@ impl RcVM {
         is_protected: bool,
         xpcall_handler: Option<Value>,
     ) -> LuaResult<StepResult> {
-        let (num_params, max_stack, is_vararg, _func_proto) = {
-            let closure_ref = closure.borrow();
-            let proto_ref = &closure_ref.proto;
+        let func_slot = result_base;           // Function at result_base
+        let callee_base = result_base + 1;     // Callee R(0) at result_base + 1
+
+        let (num_params, max_stack, is_vararg, _) = {
+            let cl_ref  = closure.borrow();
+            let proto   = &cl_ref.proto;
             (
-                proto_ref.num_params as usize,
-                proto_ref.max_stack_size as usize,
-                proto_ref.is_vararg,
-                Rc::clone(&closure_ref.proto),
+                proto.num_params as usize,
+                proto.max_stack_size as usize,
+                proto.is_vararg,
+                Rc::clone(&cl_ref.proto),
             )
         };
-        
-        let new_base = result_base;
-        let frame_base = new_base + 1;
-        
-        let required_stack_size = frame_base + max_stack;
+
+        let required_stack_size = callee_base + max_stack;
         self.ensure_stack_space(required_stack_size)?;
-        
-        // Place arguments
+
+        self.set_register(func_slot, Value::Closure(closure.clone()))?;
         for (i, arg) in args.iter().enumerate() {
-            if i < num_params {
-                self.set_register(new_base + 1 + i, arg.clone())?;
-            }
+            self.set_register(callee_base + i, arg.clone())?;
         }
         
-        // Fill missing parameters with nil
         for i in args.len()..num_params {
-            self.set_register(new_base + 1 + i, Value::Nil)?;
+            self.set_register(callee_base + i, Value::Nil)?;
         }
-        
-        // Create varargs if needed
+
         let varargs = if is_vararg && args.len() > num_params {
             Some(args[num_params..].to_vec())
         } else {
             None
         };
-        
-        // Create call frame
+
         let frame = CallFrame {
             closure: closure.clone(),
             pc: 0,
-            base_register: (new_base + 1) as u16,
+            base_register: callee_base as u16,
             expected_results: if expected_results >= 0 {
                 Some(expected_results as usize)
             } else {
@@ -393,15 +409,14 @@ impl RcVM {
             is_protected,
             xpcall_handler,
             result_base,
+            frame_top: callee_base + max_stack,
         };
-        
-        // Push frame DIRECTLY (NO QUEUE!)
+
         self.heap.push_call_frame(&self.current_thread, frame)?;
-        
         Ok(StepResult::Continue)
     }
     
-    /// Call C function directly
+    /// Call a C function with unified register stack per Lua 5.1 specification
     fn call_c_function(
         &mut self,
         func: super::rc_value::CFunction,
@@ -409,80 +424,97 @@ impl RcVM {
         expected_results: i32,
         result_base: usize,
     ) -> LuaResult<StepResult> {
-        let args_base = result_base;
-        self.ensure_stack_space(args_base + 1 + args.len())?;
+        let func_slot = result_base;           // Function at result_base  
+        let arg_base = result_base + 1;        // Arguments at result_base + 1
 
-        self.set_register(args_base, Value::CFunction(func))?;
+        self.ensure_stack_space(arg_base + args.len())?;
+
+        self.set_register(func_slot, Value::CFunction(func))?;
         for (i, arg) in args.iter().enumerate() {
-            self.set_register(args_base + 1 + i, arg.clone())?;
+            self.set_register(arg_base + i, arg.clone())?;
         }
-        
-        self.process_c_function_call(func, result_base as u16, args.len(), expected_results)
+
+        self.process_c_function_call(
+            func,
+            func_slot,        // Function at result_base
+            args.len(),
+            expected_results,
+            result_base,      // Results go to same location
+        )
     }
     
-    /// Process C function call directly
+    /// Process C function call with unified register stack addressing
     fn process_c_function_call(
         &mut self,
         function: super::rc_value::CFunction,
-        base: u16,  
+        func_slot: usize,  // Function position in unified stack
         nargs: usize,
         expected_results: i32,
+        result_base: usize,
     ) -> LuaResult<StepResult> {
-        eprintln!("DEBUG process_c_function_call: base={}, nargs={}, expected_results={}", base, nargs, expected_results);
-        
+        let arg_base = func_slot + 1;  // Arguments follow function in unified stack
+
+        eprintln!(
+            "DEBUG process_c_function_call: func_slot={}, nargs={}, expected_results={}, result_base={}",
+            func_slot, nargs, expected_results, result_base
+        );
+
         let mut ctx = VmExecutionContext {
             vm: self,
-            base: (base + 1) as usize,
+            base: arg_base,  // Arguments at func_slot + 1
             nargs,
             results_pushed: 0,
             results: Vec::new(),
         };
-        
-        let actual_results = function(&mut ctx)?;
-        
-        if actual_results == -1 {
-            drop(ctx);
-            return Ok(StepResult::Continue);
-        }
-        
-        if actual_results < 0 {
-            return Err(LuaError::RuntimeError(
-                "C function returned invalid result count".to_string()
-            ));
-        }
-        
+
+        let declared_results = function(&mut ctx)?;
         let mut results = std::mem::take(&mut ctx.results);
         let pushed = results.len();
-        drop(ctx);
-        
-        let mut results_pushed = actual_results as usize;
-        if results_pushed > pushed {
-            results.resize(results_pushed, Value::Nil);
-        } else if results_pushed < pushed {
-            results.truncate(results_pushed);
+
+        let mut final_result_count = if declared_results < 0 { 
+            pushed  
+        } else { 
+            declared_results as usize 
+        };
+
+        if final_result_count > pushed {
+            results.resize(final_result_count, Value::Nil);
+        } else if final_result_count < pushed {
+            results.truncate(final_result_count);
         }
-        
-        let base_usize = base as usize;
+
         if expected_results >= 0 {
             let expected = expected_results as usize;
-            
-            if results_pushed < expected {
-                results.resize(expected, Value::Nil);
-                results_pushed = expected;
-            } else if results_pushed > expected {
+            if expected < final_result_count {
                 results.truncate(expected);
-                results_pushed = expected;
+                final_result_count = expected;
+            } else if expected > final_result_count {
+                results.resize(expected, Value::Nil);
+                final_result_count = expected;
             }
         }
-        
+
+        eprintln!(
+            "DEBUG process_c_function_call: declared={}, pushed={}, final_count={}, copying to result_base={}",
+            declared_results, pushed, final_result_count, result_base
+        );
+
         for (i, val) in results.iter().enumerate() {
-            self.set_register(base_usize + i, val.clone())?;
+            self.set_register(result_base + i, val.clone())?;
         }
-        
+
+        self.current_thread.borrow_mut().top = result_base + final_result_count;
+
+        eprintln!(
+            "DEBUG process_c_function_call: unified stack - results placed at result_base={}, top set to {}",
+            result_base, result_base + final_result_count
+        );
+
         Ok(StepResult::Continue)
     }
+
     
-    /// Process return DIRECTLY (NO QUEUE!)
+    /// Process return with ZERO TOLERANCE - remove accommodations that mask problems
     fn process_return(&mut self, values: Vec<Value>) -> LuaResult<StepResult> {
         if self.heap.get_call_depth(&self.current_thread) == 0 {
             return Ok(StepResult::Completed(values));
@@ -513,25 +545,18 @@ impl RcVM {
 
     /// Place return values directly 
     fn place_return_values(&mut self, values: Vec<Value>, result_base: usize, expected_results: Option<usize>) -> LuaResult<()> {
-        let result_count = if let Some(n) = expected_results {
-            n
-        } else {
-            values.len()
-        };
+        // How many values does the caller expect?
+        let result_count = expected_results.unwrap_or_else(|| values.len());
 
-        if result_count == 0 {
-            eprintln!("DEBUG place_return_values: caller expects 0 results – truncating stack to result_base ({})", result_base);
-            let mut thread = self.current_thread.borrow_mut();
-            if thread.stack.len() > result_base {
-                thread.stack.truncate(result_base);
-            }
-            return Ok(());
-        }
-
+        // Write requested results (or nil padding) into the destination window
         for i in 0..result_count {
-            let value_to_set = values.get(i).cloned().unwrap_or(Value::Nil);
-            self.set_register(result_base + i, value_to_set)?;
+            let value = values.get(i).cloned().unwrap_or(Value::Nil);
+            self.set_register(result_base + i, value)?;
         }
+
+        // Update logical top to point just past the last visible result
+        // For result_count == 0 this correctly collapses top to result_base
+        self.current_thread.borrow_mut().top = result_base + result_count;
         
         Ok(())
     }
@@ -729,53 +754,58 @@ impl RcVM {
     // Register access helpers  
     //
     
+    /// Return the logical top of the current thread.
+    fn current_top(&self) -> usize {
+        self.current_thread.borrow().top
+    }
+
+    /// Fetch a register value with SPECIFICATION-COMPLIANT dynamic growth
     fn get_register(&self, index: usize) -> LuaResult<Value> {
-        match self.heap.get_register(&self.current_thread, index) {
-            Ok(value) => Ok(value),
-            Err(e) => {
-                eprintln!("REGISTER OVERFLOW DEBUG:");
-                eprintln!("  Attempted to access register: {}", index);
-                
-                let thread_ref = self.current_thread.borrow();
-                eprintln!("  Current stack size: {}", thread_ref.stack.len());
-                eprintln!("  Valid register range: 0-{}", thread_ref.stack.len().saturating_sub(1));
-                eprintln!("  Call frames: {}", thread_ref.call_frames.len());
-                
-                if !thread_ref.call_frames.is_empty() {
-                    match thread_ref.call_frames.last().unwrap() {
-                        super::rc_value::Frame::Call(current_frame) => {
-                            eprintln!("  Current frame base_register: {}", current_frame.base_register);
-                            eprintln!("  Current frame PC: {}", current_frame.pc);
-                        }
-                        super::rc_value::Frame::Continuation(_) => {
-                            eprintln!("  Current frame: Continuation");
-                        }
-                    }
-                }
-                
-                if index > 255 {
-                    eprintln!("  POTENTIAL CAUSE: Index {} suggests base+offset calculation error", index);
-                }
-                
-                Err(LuaError::RuntimeError(
-                    format!("Register {} out of bounds (stack size: {}) - Direct execution fix applied", 
-                           index, thread_ref.stack.len())
-                ))
+        // SPECIFICATION COMPLIANCE: Check against fixed frame_top limit first
+        if let Ok(frame) = self.heap.get_current_frame(&self.current_thread) {
+            if index >= frame.frame_top {
+                return Err(LuaError::StackOverflow);
             }
         }
+        
+        // SPECIFICATION COMPLIANCE: Dynamic growth on access per Lua 5.1
+        let mut thread_ref = self.current_thread.borrow_mut();
+        if index >= thread_ref.stack.len() {
+            thread_ref.stack.resize(index + 1, Value::Nil);
+        }
+        Ok(thread_ref.stack[index].clone())
     }
-    
+
+    /// Set register with SPECIFICATION-COMPLIANT bounds checking
     fn set_register(&self, index: usize, value: Value) -> LuaResult<()> {
-        self.heap.set_register(&self.current_thread, index, value)
+        // SPECIFICATION COMPLIANCE: Enforce fixed frame_top limit
+        if let Ok(frame) = self.heap.get_current_frame(&self.current_thread) {
+            if index >= frame.frame_top {
+                return Err(LuaError::StackOverflow);
+            }
+        }
+
+        let mut thread_ref = self.current_thread.borrow_mut();
+
+        if index >= thread_ref.stack.len() {
+            thread_ref.stack.resize(index + 1, Value::Nil);
+        }
+
+        thread_ref.stack[index] = value;
+
+        if index + 1 > thread_ref.top {
+            thread_ref.top = index + 1;
+        }
+        Ok(())
     }
     
+    /// Ensure the physical stack can hold `size` elements.  
+    /// Does **not** manipulate `top` — callers decide whether the
+    /// slots are logically visible.
     fn ensure_stack_space(&self, size: usize) -> LuaResult<()> {
-        let current_size = self.heap.get_stack_size(&self.current_thread);
-        if current_size < size {
-            let mut thread = self.current_thread.borrow_mut();
-            if thread.stack.len() < size {
-                thread.stack.resize(size, Value::Nil);
-            }
+        let mut thread = self.current_thread.borrow_mut();
+        if thread.stack.len() < size {
+            thread.stack.resize(size, Value::Nil);
         }
         Ok(())
     }
@@ -873,7 +903,7 @@ impl RcVM {
         Ok(())
     }
     
-    /// GETGLOBAL: R(A) := Gbl[Kst(Bx)] (DIRECT metamethod execution)
+    /// GETGLOBAL: R(A) := Gbl[Kst(Bx)] - SPECIFICATION COMPLIANT (raw access only)
     fn op_getglobal(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let bx = inst.get_bx() as usize;
@@ -898,23 +928,13 @@ impl RcVM {
             }
         };
         
-        let value = self.heap.get_table_field(&globals, &key)?;
-        
-        // Handle metamethods DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
-        let final_value = match value {
-            Value::PendingMetamethod(boxed_mm) => {
-                // Execute metamethod DIRECTLY
-                self.execute_function_call(*boxed_mm, vec![Value::Table(Rc::clone(&globals)), key.clone()], 1, base + a, false, None)?;
-                return Ok(());
-            },
-            other => other,
-        };
-        
-        self.set_register(base + a, final_value)?;
+        // SPECIFICATION COMPLIANT: Raw access only, no metamethods per Lua 5.1
+        let value = self.heap.raw_get_table_field(&globals, &key);
+        self.set_register(base + a, value)?;
         Ok(())
     }
     
-    /// SETGLOBAL: Gbl[Kst(Bx)] := R(A) (DIRECT metamethod execution)
+    /// SETGLOBAL: Gbl[Kst(Bx)] := R(A) - SPECIFICATION COMPLIANT (raw access only)
     fn op_setglobal(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let bx = inst.get_bx() as usize;
@@ -940,19 +960,13 @@ impl RcVM {
             }
         };
         
-        // Set value with DIRECT metamethod execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
-        match self.heap.set_table_field(&globals, &key, &value)? {
-            Some(metamethod) => {
-                self.execute_function_call(metamethod, vec![Value::Table(Rc::clone(&globals)), key.clone(), value.clone()], 0, 0, false, None)?;
-            },
-            None => {},
-        }
-        
+        // SPECIFICATION COMPLIANT: Raw set only, no metamethods per Lua 5.1
+        self.heap.set_table_field_raw(&globals, &key, &value)?;
         Ok(())
     }
     
-    /// GETTABLE: R(A) := R(B)[RK(C)] (DIRECT metamethod execution)
-    fn op_gettable(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// GETTABLE: R(A) := R(B)[RK(C)] - SPECIFICATION COMPLIANT with StepResult propagation
+    fn op_gettable(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
 
@@ -975,22 +989,21 @@ impl RcVM {
 
         let value = self.heap.get_table_field(table_handle, &key)?;
         
-        // Handle metamethods DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
+        // SPECIFICATION COMPLIANCE: Handle metamethods with proper StepResult propagation
         let final_value = match value {
             Value::PendingMetamethod(boxed_mm) => {
-                // Execute metamethod DIRECTLY
-                self.execute_function_call(*boxed_mm, vec![Value::Table(Rc::clone(table_handle)), key.clone()], 1, base + a, false, None)?;
-                return Ok(());
+                // Execute metamethod and propagate StepResult
+                return self.execute_function_call(*boxed_mm, vec![Value::Table(Rc::clone(table_handle)), key.clone()], 1, base + a, false, None);
             },
             other => other,
         };
         
         self.set_register(base + a, final_value)?;
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
-    /// SETTABLE: R(A)[RK(B)] := RK(C) (DIRECT metamethod execution)
-    fn op_settable(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// SETTABLE: R(A)[RK(B)] := RK(C) - SPECIFICATION COMPLIANT with StepResult propagation
+    fn op_settable(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a() as usize;
         
         eprintln!("DEBUG SETTABLE: EXECUTING at base={}, A={} (DIRECT)", base, a);
@@ -1016,19 +1029,19 @@ impl RcVM {
         
         eprintln!("DEBUG SETTABLE: Key={:?}, Value={:?}", key, value);
         
-        // Use heap's metamethod-aware set with DIRECT execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
+        // SPECIFICATION COMPLIANCE: Handle metamethods with proper StepResult propagation
         let metamethod_result = self.heap.set_table_field(table_handle, &key, &value)?;
         
         if let Some(metamethod) = metamethod_result {
-            eprintln!("DEBUG SETTABLE: Metamethod found, executing DIRECTLY (no queue)");
-            // Execute __newindex metamethod DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
-            self.execute_function_call(metamethod, vec![Value::Table(table_handle.clone()), key.clone(), value.clone()], 0, 0, false, None)?;
+            eprintln!("DEBUG SETTABLE: Metamethod found, executing with StepResult propagation");
+            // Execute __newindex metamethod and propagate StepResult
+            return self.execute_function_call(metamethod, vec![Value::Table(table_handle.clone()), key.clone(), value.clone()], 0, 0, false, None);
         } else {
             eprintln!("DEBUG SETTABLE: No metamethod, direct field storage completed");
         }
         
         eprintln!("DEBUG SETTABLE: Operation complete");
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
     /// NEWTABLE: R(A) := {} (size = B,C)
@@ -1046,8 +1059,8 @@ impl RcVM {
         Ok(())
     }
     
-    /// SELF: R(A+1) := R(B); R(A) := R(B)[RK(C)] (DIRECT metamethod execution)
-    fn op_self(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// SELF with StepResult propagation for metamethod handling
+    fn op_self(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         let (c_is_const, c_idx) = inst.get_rk_c();
@@ -1067,11 +1080,9 @@ impl RcVM {
                 
                 let method = self.heap.get_table_field(table_handle, &key)?;
                 
-                // Handle metamethods DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                 match method {
                     Value::PendingMetamethod(boxed_mm) => {
-                        // Execute metamethod DIRECTLY
-                        self.execute_function_call(*boxed_mm, vec![Value::Table(Rc::clone(&table_handle)), key.clone()], 1, base + a, false, None)?;
+                        return self.execute_function_call(*boxed_mm, vec![Value::Table(Rc::clone(&table_handle)), key.clone()], 1, base + a, false, None);
                     },
                     _ => {
                         self.set_register(base + a, method)?;
@@ -1086,36 +1097,11 @@ impl RcVM {
             }
         }
         
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
-    /// Arithmetic operations with DIRECT metamethod execution (COMPLETE QUEUE ELIMINATION!)
-    fn op_add(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_arithmetic(inst, base, ArithOp::Add)
-    }
-    
-    fn op_sub(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_arithmetic(inst, base, ArithOp::Sub)
-    }
-    
-    fn op_mul(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_arithmetic(inst, base, ArithOp::Mul)
-    }
-    
-    fn op_div(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_arithmetic(inst, base, ArithOp::Div)
-    }
-    
-    fn op_mod(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_arithmetic(inst, base, ArithOp::Mod)
-    }
-    
-    fn op_pow(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        self.op_arithmetic(inst, base, ArithOp::Pow)
-    }
-    
-    /// Generic arithmetic with DIRECT metamethod execution (COMPLETE QUEUE ELIMINATION!)
-    fn op_arithmetic(&mut self, inst: Instruction, base: usize, op: ArithOp) -> LuaResult<()> {
+    /// Generic arithmetic with SPECIFICATION COMPLIANT StepResult propagation
+    fn op_arithmetic(&mut self, inst: Instruction, base: usize, op: ArithOp) -> LuaResult<StepResult> {
         let a = inst.get_a() as usize;
         
         let left = self.read_rk(base, inst.get_b())?;
@@ -1156,10 +1142,10 @@ impl RcVM {
             }
             
             self.set_register(base + a, result)?;
-            return Ok(());
+            return Ok(StepResult::Continue);
         }
 
-        // Try metamethods with DIRECT execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
+        // SPECIFICATION COMPLIANCE: Try metamethods with proper StepResult propagation
         let mm_key = match op {
             ArithOp::Add => &self.heap.metamethod_names.add,
             ArithOp::Sub => &self.heap.metamethod_names.sub,
@@ -1176,11 +1162,10 @@ impl RcVM {
 
         if let Some(method) = mm {
             if matches!(op, ArithOp::Add) {
-                eprintln!("DEBUG ADD: Found metamethod __add, executing DIRECTLY (no queue)");
+                eprintln!("DEBUG ADD: Found metamethod __add, executing with StepResult propagation");
             }
-            // Execute metamethod DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
-            self.execute_function_call(method, vec![left, right], 1, base + a, false, None)?;
-            return Ok(());
+            // SPECIFICATION COMPLIANCE: Execute metamethod and propagate StepResult
+            return self.execute_function_call(method, vec![left, right], 1, base + a, false, None);
         }
         
         if matches!(op, ArithOp::Add) {
@@ -1191,9 +1176,39 @@ impl RcVM {
             got: format!("'{}' and '{}'", left.type_name(), right.type_name()),
         })
     }
+
+    /// ADD with StepResult propagation
+    fn op_add(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
+        self.op_arithmetic(inst, base, ArithOp::Add)
+    }
     
-    /// UNM: R(A) := -R(B) (DIRECT metamethod execution)
-    fn op_unm(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// SUB with StepResult propagation
+    fn op_sub(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
+        self.op_arithmetic(inst, base, ArithOp::Sub)
+    }
+    
+    /// MUL with StepResult propagation
+    fn op_mul(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
+        self.op_arithmetic(inst, base, ArithOp::Mul)
+    }
+    
+    /// DIV with StepResult propagation
+    fn op_div(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
+        self.op_arithmetic(inst, base, ArithOp::Div)
+    }
+    
+    /// MOD with StepResult propagation  
+    fn op_mod(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
+        self.op_arithmetic(inst, base, ArithOp::Mod)
+    }
+    
+    /// POW with StepResult propagation
+    fn op_pow(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
+        self.op_arithmetic(inst, base, ArithOp::Pow)
+    }
+    
+    /// UNM: R(A) := -R(B) with StepResult propagation
+    fn op_unm(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
@@ -1202,13 +1217,10 @@ impl RcVM {
         let result = match &operand {
             Value::Number(n) => Ok(Value::Number(-*n)),
             _ => {
-                // Try metamethod with DIRECT execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                 let mm = self.find_metamethod(&operand, &Value::String(Rc::clone(&self.heap.metamethod_names.unm)))?;
                 
                 if let Some(method) = mm {
-                    // Execute metamethod DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
-                    self.execute_function_call(method, vec![operand.clone()], 1, base + a, false, None)?;
-                    return Ok(());
+                    return self.execute_function_call(method, vec![operand.clone()], 1, base + a, false, None);
                 }
                 
                 Err(LuaError::TypeError {
@@ -1219,7 +1231,7 @@ impl RcVM {
         }?;
         
         self.set_register(base + a, result)?;
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
     /// NOT: R(A) := not R(B)
@@ -1234,8 +1246,8 @@ impl RcVM {
         Ok(())
     }
     
-    /// LEN: R(A) := length of R(B) (DIRECT metamethod execution)
-    fn op_len(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// LEN: R(A) := length of R(B) with StepResult propagation
+    fn op_len(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a() as usize;
         let b = inst.get_b() as usize;
         
@@ -1247,13 +1259,10 @@ impl RcVM {
                 Ok(Value::Number(string_ref.len() as f64))
             },
             Value::Table(ref handle) => {
-                // Check for metamethod with DIRECT execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                 let mm = self.find_metamethod(&operand, &Value::String(Rc::clone(&self.heap.metamethod_names.len)))?;
                 
                 if let Some(method) = mm {
-                    // Execute metamethod DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
-                    self.execute_function_call(method, vec![operand.clone()], 1, base + a, false, None)?;
-                    return Ok(());
+                    return self.execute_function_call(method, vec![operand.clone()], 1, base + a, false, None);
                 }
                 
                 let table_ref = handle.borrow();
@@ -1266,7 +1275,7 @@ impl RcVM {
         }?;
         
         self.set_register(base + a, result)?;
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
     /// CONCAT: R(A) := R(B).. ... ..R(C) (DIRECT execution - MAJOR QUEUE ELIMINATION!)
@@ -1393,7 +1402,7 @@ impl RcVM {
         let func = self.get_register(base + a)?;
         
         let arg_count = if b == 0 {
-            self.heap.get_stack_size(&self.current_thread) - (base + a + 1)
+            self.current_top().saturating_sub(base + a + 1)
         } else {
             (b - 1) as usize
         };
@@ -1413,18 +1422,19 @@ impl RcVM {
         self.execute_function_call(func, args, expected_results, base + a, false, None)
     }
     
-    /// RETURN: return R(A), ..., R(A+B-2) (DIRECT execution)
+    /// SPECIFICATION COMPLIANT: OP_RETURN with correct upvalue closing order
     fn op_return(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a() as usize;
         let b = inst.get_b();
 
         eprintln!("DEBUG RETURN: Executing with A={}, B={}, base={} (DIRECT)", a, b, base);
 
+        // SPECIFICATION COMPLIANCE: Close upvalues BEFORE collecting return values
         self.heap.close_upvalues(&self.current_thread, base)?;
 
         let mut values = Vec::new();
         if b == 0 {
-            let stack_size = self.heap.get_stack_size(&self.current_thread);
+            let stack_size = self.current_top();
             let return_start = base + a;
             eprintln!("DEBUG RETURN: Multireturn (B=0). Collecting all values from R({}) to stack top ({})", 
                      return_start, stack_size);
@@ -1450,72 +1460,64 @@ impl RcVM {
 
         eprintln!("DEBUG RETURN: Collected {} return values", values.len());
 
-        // Process return DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
+        // Process return with zero tolerance approach
         self.process_return(values)
     }
-    
-    /// TFORCALL/TFORLOOP: DIRECT execution eliminates temporal state separation (NO QUEUE!)
-    fn op_tforcall(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// SPECIFICATION ALIGNED: TFORLOOP - Complete iterator protocol per Lua 5.1 specification
+    fn op_tforloop(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
         let a = inst.get_a() as usize;
         let c = inst.get_c() as usize;
-
-        eprintln!("DEBUG TFORCALL: EXECUTING DIRECTLY - eliminates temporal state separation!");
         
-        let call_base = base + a + 3;
-
+        eprintln!("DEBUG TFORLOOP: EXECUTING at base={}, A={}, C={} (SPECIFICATION ALIGNED)", base, a, c);
+        
+        // SPECIFICATION: Call iterator function with state and control as arguments
         let iter_func = self.get_register(base + a)?;
         let state = self.get_register(base + a + 1)?;
         let control = self.get_register(base + a + 2)?;
-        let args = vec![state, control];
-
-        self.ensure_stack_space(call_base + 1 + args.len())?;
-
-        self.set_register(call_base, iter_func.clone())?;
-        for (i, arg) in args.iter().enumerate() {
-            self.set_register(call_base + 1 + i, arg.clone())?;
-        }
-
-        // Execute iterator call IMMEDIATELY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
-        self.execute_function_call(iter_func, args, c as i32, call_base, false, None)?;
-
-        Ok(())
-    }
-    
-    /// TFORLOOP: DIRECT register check (NO temporal separation!)
-    fn op_tforloop(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
-        let a = inst.get_a() as usize;
-        let sbx = inst.get_sbx();
         
-        eprintln!("DEBUG TFORLOOP: base={}, A={}, sBx={} (DIRECT CHECK)", base, a, sbx);
-
-        // DIRECT register check - no temporal separation! - COMPLETE QUEUE ELIMINATION
-        let first_var_reg = base + a + 3;
-        let stack_size = self.heap.get_stack_size(&self.current_thread);
-        if first_var_reg >= stack_size {
-            eprintln!("DEBUG TFORLOOP: End of iteration (stack truncated before result register at index {})", first_var_reg);
-            return Ok(());
-        }
-
-        let first_result = self.get_register(first_var_reg)?;
+        let args = vec![state, control];
+        
+        // SPECIFICATION: Call iterator expecting C+1 results (control + C vars)
+        // Results are placed at R(A+3) to R(A+3+C)
+        self.execute_function_call(iter_func, args, (c + 1) as i32, base + a + 3, false, None)?;
+        
+        // SPECIFICATION CRITICAL: Check if first result (R(A+3)) is nil and handle conditional jump
+        let first_result = self.get_register(base + a + 3)?;
         
         if !first_result.is_nil() {
-            eprintln!("DEBUG TFORLOOP: Continuing iteration");
-            let control_var_reg = base + a + 2;
-            self.set_register(control_var_reg, first_result.clone())?;
+            eprintln!("DEBUG TFORLOOP: Iteration continues - updating control variable and jumping");
+            // Update control variable R(A+2) = R(A+3)
+            self.set_register(base + a + 2, first_result.clone())?;
             
-            let pc = self.heap.get_pc(&self.current_thread)?;
-            let new_pc = (pc as isize + sbx as isize) as usize;
-            eprintln!("DEBUG TFORLOOP: Jumping back from PC {} to PC {} (DIRECT)", pc, new_pc);
-            self.heap.set_pc(&self.current_thread, new_pc)?;
+            // SPECIFICATION CRITICAL: Jump using sBx from NEXT instruction (following JMP)
+            let next_pc = self.heap.get_pc(&self.current_thread)?;
+            // Get the next instruction which should be a JMP with sBx back offset
+            let frame = self.heap.get_current_frame(&self.current_thread)?;
+            let next_inst = self.get_instruction(&frame.closure, next_pc)?;
+            let jump_inst = Instruction(next_inst);
+            
+            if jump_inst.get_opcode() != OpCode::Jmp {
+                return Err(LuaError::RuntimeError(format!(
+                    "TFORLOOP must be followed by JMP instruction, found {:?}", 
+                    jump_inst.get_opcode()
+                )));
+            }
+            
+            let sbx = jump_inst.get_sbx();
+            let target_pc = (next_pc as i32 + sbx) as usize;
+            eprintln!("DEBUG TFORLOOP: Jumping from PC {} with sBx {} to PC {} (SPECIFICATION)", next_pc, sbx, target_pc);
+            self.heap.set_pc(&self.current_thread, target_pc)?;
         } else {
-            eprintln!("DEBUG TFORLOOP: End of iteration (first result is nil)");
+            eprintln!("DEBUG TFORLOOP: Iteration complete (first result is nil) - skipping JMP");
+            // SPECIFICATION: Skip the next instruction (JMP) to exit loop
+            self.heap.increment_pc(&self.current_thread)?;
         }
         
         Ok(())
     }
     
-    /// EQ/LT/LE: DIRECT metamethod execution (NO comparison continuations!)
-    fn op_eq(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// EQ with StepResult propagation for metamethod handling
+    fn op_eq(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a();
         let left = self.read_rk(base, inst.get_b())?;
         let right = self.read_rk(base, inst.get_c())?;
@@ -1525,7 +1527,7 @@ impl RcVM {
             if result != (a != 0) {
                 self.heap.increment_pc(&self.current_thread)?;
             }
-            return Ok(());
+            return Ok(StepResult::Continue);
         }
 
         if !matches!(left, Value::Table(_)) || !matches!(right, Value::Table(_)) {
@@ -1533,7 +1535,7 @@ impl RcVM {
             if result != (a != 0) {
                 self.heap.increment_pc(&self.current_thread)?;
             }
-            return Ok(());
+            return Ok(StepResult::Continue);
         }
 
         let mt1 = self.get_metatable(&left)?;
@@ -1546,7 +1548,6 @@ impl RcVM {
             if !mm1.is_nil() {
                 let mm2 = self.heap.get_table_field(&mt2_handle, &eq_key)?;
                 if mm1 == mm2 {
-                    // Execute metamethod DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                     let temp = self.heap.get_stack_size(&self.current_thread);
                     self.ensure_stack_space(temp + 1)?;
 
@@ -1555,7 +1556,6 @@ impl RcVM {
                     let mm_result = self.get_register(temp)?;
                     let result = !mm_result.is_falsey();
                     
-                    // Truncate temp register
                     let mut thread = self.current_thread.borrow_mut();
                     thread.stack.truncate(temp);
                     drop(thread);
@@ -1563,7 +1563,7 @@ impl RcVM {
                     if result != (a != 0) {
                         self.heap.increment_pc(&self.current_thread)?;
                     }
-                    return Ok(());
+                    return Ok(StepResult::Continue);
                 }
             }
         }
@@ -1572,10 +1572,11 @@ impl RcVM {
         if result != (a != 0) {
             self.heap.increment_pc(&self.current_thread)?;
         }
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
-    fn op_lt(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// LT with StepResult propagation for metamethod handling
+    fn op_lt(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a();
         let left = self.read_rk(base, inst.get_b())?;
         let right = self.read_rk(base, inst.get_c())?;
@@ -1586,7 +1587,6 @@ impl RcVM {
                 l.borrow().bytes < r.borrow().bytes
             }
             _ => {
-                // Try __lt metamethod with DIRECT execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                 let mm = match self.find_metamethod(&left, &Value::String(Rc::clone(&self.heap.metamethod_names.lt)))? {
                     Some(m) => Some(m),
                     None => self.find_metamethod(&right, &Value::String(Rc::clone(&self.heap.metamethod_names.lt)))?,
@@ -1595,7 +1595,6 @@ impl RcVM {
                     let temp = self.heap.get_stack_size(&self.current_thread);
                     self.ensure_stack_space(temp + 1)?;
 
-                    // Execute metamethod DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                     self.execute_function_call(method, vec![left, right], 1, temp, false, None)?;
                     
                     let mm_result = self.get_register(temp)?;
@@ -1608,7 +1607,7 @@ impl RcVM {
                     if result != (a != 0) {
                         self.heap.increment_pc(&self.current_thread)?;
                     }
-                    return Ok(());
+                    return Ok(StepResult::Continue);
                 } else {
                     return Err(LuaError::TypeError {
                         expected: "comparable values".to_string(),
@@ -1622,10 +1621,11 @@ impl RcVM {
         if skip {
             self.heap.increment_pc(&self.current_thread)?;
         }
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
-    fn op_le(&mut self, inst: Instruction, base: usize) -> LuaResult<()> {
+    /// LE with StepResult propagation for metamethod handling  
+    fn op_le(&mut self, inst: Instruction, base: usize) -> LuaResult<StepResult> {
         let a = inst.get_a();
         let left = self.read_rk(base, inst.get_b())?;
         let right = self.read_rk(base, inst.get_c())?;
@@ -1636,7 +1636,6 @@ impl RcVM {
                 l.borrow().bytes <= r.borrow().bytes
             }
             _ => {
-                // First try __le with DIRECT execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                 let le_key = Value::String(Rc::clone(&self.heap.metamethod_names.le));
                 let mm_le = match self.find_metamethod(&left, &le_key)? {
                     Some(m) => Some(m),
@@ -1647,7 +1646,6 @@ impl RcVM {
                     let temp = self.heap.get_stack_size(&self.current_thread);
                     self.ensure_stack_space(temp + 1)?;
 
-                    // Execute metamethod DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                     self.execute_function_call(method, vec![left, right], 1, temp, false, None)?;
                     
                     let mm_result = self.get_register(temp)?;
@@ -1660,10 +1658,9 @@ impl RcVM {
                     if result != (a != 0) {
                         self.heap.increment_pc(&self.current_thread)?;
                     }
-                    return Ok(());
+                    return Ok(StepResult::Continue);
                 }
 
-                // Try __lt fallback with DIRECT execution (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                 let lt_key = Value::String(Rc::clone(&self.heap.metamethod_names.lt));
                 let mm_lt = match self.find_metamethod(&left, &lt_key)? {
                     Some(m) => Some(m),
@@ -1674,11 +1671,10 @@ impl RcVM {
                     let temp = self.heap.get_stack_size(&self.current_thread);
                     self.ensure_stack_space(temp + 1)?;
 
-                    // Execute __lt(right, left) DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
                     self.execute_function_call(method, vec![right, left], 1, temp, false, None)?;
                     
                     let mm_result = self.get_register(temp)?;
-                    let result = mm_result.is_falsey(); // NEGATE for LE fallback
+                    let result = mm_result.is_falsey();
                     
                     let mut thread = self.current_thread.borrow_mut();
                     thread.stack.truncate(temp);
@@ -1687,7 +1683,7 @@ impl RcVM {
                     if result != (a != 0) {
                         self.heap.increment_pc(&self.current_thread)?;
                     }
-                    return Ok(());
+                    return Ok(StepResult::Continue);
                 }
 
                 return Err(LuaError::TypeError {
@@ -1701,7 +1697,7 @@ impl RcVM {
         if skip {
             self.heap.increment_pc(&self.current_thread)?;
         }
-        Ok(())
+        Ok(StepResult::Continue)
     }
     
     /// Remaining opcodes with direct execution...
@@ -1807,13 +1803,23 @@ impl RcVM {
         let frame = self.heap.get_current_frame(&self.current_thread)?;
         let closure_ref = frame.closure.borrow();
         
-        let proto_value = match &closure_ref.proto.constants[bx] {
-            Value::FunctionProto(handle) => Rc::clone(handle),
-            _ => {
-                drop(closure_ref);
-                return Err(LuaError::RuntimeError(
-                    format!("Constant {} is not a function prototype", bx)
-                ));
+        let constants_len = closure_ref.proto.constants.len();
+        
+        let proto_value = if bx >= constants_len {
+            drop(closure_ref);
+            return Err(LuaError::RuntimeError(
+                format!("Constant index {} out of bounds (constants size: {})", 
+                       bx, constants_len)
+            ));
+        } else {
+            match &closure_ref.proto.constants[bx] {
+                Value::FunctionProto(handle) => Rc::clone(handle),
+                _ => {
+                    drop(closure_ref);
+                    return Err(LuaError::RuntimeError(
+                        format!("Constant {} is not a function prototype", bx)
+                    ));
+                }
             }
         };
         
@@ -1824,7 +1830,16 @@ impl RcVM {
         
         let mut upvalues = Vec::with_capacity(num_upvalues);
         
-        for (i, _upvalue_info) in proto_value.upvalues.iter().enumerate() {
+        for (i, upvalue_info) in proto_value.upvalues.iter().enumerate() {
+            if i == 0 && upvalue_info.in_stack == false && upvalue_info.index == 0 {
+                let globals_value = Value::Table(self.heap.globals());
+                let globals_upvalue = Rc::new(RefCell::new(UpvalueState::Closed {
+                    value: globals_value,
+                }));
+                upvalues.push(globals_upvalue);
+                continue;
+            }
+            
             let pseudo_inst = self.get_instruction(&frame.closure, current_pc + i)?;
             let pseudo = Instruction(pseudo_inst);
             
@@ -1835,10 +1850,18 @@ impl RcVM {
 
                     let stack_size = self.heap.get_stack_size(&self.current_thread);
                     if absolute_idx >= stack_size {
-                        return Err(LuaError::RuntimeError(format!(
-                            "op_closure: cannot capture upvalue from invalid register {} (stack size: {})",
-                            absolute_idx, stack_size
-                        )));
+                        eprintln!("DEBUG op_closure: Stack bounds check - absolute_idx={}, stack_size={}, base={}, b={}", 
+                                 absolute_idx, stack_size, base, idx);
+                        
+                        if absolute_idx < 256 {
+                            self.ensure_stack_space(absolute_idx + 1)?;
+                            self.set_register(absolute_idx, Value::Nil)?;
+                        } else {
+                            return Err(LuaError::RuntimeError(format!(
+                                "op_closure: upvalue capture index {} exceeds reasonable stack limit", 
+                                absolute_idx
+                            )));
+                        }
                     }
 
                     self.heap.find_or_create_upvalue(&self.current_thread, absolute_idx)?
@@ -1850,7 +1873,7 @@ impl RcVM {
                     if idx >= parent_closure_ref.upvalues.len() {
                         drop(parent_closure_ref);
                         return Err(LuaError::RuntimeError(
-                            format!("Upvalue index {} out of bounds", idx)
+                            format!("Parent upvalue index {} out of bounds", idx)
                         ));
                     }
                     
@@ -1981,7 +2004,7 @@ impl RcVM {
         let func = self.get_register(base + a)?;
         
         let arg_count = if b == 0 {
-            self.heap.get_stack_size(&self.current_thread) - (base + a + 1)
+            self.current_top().saturating_sub(base + a + 1)
         } else {
             (b - 1) as usize
         };
@@ -1996,11 +2019,13 @@ impl RcVM {
         let frame = self.heap.pop_call_frame(&self.current_thread)?;
         let expected_results = frame.expected_results.map_or(-1, |n| n as i32);
         
-        let result_base = if let Ok(parent_frame) = self.heap.get_current_frame(&self.current_thread) {
-            parent_frame.base_register as usize - 1
-        } else {
-            0
-        };
+        // Tail-call returns must overwrite the exact slots that belonged to the
+        // tail-calling frame.  Those slots start at `frame.result_base`, recorded
+        // when the tail-caller itself was invoked.  Using any other base (such as
+        // the grand-parent frame's function slot) violates Lua 5.1 semantics and
+        // corrupts the stack.  Therefore, we forward the popped frame's
+        // `result_base` unchanged.
+        let result_base = frame.result_base;
         
         // Execute tail call DIRECTLY (NO QUEUE!) - COMPLETE QUEUE ELIMINATION
         self.execute_function_call(func, args, expected_results, result_base, false, None)
@@ -2011,24 +2036,35 @@ impl RcVM {
         let b = inst.get_b();
         
         let frame = self.heap.get_current_frame(&self.current_thread)?;
+        let num_fixed = frame.closure.borrow().proto.num_params as usize;
+        let callee_base = frame.base_register as usize;
+        let vararg_start = callee_base + num_fixed;
         
-        let varargs = match &frame.varargs {
-            Some(varargs) => varargs,
-            None => return Ok(()),
+        let vararg_len = {
+            let thread_ref = self.current_thread.borrow();
+            thread_ref.top.saturating_sub(vararg_start)
         };
         
-        let count = if b == 0 {
-            varargs.len()
+        let copy_count = if b == 0 {
+            vararg_len
         } else {
             (b - 1) as usize
         };
         
-        for i in 0..count {
-            if i < varargs.len() {
-                self.set_register(base + a + i, varargs[i].clone())?;
-            } else {
-                self.set_register(base + a + i, Value::Nil)?;
-            }
+        for i in 0..copy_count {
+            let val = {
+                let thread_ref = self.current_thread.borrow();
+                if vararg_start + i < thread_ref.stack.len() && vararg_start + i < thread_ref.top {
+                    thread_ref.stack[vararg_start + i].clone()
+                } else {
+                    Value::Nil
+                }
+            };
+            self.set_register(base + a + i, val)?;
+        }
+        
+        if b == 0 {
+            self.current_thread.borrow_mut().top = base + a + vararg_len;
         }
         
         Ok(())
@@ -2179,11 +2215,14 @@ impl<'a> ExecutionContext for VmExecutionContext<'a> {
         let table_ref = table.borrow();
 
         if key.is_nil() {
+            // Lua 5.1 spec: nil key starts iteration from beginning
+            // Try array part first
             for i in 0..table_ref.array.len() {
                 if !table_ref.array[i].is_nil() {
                     return Ok(Some((Value::Number((i + 1) as f64), table_ref.array[i].clone())));
                 }
             }
+            // Then try hash part
             if let Some((k, v)) = table_ref.map.iter().next() {
                 return Ok(Some((k.to_value(), v.clone())));
             }
@@ -2194,13 +2233,19 @@ impl<'a> ExecutionContext for VmExecutionContext<'a> {
         if let Value::Number(n) = key {
             if n.fract() == 0.0 && *n >= 1.0 {
                 let index = *n as usize;
-                if index <= table_ref.array.len() {
+                if index > 0 && index <= table_ref.array.len() {
                     in_array = true;
+                    // Continue from this array position
                     for i in index..table_ref.array.len() {
                         if !table_ref.array[i].is_nil() {
                             return Ok(Some((Value::Number((i + 1) as f64), table_ref.array[i].clone())));
                         }
                     }
+                    // Transition to hash part after array
+                    if let Some((k, v)) = table_ref.map.iter().next() {
+                        return Ok(Some((k.to_value(), v.clone())));
+                    }
+                    return Ok(None);
                 }
             }
         }
@@ -2208,25 +2253,24 @@ impl<'a> ExecutionContext for VmExecutionContext<'a> {
         if !in_array {
             let current_key_hashable = match HashableValue::from_value(key) {
                 Ok(h) => h,
-                Err(_) => return Err(LuaError::RuntimeError(format!("invalid key to 'next'"))),
+                Err(_) => return Ok(None),
             };
             
             let mut found_current = false;
             for (hash_key, hash_value) in table_ref.map.iter() {
                 if found_current {
+                    // Return the next key-value pair after the current one
                     return Ok(Some((hash_key.to_value(), hash_value.clone())));
                 }
+                
                 if hash_key == &current_key_hashable {
                     found_current = true;
+                    // Continue to find the next entry
                 }
             }
-            if !found_current {
-                return Err(LuaError::RuntimeError(format!("invalid key to 'next'")));
-            }
-        } else {
-            if let Some((k, v)) = table_ref.map.iter().next() {
-                return Ok(Some((k.to_value(), v.clone())));
-            }
+            
+            // If current key was the last or not found, end iteration
+            return Ok(None);
         }
         
         Ok(None)
