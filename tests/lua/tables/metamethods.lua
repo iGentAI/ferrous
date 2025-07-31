@@ -1,6 +1,5 @@
 -- Table Metamethods Test
--- Tests the complete set of table metamethods
--- Status: PARTIAL - Some metamethods are implemented, others are not
+-- Tests the complete set of table metamethods available in Lua 5.1
 
 -- Create test tables
 local t1 = {a = 1, b = 2}
@@ -69,14 +68,9 @@ local tostring_result = tostring(t1)
 print("__tostring result:", tostring_result)
 results.tostring = tostring_result == "Table{a=1, b=2}"
 
--- Test __len metamethod
-mt2.__len = function(t)
-  return 100  -- Custom length implementation
-end
-
-local len_result = #t2
-print("__len result:", len_result)
-results.len = len_result == 100
+-- NOTE: __len metamethod is not supported for tables in Lua 5.1
+-- The # operator ignores __len for tables and uses the array length
+print("Note: __len metamethod not tested - Lua 5.1 ignores __len for tables")
 
 -- Test __metatable protection
 mt2.__metatable = "Protected"

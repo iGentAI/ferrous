@@ -153,8 +153,9 @@ print_header "Control Flow"
 run_test "tests/lua/control/numeric_for.lua" "Numeric for loops"
 run_test "tests/lua/control/pairs.lua" "Generic pairs loops"
 run_test "tests/lua/control/tforloop.lua" "Generic for loop protocol"
+run_test "tests/lua/control/register_overflow_edge_case.lua" "Register overflow edge case"
 
-control_total=3
+control_total=4
 control_passed=$passed
 control_failed=$failed
 control_skipped=$skipped
@@ -183,11 +184,29 @@ stdlib_passed=$passed
 stdlib_failed=$failed
 stdlib_skipped=$skipped
 
+# Reset counters for next section
+passed=0
+failed=0
+skipped=0
+
+# Architectural Defect Validation
+print_header "Architectural Defect Validation"
+run_test "tests/lua/functions/function_identity_statement_context.lua" "Function identity preservation"
+run_test "tests/lua/tables/metamethod_variable_initialization.lua" "Metamethod variable initialization"  
+run_test "tests/lua/basic/complex_concatenation.lua" "Complex concatenation validation"
+run_test "tests/lua/control/iterator_state_management.lua" "Iterator state management"
+run_test "tests/lua/functions/varargs_type_safety.lua" "Varargs type safety"
+
+defect_total=5
+defect_passed=$passed
+defect_failed=$failed
+defect_skipped=$skipped
+
 # Calculate totals across all sections
-total_tests=$((basic_total + table_total + function_total + control_total + stdlib_total))
-total_passed=$((basic_passed + table_passed + function_passed + control_passed + stdlib_passed))
-total_failed=$((basic_failed + table_failed + function_failed + control_failed + stdlib_failed))
-total_skipped=$((basic_skipped + table_skipped + function_skipped + control_skipped + stdlib_skipped))
+total_tests=$((basic_total + table_total + function_total + control_total + stdlib_total + defect_total))
+total_passed=$((basic_passed + table_passed + function_passed + control_passed + stdlib_passed + defect_passed))
+total_failed=$((basic_failed + table_failed + function_failed + control_failed + stdlib_failed + defect_failed))
+total_skipped=$((basic_skipped + table_skipped + function_skipped + control_skipped + stdlib_skipped + defect_skipped))
 
 # Print section summaries
 print_section_results "Basic Language Features" $basic_total $basic_passed $basic_failed $basic_skipped
@@ -195,6 +214,7 @@ print_section_results "Table Operations" $table_total $table_passed $table_faile
 print_section_results "Functions and Closures" $function_total $function_passed $function_failed $function_skipped
 print_section_results "Control Flow" $control_total $control_passed $control_failed $control_skipped
 print_section_results "Standard Library" $stdlib_total $stdlib_passed $stdlib_failed $stdlib_skipped
+print_section_results "Architectural Defect Validation" $defect_total $defect_passed $defect_failed $defect_skipped
 
 echo -e "\n========================================"
 echo -e "${BLUE}Test Results Summary:${NC}"

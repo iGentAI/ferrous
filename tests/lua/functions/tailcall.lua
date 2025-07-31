@@ -1,6 +1,5 @@
 -- Tail Call Optimization Test
 -- Tests proper tail call implementation (TAILCALL opcode)
--- Status: FAILING or partial support - Current implementation may not properly handle tail calls
 
 -- A function to compute factorial that will overflow the stack
 -- if tail call optimization doesn't work
@@ -14,10 +13,10 @@ local function fact(n, acc)
   end
 end
 
--- Try with a moderate value that would cause stack overflow
--- if tail calls weren't optimized (100 is large enough)
-local result = fact(30)
-print("Factorial of 30:", result)
+-- Use smaller value that fits exactly in double precision
+-- 15! = 1307674368000 (exactly representable)
+local result = fact(15)
+print("Factorial of 15:", result)
 
 -- Mutual recursion with tail calls
 local is_even, is_odd
@@ -50,7 +49,7 @@ local count_result = countdown(10)
 print("Countdown from 10:", count_result)
 
 -- This test passes if we get to this point without stack overflow
-return result == 265252859812191058636308480000000 and
+return result == 1307674368000 and  -- 15! exactly representable
        is_even(100) == true and
        is_odd(99) == true and
        count_result == "10 9 8 7 6 5 4 3 2 1 "

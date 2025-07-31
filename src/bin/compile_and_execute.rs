@@ -1,6 +1,6 @@
 //! Lua VM test script compiler and executor
 //!
-//! This binary compiles and executes a Lua script using the Ferrous Lua VM.
+//! This binary compiles and executes a Lua script using the Ferrous RC RefCell Lua VM.
 //! It takes a filepath as the only argument and reports the result.
 
 use std::env;
@@ -8,7 +8,8 @@ use std::fs;
 use std::path::Path;
 use std::process;
 
-use ferrous::lua::{compile, vm as lua_vm, Value};
+use ferrous::lua::{compile, RcVM};
+use ferrous::lua::rc_value::Value;
 
 fn main() {
     // Parse command line arguments
@@ -52,7 +53,7 @@ fn main() {
     println!("Running script...");
     
     // Create VM and initialize standard library
-    let mut vm = match lua_vm::LuaVM::new() {
+    let mut vm = match RcVM::new() {
         Ok(vm) => vm,
         Err(e) => {
             eprintln!("Error creating VM: {}", e);
@@ -75,64 +76,55 @@ fn main() {
         }
     };
     
-    // Print the result
+    // Print the result using RC RefCell value types
     match result {
         Value::Nil => println!("Result: nil"),
         Value::Boolean(b) => println!("Result: {}", b),
         Value::Number(n) => println!("Result: {}", n),
-        Value::String(_) => {
-            // Create a transaction to access the string value
-            let mut tx = ferrous::lua::transaction::HeapTransaction::new(vm.heap_mut());
-            match tx.get_string_value(match result {
-                Value::String(h) => h,
-                _ => unreachable!(),
-            }) {
+        Value::String(string_handle) => {
+            // Access string value through RC RefCell
+            let string_ref = string_handle.borrow();
+            match string_ref.to_str() {
                 Ok(s) => println!("Result: \"{}\"", s),
-                Err(e) => println!("Result: <error reading string: {}>", e),
+                Err(_) => println!("Result: <binary string data>"),
             }
         },
         Value::Table(table_handle) => {
-            println!("DEBUG: Handling table return value with handle: {:?}", table_handle);
-            // Provide more information about the returned table
-            let mut tx = ferrous::lua::transaction::HeapTransaction::new(vm.heap_mut());
+            println!("DEBUG: Handling table return value");
             
-            // Try to get basic table info
-            match tx.get_table(table_handle) {
-                Ok(table) => {
-                    let array_len = table.array.len();
-                    let hash_len = table.map.len();
-                    
-                    println!("Result: <table with {} array elements and {} hash entries>", 
-                             array_len, hash_len);
-                    
-                    // For small tables, print some content
-                    if array_len > 0 {
-                        println!("  Array elements:");
-                        for i in 0..std::cmp::min(array_len, 5) {
-                            println!("    [{}]: {:?}", i+1, table.array[i]);
-                        }
-                        if array_len > 5 {
-                            println!("    ... ({} more elements)", array_len - 5);
-                        }
+            // Get basic table info through RC RefCell
+            let table_ref = table_handle.borrow();
+            let array_len = table_ref.array.len();
+            let hash_len = table_ref.map.len();
+            
+            println!("Result: <table with {} array elements and {} hash entries>", 
+                     array_len, hash_len);
+            
+            // For small tables, print some content
+            if array_len > 0 {
+                println!("  Array elements:");
+                for i in 0..std::cmp::min(array_len, 5) {
+                    println!("    [{}]: {:?}", i+1, table_ref.array[i]);
+                }
+                if array_len > 5 {
+                    println!("    ... ({} more elements)", array_len - 5);
+                }
+            }
+            
+            if hash_len > 0 {
+                println!("  Hash entries:");
+                let mut printed = 0;
+                for (k, v) in &table_ref.map {
+                    if printed < 5 {
+                        println!("    {:?} => {:?}", k, v);
+                        printed += 1;
+                    } else {
+                        break;
                     }
-                    
-                    if hash_len > 0 {
-                        println!("  Hash entries:");
-                        let mut printed = 0;
-                        for (k, v) in &table.map {
-                            if printed < 5 {
-                                println!("    {:?} => {:?}", k, v);
-                                printed += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        if hash_len > 5 {
-                            println!("    ... ({} more entries)", hash_len - 5);
-                        }
-                    }
-                },
-                Err(e) => println!("Result: <table - unable to read details: {}>", e),
+                }
+                if hash_len > 5 {
+                    println!("    ... ({} more entries)", hash_len - 5);
+                }
             }
         },
         Value::Closure(_) => println!("Result: <function>"),
@@ -140,6 +132,7 @@ fn main() {
         Value::CFunction(_) => println!("Result: <c function>"),
         Value::UserData(_) => println!("Result: <userdata>"),
         Value::FunctionProto(_) => println!("Result: <function prototype>"),
+        Value::PendingMetamethod(_) => println!("Result: <pending metamethod>"),
     }
     println!("Script execution completed successfully!");
 }

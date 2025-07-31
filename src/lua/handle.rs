@@ -6,6 +6,7 @@
 use super::arena::Handle;
 use super::value::{LuaString, Table, Closure, Thread, Upvalue, UserData, FunctionProto};
 use std::marker::PhantomData;
+use std::cmp::Ordering;
 
 /// Macro to generate typed handle wrappers
 macro_rules! typed_handle {
@@ -29,6 +30,23 @@ macro_rules! typed_handle {
         impl From<Handle<$type>> for $name {
             fn from(handle: Handle<$type>) -> Self {
                 $name(handle)
+            }
+        }
+        
+        // Implement Ord for handle types
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // Compare by index if generations match, otherwise by generation
+                match self.0.generation.cmp(&other.0.generation) {
+                    Ordering::Equal => self.0.index.cmp(&other.0.index),
+                    ordering => ordering
+                }
             }
         }
     };
@@ -294,5 +312,24 @@ mod tests {
         // Verify it has the expected properties
         assert_eq!(invalid.0.index, 9999);
         assert_eq!(invalid.0.generation, 999);
+    }
+    
+    #[test]
+    fn test_ordering_implementation() {
+        // Test that handles can be compared with Ord
+        let handle1 = StringHandle::from_raw_parts(1, 1);
+        let handle2 = StringHandle::from_raw_parts(2, 1);
+        let handle3 = StringHandle::from_raw_parts(1, 2);
+        
+        // Compare indexes if generations are equal
+        assert!(handle1 < handle2);
+        assert!(handle2 > handle1);
+        
+        // Generation takes precedence
+        assert!(handle1 < handle3);
+        assert!(handle3 > handle1);
+        
+        // Different generation trumps index
+        assert!(handle2 < handle3);
     }
 }

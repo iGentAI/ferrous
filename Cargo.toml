@@ -41,20 +41,12 @@ name = "lua_compiler_test"
 path = "src/bin/lua_compiler_test.rs"
 
 [[bin]]
-name = "standalone_lua_test"
-path = "src/bin/standalone_lua_test.rs"
-
-[[bin]]
 name = "run_lua_tests"
 path = "src/bin/run_lua_tests.rs"
 
 [[bin]]
 name = "test_stdlib"
 path = "src/bin/test_stdlib.rs"
-
-[[bin]]
-name = "debug_globals"
-path = "src/bin/debug_globals.rs"
 
 [[bin]]
 name = "test_getglobal"
@@ -64,10 +56,10 @@ path = "src/bin/test_getglobal.rs"
 name = "stdlib_test_runner"
 path = "src/bin/stdlib_test_runner.rs"
 
-[[bin]]
-name = "tforloop_test_runner"
-path = "tests/lua/tforloop_test_runner.rs"
+# [[bin]]
+# name = "tforloop_test_runner"
+# path = "tests/lua/tforloop_test_runner.rs"
 
-[[bin]]
-name = "test_vm"
-path = "src/bin/test_vm.rs"
+[[example]]
+name = "for_loop_comparison"
+path = "examples/for_loop_comparison.rs"

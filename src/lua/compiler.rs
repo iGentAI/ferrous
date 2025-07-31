@@ -6,7 +6,7 @@
 
 use super::error::{LuaError, LuaResult};
 use super::codegen::{generate_bytecode, CompleteCompilationOutput, CompiledFunction, CompilationConstant, CompilationUpvalue};
-use std::collections::HashMap;
+use super::ast::{Statement, LocalDeclaration, Expression};
 
 // Re-export parser for convenience
 pub use super::parser::parse;
@@ -88,14 +88,14 @@ impl Default for CompilerConfig {
     }
 }
 
-/// Helper function to collect and remap all nested prototypes
-fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunction>, Vec<CompilationConstant>) {
+/// Helper function to collect and remap all nested prototypes with unified string coordination
+fn collect_and_remap_prototypes_with_strings(main: &CompiledFunction, original_strings: &[String]) -> (Vec<CompiledFunction>, Vec<CompilationConstant>, Vec<String>) {
     // First, collect all prototypes with their positions in a tree structure
     #[derive(Debug)]
     struct ProtoInfo {
         proto: CompiledFunction,
         parent_idx: Option<usize>,
-        local_idx: usize,  // Index in parent's prototype list
+        local_idx: usize,
     }
     
     let mut all_protos = Vec::new();
@@ -123,7 +123,7 @@ fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunctio
         });
     }
     
-    // Build index mapping: (parent_idx, local_idx) -> global_idx
+    // Build function prototype index mapping: (parent_idx, local_idx) -> global_idx
     let mut index_map = std::collections::HashMap::new();
     
     // Main function's prototypes
@@ -139,28 +139,102 @@ fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunctio
             index_map.insert((Some(parent), info.local_idx), i);
         }
     }
+
+    // Build unified string pool
+    let mut unified_strings_map = std::collections::HashMap::<String, usize>::new();
+    let mut unified_strings_list = Vec::<String>::new();
     
-    // Now remap all FunctionProto constants in each prototype
+    // Helper to add string to unified pool and return new index
+    let mut add_unified_string = |s: &str| -> usize {
+        if let Some(&index) = unified_strings_map.get(s) {
+            return index;
+        }
+        let index = unified_strings_list.len();
+        unified_strings_map.insert(s.to_string(), index);
+        unified_strings_list.push(s.to_string());
+        index
+    };
+
+    // Start with original compilation strings
+    for original_string in original_strings {
+        add_unified_string(original_string);
+    }
+
+    // Collect and add all strings from all prototype constants
+    fn collect_strings_recursive(constants: &[CompilationConstant], original_strings: &[String], add_string: &mut dyn FnMut(&str) -> usize) {
+        for constant in constants {
+            match constant {
+                CompilationConstant::String(idx) => {
+                    if *idx < original_strings.len() {
+                        add_string(&original_strings[*idx]);
+                    }
+                }
+                CompilationConstant::Table(entries) => {
+                    for (k, v) in entries {
+                        collect_strings_recursive(&[k.clone()], original_strings, add_string);
+                        collect_strings_recursive(&[v.clone()], original_strings, add_string);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Collect strings from main function constants
+    collect_strings_recursive(&main.constants, original_strings, &mut add_unified_string);
+
+    // Collect strings from all prototype constants
+    for info in &all_protos {
+        collect_strings_recursive(&info.proto.constants, original_strings, &mut add_unified_string);
+    }
+    
+    // Helper to remap string constants using unified pool
+    fn remap_constants(constants: &mut Vec<CompilationConstant>, original_strings: &[String], string_map: &std::collections::HashMap<String, usize>) {
+        for constant in constants {
+            match constant {
+                CompilationConstant::String(old_idx) => {
+                    if *old_idx < original_strings.len() {
+                        let string_value = &original_strings[*old_idx];
+                        if let Some(&new_idx) = string_map.get(string_value) {
+                            *constant = CompilationConstant::String(new_idx);
+                        }
+                    }
+                }
+                CompilationConstant::Table(entries) => {
+                    for (k, v) in entries {
+                        let mut temp_constants = vec![k.clone(), v.clone()];
+                        remap_constants(&mut temp_constants, original_strings, string_map);
+                        *k = temp_constants[0].clone();
+                        *v = temp_constants[1].clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    // Remap all constants and prototypes
     let mut remapped_protos = Vec::new();
     for (current_global_idx, info) in all_protos.iter().enumerate() {
         let mut proto = info.proto.clone();
         
-        // Remap constants for this prototype
+        // Remap function prototype constants
         for constant in &mut proto.constants {
             if let CompilationConstant::FunctionProto(local_idx) = constant {
-                // This constant refers to a child of the current prototype
                 let global_idx = match index_map.get(&(Some(current_global_idx), *local_idx)) {
                     Some(idx) => *idx,
                     None => {
-                        // This is a critical error in our understanding, but we'll handle it gracefully
                         println!("WARNING: Failed to remap function prototype index {} for prototype {}", 
                                 *local_idx, current_global_idx);
-                        continue; // Keep the old index as a fallback
+                        continue;
                     }
                 };
                 *constant = CompilationConstant::FunctionProto(global_idx);
             }
         }
+        
+        // Remap string constants using unified pool
+        remap_constants(&mut proto.constants, original_strings, &unified_strings_map);
         
         // Clear the nested prototypes as they're now in the flat list
         proto.prototypes = Vec::new();
@@ -169,21 +243,25 @@ fn collect_and_remap_prototypes(main: &CompiledFunction) -> (Vec<CompiledFunctio
     
     // Remap main function's constants
     let mut main_constants = main.constants.clone();
+    
+    // Remap function prototypes in main constants
     for constant in &mut main_constants {
         if let CompilationConstant::FunctionProto(local_idx) = constant {
             let global_idx = match index_map.get(&(None, *local_idx)) {
                 Some(idx) => *idx,
                 None => {
-                    // This is a critical error in our understanding, but we'll handle it gracefully
                     println!("WARNING: Failed to remap main function prototype index {}", *local_idx);
-                    continue; // Keep the old index as a fallback
+                    continue;
                 }
             };
             *constant = CompilationConstant::FunctionProto(global_idx);
         }
     }
     
-    (remapped_protos, main_constants)
+    // Remap string constants in main function
+    remap_constants(&mut main_constants, original_strings, &unified_strings_map);
+    
+    (remapped_protos, main_constants, unified_strings_list)
 }
 
 /// Compile Lua source code into a module
@@ -199,13 +277,13 @@ pub fn compile_with_config(source: &str, config: &CompilerConfig) -> LuaResult<C
     // Generate bytecode
     let output = generate_bytecode(&ast)?;
     
-    // Collect and remap nested prototypes to ensure indices are correct
-    let (all_prototypes, main_constants) = collect_and_remap_prototypes(&output.main);
+    // Collect and remap nested prototypes with unified string coordination
+    let (all_prototypes, main_constants, unified_strings) = collect_and_remap_prototypes_with_strings(&output.main, &output.strings);
     
     println!("DEBUG COMPILER: Compilation complete - main bytecode: {}, total prototypes: {}, strings: {}", 
-             output.main.bytecode.len(), all_prototypes.len(), output.strings.len());
+             output.main.bytecode.len(), all_prototypes.len(), unified_strings.len());
     
-    // Convert the compilation output to a compiled module
+    // Convert the compilation output to a compiled module with unified strings
     Ok(CompiledModule {
         bytecode: output.main.bytecode,
         constants: main_constants,
@@ -213,311 +291,71 @@ pub fn compile_with_config(source: &str, config: &CompilerConfig) -> LuaResult<C
         is_vararg: output.main.is_vararg,
         max_stack_size: output.main.max_stack_size,
         upvalues: output.main.upvalues,
-        strings: output.strings,
+        strings: unified_strings,
         prototypes: all_prototypes,
         source_name: config.source_name.clone(),
     })
 }
 
-pub mod loader {
-    use super::*;
-    use super::super::error::LuaResult;
-    use super::super::handle::{StringHandle, FunctionProtoHandle, TableHandle};
-    use super::super::transaction::HeapTransaction;
-    use super::super::value::{Value, FunctionProto, UpvalueInfo as VMUpvalueInfo};
-    
 
+/// Initialize pre-compiled values using compiler infrastructure
+/// This prevents module dependency cycles while reusing compilation logic.
+pub(crate) fn compile_value_to_constant(value_expr: &str) -> Result<CompilationConstant, LuaError> {
+    eprintln!("DEBUG compile_value_to_constant: Compiling expression: {}", value_expr);
     
-    /// Load a compiled module into the heap
-    pub fn load_module<'a>(
-        tx: &mut HeapTransaction<'a>,
-        module: &CompiledModule
-    ) -> LuaResult<FunctionProtoHandle> {
-        // VALIDATION: Before processing, check that the string table isn't empty
-        // if constants reference strings
-        let has_string_constants = module.constants.iter().any(|c| matches!(c, CompilationConstant::String(_)));
-        
-        if has_string_constants && module.strings.is_empty() {
-            return Err(LuaError::CompileError(
-                "Module contains string constants but has empty string table".to_string()
-            ));
+    let tokens = super::lexer::tokenize(value_expr)?;
+    let expr = super::parser::parse(value_expr)?.statements.first().and_then(|stmt| {
+        if let Statement::LocalDeclaration(LocalDeclaration { expressions, .. }) = stmt {
+            expressions.first().cloned()
+        } else {
+            None
         }
-        
-        // Step 1: Create all string handles
-        let mut string_handles = Vec::with_capacity(module.strings.len());
-        for s in &module.strings {
-            string_handles.push(tx.create_string(s)?);
+    }).unwrap_or(Expression::Nil);
+    
+    // Convert parsed expression to compilation constant
+    expr_to_constant(&expr)
+}
+
+// Helper functions
+fn expr_to_constant(expr: &super::ast::Expression) -> Result<CompilationConstant, LuaError> {
+    match expr {
+        super::ast::Expression::Nil => Ok(CompilationConstant::Nil),
+        super::ast::Expression::Boolean(b) => Ok(CompilationConstant::Boolean(*b)),
+        super::ast::Expression::Number(n) => Ok(CompilationConstant::Number(*n)),
+        super::ast::Expression::String(s) => {
+            // For standalone expressions, we can't intern strings
+            // This is a limitation of this approach
+            Err(LuaError::NotImplemented("String constants in compile_value_to_constant".to_string()))
         }
-        
-        println!("DEBUG LOADER: Created {} string handles", string_handles.len());
-        
-        // VALIDATION: If about to process constants, validate all string indexes first
-        for constant in &module.constants {
-            if let CompilationConstant::String(idx) = constant {
-                if *idx >= string_handles.len() {
-                    return Err(LuaError::CompileError(format!(
-                        "Invalid string index: {} (string table size: {})", 
-                        idx, string_handles.len()
-                    )));
-                }
-            }
-        }
-        
-        // Print debug info about constants
-        println!("DEBUG LOADER: Module has {} constants", module.constants.len());
-        for (i, constant) in module.constants.iter().enumerate() {
-            println!("DEBUG LOADER:   Constant {}: {:?}", i, constant);
-        }
-        
-        // NEW APPROACH: Two-pass function prototype loading
-        
-        // Step 2a: First pass - Create all prototypes with placeholder constants
-        println!("DEBUG LOADER: Processing {} nested prototypes", module.prototypes.len());
-        
-        // Create all prototype handles first (with placeholder Nil for FunctionProto constants)
-        let mut proto_handles = Vec::with_capacity(module.prototypes.len());
-        let mut proto_constants = Vec::with_capacity(module.prototypes.len());
-        
-        for (proto_idx, proto) in module.prototypes.iter().enumerate() {
-            println!("DEBUG LOADER: Processing prototype {} - {} constants, {} bytecode, {} nested prototypes", 
-                    proto_idx, proto.constants.len(), proto.bytecode.len(), proto.prototypes.len());
+        super::ast::Expression::TableConstructor(tc) => {
+            let mut items = vec![];
             
-            // Convert upvalues
-            let mut vm_upvalues = Vec::with_capacity(proto.upvalues.len());
-            for (upval_idx, upvalue) in proto.upvalues.iter().enumerate() {
-                println!("DEBUG LOADER:   Proto {} upvalue {}: in_stack={}, index={}", 
-                         proto_idx, upval_idx, upvalue.in_stack, upvalue.index);
-                vm_upvalues.push(VMUpvalueInfo {
-                    in_stack: upvalue.in_stack,
-                    index: upvalue.index,
-                });
-            }
-            
-            // Create temporary constants with Nil for FunctionProto references
-            let mut temp_constants = Vec::with_capacity(proto.constants.len());
-            for (const_idx, constant) in proto.constants.iter().enumerate() {
-                match constant {
-                    CompilationConstant::FunctionProto(idx) => {
-                        println!("DEBUG LOADER:   Proto {} has FunctionProto const {} = proto index {}", 
-                                proto_idx, const_idx, idx);
-                        // Use Nil as placeholder for function prototypes
-                        temp_constants.push(Value::Nil);
+            // Array fields
+            for field in &tc.fields {
+                match field {
+                    super::ast::TableField::List(expr) => {
+                        // For array part, index is explicit (1-based)
+                        let idx = items.len() + 1;
+                        let key = CompilationConstant::Number(idx as f64);
+                        let val = expr_to_constant(expr)?;
+                        items.push((key, val));
                     },
-                    CompilationConstant::Table(_) => {
-                        println!("DEBUG LOADER:   Proto {} has Table const {} (placeholder Nil)", 
-                                proto_idx, const_idx);
-                        // Use Nil as placeholder for tables (will be created in second pass)
-                        temp_constants.push(Value::Nil);
+                    super::ast::TableField::Record { key, value } => {
+                        let key_const = CompilationConstant::String(0); // Fake string index
+                        let val = expr_to_constant(value)?;
+                        items.push((key_const, val));
                     },
-                    CompilationConstant::Nil => {
-                        temp_constants.push(Value::Nil);
-                    },
-                    CompilationConstant::Boolean(b) => {
-                        temp_constants.push(Value::Boolean(*b));
-                    },
-                    CompilationConstant::Number(n) => {
-                        temp_constants.push(Value::Number(*n));
-                    },
-                    CompilationConstant::String(idx) => {
-                        // String handles are already created so we can resolve them now
-                        if *idx < string_handles.len() {
-                            temp_constants.push(Value::String(string_handles[*idx]));
-                        } else {
-                            return Err(LuaError::CompileError(format!(
-                                "Invalid string index: {}", idx
-                            )));
-                        }
-                    },
-                }
-            }
-            
-            // Create the prototype with temporary constants
-            let temp_proto = FunctionProto {
-                bytecode: proto.bytecode.clone(),
-                constants: temp_constants,
-                num_params: proto.num_params,
-                is_vararg: proto.is_vararg,
-                max_stack_size: proto.max_stack_size,
-                upvalues: vm_upvalues,
-            };
-            
-            // Create function prototype in heap
-            let proto_handle = tx.create_function_proto(temp_proto)?;
-            println!("DEBUG LOADER:   Created prototype handle for proto {}", proto_idx);
-            proto_handles.push(proto_handle);
-            
-            // Remember original constants for second pass
-            proto_constants.push(proto.constants.clone());
-        }
-        
-        // Step 2b: Second pass - Update all FunctionProto constants now that all handles exist
-        println!("DEBUG LOADER: Processing second pass for prototype constants");
-        for (i, constants) in proto_constants.iter().enumerate() {
-            println!("DEBUG LOADER:   Updating prototype {}", i);
-            let proto_handle = proto_handles[i];
-            
-            // Get the current prototype 
-            let mut proto = tx.get_function_proto_copy(proto_handle)?;
-            
-            // Update constants that are FunctionProto or Table references
-            for (j, constant) in constants.iter().enumerate() {
-                match constant {
-                    CompilationConstant::FunctionProto(proto_idx) => {
-                        println!("DEBUG LOADER:     Updating const {} to FunctionProto {}", j, proto_idx);
-                        // Now we can resolve the function prototype
-                        if *proto_idx < proto_handles.len() {
-                            proto.constants[j] = Value::FunctionProto(proto_handles[*proto_idx]);
-                        } else {
-                            return Err(LuaError::CompileError(format!(
-                                "Invalid function prototype index: {} (only {} prototypes)", proto_idx, proto_handles.len()
-                            )));
-                        }
-                    },
-                    CompilationConstant::Table(entries) => {
-                        println!("DEBUG LOADER:     Creating table const {} with {} entries", j, entries.len());
-                        // Create the table constant
-                        let table_handle = create_table_constant(tx, entries, &string_handles, &proto_handles)?;
-                        proto.constants[j] = Value::Table(table_handle);
-                    },
-                    _ => {
-                        // Other constants are already set correctly
+                    super::ast::TableField::Index { key, value } => {
+                        let key_const = expr_to_constant(key)?;
+                        let val = expr_to_constant(value)?;
+                        items.push((key_const, val));
                     }
                 }
             }
             
-            // Store the updated prototype
-            let updated_proto_handle = tx.replace_function_proto(proto_handle, proto)?;
-            proto_handles[i] = updated_proto_handle;
-        }
-        
-        // Step 3: Convert the main function
-        println!("DEBUG LOADER: Processing main function - {} constants, {} bytecode", 
-                module.constants.len(), module.bytecode.len());
-        
-        // Create constants with proper function prototype references
-        let mut vm_constants = Vec::with_capacity(module.constants.len());
-        
-        for (i, constant) in module.constants.iter().enumerate() {
-            println!("DEBUG LOADER:   Main function constant {}: {:?}", i, constant);
-            let value = match constant {
-                CompilationConstant::Nil => Value::Nil,
-                CompilationConstant::Boolean(b) => Value::Boolean(*b),
-                CompilationConstant::Number(n) => Value::Number(*n),
-                CompilationConstant::String(idx) => {
-                    // Use the string handle from the table
-                    if *idx < string_handles.len() {
-                        Value::String(string_handles[*idx])
-                    } else {
-                        return Err(LuaError::CompileError(format!(
-                            "Invalid string index: {}", idx
-                        )));
-                    }
-                },
-                CompilationConstant::FunctionProto(idx) => {
-                    // Use the proto handle from the table
-                    println!("DEBUG LOADER:     Main function has FunctionProto const {} = proto index {}", 
-                            i, idx);
-                    if *idx < proto_handles.len() {
-                        Value::FunctionProto(proto_handles[*idx])
-                    } else {
-                        return Err(LuaError::CompileError(format!(
-                            "Invalid function prototype index: {}", idx
-                        )));
-                    }
-                },
-                CompilationConstant::Table(entries) => {
-                    println!("DEBUG LOADER:     Creating table const {} with {} entries", 
-                            i, entries.len());
-                    // Create the table constant
-                    let table_handle = create_table_constant(tx, entries, &string_handles, &proto_handles)?;
-                    Value::Table(table_handle)
-                },
-            };
-            
-            vm_constants.push(value);
-        }
-        
-        // Convert upvalues
-        let mut vm_upvalues = Vec::with_capacity(module.upvalues.len());
-        for (upval_idx, upvalue) in module.upvalues.iter().enumerate() {
-            println!("DEBUG LOADER:   Main function upvalue {}: in_stack={}, index={}", 
-                     upval_idx, upvalue.in_stack, upvalue.index);
-            vm_upvalues.push(VMUpvalueInfo {
-                in_stack: upvalue.in_stack,
-                index: upvalue.index,
-            });
-        }
-        
-        // Create the final function prototype
-        let proto = FunctionProto {
-            bytecode: module.bytecode.clone(),
-            constants: vm_constants,
-            num_params: module.num_params,
-            is_vararg: module.is_vararg,
-            max_stack_size: module.max_stack_size,
-            upvalues: vm_upvalues,
-        };
-        
-        println!("DEBUG LOADER: Creating main function prototype");
-        tx.create_function_proto(proto)
-    }
-    
-    /// Helper function to create a table constant with proper string interning
-    fn create_table_constant<'a>(
-        tx: &mut HeapTransaction<'a>,
-        entries: &[(CompilationConstant, CompilationConstant)],
-        string_handles: &[StringHandle],
-        proto_handles: &[FunctionProtoHandle],
-    ) -> LuaResult<TableHandle> {
-        // Create the table
-        let table_handle = tx.create_table()?;
-        
-        // Populate the table with entries
-        for (key_const, value_const) in entries {
-            // Convert key constant to Value
-            let key = constant_to_value(key_const, string_handles, proto_handles, tx)?;
-            
-            // Convert value constant to Value
-            let value = constant_to_value(value_const, string_handles, proto_handles, tx)?;
-            
-            // Use the transaction's set_table_field which properly handles HashableValue
-            tx.set_table_field(table_handle, key, value)?;
-        }
-        
-        Ok(table_handle)
-    }
-    
-    /// Helper to convert CompilationConstant to Value
-    fn constant_to_value<'a>(
-        constant: &CompilationConstant,
-        string_handles: &[StringHandle],
-        proto_handles: &[FunctionProtoHandle],
-        tx: &mut HeapTransaction<'a>,
-    ) -> LuaResult<Value> {
-        match constant {
-            CompilationConstant::Nil => Ok(Value::Nil),
-            CompilationConstant::Boolean(b) => Ok(Value::Boolean(*b)),
-            CompilationConstant::Number(n) => Ok(Value::Number(*n)),
-            CompilationConstant::String(idx) => {
-                if *idx < string_handles.len() {
-                    Ok(Value::String(string_handles[*idx]))
-                } else {
-                    Err(LuaError::CompileError(format!("Invalid string index: {}", idx)))
-                }
-            },
-            CompilationConstant::FunctionProto(idx) => {
-                if *idx < proto_handles.len() {
-                    Ok(Value::FunctionProto(proto_handles[*idx]))
-                } else {
-                    Err(LuaError::CompileError(format!("Invalid prototype index: {}", idx)))
-                }
-            },
-            CompilationConstant::Table(entries) => {
-                // Recursively create table
-                let table = create_table_constant(tx, entries, string_handles, proto_handles)?;
-                Ok(Value::Table(table))
-            },
-        }
+            Ok(CompilationConstant::Table(items))
+        },
+        _ => Err(LuaError::NotImplemented(format!("Expression type {:?} in compile_value_to_constant", expr)))
     }
 }
 
