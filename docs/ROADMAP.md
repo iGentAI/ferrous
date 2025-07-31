@@ -280,34 +280,31 @@ Commands essential for production use:
 - Add advanced data structures
 - Support extended use cases
 
-### Priority 5.1: Scripting
+### Priority 5.1: Scripting ✅ COMPLETED
 ```
-Redis Lua support:
-- [✅] EVAL/EVALSHA commands - Implementation complete with GIL approach
-- [✅] Lua interpreter integration - Generational arena + GIL architecture implemented
-- [✅] Redis Lua API - Core functionality (call, pcall) implemented with GIL
-- [✅] Script caching - Working
-- [✅] SCRIPT commands - Basic implementation complete
-- [✅] Standard library subset - Basic functions implemented
-- [✅] Special Redis libraries:
-  - [✅] cjson.encode - Complete with table and array support
-  - [✅] cjson.decode - Implementation complete
-  - [❌] cmsgpack - Not yet implemented (optional in Redis)
-  - [❌] bit - Not yet implemented (optional in Redis)
-- [✅] Table operations:
-  - [✅] Table field access now works correctly
-  - [✅] Table field concatenation now works correctly 
-  - [✅] Direct number field concatenation now works
-- [🟡] Transaction semantics:
-  - [✅] Basic transaction support implemented
-  - [🟡] Transaction rollback needs improvement for error cases
-- [🟡] Loop and control flow:
-  - [✅] Basic control flow (if/else, while, repeat) works 
-  - [🟡] Numeric for loops have correct borrow handling but execution issues
-  - [🟡] Generic for loops still have issues with the next/pairs implementation
-- [🟡] Function execution:
-  - [✅] Basic function definition works
-  - [🟡] Nested functions still have stack overflow issues
+Redis Lua support - COMPLETED with MLua Integration:
+- [✅] EVAL/EVALSHA commands - Fully implemented with production-ready MLua
+- [✅] Lua 5.1 interpreter integration - Complete via battle-tested MLua library
+- [✅] Redis Lua API - Full functionality (redis.call, redis.pcall) implemented
+- [✅] Script caching - SHA1-based script caching working perfectly  
+- [✅] SCRIPT commands - Complete family (LOAD, EXISTS, FLUSH, KILL)
+- [✅] Standard library subset - All safe Lua 5.1 functions available
+- [✅] Redis Lua sandboxing - Matches Redis security model exactly:
+  - [✅] Disabled dangerous functions: os, io, debug, package, require, dofile, loadfile, load
+  - [✅] Available safe functions: math.*, string.*, table.*, pairs, ipairs, type, etc.
+  - [✅] redis.call and redis.pcall for Redis command execution
+- [✅] KEYS/ARGV access - 1-indexed arrays properly implemented
+- [✅] Error handling - Proper Lua error propagation to Redis error responses  
+- [✅] Performance characteristics - Script execution meets Redis compatibility standards
+- [✅] Resource limits - Memory and instruction limits for secure execution
+- [✅] CLI testing tool - Standalone lua_cli for script validation
+
+**Architecture Decision: MLua vs Custom Implementation**
+After extensive development of a custom transaction-based Lua VM, we made the strategic decision to adopt MLua for production reliability:
+- ✅ **Immediate Lua 5.1 compatibility** - vs months/years of custom VM development 
+- ✅ **Battle-tested security** - MLua's sandboxing is production-proven
+- ✅ **Maintenance reduction** - Focus on Redis features rather than VM debugging
+- ✅ **Risk mitigation** - Eliminated complex transaction-based VM architecture issues
 ```
 
 ### Priority 5.2: Streams
@@ -367,20 +364,20 @@ Ferrous has now completed Technical Groups 1-3 entirely, with significant portio
   - Some monitoring and security features are implemented
   - SCAN command family is implemented for production use cases
 - **Feature Completeness (Group 5)**: 🟡 Largely Complete
-  - **Scripting (Lua)**: ✅ Largely complete with GIL implementation
-    - Access to KEYS/ARGV arrays now works correctly
-    - redis.call and redis.pcall functions now work correctly
-    - Transaction semantics partially implemented (needs refinement)
-    - cjson.encode and cjson.decode now fully working
+  - **Scripting (Lua)**: ✅ Complete with MLua integration
+    - Full Lua 5.1 compatibility via production-ready MLua library
+    - Complete Redis Lua API with proper sandboxing
+    - All SCRIPT commands and EVAL/EVALSHA functionality working
+    - Production-ready performance and security characteristics
   - Streams and other extended data types not yet implemented
 
 ### Current Priority Focus
 
 Based on the current implementation state and performance achievements, these are the highest priority remaining tasks:
 
-1. **Lua Transaction Rollback** - Improve error handling and rollback behavior
-2. **Extended Security** - Additional protection mechanisms
-3. **Key Migration Commands** - For cluster preparation
+1. **Extended Security** - Additional protection mechanisms
+2. **Key Migration Commands** - For cluster preparation
+3. **Streams Implementation** - Redis streams data type for advanced use cases
 
 ## Performance Achievement
 

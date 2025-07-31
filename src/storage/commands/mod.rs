@@ -16,7 +16,7 @@ pub mod debug;
 pub mod monitor_cmd;
 pub mod client;
 pub mod memory;
-pub mod lua;
+pub mod lua;          // MLua-based Lua 5.1 scripting
 
 // Re-export all handlers for easy access
 pub use lists::*;
@@ -33,4 +33,4 @@ pub use debug::*;
 pub use monitor_cmd::*;
 pub use client::*;
 pub use memory::*;
-pub use lua::*;
+pub use lua::*;       // Export new MLua-based Lua commands

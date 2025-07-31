@@ -64,6 +64,11 @@ impl StorageEngine {
         Self::with_config(16, MemoryManager::unlimited())
     }
     
+    /// Create a new in-memory storage engine for testing
+    pub fn new_in_memory() -> Arc<Self> {
+        Self::new()
+    }
+    
     /// Create storage engine with configuration
     pub fn with_config(num_databases: usize, memory_manager: MemoryManager) -> Arc<Self> {
         let mut databases = Vec::with_capacity(num_databases);
@@ -2144,6 +2149,12 @@ impl StorageEngine {
         }
     }
     
+    /// Get the current database ID
+    pub fn get_current_db(&self) -> usize {
+        // For now, just return 0 (the default database)
+        0
+    }
+
     /// Background thread for cleaning up expired keys
     fn expiration_cleanup_loop(engine: Arc<StorageEngine>) {
         loop {
@@ -2228,19 +2239,19 @@ mod tests {
     }
     
     #[test]
-    fn test_increment() {
-        let engine = StorageEngine::new();
+    fn test_incr_command() {
+        let engine = StorageEngine::new_in_memory();
         
-        // Increment non-existent key
-        let result = engine.incr(b"counter".to_vec(), 0).unwrap();
+        // Test incrementing a non-existent key
+        let result = engine.incr(0, b"counter".to_vec()).unwrap();
         assert_eq!(result, 1);
         
-        // Increment existing key
-        let result = engine.incr(b"counter".to_vec(), 0).unwrap();
+        // Test incrementing an existing key
+        let result = engine.incr(0, b"counter".to_vec()).unwrap();
         assert_eq!(result, 2);
         
-        // Increment by specific amount
-        let result = engine.incr_by(b"counter".to_vec(), 0, 5).unwrap();
+        // Test incrementing by a specific value
+        let result = engine.incr_by(0, b"counter".to_vec(), 5).unwrap();
         assert_eq!(result, 7);
     }
     

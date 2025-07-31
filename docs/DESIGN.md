@@ -2,16 +2,32 @@
 
 ## Overview
 
-Ferrous is a Redis-compatible in-memory database server written in pure Rust with zero external dependencies. This document outlines the architecture, design decisions, and implementation strategy for creating a performant, safe, and fully compatible Redis alternative.
+Ferrous is a Redis-compatible in-memory database server written in Rust with battle-tested MLua-based Lua 5.1 scripting. This document outlines the architecture, design decisions, and implementation strategy for creating a performant, safe, and fully compatible Redis alternative.
 
 ## Design Goals
 
 1. **100% Redis Protocol Compatibility**: Implement RESP2/RESP3 to ensure drop-in compatibility with existing Redis clients
 2. **Memory Safety**: Leverage Rust's ownership model to eliminate entire classes of vulnerabilities
 3. **True Concurrency**: Unlike Redis's single-threaded architecture, safely utilize multiple CPU cores
-4. **Zero Dependencies**: Use only Rust's standard library for maximum portability and security
+4. **Production-Ready Architecture**: Use proven libraries like MLua for critical functionality rather than reimplementing complex systems
 5. **Performance Parity**: Achieve performance comparable to or better than Redis
 6. **Permissive Licensing**: MIT/Apache-2.0 dual license for maximum adoption
+
+## Dependency Strategy
+
+Ferrous follows a **selective dependency approach** prioritizing reliability and production readiness:
+
+### Core Dependencies
+- **MLua**: Battle-tested Lua 5.1 implementation for Redis scripting compatibility
+  - Provides immediate Lua 5.1 compatibility vs years of custom VM development
+  - Proven sandboxing and security features
+  - Used by Redis-compatible systems for reliable script execution
+  
+### Minimal Additional Dependencies
+- **Standard cryptography libraries**: SHA1, hex encoding for script caching
+- **Core async runtime**: For timeouts and background tasks
+
+This approach balances the theoretical ideal of zero dependencies with the practical reality of delivering production-ready Redis compatibility quickly and reliably.
 
 ## Architecture Overview
 
