@@ -2,13 +2,14 @@
 //! 
 //! Handles TCP connections, client management, and network I/O.
 
-pub mod server;
-pub mod connection;
 pub mod listener;
+pub mod connection;
+pub mod server;
+pub mod monitoring;
 
-pub use server::Server;
-pub use connection::{Connection, ConnectionState};
 pub use listener::Listener;
+pub use connection::{Connection, ConnectionState};
+pub use server::Server;
 
 /// Network configuration
 #[derive(Debug, Clone)]

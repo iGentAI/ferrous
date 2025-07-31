@@ -18,6 +18,7 @@ use crate::pubsub::{PubSubManager, format_message, format_pmessage,
                     format_unsubscribe_response, format_punsubscribe_response};
 use crate::replication::{ReplicationManager, ReplicationConfig};
 use super::{Listener, Connection, ConnectionState, NetworkConfig};
+use super::monitoring::{PerformanceMonitoring, MonitoringConfig};
 use crate::Config as FerrousConfig;
 
 /// Connection ID generator
@@ -187,6 +188,8 @@ pub struct Server {
     monitor_subscribers: Arc<MonitorSubscribers>,
     /// Clients paused until this time
     clients_paused_until: Arc<Mutex<SystemTime>>,
+    /// Zero-overhead performance monitoring backend
+    monitoring: Arc<dyn PerformanceMonitoring>,
 }
 
 impl Server {
@@ -258,6 +261,33 @@ impl Server {
         // Initialize client pause to UNIX_EPOCH (not paused)
         let clients_paused_until = Arc::new(Mutex::new(UNIX_EPOCH));
         
+        // Create monitoring backend based on configuration
+        let monitoring = if config.monitoring.slowlog_enabled || config.monitoring.monitor_enabled || config.monitoring.stats_enabled {
+            // Enable monitoring based on config
+            let monitoring_config = super::monitoring::MonitoringConfig {
+                slowlog_enabled: config.monitoring.slowlog_enabled,
+                monitor_enabled: config.monitoring.monitor_enabled,
+                stats_enabled: config.monitoring.stats_enabled,
+            };
+            monitoring_config.create_monitoring(
+                Arc::clone(&slowlog),
+                Arc::clone(&monitor_subscribers),
+                Arc::clone(&stats),
+            )
+        } else {
+            // Use production-optimized (disabled) monitoring for maximum performance
+            let monitoring_config = super::monitoring::MonitoringConfig::production();
+            monitoring_config.create_monitoring(
+                Arc::clone(&slowlog),
+                Arc::clone(&monitor_subscribers),
+                Arc::clone(&stats),
+            )
+        };
+        
+        // Configure SLOWLOG settings from config
+        slowlog.set_threshold_micros(config.monitoring.slowlog_threshold_micros);
+        slowlog.set_max_len(config.monitoring.slowlog_max_len);
+        
         // Load existing RDB if available
         if let Err(e) = rdb_engine.load(&storage) {
             eprintln!("Failed to load RDB file: {}", e);
@@ -300,6 +330,7 @@ impl Server {
             slowlog,
             monitor_subscribers,
             clients_paused_until,
+            monitoring,
         })
     }
     
@@ -644,9 +675,11 @@ impl Server {
     
     /// Process a RESP frame and generate a response
     fn process_frame(&mut self, frame: RespFrame, conn_id: u64) -> Result<RespFrame> {
-        // We've removed the start_time here since it was causing duplicate timing
         let result = match &frame {
             RespFrame::Array(Some(parts)) if !parts.is_empty() => {
+                // Zero-overhead command counting using correct trait method
+                self.monitoring.record_command_count();
+                
                 // Extract command name
                 let cmd_frame = &parts[0];
                 let command = match cmd_frame {
@@ -677,18 +710,13 @@ impl Server {
                     }
                 }
                 
-                // Special handling for MONITOR command - must be implemented at this level
-                // since it affects the connection state directly
+                // Special handling for MONITOR command
                 if command.as_str() == "MONITOR" {
-                    // Only handle MONITOR if parts count is correct
                     if parts.len() != 1 {
                         return Ok(RespFrame::error("ERR wrong number of arguments for 'monitor' command"));
                     }
                     
-                    // Subscribe this connection to monitoring
                     self.monitor_subscribers.subscribe(conn_id)?;
-                    
-                    // Mark connection as monitoring in its state
                     self.connections.with_connection(conn_id, |conn| {
                         conn.is_monitoring = true;
                     });
@@ -825,10 +853,7 @@ impl Server {
 
     /// Process a normal (non-transaction) command
     fn process_normal_command(&mut self, parts: &[RespFrame], db: usize, conn_id: u64) -> Result<RespFrame> {
-        // Record the command timestamp for MONITOR
-        let command_timestamp = SystemTime::now();
-        
-        // Extract command name for debugging
+        // Extract command name
         let cmd_frame = &parts[0];
         let command_name = match cmd_frame {
             RespFrame::BulkString(Some(bytes)) => {
@@ -837,13 +862,8 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid command format")),
         };
         
-        // Start timing for SLOWLOG - moved here for accurate timing of just the command execution
-        let start_time = std::time::Instant::now();
-        
-        // Debug output to show we're processing a command
-        crate::storage::commands::debug::log_slowlog(
-            &format!("Processing command: {}", command_name)
-        );
+        // Zero-overhead timing start using correct trait method
+        let start_time = self.monitoring.start_timing();
         
         // Log to AOF for write commands
         if let Some(aof) = &self.aof_engine {
@@ -889,7 +909,6 @@ impl Server {
                 
                 Ok(RespFrame::ok())
             },
-            // Add config command handling for slowlog settings
             "CONFIG" => {
                 if parts.len() < 2 {
                     return Ok(RespFrame::error("ERR wrong number of arguments for 'config' command"));
@@ -903,7 +922,6 @@ impl Server {
                 };
                 
                 if subcommand.as_str() == "SET" && parts.len() >= 4 {
-                    // Handle CONFIG SET for slowlog settings
                     let param_name = match &parts[2] {
                         RespFrame::BulkString(Some(bytes)) => {
                             String::from_utf8_lossy(bytes).to_string().to_lowercase()
@@ -939,7 +957,6 @@ impl Server {
                     }
                 }
                 
-                // Default CONFIG handling for other cases
                 crate::storage::commands::config::handle_config(parts)
             },
             // Additional string commands
@@ -1049,7 +1066,7 @@ impl Server {
             // Add the Lua script commands
             "EVAL" => {
                 println!("[SERVER DEBUG] Processing EVAL command");
-                match crate::storage::commands::lua::handle_lua_command(&self.storage, "eval", parts) {
+                match crate::storage::commands::lua::handle_eval(&self.storage, parts) {
                     Ok(resp) => {
                         println!("[SERVER DEBUG] EVAL executed successfully");
                         Ok(resp)
@@ -1061,42 +1078,51 @@ impl Server {
                     }
                 }
             },
-            "EVALSHA" => {
-                println!("[SERVER DEBUG] Processing EVALSHA command");
-                match crate::storage::commands::lua::handle_lua_command(&self.storage, "evalsha", parts) {
-                    Ok(resp) => {
-                        println!("[SERVER DEBUG] EVALSHA executed successfully");
-                        Ok(resp)
-                    },
-                    Err(e) => {
-                        // Log the error but return it as a Redis error response instead of propagating
-                        eprintln!("[SERVER ERROR] Lua EVALSHA error: {}", e);
-                        Ok(RespFrame::error(format!("ERR Lua execution error: {}", e)))
-                    }
-                }
-            },
-            "SCRIPT" => {
-                println!("[SERVER DEBUG] Processing SCRIPT command");
-                match crate::storage::commands::lua::handle_lua_command(&self.storage, "script", parts) {
-                    Ok(resp) => {
-                        println!("[SERVER DEBUG] SCRIPT executed successfully");
-                        Ok(resp)
-                    },
-                    Err(e) => {
-                        // Log the error but return it as a Redis error response instead of propagating
-                        eprintln!("[SERVER ERROR] Lua SCRIPT error: {}", e);
-                        Ok(RespFrame::error(format!("ERR Lua script error: {}", e)))
-                    }
+            "EVALSHA" | "SCRIPT" => {
+                // These commands need per-connection script cache access
+                let response = self.connections.with_connection(conn_id, |conn| -> Result<RespFrame> {
+                    crate::storage::commands::lua::handle_lua_command_with_cache(
+                        &self.storage, 
+                        command_name.to_lowercase().as_str(), 
+                        parts, 
+                        &mut conn.script_cache
+                    )
+                });
+                
+                match response {
+                    Some(resp) => resp,
+                    None => Ok(RespFrame::error("ERR connection not found")),
                 }
             },
             _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command_name))),
         };
         
-        // If this was a successful write command, propagate to replicas
+        // Auto-save change recording - always enabled (independent of monitoring)
         if self.is_write_command(&command_name) {
             if let Ok(resp) = &result {
                 if !resp.is_error() {
-                    // Log successful propagation
+                    self.record_change();
+                }
+            }
+        }
+        
+        // Zero-overhead monitoring completion using correct trait methods
+        if self.monitoring.is_enabled() {
+            let client_addr = self.connections.with_connection(conn_id, |conn| {
+                conn.addr.to_string()
+            }).unwrap_or_else(|| "127.0.0.1:unknown".to_string());
+            
+            // Use correct trait method for timing completion
+            self.monitoring.record_command_timing(start_time, &command_name, parts, &client_addr);
+            
+            // Use correct trait method for monitor broadcasting with proper signature
+            self.monitoring.broadcast_to_monitors(parts, conn_id, db, SystemTime::now());
+        }
+        
+        // Replication propagation for write commands
+        if self.is_write_command(&command_name) {
+            if let Ok(resp) = &result {
+                if !resp.is_error() {
                     println!("Propagating command {} to replicas", command_name);
                     
                     if let Ok(replica_ids) = self.replication.propagate_command(&RespFrame::Array(Some(parts.to_vec()))) {
@@ -1104,7 +1130,6 @@ impl Server {
                             println!("Propagating to {} replicas", replica_ids.len());
                         }
                         
-                        // Send command to all replicas
                         for replica_id in replica_ids {
                             let propagated = self.connections.with_connection(replica_id, |conn| -> Result<()> {
                                 conn.send_frame(&RespFrame::Array(Some(parts.to_vec())))?;
@@ -1116,45 +1141,6 @@ impl Server {
                             }
                         }
                     }
-                }
-            }
-        }
-        
-        // Measure command execution time for SLOWLOG at the very end
-        let duration = start_time.elapsed();
-        let duration_micros = duration.as_micros() as u64;
-        let threshold_micros = self.slowlog.get_threshold_micros();
-        
-        // Debug information to see what's happening
-        crate::storage::commands::debug::log_command_timing(&command_name, duration_micros, threshold_micros);
-        
-        // Get client address for slowlog
-        let client_addr = self.connections.with_connection(conn_id, |conn| {
-            conn.addr.to_string()
-        }).unwrap_or_else(|| "127.0.0.1:unknown".to_string());
-        
-        // Only add to slowlog if actually slow
-        if threshold_micros >= 0 && duration_micros >= threshold_micros as u64 {
-            crate::storage::commands::debug::log_slowlog(
-                &format!("Adding slow command: {} ({}μs) from {}", 
-                         command_name, duration_micros, client_addr)
-            );
-            
-            self.slowlog.add_if_slow(duration, parts, &client_addr, None);
-        } else {
-            crate::storage::commands::debug::log_slowlog(
-                &format!("Command not slow enough: {} ({}μs, threshold {}μs)", 
-                         command_name, duration_micros, threshold_micros)
-            );
-        }
-        
-        // Broadcast to monitors if anyone is monitoring
-        if !self.monitor_subscribers.get_subscribers().is_empty() {
-            // Skip broadcasting sensitive commands like AUTH
-            if let RespFrame::BulkString(Some(cmd_bytes)) = &parts[0] {
-                let cmd = String::from_utf8_lossy(cmd_bytes).to_uppercase();
-                if cmd != "AUTH" {  // Don't broadcast AUTH commands for security
-                    self.broadcast_to_monitors(parts, conn_id, db, command_timestamp)?;
                 }
             }
         }
@@ -1206,6 +1192,13 @@ impl Server {
         }
     }
     
+    /// Record a change for auto-save monitoring
+    fn record_change(&self) {
+        if let Some(monitor) = &self.storage_monitor {
+            monitor.record_change();
+        }
+    }
+    
     /// Check if a command is a write command that should be logged to AOF
     fn is_write_command(&self, command: &str) -> bool {
         if command == "SCRIPT" {
@@ -1225,12 +1218,7 @@ impl Server {
         }
     }
 
-    /// Record a data change for auto-save monitoring
-    fn record_change(&self) {
-        if let Some(monitor) = &self.storage_monitor {
-            monitor.record_change();
-        }
-    }
+
 
     /// Handle PUBLISH command
     fn handle_publish(&self, parts: &[RespFrame]) -> Result<RespFrame> {
@@ -1481,8 +1469,6 @@ impl Server {
             // Add to sorted set 
             if self.storage.zadd(db, key.clone(), member, score)? {
                 new_members += 1;
-                // Record change for auto-save
-                self.record_change();
             }
         }
         
@@ -2059,19 +2045,15 @@ impl Server {
             }
         }
         
-        // Record change for auto-save
-        self.record_change();
-        
         Ok(RespFrame::ok())
     }
     
-    /// Handle GET command
+    /// Handle GET command  
     fn handle_get(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
         if parts.len() != 2 {
             return Ok(RespFrame::error("ERR wrong number of arguments for 'get' command"));
         }
         
-        // Extract key
         let key = match &parts[1] {
             RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
             _ => return Ok(RespFrame::error("ERR invalid key format")),
@@ -2080,13 +2062,13 @@ impl Server {
         // Get the value
         match self.storage.get_string(db, key)? {
             Some(value) => {
-                // Record a cache hit
-                self.stats.keyspace_hits.fetch_add(1, Ordering::Relaxed);
+                // Zero-overhead cache hit recording using correct trait method
+                self.monitoring.record_cache_hit(true);
                 Ok(RespFrame::from_bytes(value))
             }
             None => {
-                // Record a cache miss
-                self.stats.keyspace_misses.fetch_add(1, Ordering::Relaxed);
+                // Zero-overhead cache miss recording using correct trait method
+                self.monitoring.record_cache_hit(false);
                 Ok(RespFrame::null_bulk())
             }
         }
@@ -2169,8 +2151,6 @@ impl Server {
             
             if self.storage.delete(db, key)? {
                 deleted += 1;
-                // Record change for auto-save
-                self.record_change();
             }
         }
         
@@ -2193,11 +2173,9 @@ impl Server {
             
             if self.storage.exists(db, key)? {
                 count += 1;
-                // Record a cache hit
-                self.stats.keyspace_hits.fetch_add(1, Ordering::Relaxed);
+                self.monitoring.record_cache_hit(true);
             } else {
-                // Record a cache miss
-                self.stats.keyspace_misses.fetch_add(1, Ordering::Relaxed);
+                self.monitoring.record_cache_hit(false);
             }
         }
         
@@ -2307,39 +2285,7 @@ impl Server {
         }
     }
     
-    /// Broadcast a command to all monitor subscribers
-    fn broadcast_to_monitors(&self, parts: &[RespFrame], conn_id: u64, db: usize, timestamp: SystemTime) -> Result<()> {
-        let subscribers = self.monitor_subscribers.get_subscribers();
-        
-        if subscribers.is_empty() {
-            return Ok(());
-        }
-        
-        // Get client address for the command
-        let client_addr = self.connections.with_connection(conn_id, |conn| {
-            conn.addr.to_string()
-        }).unwrap_or_else(|| "127.0.0.1:unknown".to_string());
-        
-        // Format the monitor output
-        let monitor_output = MonitorSubscribers::format_monitor_output(
-            timestamp,
-            db,
-            &client_addr,
-            parts
-        );
-        
-        // Send to all monitor subscribers
-        for subscriber_id in subscribers {
-            // Don't send to the connection that issued the command
-            if subscriber_id != conn_id {
-                let _ = self.connections.with_connection(subscriber_id, |conn| {
-                    conn.send_frame(&monitor_output)
-                });
-            }
-        }
-        
-        Ok(())
-    }
+
 
     /// Clean up closed connections
     fn cleanup_connections(&mut self) -> Result<()> {

@@ -6,6 +6,7 @@
 use std::net::{TcpStream, SocketAddr};
 use std::io::{Read, Write, ErrorKind};
 use std::time::Instant;
+use std::collections::HashMap;
 use crate::error::{FerrousError, Result};
 use crate::protocol::{RespParser, RespFrame, serialize_resp_frame};
 use crate::storage::commands::transactions::TransactionState;
@@ -66,6 +67,9 @@ pub struct Connection {
     
     /// Client name (set via CLIENT SETNAME)
     pub name: Option<String>,
+    
+    /// Per-connection Lua script cache (SHA1 -> script content)
+    pub script_cache: HashMap<String, String>,
 }
 
 impl Connection {
@@ -93,6 +97,7 @@ impl Connection {
             transaction_state: TransactionState::default(),
             is_monitoring: false,
             name: None,
+            script_cache: HashMap::new(),
         })
     }
     

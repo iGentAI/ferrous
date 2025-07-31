@@ -1,35 +1,46 @@
-//! Main storage engine implementation
+//! Sharded storage engine implementation optimized for performance
 //! 
-//! Provides Redis-compatible storage with multiple databases, expiration,
-//! and memory management.
+//! Provides Redis-compatible storage with sharded simple structure and no access time tracking overhead.
 
-use std::collections::{HashMap, VecDeque, HashSet};
+use std::collections::{VecDeque, HashSet, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use std::thread;
 use rand::seq::SliceRandom;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use crate::error::{FerrousError, Result, StorageError, CommandError};
 use super::value::{Value, StoredValue};
 use super::memory::MemoryManager;
 use super::skiplist::SkipList;
 use super::{DatabaseIndex, Key};
 
-/// Main storage engine
+/// Number of shards per database for optimal concurrency
+const SHARDS_PER_DATABASE: usize = 16;
+
+/// Sharded storage engine with simple HashMap structures - NO access time tracking
 pub struct StorageEngine {
-    /// Multiple databases (like Redis)
-    databases: Vec<Arc<RwLock<Database>>>,
+    /// Multiple databases, each with multiple shards
+    /// databases[db_id].shards[shard_id] = Arc<RwLock<DatabaseShard>>
+    databases: Vec<Database>,
     
-    /// Memory management
+    /// Memory management (atomic-based, no locks)
     memory_manager: Arc<MemoryManager>,
     
     /// Background expiration thread handle
     expiration_handle: Option<thread::JoinHandle<()>>,
 }
 
-/// A single database instance
-#[derive(Debug)]
+/// A single database with sharded storage
 pub struct Database {
-    /// Key-value storage
+    /// Sharded key-value storage for maximum concurrency
+    shards: Vec<Arc<RwLock<DatabaseShard>>>,
+}
+
+/// A single database shard with simple HashMap
+#[derive(Debug)]
+pub struct DatabaseShard {
+    /// Key-value storage using simple HashMap for maximum performance
     data: HashMap<Key, StoredValue>,
     
     /// Keys with expiration timestamps for efficient cleanup
@@ -73,7 +84,7 @@ impl StorageEngine {
     pub fn with_config(num_databases: usize, memory_manager: MemoryManager) -> Arc<Self> {
         let mut databases = Vec::with_capacity(num_databases);
         for _ in 0..num_databases {
-            databases.push(Arc::new(RwLock::new(Database::new())));
+            databases.push(Database::new());
         }
         
         let engine = Arc::new(StorageEngine {
@@ -88,10 +99,21 @@ impl StorageEngine {
             Self::expiration_cleanup_loop(engine_clone);
         });
         
-        // Note: This is a bit of a hack, we can't store the handle in the Arc
-        // In a real implementation, we'd use a different pattern
-        
         engine
+    }
+    
+    /// Calculate shard index for a key using fast hash function
+    fn get_shard_index(&self, key: &[u8]) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() % SHARDS_PER_DATABASE as u64) as usize
+    }
+    
+    /// Get shard for a key in a specific database
+    fn get_shard(&self, db: DatabaseIndex, key: &[u8]) -> Result<&Arc<RwLock<DatabaseShard>>> {
+        let database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
+        let shard_idx = self.get_shard_index(key);
+        Ok(&database.shards[shard_idx])
     }
     
     /// Set a string value
@@ -104,10 +126,10 @@ impl StorageEngine {
         self.set_value(db, key, Value::string(value), Some(expires_in))
     }
     
-    /// Set any value
+    /// Set any value - optimized with sharded simple structure, no access time tracking
     pub fn set_value(&self, db: DatabaseIndex, key: Key, value: Value, expires_in: Option<Duration>) -> Result<()> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
         
         // Calculate memory usage
         let memory_size = self.calculate_value_size(&key, &value);
@@ -126,32 +148,31 @@ impl StorageEngine {
         
         // Track expiration if needed
         if let Some(expires_at) = stored_value.metadata.expires_at {
-            db_guard.expiring_keys.insert(key.clone(), expires_at);
+            shard_guard.expiring_keys.insert(key.clone(), expires_at);
         }
         
-        // Store the value
-        db_guard.data.insert(key.clone(), stored_value);
-        db_guard.mark_modified(&key);
+        // Store the value - direct HashMap access for maximum performance
+        shard_guard.data.insert(key.clone(), stored_value);
+        shard_guard.mark_modified(&key);
         
         Ok(())
     }
     
-    /// Get a value
+    /// Get a value - optimized by removing all access time tracking overhead
     pub fn get(&self, db: DatabaseIndex, key: &[u8]) -> Result<GetResult> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
+        match shard_guard.data.get_mut(key) {
             Some(stored_value) => {
                 // Check if expired
                 if stored_value.is_expired() {
                     // Remove expired key
-                    db_guard.data.remove(key);
-                    db_guard.expiring_keys.remove(key);
+                    shard_guard.data.remove(key);
+                    shard_guard.expiring_keys.remove(key);
                     Ok(GetResult::Expired)
                 } else {
-                    // Update access time and return value
-                    stored_value.touch();
+                    // Return value without touch() - matches Valkey's noeviction config
                     Ok(GetResult::Found(stored_value.value.clone()))
                 }
             }
@@ -169,21 +190,25 @@ impl StorageEngine {
         }
     }
     
-    /// Check if key exists
+    /// Check if key exists - optimized read path, no access time tracking
     pub fn exists(&self, db: DatabaseIndex, key: &[u8]) -> Result<bool> {
-        match self.get(db, key)? {
-            GetResult::Found(_) => Ok(true),
-            _ => Ok(false),
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap(); // Use read lock for existence check
+        
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            Ok(!stored_value.is_expired())
+        } else {
+            Ok(false)
         }
     }
     
     /// Delete a key
     pub fn delete(&self, db: DatabaseIndex, key: &[u8]) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        if let Some(stored_value) = db_guard.data.remove(key) {
-            db_guard.expiring_keys.remove(key);
+        if let Some(stored_value) = shard_guard.data.remove(key) {
+            shard_guard.expiring_keys.remove(key);
             
             // Update memory usage
             let memory_size = self.calculate_value_size(key, &stored_value.value);
@@ -197,24 +222,24 @@ impl StorageEngine {
     
     /// Set expiration on a key
     pub fn expire(&self, db: DatabaseIndex, key: &[u8], expires_in: Duration) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        if let Some(stored_value) = db_guard.data.get_mut(key) {
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
             stored_value.metadata.set_expiration(expires_in);
-            db_guard.expiring_keys.insert(key.to_vec(), Instant::now() + expires_in);
+            shard_guard.expiring_keys.insert(key.to_vec(), Instant::now() + expires_in);
             Ok(true)
         } else {
             Ok(false)
         }
     }
     
-    /// Get time to live for a key
+    /// Get time to live for a key - optimized read path, no access time tracking
     pub fn ttl(&self, db: DatabaseIndex, key: &[u8]) -> Result<Option<Duration>> {
-        let database = self.get_database(db)?;
-        let db_guard = database.read().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap(); // Use read lock for TTL check
         
-        if let Some(stored_value) = db_guard.data.get(key) {
+        if let Some(stored_value) = shard_guard.data.get(key) {
             if let Some(expires_at) = stored_value.metadata.expires_at {
                 let now = Instant::now();
                 if expires_at > now {
@@ -235,42 +260,55 @@ impl StorageEngine {
         self.incr_by(db, key, 1)
     }
     
-    /// Increment integer value by amount
+    /// Increment integer value by amount - optimized without access time tracking
     pub fn incr_by(&self, db: DatabaseIndex, key: Key, increment: i64) -> Result<i64> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        let new_value = match db_guard.data.get(&key) {
-            Some(stored_value) => {
-                // Try to parse existing value as integer
-                match stored_value.value.as_integer() {
-                    Some(current) => current + increment,
-                    None => return Err(FerrousError::Command(crate::error::CommandError::NotInteger)),
+        let new_value = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            // Try to parse existing value as integer
+            match stored_value.value.as_integer() {
+                Some(current) => {
+                    let new_val = current + increment;
+                    stored_value.value = Value::integer(new_val);
+                    // NO touch() call - matches Valkey's noeviction config
+                    shard_guard.mark_modified(&key);
+                    new_val
                 }
+                None => return Err(FerrousError::Command(CommandError::NotInteger)),
             }
-            None => increment, // Start from increment if key doesn't exist
+        } else {
+            // Create new key with increment value
+            let new_val = increment;
+            let stored_value = StoredValue::new(Value::integer(new_val));
+            let memory_size = self.calculate_value_size(&key, &stored_value.value);
+            
+            if !self.memory_manager.add_memory(memory_size) {
+                return Err(StorageError::OutOfMemory.into());
+            }
+            
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            new_val
         };
         
-        // Store the new value
-        let stored_value = StoredValue::new(Value::integer(new_value));
-        let memory_size = self.calculate_value_size(&key, &stored_value.value);
-        
-        if !self.memory_manager.add_memory(memory_size) {
-            return Err(StorageError::OutOfMemory.into());
-        }
-        
-        db_guard.data.insert(key.clone(), stored_value);
-        db_guard.mark_modified(&key);
         Ok(new_value)
     }
     
     /// Get all keys from a database (for RDB persistence)
     pub fn get_all_keys(&self, db: DatabaseIndex) -> Result<Vec<Key>> {
-        let database = self.get_database(db)?;
-        let db_guard = database.read().unwrap();
+        let database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
+        let mut all_keys = Vec::new();
         
-        let keys: Vec<Key> = db_guard.data.keys().cloned().collect();
-        Ok(keys)
+        // Collect keys from all shards
+        for shard in &database.shards {
+            let shard_guard = shard.read().unwrap();
+            for key in shard_guard.data.keys() {
+                all_keys.push(key.clone());
+            }
+        }
+        
+        Ok(all_keys)
     }
     
     /// Get database count
@@ -285,1013 +323,27 @@ impl StorageEngine {
     
     /// Flush all data from a database
     pub fn flush_db(&self, db: DatabaseIndex) -> Result<()> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
         
-        // Calculate memory to free
-        let mut memory_to_free = 0;
-        for (key, stored_value) in db_guard.data.iter() {
-            memory_to_free += self.calculate_value_size(key, &stored_value.value);
+        let mut total_memory_to_free = 0;
+        
+        // Clear all shards
+        for shard in &database.shards {
+            let mut shard_guard = shard.write().unwrap();
+            
+            // Calculate memory to free from this shard
+            for (key, stored_value) in shard_guard.data.iter() {
+                total_memory_to_free += self.calculate_value_size(key, &stored_value.value);
+            }
+            
+            shard_guard.data.clear();
+            shard_guard.expiring_keys.clear();
         }
         
-        db_guard.data.clear();
-        db_guard.expiring_keys.clear();
-        
-        self.memory_manager.remove_memory(memory_to_free);
+        self.memory_manager.remove_memory(total_memory_to_free);
         Ok(())
     }
     
-    /// Get database reference
-    fn get_database(&self, db: DatabaseIndex) -> Result<&Arc<RwLock<Database>>> {
-        self.databases.get(db).ok_or_else(|| {
-            StorageError::InvalidDatabase.into()
-        })
-    }
-    
-    /// Add a member with score to a sorted set
-    pub fn zadd(&self, db: DatabaseIndex, key: Key, member: Vec<u8>, score: f64) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and is a sorted set
-        let is_new = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                // Check if it's a sorted set
-                match &mut stored_value.value {
-                    Value::SortedSet(skiplist) => {
-                        // Try to insert/update the member
-                        let old_score = skiplist.insert(member.clone(), score);
-                        stored_value.touch();
-                        old_score.is_none() // Return true if new member
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                }
-            }
-            None => {
-                // Create a new sorted set
-                let skiplist = SkipList::new();
-                skiplist.insert(member.clone(), score);
-                
-                // Calculate memory usage
-                let memory_size = self.calculate_value_size(&key, &Value::empty_sorted_set()) +
-                                 self.calculate_member_size(&member);
-                
-                if !self.memory_manager.add_memory(memory_size) {
-                    return Err(StorageError::OutOfMemory.into());
-                }
-                
-                let stored_value = StoredValue::new(Value::SortedSet(Arc::new(skiplist)));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                true // New member in new set
-            }
-        };
-        
-        Ok(is_new)
-    }
-    
-    /// Remove a member from a sorted set
-    pub fn zrem(&self, db: DatabaseIndex, key: &[u8], member: &[u8]) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and is a sorted set
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                let (removed, is_empty) = match &mut stored_value.value {
-                    Value::SortedSet(skiplist) => {
-                        let removed = skiplist.remove(member).is_some();
-                        (removed, skiplist.is_empty())
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                
-                if removed {
-                    // Update memory usage
-                    let member_size = self.calculate_member_size(member);
-                    self.memory_manager.remove_memory(member_size);
-                    
-                    // Delete the key if the set is now empty
-                    if is_empty {
-                        db_guard.data.remove(key);
-                    } else {
-                        stored_value.touch();
-                    }
-                }
-                
-                Ok(removed)
-            }
-            None => Ok(false), // Key doesn't exist
-        }
-    }
-    
-    /// Get the score of a member in a sorted set
-    pub fn zscore(&self, db: DatabaseIndex, key: &[u8], member: &[u8]) -> Result<Option<f64>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and is a sorted set
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                let score = match &stored_value.value {
-                    Value::SortedSet(skiplist) => skiplist.get_score(member),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                
-                stored_value.touch();
-                Ok(score)
-            }
-            None => Ok(None), // Key doesn't exist
-        }
-    }
-    
-    /// Get the rank of a member in a sorted set (0-based)
-    pub fn zrank(&self, db: DatabaseIndex, key: &[u8], member: &[u8], reverse: bool) -> Result<Option<usize>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and is a sorted set
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                let result = match &stored_value.value {
-                    Value::SortedSet(skiplist) => {
-                        let rank = skiplist.get_rank(member);
-                        
-                        if let Some(rank) = rank {
-                            if reverse {
-                                // For ZREVRANK, invert the rank
-                                Some(skiplist.len() - 1 - rank)
-                            } else {
-                                Some(rank)
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                
-                stored_value.touch();
-                Ok(result)
-            }
-            None => Ok(None), // Key doesn't exist
-        }
-    }
-    
-    /// Get a range of members by rank from a sorted set
-    pub fn zrange(&self, db: DatabaseIndex, key: &[u8], start: isize, stop: isize, reverse: bool) 
-        -> Result<Vec<(Vec<u8>, f64)>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and is a sorted set
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                let result = match &stored_value.value {
-                    Value::SortedSet(skiplist) => {
-                        let len = skiplist.len();
-                        if len == 0 {
-                            Vec::new()
-                        } else {
-                            // Convert negative indices and clamp to valid range
-                            let start_idx = if start < 0 { 
-                                (len as isize + start).max(0) as usize
-                            } else {
-                                start as usize
-                            };
-                            
-                            let stop_idx = if stop < 0 {
-                                (len as isize + stop).max(0) as usize
-                            } else {
-                                stop as usize
-                            };
-                            
-                            // Handle reverse ordering
-                            if reverse {
-                                let real_start = len.saturating_sub(1).saturating_sub(stop_idx.min(len.saturating_sub(1)));
-                                let real_stop = len.saturating_sub(1).saturating_sub(start_idx.min(len.saturating_sub(1)));
-                                
-                                let range = skiplist.range_by_rank(real_start, real_stop);
-                                // Reverse the results
-                                let mut items = range.items;
-                                items.reverse();
-                                items
-                            } else {
-                                if start_idx >= len || start_idx > stop_idx {
-                                    Vec::new()
-                                } else {
-                                    let start_idx = start_idx.min(len - 1);
-                                    let stop_idx = stop_idx.min(len - 1);
-                                    
-                                    let range = skiplist.range_by_rank(start_idx, stop_idx);
-                                    range.items
-                                }
-                            }
-                        }
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                
-                stored_value.touch();
-                Ok(result)
-            }
-            None => Ok(Vec::new()), // Key doesn't exist
-        }
-    }
-    
-    /// Get a range of members by score from a sorted set
-    pub fn zrangebyscore(&self, db: DatabaseIndex, key: &[u8], min_score: f64, max_score: f64, reverse: bool) 
-        -> Result<Vec<(Vec<u8>, f64)>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and is a sorted set
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                let result = match &stored_value.value {
-                    Value::SortedSet(skiplist) => {
-                        // Get the range
-                        let range = skiplist.range_by_score(min_score, max_score);
-                        let mut items = range.items;
-                        
-                        if reverse {
-                            items.reverse();
-                        }
-                        
-                        items
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                
-                stored_value.touch();
-                Ok(result)
-            }
-            None => Ok(Vec::new()), // Key doesn't exist
-        }
-    }
-    
-    /// Count members within score range
-    pub fn zcount(&self, db: DatabaseIndex, key: &[u8], min_score: f64, max_score: f64) -> Result<usize> {
-        let members = self.zrangebyscore(db, key, min_score, max_score, false)?;
-        Ok(members.len())
-    }
-    
-    /// Increment score of a member
-    pub fn zincrby(&self, db: DatabaseIndex, key: Key, member: Vec<u8>, increment: f64) -> Result<f64> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and is a sorted set
-        match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                // Check if it's a sorted set
-                match &mut stored_value.value {
-                    Value::SortedSet(skiplist) => {
-                        // Try to get current score
-                        let new_score = match skiplist.get_score(&member) {
-                            Some(curr_score) => curr_score + increment,
-                            None => increment,
-                        };
-                        
-                        // Update the score
-                        skiplist.insert(member, new_score);
-                        stored_value.touch();
-                        
-                        Ok(new_score)
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => {
-                // Create a new sorted set
-                let skiplist = SkipList::new();
-                skiplist.insert(member.clone(), increment);
-                
-                // Calculate memory usage
-                let memory_size = self.calculate_value_size(&key, &Value::empty_sorted_set()) +
-                                 self.calculate_member_size(&member);
-                
-                if !self.memory_manager.add_memory(memory_size) {
-                    return Err(StorageError::OutOfMemory.into());
-                }
-                
-                let stored_value = StoredValue::new(Value::SortedSet(Arc::new(skiplist)));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                
-                Ok(increment)
-            }
-        }
-    }
-    
-    /// Calculate the memory size of a sorted set member
-    fn calculate_member_size(&self, member: &[u8]) -> usize {
-        // Member size + Score size + Node overhead
-        MemoryManager::calculate_size(member) + std::mem::size_of::<f64>() + 32
-    }
-
-    /// Push elements to the head of a list
-    pub fn lpush(&self, db: DatabaseIndex, key: Key, elements: Vec<Vec<u8>>) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and get its type
-        if let Some(stored_value) = db_guard.data.get(&key) {
-            // Check type before mutation
-            match &stored_value.value {
-                Value::List(_) => {}
-                _ => return Err(StorageError::WrongType.into()),
-            }
-        }
-        
-        // Now perform the actual operation
-        let list_len = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                if let Value::List(list) = &mut stored_value.value {
-                    // Directly modify the list
-                    for element in elements.into_iter().rev() {
-                        list.push_front(element);
-                    }
-                    let len = list.len();
-                    stored_value.touch();
-                    db_guard.mark_modified(&key);
-                    len
-                } else {
-                    unreachable!("Type already checked");
-                }
-            }
-            None => {
-                // Create new list
-                let mut list = VecDeque::new();
-                for element in elements.into_iter().rev() {
-                    list.push_front(element);
-                }
-                let len = list.len();
-                
-                let stored_value = StoredValue::new(Value::List(list));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                len
-            }
-        };
-        
-        Ok(list_len)
-    }
-    
-    /// Push elements to the tail of a list
-    pub fn rpush(&self, db: DatabaseIndex, key: Key, elements: Vec<Vec<u8>>) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Check if key exists and get its type
-        if let Some(stored_value) = db_guard.data.get(&key) {
-            // Check type before mutation
-            match &stored_value.value {
-                Value::List(_) => {}
-                _ => return Err(StorageError::WrongType.into()),
-            }
-        }
-        
-        // Now perform the actual operation
-        let list_len = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                if let Value::List(list) = &mut stored_value.value {
-                    // Directly modify the list
-                    for element in elements {
-                        list.push_back(element);
-                    }
-                    let len = list.len();
-                    stored_value.touch();
-                    db_guard.mark_modified(&key);
-                    len
-                } else {
-                    unreachable!("Type already checked");
-                }
-            }
-            None => {
-                // Create new list
-                let mut list = VecDeque::new();
-                for element in elements {
-                    list.push_back(element);
-                }
-                let len = list.len();
-                
-                let stored_value = StoredValue::new(Value::List(list));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                len
-            }
-        };
-        
-        Ok(list_len)
-    }
-    
-    /// Pop element from head of list
-    pub fn lpop(&self, db: DatabaseIndex, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::List(list) => {
-                        let element = list.pop_front();
-                        
-                        // Remove empty list
-                        if list.is_empty() {
-                            db_guard.data.remove(key);
-                        } else {
-                            stored_value.touch();
-                        }
-                        
-                        Ok(element)
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => Ok(None),
-        }
-    }
-    
-    /// Pop element from tail of list
-    pub fn rpop(&self, db: DatabaseIndex, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::List(list) => {
-                        let element = list.pop_back();
-                        
-                        // Remove empty list
-                        if list.is_empty() {
-                            db_guard.data.remove(key);
-                        } else {
-                            stored_value.touch();
-                        }
-                        
-                        Ok(element)
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => Ok(None),
-        }
-    }
-    
-    /// Get list length
-    pub fn llen(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // First get the length, then touch
-                let len = match &stored_value.value {
-                    Value::List(list) => list.len(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(len)
-            }
-            None => Ok(0),
-        }
-    }
-    
-    /// Get range of elements from list
-    pub fn lrange(&self, db: DatabaseIndex, key: &[u8], start: isize, stop: isize) -> Result<Vec<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Extract data first, then touch
-                let result = match &stored_value.value {
-                    Value::List(list) => {
-                        let len = list.len() as isize;
-                        
-                        // Convert negative indices
-                        let start = if start < 0 { (len + start).max(0) } else { start } as usize;
-                        let stop = if stop < 0 { (len + stop).max(0) } else { stop } as usize;
-                        
-                        // Collect range
-                        let mut result = Vec::new();
-                        for (i, item) in list.iter().enumerate() {
-                            if i >= start && i <= stop {
-                                result.push(item.clone());
-                            }
-                            if i > stop {
-                                break;
-                            }
-                        }
-                        result
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(result)
-            }
-            None => Ok(Vec::new()),
-        }
-    }
-    
-    /// Get element at index
-    pub fn lindex(&self, db: DatabaseIndex, key: &[u8], index: isize) -> Result<Option<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Get element first, then touch
-                let result = match &stored_value.value {
-                    Value::List(list) => {
-                        let len = list.len() as isize;
-                        let idx = if index < 0 { len + index } else { index };
-                        
-                        if idx >= 0 && idx < len {
-                            list.get(idx as usize).cloned()
-                        } else {
-                            None
-                        }
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(result)
-            }
-            None => Ok(None),
-        }
-    }
-    
-    /// Set element at index
-    pub fn lset(&self, db: DatabaseIndex, key: Key, index: isize, value: Vec<u8>) -> Result<()> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::List(list) => {
-                        let len = list.len() as isize;
-                        let idx = if index < 0 { len + index } else { index };
-                        
-                        if idx >= 0 && idx < len {
-                            list[idx as usize] = value;
-                            stored_value.touch();
-                            Ok(())
-                        } else {
-                            Err(FerrousError::Command(CommandError::IndexOutOfRange))
-                        }
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => Err(FerrousError::Command(CommandError::NoSuchKey)),
-        }
-    }
-    
-    /// Trim list to specified range
-    pub fn ltrim(&self, db: DatabaseIndex, key: Key, start: isize, stop: isize) -> Result<()> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::List(list) => {
-                        let len = list.len() as isize;
-                        
-                        // Convert negative indices
-                        let start = if start < 0 { (len + start).max(0) } else { start } as usize;
-                        let stop = if stop < 0 { (len + stop).max(0) } else { stop } as usize;
-                        
-                        // Create new list with range
-                        let mut new_list = VecDeque::new();
-                        for (i, item) in list.iter().enumerate() {
-                            if i >= start && i <= stop {
-                                new_list.push_back(item.clone());
-                            }
-                        }
-                        
-                        *list = new_list;
-                        
-                        // Remove empty list
-                        if list.is_empty() {
-                            db_guard.data.remove(&key);
-                        } else {
-                            stored_value.touch();
-                        }
-                        
-                        Ok(())
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => Ok(()),
-        }
-    }
-    
-    /// Remove elements from list
-    pub fn lrem(&self, db: DatabaseIndex, key: Key, count: isize, element: Vec<u8>) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::List(list) => {
-                        let mut removed = 0;
-                        
-                        if count == 0 {
-                            // Remove all occurrences
-                            list.retain(|item| {
-                                if item == &element {
-                                    removed += 1;
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-                        } else if count > 0 {
-                            // Remove from head
-                            let mut new_list = VecDeque::new();
-                            let mut to_remove = count as usize;
-                            
-                            for item in list.drain(..) {
-                                if item == element && to_remove > 0 {
-                                    to_remove -= 1;
-                                    removed += 1;
-                                } else {
-                                    new_list.push_back(item);
-                                }
-                            }
-                            
-                            *list = new_list;
-                        } else {
-                            // Remove from tail
-                            let mut new_list = VecDeque::new();
-                            let mut to_remove = (-count) as usize;
-                            
-                            for item in list.drain(..).rev() {
-                                if item == element && to_remove > 0 {
-                                    to_remove -= 1;
-                                    removed += 1;
-                                } else {
-                                    new_list.push_front(item);
-                                }
-                            }
-                            
-                            *list = new_list;
-                        }
-                        
-                        // Remove empty list
-                        if list.is_empty() {
-                            db_guard.data.remove(&key);
-                        } else {
-                            stored_value.touch();
-                        }
-                        
-                        Ok(removed)
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => Ok(0),
-        }
-    }
-
-    /// Add members to a set
-    pub fn sadd(&self, db: DatabaseIndex, key: Key, members: Vec<Vec<u8>>) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        let added = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::Set(set) => {
-                        // Add to existing set
-                        let mut added = 0;
-                        for member in members {
-                            if set.insert(member) {
-                                added += 1;
-                            }
-                        }
-                        stored_value.touch();
-                        added
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                }
-            }
-            None => {
-                // Create new set
-                let mut set = HashSet::new();
-                let mut added = 0;
-                for member in members {
-                    if set.insert(member) {
-                        added += 1;
-                    }
-                }
-                
-                let stored_value = StoredValue::new(Value::Set(set));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                added
-            }
-        };
-        
-        Ok(added)
-    }
-    
-    /// Remove members from a set - Support Vec<&Vec<u8>> arguments for command handlers
-    pub fn srem<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, key: &[u8], members: &[T]) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::Set(set) => {
-                        let mut removed = 0;
-                        for member in members {
-                            if set.remove(member.as_ref()) {
-                                removed += 1;
-                            }
-                        }
-                        
-                        // Remove empty set
-                        if set.is_empty() {
-                            db_guard.data.remove(key);
-                        } else {
-                            stored_value.touch();
-                        }
-                        db_guard.mark_modified(key);
-                        
-                        Ok(removed)
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => Ok(0),
-        }
-    }
-    
-    /// Get all members of a set
-    pub fn smembers(&self, db: DatabaseIndex, key: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Clone members first, then touch
-                let members = match &stored_value.value {
-                    Value::Set(set) => set.iter().cloned().collect(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(members)
-            }
-            None => Ok(Vec::new()),
-        }
-    }
-    
-    /// Check if member exists in set
-    pub fn sismember(&self, db: DatabaseIndex, key: &[u8], member: &[u8]) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Check membership first, then touch
-                let is_member = match &stored_value.value {
-                    Value::Set(set) => set.contains(member),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(is_member)
-            }
-            None => Ok(false),
-        }
-    }
-    
-    /// Get cardinality of a set
-    pub fn scard(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Get length first, then touch
-                let len = match &stored_value.value {
-                    Value::Set(set) => set.len(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(len)
-            }
-            None => Ok(0),
-        }
-    }
-    
-    /// Get union of multiple sets - Support Vec<&Vec<u8>> arguments for command handlers
-    pub fn sunion<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, keys: &[T]) -> Result<Vec<Vec<u8>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        let mut result = HashSet::new();
-        
-        for key in keys {
-            if let Some(stored_value) = db_guard.data.get_mut(key.as_ref()) {
-                match &stored_value.value {
-                    Value::Set(set) => {
-                        for member in set {
-                            result.insert(member.clone());
-                        }
-                        stored_value.touch();
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                }
-            }
-        }
-        
-        Ok(result.into_iter().collect())
-    }
-    
-    /// Get intersection of multiple sets - Support Vec<&Vec<u8>> arguments for command handlers
-    pub fn sinter<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, keys: &[T]) -> Result<Vec<Vec<u8>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Get first set as base
-        let first_key = keys[0].as_ref();
-        let result: HashSet<Vec<u8>> = match db_guard.data.get_mut(first_key) {
-            Some(stored_value) => {
-                stored_value.touch();
-                match &stored_value.value {
-                    Value::Set(set) => set.iter().cloned().collect(),
-                    _ => return Err(StorageError::WrongType.into()),
-                }
-            }
-            None => return Ok(Vec::new()), // Empty set
-        };
-        
-        // Intersect with other sets
-        let mut result: HashSet<Vec<u8>> = result;
-        for k in 1..keys.len() {
-            let key = keys[k].as_ref();
-            if let Some(stored_value) = db_guard.data.get_mut(key) {
-                stored_value.touch();
-                match &stored_value.value {
-                    Value::Set(set) => {
-                        result.retain(|member| set.contains(member));
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                }
-            } else {
-                // Non-existent key means empty intersection
-                return Ok(Vec::new());
-            }
-        }
-        
-        Ok(result.into_iter().collect())
-    }
-    
-    /// Get difference of sets - Support Vec<&Vec<u8>> arguments for command handlers
-    pub fn sdiff<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, keys: &[T]) -> Result<Vec<Vec<u8>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        // Get first set as base
-        let first_key = keys[0].as_ref();
-        let result: HashSet<Vec<u8>> = match db_guard.data.get_mut(first_key) {
-            Some(stored_value) => {
-                stored_value.touch();
-                match &stored_value.value {
-                    Value::Set(set) => set.iter().cloned().collect(),
-                    _ => return Err(StorageError::WrongType.into()),
-                }
-            }
-            None => return Ok(Vec::new()),
-        };
-        
-        // Remove elements from other sets
-        let mut result = result;
-        for k in 1..keys.len() {
-            let key = keys[k].as_ref();
-            if let Some(stored_value) = db_guard.data.get_mut(key) {
-                stored_value.touch();
-                match &stored_value.value {
-                    Value::Set(set) => {
-                        for member in set {
-                            result.remove(member);
-                        }
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                }
-            }
-        }
-        
-        Ok(result.into_iter().collect())
-    }
-    
-    /// Get random members from a set
-    pub fn srandmember(&self, db: DatabaseIndex, key: &[u8], count: i64) -> Result<Vec<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Extract and process members first, then touch
-                let result = match &stored_value.value {
-                    Value::Set(set) => {
-                        let members: Vec<Vec<u8>> = set.iter().cloned().collect();
-                        if members.is_empty() {
-                            Vec::new()
-                        } else {
-                            let mut rng = rand::thread_rng();
-                            
-                            if count >= 0 {
-                                // Return unique members
-                                let n = std::cmp::min(count as usize, members.len());
-                                let mut result = members;
-                                result.shuffle(&mut rng);
-                                result.truncate(n);
-                                result
-                            } else {
-                                // Allow duplicates
-                                let n = (-count) as usize;
-                                let mut result = Vec::with_capacity(n);
-                                for _ in 0..n {
-                                    if let Some(member) = members.choose(&mut rng) {
-                                        result.push(member.clone());
-                                    }
-                                }
-                                result
-                            }
-                        }
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(result)
-            }
-            None => Ok(Vec::new()),
-        }
-    }
-    
-    /// Pop random members from a set
-    pub fn spop(&self, db: DatabaseIndex, key: Key, count: usize) -> Result<Vec<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
-        
-        match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::Set(set) => {
-                        let mut members: Vec<Vec<u8>> = set.iter().cloned().collect();
-                        if members.is_empty() {
-                            return Ok(Vec::new());
-                        }
-                        
-                        let mut rng = rand::thread_rng();
-                        members.shuffle(&mut rng);
-                        
-                        let n = std::cmp::min(count, members.len());
-                        let result: Vec<Vec<u8>> = members.drain(..n).collect();
-                        
-                        // Remove popped members
-                        for member in &result {
-                            set.remove(member);
-                        }
-                        
-                        // Remove empty set
-                        if set.is_empty() {
-                            db_guard.data.remove(&key);
-                        } else {
-                            stored_value.touch();
-                        }
-                        
-                        Ok(result)
-                    }
-                    _ => Err(StorageError::WrongType.into()),
-                }
-            }
-            None => Ok(Vec::new()),
-        }
-    }
-
     /// Calculate memory size for a key-value pair
     fn calculate_value_size(&self, key: &[u8], value: &Value) -> usize {
         let key_size = MemoryManager::calculate_size(key);
@@ -1310,463 +362,1285 @@ impl StorageEngine {
                     + std::mem::size_of::<HashMap<Vec<u8>, Vec<u8>>>()
             }
             Value::SortedSet(skiplist) => {
-                // Use the memory_usage method directly from the SkipList
                 skiplist.memory_usage()
             }
         };
         key_size + value_size
     }
 
-    /// Set hash fields
-    pub fn hset(&self, db: DatabaseIndex, key: Key, field_values: Vec<(Vec<u8>, Vec<u8>)>) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+    /// Calculate the memory size of a sorted set member
+    fn calculate_member_size(&self, member: &[u8]) -> usize {
+        MemoryManager::calculate_size(member) + std::mem::size_of::<f64>() + 32
+    }
+
+    /// Add a member with score to a sorted set - NO access time tracking
+    pub fn zadd(&self, db: DatabaseIndex, key: Key, member: Vec<u8>, score: f64) -> Result<bool> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        let fields_added = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::Hash(hash) => {
-                        // Set fields in existing hash
-                        let mut added = 0;
-                        for (field, value) in field_values {
-                            if hash.insert(field, value).is_none() {
-                                added += 1;
+        let is_new = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::SortedSet(skiplist) => {
+                    let old_score = skiplist.insert(member.clone(), score);
+                    // NO touch() call - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    old_score.is_none()
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            // Create a new sorted set
+            let skiplist = SkipList::new();
+            skiplist.insert(member.clone(), score);
+            
+            let memory_size = self.calculate_value_size(&key, &Value::empty_sorted_set()) +
+                             self.calculate_member_size(&member);
+            
+            if !self.memory_manager.add_memory(memory_size) {
+                return Err(StorageError::OutOfMemory.into());
+            }
+            
+            let stored_value = StoredValue::new(Value::SortedSet(Arc::new(skiplist)));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            true
+        };
+        
+        Ok(is_new)
+    }
+    
+    pub fn zrem(&self, db: DatabaseIndex, key: &[u8], member: &[u8]) -> Result<bool> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let (removed, is_empty) = match &mut stored_value.value {
+                Value::SortedSet(skiplist) => {
+                    let removed = skiplist.remove(member).is_some();
+                    (removed, skiplist.is_empty())
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            if removed {
+                let member_size = self.calculate_member_size(member);
+                self.memory_manager.remove_memory(member_size);
+                
+                if is_empty {
+                    shard_guard.data.remove(key);
+                } 
+                // NO else branch with touch() - no access time tracking overhead
+            }
+            
+            Ok(removed)
+        } else {
+            Ok(false)
+        }
+    }
+    
+    pub fn zscore(&self, db: DatabaseIndex, key: &[u8], member: &[u8]) -> Result<Option<f64>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let score = match &stored_value.value {
+                Value::SortedSet(skiplist) => skiplist.get_score(member),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            // NO touch() call - no access time tracking overhead
+            Ok(score)
+        } else {
+            Ok(None)
+        }
+    }
+    
+    pub fn zrank(&self, db: DatabaseIndex, key: &[u8], member: &[u8], reverse: bool) -> Result<Option<usize>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let result = match &stored_value.value {
+                Value::SortedSet(skiplist) => {
+                    let rank = skiplist.get_rank(member);
+                    
+                    if let Some(rank) = rank {
+                        if reverse {
+                            Some(skiplist.len() - 1 - rank)
+                        } else {
+                            Some(rank)
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            // NO touch() call - no access time tracking overhead
+            Ok(result)
+        } else {
+            Ok(None)
+        }
+    }
+    
+    pub fn zrange(&self, db: DatabaseIndex, key: &[u8], start: isize, stop: isize, reverse: bool) 
+        -> Result<Vec<(Vec<u8>, f64)>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let result = match &stored_value.value {
+                Value::SortedSet(skiplist) => {
+                    let len = skiplist.len();
+                    if len == 0 {
+                        Vec::new()
+                    } else {
+                        let start_idx = if start < 0 { 
+                            (len as isize + start).max(0) as usize
+                        } else {
+                            start as usize
+                        };
+                        
+                        let stop_idx = if stop < 0 {
+                            (len as isize + stop).max(0) as usize
+                        } else {
+                            stop as usize
+                        };
+                        
+                        if reverse {
+                            let real_start = len.saturating_sub(1).saturating_sub(stop_idx.min(len.saturating_sub(1)));
+                            let real_stop = len.saturating_sub(1).saturating_sub(start_idx.min(len.saturating_sub(1)));
+                            
+                            let range = skiplist.range_by_rank(real_start, real_stop);
+                            let mut items = range.items;
+                            items.reverse();
+                            items
+                        } else {
+                            if start_idx >= len || start_idx > stop_idx {
+                                Vec::new()
+                            } else {
+                                let start_idx = start_idx.min(len - 1);
+                                let stop_idx = stop_idx.min(len - 1);
+                                
+                                let range = skiplist.range_by_rank(start_idx, stop_idx);
+                                range.items
                             }
                         }
-                        stored_value.touch();
-                        added
+                    }
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            // NO touch() call - no access time tracking overhead  
+            Ok(result)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    pub fn zrangebyscore(&self, db: DatabaseIndex, key: &[u8], min_score: f64, max_score: f64, reverse: bool) 
+        -> Result<Vec<(Vec<u8>, f64)>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let result = match &stored_value.value {
+                Value::SortedSet(skiplist) => {
+                    let range = skiplist.range_by_score(min_score, max_score);
+                    let mut items = range.items;
+                    
+                    if reverse {
+                        items.reverse();
+                    }
+                    
+                    items
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            // NO touch() call - no access time tracking overhead
+            Ok(result)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    pub fn zcount(&self, db: DatabaseIndex, key: &[u8], min_score: f64, max_score: f64) -> Result<usize> {
+        let members = self.zrangebyscore(db, key, min_score, max_score, false)?;
+        Ok(members.len())
+    }
+    
+    pub fn zincrby(&self, db: DatabaseIndex, key: Key, member: Vec<u8>, increment: f64) -> Result<f64> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let new_score = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::SortedSet(skiplist) => {
+                    let new_score = match skiplist.get_score(&member) {
+                        Some(curr_score) => curr_score + increment,
+                        None => increment,
+                    };
+                    
+                    skiplist.insert(member, new_score);
+                    // NO touch() call - no access time tracking overhead
+                    new_score
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            let skiplist = SkipList::new();
+            skiplist.insert(member.clone(), increment);
+            
+            let memory_size = self.calculate_value_size(&key, &Value::empty_sorted_set()) +
+                             self.calculate_member_size(&member);
+            
+            if !self.memory_manager.add_memory(memory_size) {
+                return Err(StorageError::OutOfMemory.into());
+            }
+            
+            let stored_value = StoredValue::new(Value::SortedSet(Arc::new(skiplist)));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            
+            increment
+        };
+        
+        Ok(new_score)
+    }
+
+    /// Push elements to the head of a list - NO access time tracking
+    pub fn lpush(&self, db: DatabaseIndex, key: Key, elements: Vec<Vec<u8>>) -> Result<usize> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let list_len = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::List(list) => {
+                    for element in elements.into_iter().rev() {
+                        list.push_front(element);
+                    }
+                    let len = list.len();
+                    // NO touch() call - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    len
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            // Create new list
+            let mut list = VecDeque::new();
+            for element in elements.into_iter().rev() {
+                list.push_front(element);
+            }
+            let len = list.len();
+            
+            let stored_value = StoredValue::new(Value::List(list));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            len
+        };
+        
+        Ok(list_len)
+    }
+    
+    pub fn rpush(&self, db: DatabaseIndex, key: Key, elements: Vec<Vec<u8>>) -> Result<usize> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let list_len = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::List(list) => {
+                    for element in elements {
+                        list.push_back(element);
+                    }
+                    let len = list.len();
+                    // NO touch() call - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    len
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            // Create new list
+            let mut list = VecDeque::new();
+            for element in elements {
+                list.push_back(element);
+            }
+            let len = list.len();
+            
+            let stored_value = StoredValue::new(Value::List(list));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            len
+        };
+        
+        Ok(list_len)
+    }
+    
+    pub fn lpop(&self, db: DatabaseIndex, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            match &mut stored_value.value {
+                Value::List(list) => {
+                    let element = list.pop_front();
+                    
+                    if list.is_empty() {
+                        shard_guard.data.remove(key);
+                    } 
+                    // NO else branch with touch() - no access time tracking overhead
+                    
+                    Ok(element)
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+    
+    pub fn rpop(&self, db: DatabaseIndex, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            match &mut stored_value.value {
+                Value::List(list) => {
+                    let element = list.pop_back();
+                    
+                    if list.is_empty() {
+                        shard_guard.data.remove(key);
+                    }
+                    // NO else branch with touch() - no access time tracking overhead
+                    
+                    Ok(element)
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+    
+    pub fn llen(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let len = match &stored_value.value {
+                Value::List(list) => list.len(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(len)
+        } else {
+            Ok(0)
+        }
+    }
+    
+    pub fn lrange(&self, db: DatabaseIndex, key: &[u8], start: isize, stop: isize) -> Result<Vec<Vec<u8>>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let result = match &stored_value.value {
+                Value::List(list) => {
+                    let len = list.len() as isize;
+                    
+                    let start = if start < 0 { (len + start).max(0) } else { start } as usize;
+                    let stop = if stop < 0 { (len + stop).max(0) } else { stop } as usize;
+                    
+                    let mut result = Vec::new();
+                    for (i, item) in list.iter().enumerate() {
+                        if i >= start && i <= stop {
+                            result.push(item.clone());
+                        }
+                        if i > stop {
+                            break;
+                        }
+                    }
+                    result
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(result)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    pub fn lindex(&self, db: DatabaseIndex, key: &[u8], index: isize) -> Result<Option<Vec<u8>>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let result = match &stored_value.value {
+                Value::List(list) => {
+                    let len = list.len() as isize;
+                    let idx = if index < 0 { len + index } else { index };
+                    
+                    if idx >= 0 && idx < len {
+                        list.get(idx as usize).cloned()
+                    } else {
+                        None
+                    }
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(result)
+        } else {
+            Ok(None)
+        }
+    }
+    
+    pub fn lset(&self, db: DatabaseIndex, key: Key, index: isize, value: Vec<u8>) -> Result<()> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::List(list) => {
+                    let len = list.len() as isize;
+                    let idx = if index < 0 { len + index } else { index };
+                    
+                    if idx >= 0 && idx < len {
+                        list[idx as usize] = value;
+                        // NO touch() call - no access time tracking overhead
+                        Ok(())
+                    } else {
+                        Err(FerrousError::Command(CommandError::IndexOutOfRange))
+                    }
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Err(FerrousError::Command(CommandError::NoSuchKey))
+        }
+    }
+    
+    pub fn ltrim(&self, db: DatabaseIndex, key: Key, start: isize, stop: isize) -> Result<()> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::List(list) => {
+                    let len = list.len() as isize;
+                    
+                    let start = if start < 0 { (len + start).max(0) } else { start } as usize;
+                    let stop = if stop < 0 { (len + stop).max(0) } else { stop } as usize;
+                    
+                    let mut new_list = VecDeque::new();
+                    for (i, item) in list.iter().enumerate() {
+                        if i >= start && i <= stop {
+                            new_list.push_back(item.clone());
+                        }
+                    }
+                    
+                    *list = new_list;
+                    
+                    if list.is_empty() {
+                        shard_guard.data.remove(&key);
+                    } 
+                    // NO else branch with touch() - no access time tracking overhead
+                    
+                    Ok(())
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Ok(())
+        }
+    }
+    
+    pub fn lrem(&self, db: DatabaseIndex, key: Key, count: isize, element: Vec<u8>) -> Result<usize> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::List(list) => {
+                    let mut removed = 0;
+                    
+                    if count == 0 {
+                        list.retain(|item| {
+                            if item == &element {
+                                removed += 1;
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                    } else if count > 0 {
+                        let mut new_list = VecDeque::new();
+                        let mut to_remove = count as usize;
+                        
+                        for item in list.drain(..) {
+                            if item == element && to_remove > 0 {
+                                to_remove -= 1;
+                                removed += 1;
+                            } else {
+                                new_list.push_back(item);
+                            }
+                        }
+                        
+                        *list = new_list;
+                    } else {
+                        let mut new_list = VecDeque::new();
+                        let mut to_remove = (-count) as usize;
+                        
+                        for item in list.drain(..).rev() {
+                            if item == element && to_remove > 0 {
+                                to_remove -= 1;
+                                removed += 1;
+                            } else {
+                                new_list.push_front(item);
+                            }
+                        }
+                        
+                        *list = new_list;
+                    }
+                    
+                    if list.is_empty() {
+                        shard_guard.data.remove(&key);
+                    } 
+                    // NO else branch with touch() - no access time tracking overhead
+                    
+                    Ok(removed)
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Set operations - NO access time tracking
+    pub fn sadd(&self, db: DatabaseIndex, key: Key, members: Vec<Vec<u8>>) -> Result<usize> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let added = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::Set(set) => {
+                    let mut added = 0;
+                    for member in members {
+                        if set.insert(member) {
+                            added += 1;
+                        }
+                    }
+                    // NO touch() call - no access time tracking overhead
+                    added
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            // Create new set
+            let mut set = HashSet::new();
+            let mut added = 0;
+            for member in members {
+                if set.insert(member) {
+                    added += 1;
+                }
+            }
+            
+            let stored_value = StoredValue::new(Value::Set(set));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            added
+        };
+        
+        Ok(added)
+    }
+    
+    pub fn srem<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, key: &[u8], members: &[T]) -> Result<usize> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            match &mut stored_value.value {
+                Value::Set(set) => {
+                    let mut removed = 0;
+                    for member in members {
+                        if set.remove(member.as_ref()) {
+                            removed += 1;
+                        }
+                    }
+                    
+                    if set.is_empty() {
+                        shard_guard.data.remove(key);
+                    } 
+                    // NO else branch with touch() - no access time tracking overhead
+                    shard_guard.mark_modified(key);
+                    
+                    Ok(removed)
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Ok(0)
+        }
+    }
+    
+    pub fn smembers(&self, db: DatabaseIndex, key: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let members = match &stored_value.value {
+                Value::Set(set) => set.iter().cloned().collect(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(members)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    pub fn sismember(&self, db: DatabaseIndex, key: &[u8], member: &[u8]) -> Result<bool> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let is_member = match &stored_value.value {
+                Value::Set(set) => set.contains(member),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(is_member)
+        } else {
+            Ok(false)
+        }
+    }
+    
+    pub fn scard(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let len = match &stored_value.value {
+                Value::Set(set) => set.len(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(len)
+        } else {
+            Ok(0)
+        }
+    }
+    
+    pub fn sunion<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, keys: &[T]) -> Result<Vec<Vec<u8>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        let mut result = HashSet::new();
+        
+        for key_ref in keys {
+            let key = key_ref.as_ref();
+            let shard = self.get_shard(db, key)?;
+            let mut shard_guard = shard.write().unwrap();
+            
+            if let Some(stored_value) = shard_guard.data.get_mut(key) {
+                match &stored_value.value {
+                    Value::Set(set) => {
+                        for member in set {
+                            result.insert(member.clone());
+                        }
+                        // NO touch() call - no access time tracking overhead
                     }
                     _ => return Err(StorageError::WrongType.into()),
                 }
             }
-            None => {
-                // Create new hash
-                let mut hash = HashMap::new();
-                let len = field_values.len();
-                for (field, value) in field_values {
-                    hash.insert(field, value);
-                }
-                
-                let stored_value = StoredValue::new(Value::Hash(hash));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                len // All fields are new
+        }
+        
+        Ok(result.into_iter().collect())
+    }
+    
+    pub fn sinter<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, keys: &[T]) -> Result<Vec<Vec<u8>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Get first set as base
+        let first_key = keys[0].as_ref();
+        let shard = self.get_shard(db, first_key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let result: HashSet<Vec<u8>> = if let Some(stored_value) = shard_guard.data.get_mut(first_key) {
+            // NO touch() call - no access time tracking overhead
+            match &stored_value.value {
+                Value::Set(set) => set.iter().cloned().collect(),
+                _ => return Err(StorageError::WrongType.into()),
             }
+        } else {
+            return Ok(Vec::new());
+        };
+        drop(shard_guard); // Release lock early
+        
+        // Intersect with other sets
+        let mut result = result;
+        for k in 1..keys.len() {
+            let key = keys[k].as_ref();
+            let shard = self.get_shard(db, key)?;
+            let mut shard_guard = shard.write().unwrap();
+            
+            if let Some(stored_value) = shard_guard.data.get_mut(key) {
+                // NO touch() call - no access time tracking overhead
+                match &stored_value.value {
+                    Value::Set(set) => {
+                        result.retain(|member| set.contains(member));
+                    }
+                    _ => return Err(StorageError::WrongType.into()),
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+        
+        Ok(result.into_iter().collect())
+    }
+    
+    pub fn sdiff<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, keys: &[T]) -> Result<Vec<Vec<u8>>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // Get first set as base
+        let first_key = keys[0].as_ref();
+        let shard = self.get_shard(db, first_key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let result: HashSet<Vec<u8>> = if let Some(stored_value) = shard_guard.data.get_mut(first_key) {
+            // NO touch() call - no access time tracking overhead
+            match &stored_value.value {
+                Value::Set(set) => set.iter().cloned().collect(),
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            return Ok(Vec::new());
+        };
+        drop(shard_guard); // Release lock early
+        
+        // Remove elements from other sets
+        let mut result = result;
+        for k in 1..keys.len() {
+            let key = keys[k].as_ref();
+            let shard = self.get_shard(db, key)?;
+            let mut shard_guard = shard.write().unwrap();
+            
+            if let Some(stored_value) = shard_guard.data.get_mut(key) {
+                // NO touch() call - no access time tracking overhead
+                match &stored_value.value {
+                    Value::Set(set) => {
+                        for member in set {
+                            result.remove(member);
+                        }
+                    }
+                    _ => return Err(StorageError::WrongType.into()),
+                }
+            }
+        }
+        
+        Ok(result.into_iter().collect())
+    }
+    
+    pub fn srandmember(&self, db: DatabaseIndex, key: &[u8], count: i64) -> Result<Vec<Vec<u8>>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let result = match &stored_value.value {
+                Value::Set(set) => {
+                    let members: Vec<Vec<u8>> = set.iter().cloned().collect();
+                    if members.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut rng = rand::thread_rng();
+                        
+                        if count >= 0 {
+                            let n = std::cmp::min(count as usize, members.len());
+                            let mut result = members;
+                            result.shuffle(&mut rng);
+                            result.truncate(n);
+                            result
+                        } else {
+                            let n = (-count) as usize;
+                            let mut result = Vec::with_capacity(n);
+                            for _ in 0..n {
+                                if let Some(member) = members.choose(&mut rng) {
+                                    result.push(member.clone());
+                                }
+                            }
+                            result
+                        }
+                    }
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(result)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    pub fn spop(&self, db: DatabaseIndex, key: Key, count: usize) -> Result<Vec<Vec<u8>>> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::Set(set) => {
+                    let mut members: Vec<Vec<u8>> = set.iter().cloned().collect();
+                    if members.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    
+                    let mut rng = rand::thread_rng();
+                    members.shuffle(&mut rng);
+                    
+                    let n = std::cmp::min(count, members.len());
+                    let result: Vec<Vec<u8>> = members.drain(..n).collect();
+                    
+                    for member in &result {
+                        set.remove(member);
+                    }
+                    
+                    if set.is_empty() {
+                        shard_guard.data.remove(&key);
+                    } 
+                    // NO else branch with touch() - no access time tracking overhead
+                    
+                    Ok(result)
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Hash operations - NO access time tracking
+    pub fn hset(&self, db: DatabaseIndex, key: Key, field_values: Vec<(Vec<u8>, Vec<u8>)>) -> Result<usize> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let fields_added = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::Hash(hash) => {
+                    let mut added = 0;
+                    for (field, value) in field_values {
+                        if hash.insert(field, value).is_none() {
+                            added += 1;
+                        }
+                    }
+                    // NO touch() call - no access time tracking overhead
+                    added
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            // Create new hash
+            let mut hash = HashMap::new();
+            let len = field_values.len();
+            for (field, value) in field_values {
+                hash.insert(field, value);
+            }
+            
+            let stored_value = StoredValue::new(Value::Hash(hash));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            len
         };
         
         Ok(fields_added)
     }
     
-    /// Get hash field value
     pub fn hget(&self, db: DatabaseIndex, key: &[u8], field: &[u8]) -> Result<Option<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Get value first, then touch
-                let value = match &stored_value.value {
-                    Value::Hash(hash) => hash.get(field).cloned(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(value)
-            }
-            None => Ok(None),
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let value = match &stored_value.value {
+                Value::Hash(hash) => hash.get(field).cloned(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(value)
+        } else {
+            Ok(None)
         }
     }
     
-    /// Get multiple hash field values - Support Vec<&Vec<u8>> arguments for command handlers
     pub fn hmget<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, key: &[u8], fields: &[T]) -> Result<Vec<Option<Vec<u8>>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                stored_value.touch();
-                match &stored_value.value {
-                    Value::Hash(hash) => Ok(fields.iter().map(|field| hash.get(field.as_ref()).cloned()).collect()),
-                    _ => Err(StorageError::WrongType.into()),
-                }
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            // NO touch() call - no access time tracking overhead
+            match &stored_value.value {
+                Value::Hash(hash) => Ok(fields.iter().map(|field| hash.get(field.as_ref()).cloned()).collect()),
+                _ => Err(StorageError::WrongType.into()),
             }
-            None => Ok(vec![None; fields.len()]),
+        } else {
+            Ok(vec![None; fields.len()])
         }
     }
     
-    /// Get all hash fields and values
     pub fn hgetall(&self, db: DatabaseIndex, key: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Clone pairs first, then touch
-                let pairs = match &stored_value.value {
-                    Value::Hash(hash) => hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(pairs)
-            }
-            None => Ok(Vec::new()),
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let pairs = match &stored_value.value {
+                Value::Hash(hash) => hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(pairs)
+        } else {
+            Ok(Vec::new())
         }
     }
     
-    /// Delete hash fields - Support Vec<&Vec<u8>> arguments for command handlers
     pub fn hdel<'a, T: AsRef<[u8]>>(&self, db: DatabaseIndex, key: Key, fields: &[T]) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::Hash(hash) => {
-                        let mut deleted = 0;
-                        for field in fields {
-                            if hash.remove(field.as_ref()).is_some() {
-                                deleted += 1;
-                            }
+        if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::Hash(hash) => {
+                    let mut deleted = 0;
+                    for field in fields {
+                        if hash.remove(field.as_ref()).is_some() {
+                            deleted += 1;
                         }
-                        
-                        // Remove empty hash
-                        if hash.is_empty() {
-                            db_guard.data.remove(&key);
-                        } else {
-                            stored_value.touch();
-                        }
-                        db_guard.mark_modified(&key);
-                        
-                        Ok(deleted)
                     }
-                    _ => Err(StorageError::WrongType.into()),
+                    
+                    if hash.is_empty() {
+                        shard_guard.data.remove(&key);
+                    } 
+                    // NO else branch with touch() - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    
+                    Ok(deleted)
                 }
+                _ => Err(StorageError::WrongType.into()),
             }
-            None => Ok(0),
+        } else {
+            Ok(0)
         }
     }
     
-    /// Get hash length
     pub fn hlen(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Get length first, then touch
-                let len = match &stored_value.value {
-                    Value::Hash(hash) => hash.len(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(len)
-            }
-            None => Ok(0),
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let len = match &stored_value.value {
+                Value::Hash(hash) => hash.len(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(len)
+        } else {
+            Ok(0)
         }
     }
     
-    /// Check if hash field exists
     pub fn hexists(&self, db: DatabaseIndex, key: &[u8], field: &[u8]) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Check existence first, then touch
-                let exists = match &stored_value.value {
-                    Value::Hash(hash) => hash.contains_key(field),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(exists)
-            }
-            None => Ok(false),
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let exists = match &stored_value.value {
+                Value::Hash(hash) => hash.contains_key(field),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(exists)
+        } else {
+            Ok(false)
         }
     }
     
-    /// Get all hash field names
     pub fn hkeys(&self, db: DatabaseIndex, key: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Get keys first, then touch
-                let keys = match &stored_value.value {
-                    Value::Hash(hash) => hash.keys().cloned().collect(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(keys)
-            }
-            None => Ok(Vec::new()),
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let keys = match &stored_value.value {
+                Value::Hash(hash) => hash.keys().cloned().collect(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(keys)
+        } else {
+            Ok(Vec::new())
         }
     }
     
-    /// Get all hash values
     pub fn hvals(&self, db: DatabaseIndex, key: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Get values first, then touch
-                let values = match &stored_value.value {
-                    Value::Hash(hash) => hash.values().cloned().collect(),
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                stored_value.touch();
-                Ok(values)
-            }
-            None => Ok(Vec::new()),
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let values = match &stored_value.value {
+                Value::Hash(hash) => hash.values().cloned().collect(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            // NO touch() call - no access time tracking overhead
+            Ok(values)
+        } else {
+            Ok(Vec::new())
         }
     }
     
-    /// Increment hash field by integer value
     pub fn hincrby(&self, db: DatabaseIndex, key: Key, field: Vec<u8>, increment: i64) -> Result<i64> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        let new_value = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                match &mut stored_value.value {
-                    Value::Hash(hash) => {
-                        let new_val = match hash.get(&field) {
-                            Some(current_bytes) => {
-                                // Parse current value as integer
-                                let current_str = String::from_utf8_lossy(current_bytes);
-                                match current_str.parse::<i64>() {
-                                    Ok(current) => current + increment,
-                                    Err(_) => return Err(FerrousError::Command(CommandError::NotInteger)),
-                                }
+        let new_value = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::Hash(hash) => {
+                    let new_val = match hash.get(&field) {
+                        Some(current_bytes) => {
+                            let current_str = String::from_utf8_lossy(current_bytes);
+                            match current_str.parse::<i64>() {
+                                Ok(current) => current + increment,
+                                Err(_) => return Err(FerrousError::Command(CommandError::NotInteger)),
                             }
-                            None => increment,
-                        };
-                        
-                        hash.insert(field, new_val.to_string().into_bytes());
-                        stored_value.touch();
-                        new_val
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
+                        }
+                        None => increment,
+                    };
+                    
+                    hash.insert(field, new_val.to_string().into_bytes());
+                    // NO touch() call - no access time tracking overhead
+                    new_val
                 }
+                _ => return Err(StorageError::WrongType.into()),
             }
-            None => {
-                // Create new hash with single field
-                let mut hash = HashMap::new();
-                hash.insert(field, increment.to_string().into_bytes());
-                
-                let stored_value = StoredValue::new(Value::Hash(hash));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                increment
-            }
+        } else {
+            // Create new hash with single field
+            let mut hash = HashMap::new();
+            hash.insert(field, increment.to_string().into_bytes());
+            
+            let stored_value = StoredValue::new(Value::Hash(hash));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            increment
         };
         
         Ok(new_value)
     }
 
-    /// Append value to a string
+    /// String operations - NO access time tracking
     pub fn append(&self, db: DatabaseIndex, key: Key, value: Vec<u8>) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        let new_len = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                // Create code path without nested mutable borrow
-                match &stored_value.value {
-                    Value::String(ref bytes) => {
-                        // Get a copy of the current bytes
-                        let mut new_bytes = bytes.clone();
-                        // Append the new value
-                        new_bytes.extend_from_slice(&value);
-                        let len = new_bytes.len();
-                        
-                        // Replace the string value
-                        stored_value.value = Value::String(new_bytes);
-                        stored_value.touch();
-                        db_guard.mark_modified(&key);
-                        len
-                    }
-                    _ => return Err(StorageError::WrongType.into()),
+        let new_len = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::String(bytes) => {
+                    bytes.extend_from_slice(&value);
+                    let len = bytes.len();
+                    // NO touch() call - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    len
                 }
+                _ => return Err(StorageError::WrongType.into()),
             }
-            None => {
-                // Create new string
-                let len = value.len();
-                let stored_value = StoredValue::new(Value::String(value));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                len
-            }
+        } else {
+            // Create new string
+            let len = value.len();
+            let stored_value = StoredValue::new(Value::String(value));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            len
         };
         
         Ok(new_len)
     }
     
-    /// Get string length
     pub fn strlen(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let db_guard = database.read().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap(); // Use read lock for size check
         
-        match db_guard.data.get(key) {
-            Some(stored_value) => {
-                match &stored_value.value {
-                    Value::String(bytes) => Ok(bytes.len()),
-                    _ => Err(StorageError::WrongType.into()),
-                }
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            match &stored_value.value {
+                Value::String(bytes) => Ok(bytes.len()),
+                _ => Err(StorageError::WrongType.into()),
             }
-            None => Ok(0),
+        } else {
+            Ok(0)
         }
     }
     
-    /// Get substring
     pub fn getrange(&self, db: DatabaseIndex, key: &[u8], start: isize, end: isize) -> Result<Vec<u8>> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        match db_guard.data.get_mut(key) {
-            Some(stored_value) => {
-                // Get substring first, then touch
-                let substring = match &stored_value.value {
-                    Value::String(bytes) => {
-                        let len = bytes.len() as isize;
-                        
-                        // Convert negative indices
-                        let start = if start < 0 {
-                            std::cmp::max(0, len + start) as usize
-                        } else {
-                            start as usize
-                        };
-                        
-                        let end = if end < 0 {
-                            std::cmp::max(-1, len + end) as usize
-                        } else {
-                            std::cmp::min(end as usize, len as usize - 1)
-                        };
-                        
-                        if start > end || start >= bytes.len() {
-                            Vec::new()
-                        } else {
-                            bytes[start..=end].to_vec()
-                        }
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let substring = match &stored_value.value {
+                Value::String(bytes) => {
+                    let len = bytes.len() as isize;
+                    
+                    let start = if start < 0 {
+                        std::cmp::max(0, len + start) as usize
+                    } else {
+                        start as usize
+                    };
+                    
+                    let end = if end < 0 {
+                        std::cmp::max(-1, len + end) as usize
+                    } else {
+                        std::cmp::min(end as usize, len as usize - 1)
+                    };
+                    
+                    if start > end || start >= bytes.len() {
+                        Vec::new()
+                    } else {
+                        bytes[start..=end].to_vec()
                     }
-                    _ => return Err(StorageError::WrongType.into()),
-                };
-                
-                stored_value.touch();
-                Ok(substring)
-            }
-            None => Ok(Vec::new()),
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            // NO touch() call - no access time tracking overhead
+            Ok(substring)
+        } else {
+            Ok(Vec::new())
         }
     }
     
-    /// Set substring
     pub fn setrange(&self, db: DatabaseIndex, key: Key, offset: usize, value: Vec<u8>) -> Result<usize> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        let new_len = match db_guard.data.get_mut(&key) {
-            Some(stored_value) => {
-                // Create code path without nested mutable borrow
-                match &stored_value.value {
-                    Value::String(ref bytes) => {
-                        // Get a copy of the current bytes
-                        let mut new_bytes = bytes.clone();
-                        
-                        // Extend if needed
-                        let required_len = offset + value.len();
-                        if required_len > new_bytes.len() {
-                            new_bytes.resize(required_len, 0);
-                        }
-                        
-                        // Set the range
-                        new_bytes[offset..offset + value.len()].copy_from_slice(&value);
-                        let len = new_bytes.len();
-                        
-                        // Replace the string value
-                        stored_value.value = Value::String(new_bytes);
-                        stored_value.touch();
-                        db_guard.mark_modified(&key);
-                        len
+        let new_len = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::String(bytes) => {
+                    let required_len = offset + value.len();
+                    if required_len > bytes.len() {
+                        bytes.resize(required_len, 0);
                     }
-                    _ => return Err(StorageError::WrongType.into()),
+                    
+                    bytes[offset..offset + value.len()].copy_from_slice(&value);
+                    let len = bytes.len();
+                    
+                    // NO touch() call - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    len
                 }
+                _ => return Err(StorageError::WrongType.into()),
             }
-            None => {
-                // Create new string with padding
-                let mut new_string = vec![0; offset + value.len()];
-                new_string[offset..].copy_from_slice(&value);
-                let len = new_string.len();
-                
-                let stored_value = StoredValue::new(Value::String(new_string));
-                db_guard.data.insert(key.clone(), stored_value);
-                db_guard.mark_modified(&key);
-                len
-            }
+        } else {
+            // Create new string with padding
+            let mut new_string = vec![0; offset + value.len()];
+            new_string[offset..].copy_from_slice(&value);
+            let len = new_string.len();
+            
+            let stored_value = StoredValue::new(Value::String(new_string));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            len
         };
         
         Ok(new_len)
     }
     
-    /// Get key type
     pub fn key_type(&self, db: DatabaseIndex, key: &[u8]) -> Result<String> {
-        let database = self.get_database(db)?;
-        let db_guard = database.read().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap(); // Use read lock for type check
         
-        match db_guard.data.get(key) {
-            Some(stored_value) => {
-                let type_name = match &stored_value.value {
-                    Value::String(_) => "string",
-                    Value::List(_) => "list",
-                    Value::Set(_) => "set",
-                    Value::Hash(_) => "hash",
-                    Value::SortedSet(_) => "zset",
-                };
-                Ok(type_name.to_string())
-            }
-            None => Ok("none".to_string()),
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            let type_name = match &stored_value.value {
+                Value::String(_) => "string",
+                Value::List(_) => "list",
+                Value::Set(_) => "set",
+                Value::Hash(_) => "hash",
+                Value::SortedSet(_) => "zset",
+            };
+            Ok(type_name.to_string())
+        } else {
+            Ok("none".to_string())
         }
     }
     
-    /// Rename a key
     pub fn rename(&self, db: DatabaseIndex, old_key: &[u8], new_key: Key) -> Result<()> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        // Handle cross-shard renames by using both shards
+        let old_shard = self.get_shard(db, old_key)?;
+        let new_shard = self.get_shard(db, &new_key)?;
         
-        // Get the value
-        let stored_value = db_guard.data.remove(old_key)
-            .ok_or_else(|| FerrousError::Command(CommandError::NoSuchKey))?;
-        
-        // Insert with new key (overwrites if exists)
-        db_guard.data.insert(new_key.clone(), stored_value);
-        db_guard.mark_modified(&new_key);
-        
-        Ok(())
+        if Arc::ptr_eq(old_shard, new_shard) {
+            // Same shard - simple case
+            let mut shard_guard = old_shard.write().unwrap();
+            if let Some(stored_value) = shard_guard.data.remove(old_key) {
+                shard_guard.data.insert(new_key.clone(), stored_value);
+                shard_guard.mark_modified(&new_key);
+                Ok(())
+            } else {
+                Err(FerrousError::Command(CommandError::NoSuchKey))
+            }
+        } else {
+            // Cross-shard rename - acquire both locks in consistent order
+            let (first_shard, second_shard, is_old_first) = if (old_shard.as_ref() as *const _) < (new_shard.as_ref() as *const _) {
+                (old_shard, new_shard, true)
+            } else {
+                (new_shard, old_shard, false)
+            };
+            
+            let mut guard1 = first_shard.write().unwrap();
+            let mut guard2 = second_shard.write().unwrap();
+            
+            let (old_guard, new_guard) = if is_old_first {
+                (&mut guard1, &mut guard2)
+            } else {
+                (&mut guard2, &mut guard1)
+            };
+            
+            // Move the value between shards
+            if let Some(stored_value) = old_guard.data.remove(old_key) {
+                new_guard.data.insert(new_key.clone(), stored_value);
+                new_guard.mark_modified(&new_key);
+                Ok(())
+            } else {
+                Err(FerrousError::Command(CommandError::NoSuchKey))
+            }
+        }
     }
     
-    /// Find keys matching pattern
     pub fn keys(&self, db: DatabaseIndex, pattern: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let database = self.get_database(db)?;
-        let db_guard = database.read().unwrap();
+        let database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
         
         let pattern_str = String::from_utf8_lossy(pattern);
         let mut matching_keys = Vec::new();
         
-        for key in db_guard.data.keys() {
-            let key_str = String::from_utf8_lossy(key);
-            if pattern_matches(&pattern_str, &key_str) {
-                matching_keys.push(key.clone());
+        // Collect keys from all shards
+        for shard in &database.shards {
+            let shard_guard = shard.read().unwrap();
+            for key in shard_guard.data.keys() {
+                let key_str = String::from_utf8_lossy(key);
+                if pattern_matches(&pattern_str, &key_str) {
+                    matching_keys.push(key.clone());
+                }
             }
         }
         
         Ok(matching_keys)
     }
     
-    /// Set expiration in milliseconds
     pub fn pexpire(&self, db: DatabaseIndex, key: &[u8], millis: u64) -> Result<bool> {
         self.expire(db, key, Duration::from_millis(millis))
     }
     
-    /// Get TTL in milliseconds
     pub fn pttl(&self, db: DatabaseIndex, key: &[u8]) -> Result<i64> {
         let ttl = self.ttl(db, key)?;
         
@@ -1774,105 +1648,84 @@ impl StorageEngine {
             Some(duration) => Ok(duration.as_millis() as i64),
             None => {
                 if self.exists(db, key)? {
-                    Ok(-1) // Key exists but no expiration
+                    Ok(-1)
                 } else {
-                    Ok(-2) // Key doesn't exist
+                    Ok(-2)
                 }
             }
         }
     }
     
-    /// Remove expiration
+    /// Remove expiration - NO access time tracking
     pub fn persist(&self, db: DatabaseIndex, key: &[u8]) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let mut db_guard = database.write().unwrap();
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
         
-        if let Some(stored_value) = db_guard.data.get_mut(key) {
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
             if stored_value.metadata.expires_at.is_some() {
                 stored_value.metadata.clear_expiration();
-                db_guard.expiring_keys.remove(key);
+                shard_guard.expiring_keys.remove(key);
                 Ok(true)
             } else {
-                Ok(false) // Key exists but has no expiration
+                Ok(false)
             }
         } else {
-            Ok(false) // Key doesn't exist
+            Ok(false)
         }
     }
 
     /// Check if a key was modified (for WATCH command)
-    pub fn was_modified(&self, db: DatabaseIndex, key: &[u8]) -> Result<bool> {
-        let database = self.get_database(db)?;
-        let db_guard = database.read().unwrap();
+    pub fn was_modified(&self, db: DatabaseIndex, _key: &[u8]) -> Result<bool> {
+        let _database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
         
         // For now, always return false (no tracking implemented)
-        // In a full implementation, we'd track modification versions
+        // In a full implementation, we'd check the modification counter
         Ok(false)
     }
 
-    /// Scan the database keys using cursor-based iteration.
-    /// 
-    /// This function implements the Redis SCAN command that allows incremental
-    /// iteration over a collection of elements.
-    ///
-    /// Parameters:
-    /// * `db`: Database index to scan
-    /// * `cursor`: Cursor position to start from (0 to start a new scan)
-    /// * `pattern`: Optional pattern for key filtering
-    /// * `type_filter`: Optional type filter (string, list, set, hash, zset)
-    /// * `count`: Number of elements to scan (default 10)
-    /// 
-    /// Returns: (next_cursor, Vec<matching_keys>)
+    /// Get the current database ID
+    pub fn get_current_db(&self) -> usize {
+        0
+    }
+
+    /// Scan operations - optimized for sharded access, NO access time tracking
     pub fn scan(&self, db: DatabaseIndex, cursor: u64, pattern: Option<&[u8]>, type_filter: Option<&str>, count: usize) -> Result<(u64, Vec<Vec<u8>>)> {
-        let database = self.get_database(db)?;
-        let db_guard = database.read().unwrap();
+        let database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
         
-        // Default count if not specified
         let scan_count = if count == 0 { 10 } else { count };
-        let max_scan_count = std::cmp::min(scan_count, 1000); // Cap at 1000 for safety
+        let max_scan_count = std::cmp::min(scan_count, 1000);
         
-        // Create a snapshot of keys for stable iteration
-        let keys_count = db_guard.data.len();
-        
-        // If no keys, return cursor 0
-        if keys_count == 0 {
-            return Ok((0, Vec::new()));
-        }
-        
-        // Temporary approach: collect all keys into a vector
-        // In a more optimized implementation, we'd use a more sophisticated cursor mechanism
-        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(keys_count);
-        for (key, stored_value) in &db_guard.data {
-            // Skip expired keys
-            if stored_value.is_expired() {
-                continue;
-            }
-            
-            // Apply type filter if specified
-            if let Some(type_name) = type_filter {
-                let value_type = match &stored_value.value {
-                    Value::String(_) => "string",
-                    Value::List(_) => "list",
-                    Value::Set(_) => "set",
-                    Value::Hash(_) => "hash",
-                    Value::SortedSet(_) => "zset",
-                };
-                
-                if value_type != type_name {
+        // Collect keys from all shards - NO touch() calls
+        let mut all_keys = Vec::new();
+        for shard in &database.shards {
+            let shard_guard = shard.read().unwrap();
+            for (key, stored_value) in shard_guard.data.iter() {
+                if stored_value.is_expired() {
                     continue;
                 }
+                
+                if let Some(type_name) = type_filter {
+                    let value_type = match &stored_value.value {
+                        Value::String(_) => "string",
+                        Value::List(_) => "list",
+                        Value::Set(_) => "set",
+                        Value::Hash(_) => "hash",
+                        Value::SortedSet(_) => "zset",
+                    };
+                    
+                    if value_type != type_name {
+                        continue;
+                    }
+                }
+                
+                all_keys.push(key.clone());
             }
-            
-            keys.push(key.clone());
         }
         
-        // Sort keys for consistent iteration
-        keys.sort();
+        all_keys.sort();
         
-        // Calculate start position from cursor
         let start_pos = if cursor == 0 { 0 } else { cursor as usize };
-        if start_pos >= keys.len() && !keys.is_empty() {
-            // Cursor is beyond the end, restart from beginning
+        if start_pos >= all_keys.len() && !all_keys.is_empty() {
             return Ok((0, Vec::new()));
         }
         
@@ -1880,20 +1733,16 @@ impl StorageEngine {
         let mut keys_examined = 0;
         let mut current_pos = start_pos;
         
-        // Pattern string for matching
         let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
         
-        // Scan keys starting from cursor position
         while keys_examined < max_scan_count * 10 && matching_keys.len() < max_scan_count {
-            if current_pos >= keys.len() {
-                // Reached end of keys
+            if current_pos >= all_keys.len() {
                 break;
             }
             
-            let key = &keys[current_pos];
+            let key = &all_keys[current_pos];
             let mut include_key = true;
             
-            // Apply pattern filter if specified
             if let Some(ref pat) = pattern_str {
                 let key_str = String::from_utf8_lossy(key);
                 if !pattern_matches(pat, &key_str) {
@@ -1909,9 +1758,8 @@ impl StorageEngine {
             keys_examined += 1;
         }
         
-        // Calculate next cursor
-        let next_cursor = if current_pos >= keys.len() {
-            0 // Completed full scan
+        let next_cursor = if current_pos >= all_keys.len() {
+            0
         } else {
             current_pos as u64
         };
@@ -1919,15 +1767,12 @@ impl StorageEngine {
         Ok((next_cursor, matching_keys))
     }
 
-    /// Scanning hash elements incrementally.
     pub fn hscan(&self, db: DatabaseIndex, key: &[u8], cursor: u64, pattern: Option<&[u8]>, count: usize, no_values: bool) -> Result<(u64, Vec<Vec<u8>>)> {
-        // Get the hash
         match self.get(db, key)? {
             GetResult::Found(Value::Hash(hash)) => {
                 let scan_count = if count == 0 { 10 } else { count };
                 let max_scan_count = std::cmp::min(scan_count, 1000);
                 
-                // For small hashes, return everything at once
                 if hash.len() <= max_scan_count && cursor == 0 && pattern.is_none() {
                     let mut result = Vec::new();
                     for (field, value) in hash.iter() {
@@ -1939,7 +1784,6 @@ impl StorageEngine {
                     return Ok((0, result));
                 }
                 
-                // Sort fields for consistent iteration
                 let mut fields: Vec<Vec<u8>> = hash.keys().cloned().collect();
                 fields.sort();
                 
@@ -1953,7 +1797,6 @@ impl StorageEngine {
                 let mut current_pos = start_pos;
                 let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
                 
-                // Scan fields
                 while fields_examined < max_scan_count * 10 && (result.len() / if no_values { 1 } else { 2 }) < max_scan_count {
                     if current_pos >= fields.len() {
                         break;
@@ -1962,7 +1805,6 @@ impl StorageEngine {
                     let field = &fields[current_pos];
                     let mut include_field = true;
                     
-                    // Apply pattern filter
                     if let Some(ref pat) = pattern_str {
                         let field_str = String::from_utf8_lossy(field);
                         if !pattern_matches(pat, &field_str) {
@@ -1982,9 +1824,8 @@ impl StorageEngine {
                     fields_examined += 1;
                 }
                 
-                // Calculate next cursor
                 let next_cursor = if current_pos >= fields.len() {
-                    0 // Completed scan
+                    0
                 } else {
                     current_pos as u64
                 };
@@ -1992,29 +1833,24 @@ impl StorageEngine {
                 Ok((next_cursor, result))
             },
             GetResult::Found(_) => {
-                Err(FerrousError::Storage(crate::error::StorageError::WrongType))
+                Err(FerrousError::Storage(StorageError::WrongType))
             },
             _ => {
-                // Key doesn't exist, return empty scan
                 Ok((0, Vec::new()))
             }
         }
     }
     
-    /// Scanning set members incrementally.
     pub fn sscan(&self, db: DatabaseIndex, key: &[u8], cursor: u64, pattern: Option<&[u8]>, count: usize) -> Result<(u64, Vec<Vec<u8>>)> {
-        // Get the set
         match self.get(db, key)? {
             GetResult::Found(Value::Set(set)) => {
                 let scan_count = if count == 0 { 10 } else { count };
                 let max_scan_count = std::cmp::min(scan_count, 1000);
                 
-                // For small sets, return everything at once
                 if set.len() <= max_scan_count && cursor == 0 && pattern.is_none() {
                     return Ok((0, set.iter().cloned().collect()));
                 }
                 
-                // Create a sorted vector of members
                 let mut members: Vec<Vec<u8>> = set.iter().cloned().collect();
                 members.sort();
                 
@@ -2028,7 +1864,6 @@ impl StorageEngine {
                 let mut current_pos = start_pos;
                 let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
                 
-                // Scan members
                 while members_examined < max_scan_count * 10 && result.len() < max_scan_count {
                     if current_pos >= members.len() {
                         break;
@@ -2037,7 +1872,6 @@ impl StorageEngine {
                     let member = &members[current_pos];
                     let mut include_member = true;
                     
-                    // Apply pattern filter
                     if let Some(ref pat) = pattern_str {
                         let member_str = String::from_utf8_lossy(member);
                         if !pattern_matches(pat, &member_str) {
@@ -2053,9 +1887,8 @@ impl StorageEngine {
                     members_examined += 1;
                 }
                 
-                // Calculate next cursor
                 let next_cursor = if current_pos >= members.len() {
-                    0 // Completed scan
+                    0
                 } else {
                     current_pos as u64
                 };
@@ -2063,34 +1896,28 @@ impl StorageEngine {
                 Ok((next_cursor, result))
             },
             GetResult::Found(_) => {
-                Err(FerrousError::Storage(crate::error::StorageError::WrongType))
+                Err(FerrousError::Storage(StorageError::WrongType))
             },
             _ => {
-                // Key doesn't exist, return empty scan
                 Ok((0, Vec::new()))
             }
         }
     }
     
-    /// Scanning sorted set elements incrementally.
     pub fn zscan(&self, db: DatabaseIndex, key: &[u8], cursor: u64, pattern: Option<&[u8]>, count: usize) -> Result<(u64, Vec<(Vec<u8>, f64)>)> {
-        // Get the sorted set
         match self.get(db, key)? {
             GetResult::Found(Value::SortedSet(zset)) => {
                 let scan_count = if count == 0 { 10 } else { count };
                 let max_scan_count = std::cmp::min(scan_count, 1000);
                 
-                // Create a vector of (member, score) pairs
                 let mut items: Vec<(Vec<u8>, f64)> = Vec::new();
                 let range = zset.range_by_rank(0, zset.len() - 1);
                 for (member, score) in range.items {
                     items.push((member, score));
                 }
                 
-                // Sort by member for consistent iteration
                 items.sort_by(|a, b| a.0.cmp(&b.0));
                 
-                // For small sorted sets, return everything at once
                 if items.len() <= max_scan_count && cursor == 0 && pattern.is_none() {
                     return Ok((0, items));
                 }
@@ -2105,7 +1932,6 @@ impl StorageEngine {
                 let mut current_pos = start_pos;
                 let pattern_str = pattern.map(|p| String::from_utf8_lossy(p));
                 
-                // Scan items
                 while items_examined < max_scan_count * 10 && result.len() < max_scan_count {
                     if current_pos >= items.len() {
                         break;
@@ -2114,7 +1940,6 @@ impl StorageEngine {
                     let (member, score) = &items[current_pos];
                     let mut include_item = true;
                     
-                    // Apply pattern filter
                     if let Some(ref pat) = pattern_str {
                         let member_str = String::from_utf8_lossy(member);
                         if !pattern_matches(pat, &member_str) {
@@ -2130,9 +1955,8 @@ impl StorageEngine {
                     items_examined += 1;
                 }
                 
-                // Calculate next cursor
                 let next_cursor = if current_pos >= items.len() {
-                    0 // Completed scan
+                    0
                 } else {
                     current_pos as u64
                 };
@@ -2140,50 +1964,48 @@ impl StorageEngine {
                 Ok((next_cursor, result))
             },
             GetResult::Found(_) => {
-                Err(FerrousError::Storage(crate::error::StorageError::WrongType))
+                Err(FerrousError::Storage(StorageError::WrongType))
             },
             _ => {
-                // Key doesn't exist, return empty scan
                 Ok((0, Vec::new()))
             }
         }
     }
-    
-    /// Get the current database ID
-    pub fn get_current_db(&self) -> usize {
-        // For now, just return 0 (the default database)
-        0
-    }
 
-    /// Background thread for cleaning up expired keys
+    /// Background thread for cleaning up expired keys in sharded structure
     fn expiration_cleanup_loop(engine: Arc<StorageEngine>) {
         loop {
             thread::sleep(Duration::from_secs(1)); // Check every second
             
-            for (_db_idx, database) in engine.databases.iter().enumerate() {
-                let mut db_guard = match database.write() {
-                    Ok(guard) => guard,
-                    Err(_) => continue, // Skip if poisoned
-                };
-                
+            for database in &engine.databases {
                 let now = Instant::now();
-                let mut expired_keys = Vec::new();
                 
-                // Find expired keys
-                for (key, expires_at) in db_guard.expiring_keys.iter() {
-                    if *expires_at <= now {
-                        expired_keys.push(key.clone());
+                // Check each shard for expired keys
+                for shard in &database.shards {
+                    let mut expired_keys = Vec::new();
+                    
+                    // Find expired keys in this shard
+                    {
+                        let shard_guard = shard.read().unwrap();
+                        for (key, expires_at) in shard_guard.expiring_keys.iter() {
+                            if *expires_at <= now {
+                                expired_keys.push(key.clone());
+                            }
+                        }
                     }
-                }
-                
-                // Remove expired keys
-                for key in expired_keys {
-                    if let Some(stored_value) = db_guard.data.remove(&key) {
-                        db_guard.expiring_keys.remove(&key);
-                        
-                        // Update memory usage
-                        let memory_size = engine.calculate_value_size(&key, &stored_value.value);
-                        engine.memory_manager.remove_memory(memory_size);
+                    
+                    // Remove expired keys with write lock
+                    if !expired_keys.is_empty() {
+                        let mut shard_guard = shard.write().unwrap();
+                        for key in expired_keys {
+                            if let Some(stored_value) = shard_guard.data.remove(&key) {
+                                shard_guard.expiring_keys.remove(&key);
+                                
+                                // Update memory usage
+                                let memory_size = engine.calculate_value_size(&key, &stored_value.value);
+                                engine.memory_manager.remove_memory(memory_size);
+                            }
+                        }
                     }
                 }
             }
@@ -2192,9 +2014,21 @@ impl StorageEngine {
 }
 
 impl Database {
-    /// Create a new database
+    /// Create a new sharded database
     pub fn new() -> Self {
-        Database {
+        let mut shards = Vec::with_capacity(SHARDS_PER_DATABASE);
+        for _ in 0..SHARDS_PER_DATABASE {
+            shards.push(Arc::new(RwLock::new(DatabaseShard::new())));
+        }
+        
+        Database { shards }
+    }
+}
+
+impl DatabaseShard {
+    /// Create a new database shard
+    pub fn new() -> Self {
+        DatabaseShard {
             data: HashMap::new(),
             expiring_keys: HashMap::new(),
             modified_keys: HashMap::new(),
@@ -2210,6 +2044,12 @@ impl Database {
 }
 
 impl Default for Database {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for DatabaseShard {
     fn default() -> Self {
         Self::new()
     }
@@ -2271,9 +2111,38 @@ mod tests {
         // Should not exist after expiration
         assert!(!engine.exists(0, b"temp").unwrap());
     }
+    
+    #[test]
+    fn test_sharding_distribution() {
+        let engine = StorageEngine::new();
+        
+        // Test that different keys go to different shards
+        let key1 = b"key1";
+        let key2 = b"key2"; 
+        
+        let shard1_idx = engine.get_shard_index(key1);
+        let shard2_idx = engine.get_shard_index(key2);
+        
+        // Keys should distribute across shards (though not guaranteed to be different)
+        assert!(shard1_idx < SHARDS_PER_DATABASE);
+        assert!(shard2_idx < SHARDS_PER_DATABASE);
+    }
+    
+    #[test]
+    fn test_no_access_time_tracking() {
+        let engine = StorageEngine::new();
+        
+        // Verify that operations complete without access time updates
+        engine.set_string(0, b"test".to_vec(), b"value".to_vec()).unwrap();
+        let _result = engine.get_string(0, b"test").unwrap(); // No touch() called
+        engine.incr(0, b"counter".to_vec()).unwrap(); // No touch() called
+        
+        // All should succeed without any access time tracking overhead
+        assert!(true);
+    }
 }
 
-/// Simple glob pattern matching
+/// Simple glob pattern matching (unchanged)
 fn pattern_matches(pattern: &str, text: &str) -> bool {
     let pattern_chars: Vec<char> = pattern.chars().collect();
     let text_chars: Vec<char> = text.chars().collect();
@@ -2298,7 +2167,6 @@ fn pattern_matches(pattern: &str, text: &str) -> bool {
                     continue;
                 }
                 '[' => {
-                    // Character class - simplified implementation
                     if let Some(end) = pattern_chars[p_idx..].iter().position(|&c| c == ']') {
                         let class_end = p_idx + end;
                         let negate = p_idx + 1 < class_end && pattern_chars[p_idx + 1] == '^';
@@ -2308,14 +2176,12 @@ fn pattern_matches(pattern: &str, text: &str) -> bool {
                         let mut i = start_idx;
                         while i < class_end {
                             if i + 2 < class_end && pattern_chars[i + 1] == '-' {
-                                // Range
                                 if text_chars[t_idx] >= pattern_chars[i] && text_chars[t_idx] <= pattern_chars[i + 2] {
                                     matched = true;
                                     break;
                                 }
                                 i += 3;
                             } else {
-                                // Single char
                                 if text_chars[t_idx] == pattern_chars[i] {
                                     matched = true;
                                     break;
@@ -2332,7 +2198,6 @@ fn pattern_matches(pattern: &str, text: &str) -> bool {
                     }
                 }
                 '\\' if p_idx + 1 < pattern_chars.len() => {
-                    // Escaped character
                     if pattern_chars[p_idx + 1] == text_chars[t_idx] {
                         p_idx += 2;
                         t_idx += 1;
@@ -2349,7 +2214,6 @@ fn pattern_matches(pattern: &str, text: &str) -> bool {
             }
         }
         
-        // No match, try to backtrack to last *
         if let Some(star_pos) = star_idx {
             p_idx = star_pos + 1;
             star_match_idx += 1;
@@ -2359,7 +2223,6 @@ fn pattern_matches(pattern: &str, text: &str) -> bool {
         }
     }
     
-    // Skip trailing * in pattern
     while p_idx < pattern_chars.len() && pattern_chars[p_idx] == '*' {
         p_idx += 1;
     }

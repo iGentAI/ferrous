@@ -36,6 +36,9 @@ pub struct Config {
     
     /// Memory management configuration
     pub memory: MemoryConfig,
+    
+    /// Monitoring and performance configuration
+    pub monitoring: MonitoringConfig,
 }
 
 /// Server-specific configuration
@@ -76,6 +79,25 @@ pub struct MemoryConfig {
     pub max_memory_samples: usize,
 }
 
+/// Monitoring and performance configuration
+#[derive(Debug, Clone)]
+pub struct MonitoringConfig {
+    /// Enable SLOWLOG command timing (disabled by default for performance)
+    pub slowlog_enabled: bool,
+    
+    /// Enable MONITOR command broadcasting (disabled by default for performance)
+    pub monitor_enabled: bool,
+    
+    /// Enable command statistics tracking (disabled by default for performance) 
+    pub stats_enabled: bool,
+    
+    /// SLOWLOG threshold in microseconds (-1 to disable)
+    pub slowlog_threshold_micros: i64,
+    
+    /// Maximum SLOWLOG entries to keep
+    pub slowlog_max_len: u64,
+}
+
 /// Log level configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -101,6 +123,7 @@ impl Default for Config {
             aof: AofConfig::default(),
             replication: ReplicationConfig::default(),
             memory: MemoryConfig::default(),
+            monitoring: MonitoringConfig::default(),
         }
     }
 }
@@ -125,6 +148,20 @@ impl Default for MemoryConfig {
             max_memory: 0, // Unlimited
             max_memory_policy: EvictionPolicy::NoEviction,
             max_memory_samples: 5,
+        }
+    }
+}
+
+impl Default for MonitoringConfig {
+    fn default() -> Self {
+        MonitoringConfig {
+            // Default to disabled like Valkey for maximum performance
+            slowlog_enabled: false,
+            monitor_enabled: false,
+            stats_enabled: false,
+            // SLOWLOG settings for when enabled
+            slowlog_threshold_micros: 10000, // 10ms threshold when enabled
+            slowlog_max_len: 128,
         }
     }
 }
@@ -190,6 +227,12 @@ impl Config {
             "appendfilename" => Some(self.aof.filename.clone()),
             "appendfsync" => Some(self.fsync_policy_str()),
             "save" => Some(self.format_save_rules()),
+            // Monitoring configuration parameters
+            "slowlog-enabled" => Some(if self.monitoring.slowlog_enabled { "yes" } else { "no" }.to_string()),
+            "monitor-enabled" => Some(if self.monitoring.monitor_enabled { "yes" } else { "no" }.to_string()),
+            "stats-enabled" => Some(if self.monitoring.stats_enabled { "yes" } else { "no" }.to_string()),
+            "slowlog-log-slower-than" => Some(self.monitoring.slowlog_threshold_micros.to_string()),
+            "slowlog-max-len" => Some(self.monitoring.slowlog_max_len.to_string()),
             _ => None,
         }
     }
@@ -224,6 +267,13 @@ impl Config {
         // Memory params
         params.push(("maxmemory".to_string(), self.memory.max_memory.to_string()));
         params.push(("maxmemory-policy".to_string(), self.memory_policy_str()));
+        
+        // Monitoring params
+        params.push(("slowlog-enabled".to_string(), if self.monitoring.slowlog_enabled { "yes" } else { "no" }.to_string()));
+        params.push(("monitor-enabled".to_string(), if self.monitoring.monitor_enabled { "yes" } else { "no" }.to_string()));
+        params.push(("stats-enabled".to_string(), if self.monitoring.stats_enabled { "yes" } else { "no" }.to_string()));
+        params.push(("slowlog-log-slower-than".to_string(), self.monitoring.slowlog_threshold_micros.to_string()));
+        params.push(("slowlog-max-len".to_string(), self.monitoring.slowlog_max_len.to_string()));
         
         params
     }

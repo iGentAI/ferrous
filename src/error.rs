@@ -31,6 +31,9 @@ pub enum FerrousError {
     /// Script execution errors
     Script(ScriptError),
     
+    /// Lua execution errors
+    LuaError(String),
+    
     /// Internal server errors
     Internal(String),
 }
@@ -123,6 +126,7 @@ impl fmt::Display for FerrousError {
             FerrousError::Config(msg) => write!(f, "Configuration error: {}", msg),
             FerrousError::Connection(msg) => write!(f, "Connection error: {}", msg),
             FerrousError::Script(err) => write!(f, "{}", err),
+            FerrousError::LuaError(msg) => write!(f, "Lua error: {}", msg),
             FerrousError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }
     }
