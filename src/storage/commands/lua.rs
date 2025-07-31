@@ -6,17 +6,12 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::str;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use sha1::{Sha1, Digest};
 use mlua::{Lua, Result as LuaResult};
 
 use crate::error::{Result, FerrousError};
 use crate::protocol::resp::RespFrame;
 use crate::storage::StorageEngine;
-
-lazy_static::lazy_static! {
-    static ref SCRIPT_CACHE: RwLock<HashMap<String, String>> = RwLock::new(HashMap::new());
-}
 
 fn create_sandboxed_lua(_storage: Arc<StorageEngine>, keys: Vec<Vec<u8>>, args: Vec<Vec<u8>>) -> LuaResult<Lua> {
     let lua = Lua::new();
@@ -214,7 +209,7 @@ pub fn handle_eval(storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Result<
     }
 }
 
-pub fn handle_evalsha(storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Result<RespFrame> {
+pub fn handle_evalsha(storage: &Arc<StorageEngine>, parts: &[RespFrame], script_cache: &HashMap<String, String>) -> Result<RespFrame> {
     if parts.len() < 3 {
         return Ok(RespFrame::error("ERR wrong number of arguments for 'evalsha' command"));
     }
@@ -229,12 +224,9 @@ pub fn handle_evalsha(storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Resu
         _ => return Ok(RespFrame::error("ERR invalid SHA1 hash")),
     };
     
-    let script = {
-        let cache = SCRIPT_CACHE.read().unwrap();
-        match cache.get(&sha1) {
-            Some(script) => script.clone(),
-            None => return Ok(RespFrame::error("NOSCRIPT No matching script. Please use EVAL.")),
-        }
+    let script = match script_cache.get(&sha1) {
+        Some(script) => script.clone(),
+        None => return Ok(RespFrame::error("NOSCRIPT No matching script. Please use EVAL.")),
     };
     
     let num_keys = match &parts[2] {
@@ -272,41 +264,35 @@ pub fn handle_evalsha(storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Resu
     }
 }
 
-pub fn handle_script_load(_storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Result<RespFrame> {
+pub fn handle_script_load(_storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Result<(String, String)> {
     if parts.len() != 2 {
-        return Ok(RespFrame::error("ERR wrong number of arguments for 'script load' command"));
+        return Err(FerrousError::LuaError("wrong number of arguments for 'script load' command".to_string()));
     }
     
     let script = match &parts[1] {
         RespFrame::BulkString(Some(bytes)) => {
             match str::from_utf8(bytes) {
                 Ok(s) => s.to_string(),
-                Err(_) => return Ok(RespFrame::error("ERR invalid script - not valid UTF-8")),
+                Err(_) => return Err(FerrousError::LuaError("invalid script - not valid UTF-8".to_string())),
             }
         }
-        _ => return Ok(RespFrame::error("ERR invalid script")),
+        _ => return Err(FerrousError::LuaError("invalid script".to_string())),
     };
     
     let lua = Lua::new();
     if let Err(e) = lua.load(&script).exec() {
-        return Ok(RespFrame::error(format!("ERR script compilation error: {}", e)));
+        return Err(FerrousError::LuaError(format!("script compilation error: {}", e)));
     }
     
     let sha1 = calculate_script_sha1(&script);
-    {
-        let mut cache = SCRIPT_CACHE.write().unwrap();
-        cache.insert(sha1.clone(), script);
-    }
-    
-    Ok(RespFrame::bulk_string(sha1))
+    Ok((sha1, script))
 }
 
-pub fn handle_script_exists(_storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Result<RespFrame> {
+pub fn handle_script_exists(_storage: &Arc<StorageEngine>, parts: &[RespFrame], script_cache: &HashMap<String, String>) -> Result<RespFrame> {
     if parts.len() < 2 {
         return Ok(RespFrame::error("ERR wrong number of arguments for 'script exists' command"));
     }
     
-    let cache = SCRIPT_CACHE.read().unwrap();
     let mut results = Vec::new();
     
     for i in 1..parts.len() {
@@ -326,7 +312,7 @@ pub fn handle_script_exists(_storage: &Arc<StorageEngine>, parts: &[RespFrame]) 
             }
         };
         
-        if cache.contains_key(&sha1) {
+        if script_cache.contains_key(&sha1) {
             results.push(RespFrame::Integer(1));
         } else {
             results.push(RespFrame::Integer(0));
@@ -336,13 +322,12 @@ pub fn handle_script_exists(_storage: &Arc<StorageEngine>, parts: &[RespFrame]) 
     Ok(RespFrame::Array(Some(results)))
 }
 
-pub fn handle_script_flush(_storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Result<RespFrame> {
+pub fn handle_script_flush(_storage: &Arc<StorageEngine>, parts: &[RespFrame], script_cache: &mut HashMap<String, String>) -> Result<RespFrame> {
     if parts.len() != 1 {
         return Ok(RespFrame::error("ERR wrong number of arguments for 'script flush' command"));
     }
     
-    let mut cache = SCRIPT_CACHE.write().unwrap();
-    cache.clear();
+    script_cache.clear();
     
     Ok(RespFrame::SimpleString(Arc::new(b"OK".to_vec())))
 }
@@ -361,10 +346,15 @@ fn calculate_script_sha1(script: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub fn handle_lua_command(storage: &Arc<StorageEngine>, cmd: &str, parts: &[RespFrame]) -> Result<RespFrame> {
+pub fn handle_lua_command_with_cache(
+    storage: &Arc<StorageEngine>, 
+    cmd: &str, 
+    parts: &[RespFrame],
+    script_cache: &mut HashMap<String, String>
+) -> Result<RespFrame> {
     match cmd.to_lowercase().as_str() {
         "eval" => handle_eval(storage, parts),
-        "evalsha" => handle_evalsha(storage, parts),
+        "evalsha" => handle_evalsha(storage, parts, script_cache),
         "script" => {
             if parts.len() < 2 {
                 return Ok(RespFrame::error("ERR wrong number of arguments for 'script' command"));
@@ -381,15 +371,29 @@ pub fn handle_lua_command(storage: &Arc<StorageEngine>, cmd: &str, parts: &[Resp
             };
             
             match subcommand.as_str() {
-                "load" => handle_script_load(storage, &parts[1..]),
-                "exists" => handle_script_exists(storage, &parts[1..]),
-                "flush" => handle_script_flush(storage, &parts[1..]),
+                "load" => {
+                    match handle_script_load(storage, &parts[1..]) {
+                        Ok((sha1, script)) => {
+                            script_cache.insert(sha1.clone(), script);
+                            Ok(RespFrame::bulk_string(sha1))
+                        }
+                        Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
+                    }
+                },
+                "exists" => handle_script_exists(storage, &parts[1..], script_cache),
+                "flush" => handle_script_flush(storage, &parts[1..], script_cache),
                 "kill" => handle_script_kill(storage, &parts[1..]),
                 _ => Ok(RespFrame::error(format!("ERR Unknown subcommand '{}'", subcommand))),
             }
         },
         _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", cmd))),
     }
+}
+
+#[deprecated(note = "Use handle_lua_command_with_cache for better performance")]
+pub fn handle_lua_command(storage: &Arc<StorageEngine>, cmd: &str, parts: &[RespFrame]) -> Result<RespFrame> {
+    let mut local_cache = HashMap::new();
+    handle_lua_command_with_cache(storage, cmd, parts, &mut local_cache)
 }
 
 #[cfg(test)]

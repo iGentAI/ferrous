@@ -290,22 +290,24 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+    use std::cell::RefCell;
     
     struct MockConnectionProvider {
-        connections: HashMap<u64, Connection>,
+        connections: Arc<Mutex<HashMap<u64, RefCell<Connection>>>>,
         killed: Arc<Mutex<Vec<u64>>>,
     }
     
     impl MockConnectionProvider {
         fn new() -> Self {
             Self {
-                connections: HashMap::new(),
+                connections: Arc::new(Mutex::new(HashMap::new())),
                 killed: Arc::new(Mutex::new(Vec::new())),
             }
         }
         
         fn add_connection(&mut self, id: u64, conn: Connection) {
-            self.connections.insert(id, conn);
+            let mut connections = self.connections.lock().unwrap();
+            connections.insert(id, RefCell::new(conn));
         }
     }
     
@@ -314,18 +316,26 @@ mod tests {
         where
             F: FnOnce(&mut Connection) -> R,
         {
-            let mut borrowed_conns = self.connections.clone();
-            borrowed_conns.get_mut(&id).map(f)
+            let connections = self.connections.lock().unwrap();
+            connections.get(&id).map(|conn_ref| {
+                let mut conn = conn_ref.borrow_mut();
+                f(&mut *conn)
+            })
         }
         
         fn all_connection_ids(&self) -> Vec<u64> {
-            self.connections.keys().copied().collect()
+            let connections = self.connections.lock().unwrap();
+            connections.keys().copied().collect()
         }
         
         fn close_connection(&self, id: u64) -> bool {
-            let mut killed = self.killed.lock().unwrap();
-            killed.push(id);
-            self.connections.contains_key(&id)
+            let connections = self.connections.lock().unwrap();
+            let exists = connections.contains_key(&id);
+            if exists {
+                let mut killed = self.killed.lock().unwrap();
+                killed.push(id);
+            }
+            exists
         }
     }
     

@@ -3,8 +3,9 @@
 //! These tests validate Redis compatibility of our MLua Lua 5.1 implementation
 
 use std::sync::Arc;
+use std::collections::HashMap;
 use ferrous::storage::engine::StorageEngine;
-use ferrous::storage::commands::lua::{handle_eval, handle_evalsha, handle_script_load, handle_lua_command};
+use ferrous::storage::commands::lua::{handle_eval, handle_evalsha, handle_script_load, handle_lua_command_with_cache};
 use ferrous::protocol::resp::RespFrame;
 
 /// Test Redis EVAL command compatibility
@@ -29,11 +30,10 @@ fn test_redis_eval_compatibility() {
         
         // String operations
         ("return 'hello' .. ' world'", RespFrame::BulkString(Some(Arc::new(b"hello world".to_vec())))),
-        ("return string.upper('hello')", RespFrame::BulkString(Some(Arc::new(b"HELLO".to_vec())))),
         ("return string.len('test')", RespFrame::Integer(4)),
         
         // Table operations
-        ("return {1, 2, 3}[2]", RespFrame::Integer(2)),
+        ("local t = {1, 2, 3}; return t[2]", RespFrame::Integer(2)),
         ("local t = {a=5}; return t.a", RespFrame::Integer(5)),
     ];
     
@@ -111,27 +111,26 @@ fn test_redis_script_caching() {
     
     let script = "return 'cached script'";
     
-    // Load script
+    // Load script - handle_script_load now returns (String, String) tuple
     let load_parts = vec![
-        RespFrame::BulkString(Some(Arc::new("SCRIPT".as_bytes().to_vec()))),
         RespFrame::BulkString(Some(Arc::new("LOAD".as_bytes().to_vec()))),
         RespFrame::BulkString(Some(Arc::new(script.as_bytes().to_vec()))),
     ];
     
-    let sha1_result = handle_script_load(&storage, &load_parts).unwrap();
-    let sha1 = match sha1_result {
-        RespFrame::BulkString(Some(bytes)) => String::from_utf8(bytes.to_vec()).unwrap(),
-        _ => panic!("Expected SHA1 string"),
-    };
+    let (sha1, _script) = handle_script_load(&storage, &load_parts).unwrap();
     
-    // Execute via EVALSHA
+    // Execute via EVALSHA - now requires script cache parameter
     let evalsha_parts = vec![
         RespFrame::BulkString(Some(Arc::new("EVALSHA".as_bytes().to_vec()))),
         RespFrame::BulkString(Some(Arc::new(sha1.as_bytes().to_vec()))),
         RespFrame::Integer(0),
     ];
     
-    let result = handle_evalsha(&storage, &evalsha_parts).unwrap();
+    // Create script cache for EVALSHA 
+    let mut script_cache = HashMap::new();
+    script_cache.insert(sha1, script.to_string());
+    
+    let result = handle_evalsha(&storage, &evalsha_parts, &script_cache).unwrap();
     match result {
         RespFrame::BulkString(Some(bytes)) => {
             assert_eq!(bytes.as_ref(), b"cached script");
@@ -174,13 +173,14 @@ fn test_redis_sandboxing_compliance() {
 fn test_allowed_stdlib_functions() {
     let storage = Arc::new(StorageEngine::new_in_memory());
     
-    // Test math library functions that should work
+    // Test math library functions that should work (return integers)
     let math_tests = vec![
         ("return math.abs(-5)", 5),
         ("return math.max(1, 3, 2)", 3),
         ("return math.min(1, 3, 2)", 1),
         ("return math.floor(3.7)", 3),
         ("return math.ceil(3.2)", 4),
+        ("return string.len('hello')", 5),
     ];
     
     for (script, expected) in math_tests {
@@ -193,9 +193,8 @@ fn test_allowed_stdlib_functions() {
         }
     }
     
-    // Test string library functions
+    // Test string library functions that return strings
     let string_tests = vec![
-        ("return string.len('hello')", 5),
         ("return string.upper('test')", "TEST"),
         ("return string.lower('TEST')", "test"),
     ];
@@ -204,21 +203,11 @@ fn test_allowed_stdlib_functions() {
         let parts = create_eval_parts(script, 0, &[], &[]);
         let result = handle_eval(&storage, &parts).unwrap();
         
-        match expected {
-            5 => {
-                if let RespFrame::Integer(n) = result {
-                    assert_eq!(n, 5);
-                } else {
-                    panic!("Expected integer 5 for: {}", script);
-                }
+        match result {
+            RespFrame::BulkString(Some(bytes)) => {
+                assert_eq!(String::from_utf8_lossy(&bytes), expected, "Script: {}", script);
             }
-            s => {
-                if let RespFrame::BulkString(Some(bytes)) = result {
-                    assert_eq!(String::from_utf8_lossy(&bytes), s);
-                } else {
-                    panic!("Expected string '{}' for: {}", s, script);
-                }
-            }
+            _ => panic!("Expected string '{}' for: {}", expected, script),
         }
     }
 }
@@ -370,6 +359,7 @@ fn test_redis_edge_cases() {
 #[test]
 fn test_script_command_family() {
     let storage = Arc::new(StorageEngine::new_in_memory());
+    let mut script_cache = HashMap::new();
     
     // Test SCRIPT LOAD
     let script = "return 'test script'";
@@ -379,7 +369,7 @@ fn test_script_command_family() {
         RespFrame::BulkString(Some(Arc::new(script.as_bytes().to_vec()))),
     ];
     
-    let sha1_result = handle_lua_command(&storage, "script", &parts).unwrap();
+    let sha1_result = handle_lua_command_with_cache(&storage, "script", &parts, &mut script_cache).unwrap();
     let sha1 = match sha1_result {
         RespFrame::BulkString(Some(bytes)) => String::from_utf8(bytes.to_vec()).unwrap(),
         _ => panic!("Expected SHA1"),
@@ -393,7 +383,7 @@ fn test_script_command_family() {
         RespFrame::BulkString(Some(Arc::new("nonexistent".as_bytes().to_vec()))),
     ];
     
-    let result = handle_lua_command(&storage, "script", &exists_parts).unwrap();
+    let result = handle_lua_command_with_cache(&storage, "script", &exists_parts, &mut script_cache).unwrap();
     match result {
         RespFrame::Array(Some(items)) => {
             assert_eq!(items.len(), 2);
@@ -409,7 +399,7 @@ fn test_script_command_family() {
         RespFrame::BulkString(Some(Arc::new("FLUSH".as_bytes().to_vec()))),
     ];
     
-    let result = handle_lua_command(&storage, "script", &flush_parts).unwrap();
+    let result = handle_lua_command_with_cache(&storage, "script", &flush_parts, &mut script_cache).unwrap();
     match result {
         RespFrame::SimpleString(bytes) => {
             assert_eq!(bytes.as_ref(), b"OK");
