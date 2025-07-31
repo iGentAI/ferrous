@@ -3,9 +3,9 @@ A Redis-compatible in-memory database server written in pure Rust with minimal p
 
 ## Project Status
 
-Ferrous is currently at Phase 4 implementation, with several key features completed:
+Ferrous has achieved **significant architectural progress** with a working Lua 5.1 interpreter implementation, but has encountered **fundamental architectural constraints** that prevent completion without redesign.
 
-### Current Status:
+### Current Status (17/27 Tests Passing - 63% Success Rate):
 - ✅ TCP Server with connection handling
 - ✅ Full RESP2 protocol implementation
 - ✅ Core data structures: Strings, Lists, Sets, Hashes, Sorted Sets
@@ -14,33 +14,75 @@ Ferrous is currently at Phase 4 implementation, with several key features comple
 - ✅ Pub/Sub messaging system
 - ✅ Transaction support (MULTI/EXEC/DISCARD/WATCH)
 - ✅ AOF persistence
-- ✅ Lua VM with unified stack architecture (in progress)
+- ⚠️ **Lua VM with architectural limitations** (see Critical Limitation below)
 
-### Phase 4 Features Completed:
-- ✅ Pipelined command processing
-- ✅ Concurrent client handling (50+ connections)
-- ✅ Configuration commands (CONFIG GET)
-- ✅ Enhanced RESP protocol parsing
-- ✅ Master-slave replication
-- ✅ SCAN command family for safe iteration
-- ✅ Improved Lua VM with unified stack architecture
-- ✅ Basic Lua standard library implementation
-- ✅ Core Lua operations (tables, closures, etc.)
+### Lua 5.1 Implementation Achievements:
+- ✅ Complete bytecode generation and VM execution pipeline
+- ✅ Table constructor value preservation (fixed corruption issues)
+- ✅ Iterator protocol implementation (TFORLOOP opcode working)
+- ✅ Canonical register allocation (specification-compliant)
+- ✅ RETURN opcode with proper upvalue closing
+- ✅ Environment handling and global variable access
+- ✅ Basic closure support and upvalue capture
+- ✅ Standard library core functions (print, type, tostring, etc.)
+- ✅ Function definitions, calls, and returns
+- ✅ Control flow: for loops, while loops, conditionals
+
+### ⚠️ **CRITICAL LIMITATION: Architectural Constraint**
+
+**The current Lua implementation has hit a fundamental architectural barrier that prevents completion:**
+
+The VM design uses an **ExecutionContext pattern that requires simultaneous mutable access** to VM state from both:
+1. VM execution (during opcode processing)
+2. Standard library functions (for `pcall`, `table_next`, etc.)
+
+This creates a **dual-mutability anti-pattern** that violates Rust's ownership model, causing compilation errors:
+```
+error[E0596]: cannot borrow `*self.vm` as mutable, as it is behind a `&` reference
+```
+
+**This is not a bug—it's a fundamental design flaw** that prevents completion of:
+- Advanced standard library functions (`pcall`, `xpcall`, complex metamethods)
+- VM-stdlib integration scenarios (where remaining test failures occur)
+- Full Lua 5.1 specification compliance
+
+### Architectural Solutions Required
+
+Research into successful pure Rust Lua interpreters (Piccolo, mlua) reveals proven patterns:
+
+1. **VM-Mediated Operations** (Piccolo's Sequence pattern)
+   - Standard library functions return operation descriptions
+   - VM executes operations with exclusive mutable control
+   - Eliminates dual-mutability deadlock
+
+2. **Proxy Patterns** (mlua's approach)
+   - Controlled access through proxy objects
+   - Cell-based interior mutability with runtime checking
+
+3. **Callback-Based Architecture**
+   - VM provides callbacks to standard library functions
+   - Avoids direct state mutation conflicts
 
 ### Known Limitations:
-- ⚠️ Lua VM: Some advanced features like generic for loops still in development
-- ⚠️ Lua VM: Metamethod handling partially implemented
-- ⚠️ Command renaming/disabling not implemented yet
-- ⚠️ Protected mode not implemented
+- ❌ **Architectural redesign required** for full Lua 5.1 compliance
+- ❌ Standard library functions requiring VM interaction incomplete
+- ❌ Complex closure scenarios show contamination in integration tests
+- ❌ Cannot complete ExecutionContext implementation in current architecture
 
-### Coming Soon (Remaining Phase 4-6):
-- Production monitoring (INFO, SLOWLOG)
-- Advanced features (Complete Lua scripting, full Redis API integration, HyperLogLog)
-- Cluster support
+### For Developers and Contributors
+
+**If you're considering using or contributing to this project:**
+
+1. **Current State**: The interpreter has extraordinary individual component success but cannot achieve full system integration
+2. **Root Cause**: Fundamental architecture violates Rust's ownership constraints
+3. **Solution**: Requires architectural redesign using proven patterns from successful Rust Lua interpreters
+4. **Effort**: Significant refactoring needed, not incremental fixes
+
+**The project demonstrates that Lua 5.1 implementation in Rust is absolutely possible** (evidenced by successful projects like Piccolo), but requires architectures that work **with** Rust's ownership model, not against it.
 
 ## Performance
 
-Current benchmarks show Ferrous achieving impressive performance:
+Current benchmarks show Ferrous achieving impressive performance for the implemented features:
 
 ### Production Build Performance (vs Valkey 8.0.3):
 
@@ -50,23 +92,8 @@ Current benchmarks show Ferrous achieving impressive performance:
 | **PING_MBULK** | 86,880 ops/sec | 74,128 ops/sec | **117%** ✅ |
 | **SET** | 84,889 ops/sec | 74,515 ops/sec | **114%** ✅ |
 | **GET** | 69,881 ops/sec | 63,451 ops/sec | **110%** ✅ |
-| **INCR** | 82,712 ops/sec | 74,794 ops/sec | **111%** ✅ |
-| **LPUSH** | 81,366 ops/sec | 74,850 ops/sec | **109%** ✅ |
-| **RPUSH** | 75,987 ops/sec | 73,046 ops/sec | **104%** ✅ |
-| **LPOP** | 82,034 ops/sec | 73,421 ops/sec | **112%** ✅ |
-| **RPOP** | 81,766 ops/sec | 71,022 ops/sec | **115%** ✅ |
-| **SADD** | 80,450 ops/sec | 78,864 ops/sec | **102%** ✅ |
-| **HSET** | 80,971 ops/sec | 78,554 ops/sec | **103%** ✅ |
 
-Average latency: ~0.29ms (Ferrous) vs ~0.32ms (Valkey)
-
-### Key Achievements:
-- **Outperforms Redis/Valkey** on ALL operations by 2-17%
-- **Multi-threaded architecture** provides consistently lower latency
-- **Production build improvements** show 10-60% gains over debug builds
-- **Master-slave replication** supports high-availability deployments
-
-These performance numbers demonstrate the effectiveness of Ferrous's multi-threaded Rust architecture, with all operations exceeding Redis performance.
+*Note: Performance testing focused on core Redis operations. Lua performance constrained by architectural limitations.*
 
 ## Dependencies
 
@@ -91,8 +118,7 @@ cargo build --release
 
 ## Testing
 
-Several test scripts are included to verify functionality and performance:
-
+### Core Database Testing
 ```bash
 # Run basic functionality tests
 ./test_basic.sh
@@ -108,14 +134,38 @@ python3 pipeline_test.py
 
 # Run performance benchmarks
 ./test_benchmark.sh
-
-# Test replication functionality
-./test_replication.sh
 ```
 
-## Running Multiple Instances for Replication
+### Lua Implementation Testing
+```bash
+# Run Lua test suite (current: 17/27 tests passing)
+./test_suite.sh
 
-To run a master-slave setup, two configuration files are provided:
+# Run enhanced validation suite
+./run_validation_suite.sh
+
+# Test specific Lua functionality
+./target/release/compile_and_execute tests/lua/basic/arithmetic.lua
+```
+
+## Contributing
+
+**Before contributing to the Lua implementation:**
+
+1. **Understand the architectural constraint** - review `docs/ARCHITECTURE.md` for details
+2. **Consider architectural solutions** - research Piccolo's Sequence pattern or mlua's proxy patterns
+3. **Focus on architectural redesign** rather than incremental fixes
+4. **Review existing analysis** - extensive debugging documentation in `desktop/complex_reasoning/`
+
+The project needs **architectural leadership** more than incremental bug fixes.
+
+## Documentation
+
+- `docs/ARCHITECTURE.md` - Detailed architectural analysis including limitations
+- `docs/LUA_IMPLEMENTATION_STATUS.md` - Current Lua implementation state and test results
+- `docs/LUA_C_FUNCTION_INTERFACE_CONVENTIONS.md` - Interface design (currently blocked)
+
+## Running Multiple Instances for Replication
 
 ```bash
 # Start the master
@@ -125,12 +175,6 @@ To run a master-slave setup, two configuration files are provided:
 ./target/release/ferrous replica.conf
 ```
 
-Alternatively, you can use the REPLICAOF command to dynamically configure replication:
+## Project Vision
 
-```bash
-redis-cli -h 127.0.0.1 -p 6380 -a mysecretpassword REPLICAOF 127.0.0.1 6379
-```
-
-## Lua VM Implementation Status
-
-The Lua VM is currently in active development with a unified stack architecture. See the [Lua Implementation Status](./docs/LUA_IMPLEMENTATION_STATUS.md) for details on what's currently working and upcoming features.
+Ferrous demonstrates that **high-performance, pure Rust Redis implementation is achievable**, but completing the Lua integration requires architectural patterns that respect Rust's ownership model. The project serves as both a working Redis server and a case study in Rust language interpreter design challenges and solutions.

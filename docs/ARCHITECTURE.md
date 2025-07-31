@@ -512,6 +512,188 @@ pub enum MasterLinkStatus {
 }
 ```
 
+## Critical Architectural Constraint: Lua VM Integration
+
+### **The Dual-Mutability Constraint**
+
+**Status**: ❌ **Blocking Issue** - Fundamental architectural limitation preventing completion
+
+The current Lua VM implementation has encountered a **fundamental architectural constraint** that prevents completion of Lua 5.1 specification compliance. This constraint is not a bug but a **design incompatibility** with Rust's ownership model.
+
+#### **The Problem: ExecutionContext Anti-Pattern**
+
+The current design uses an ExecutionContext trait that requires:
+
+```rust
+trait ExecutionContext {
+    fn pcall(&mut self, func: Value, args: Vec<Value>) -> LuaResult<()>
+    fn table_next(&self, table: &TableHandle, key: &Value) -> LuaResult<Option<(Value, Value)>>
+    // ... other methods requiring VM state modification
+}
+
+// Implementation attempts to mutably borrow VM during C function execution
+struct VmExecutionContext<'a> {
+    vm: &'a mut RcVM,  // ❌ Causes E0596: cannot borrow as mutable
+    // ...
+}
+```
+
+**This creates a dual-mutability deadlock:**
+1. **VM execution** holds mutable borrows during opcode processing
+2. **Standard library functions** need mutable VM access for `pcall`, metamethods, etc.
+3. **Rust's borrow checker prevents** simultaneous mutable access
+
+#### **Compilation Error Evidence**
+
+```
+error[E0596]: cannot borrow `*self.vm` as mutable, as it is behind a `&` reference
+    --> src/lua/rc_vm.rs:2404:27
+     |
+2404 |         let call_result = self.vm.execute_function_call(
+     |                           ^^^^^^^ cannot borrow as mutable
+```
+
+This error represents **Rust's ownership system rejecting our architectural design**, not a fixable implementation bug.
+
+#### **Impact on System Integration**
+
+The constraint manifests as:
+- ✅ **Individual components work perfectly** (17/27 tests passing)
+- ❌ **Integration scenarios fail** where VM-stdlib interaction is required
+- ❌ **Cannot complete basic standard library functions** (`pcall`, `xpcall`, etc.)
+- ❌ **Complex metamethod scenarios blocked**
+
+### **Architectural Solutions from Successful Rust Lua Interpreters**
+
+Research into production Rust Lua interpreters reveals proven patterns that solve this constraint:
+
+#### **Solution 1: Piccolo's Sequence Pattern (Recommended)**
+
+**Architecture**: VM-mediated operations eliminate dual-mutability
+
+```rust
+// Standard library functions return operation descriptions
+enum VMRequest {
+    CallFunction(Value, Vec<Value>),
+    GetTableField(TableHandle, Value),
+    SetTableField(TableHandle, Value, Value),
+}
+
+trait ExecutionContext {
+    fn request_operation(&mut self, req: VMRequest) -> RequestHandle;
+    fn get_result(&self, handle: RequestHandle) -> LuaResult<Value>;
+}
+
+// VM processes requests with exclusive mutable control
+impl RcVM {
+    fn process_request(&mut self, request: VMRequest) -> LuaResult<Value> {
+        // VM has exclusive mutable access, no borrowing conflicts
+    }
+}
+```
+
+**Benefits:**
+- ✅ **Eliminates dual-mutability**: No simultaneous mutable borrows
+- ✅ **VM maintains control**: Exclusive mutable access throughout
+- ✅ **Proven production use**: Piccolo uses this pattern successfully
+- ✅ **Rust-friendly**: Works with ownership model, not against it
+
+#### **Solution 2: mlua's Proxy Pattern**
+
+**Architecture**: Controlled access through proxy objects
+
+```rust
+pub struct Lua {
+    raw: XRc<ReentrantMutex<RawLua>>, // Thread-safe, runtime borrow checking
+}
+
+// Proxy objects provide controlled access
+impl Lua {
+    pub fn create_proxy(&self) -> LuaProxy {
+        // Provides controlled access without direct borrowing conflicts
+    }
+}
+```
+
+**Benefits:**
+- ✅ **Runtime borrow checking**: ReentrantMutex enables runtime checking
+- ✅ **Production proven**: mlua is widely used in Rust ecosystem
+- ✅ **Thread-safe design**: Suitable for concurrent environments
+
+#### **Solution 3: Callback-Based Pattern**
+
+**Architecture**: VM provides callbacks to standard library functions
+
+```rust
+struct VMCallbacks<'a> {
+    pcall: Box<dyn Fn(Value, Vec<Value>) -> LuaResult<Vec<Value>> + 'a>,
+    table_next: Box<dyn Fn(&TableHandle, &Value) -> LuaResult<Option<(Value, Value)>> + 'a>,
+}
+
+trait ExecutionContext {
+    fn with_vm_callbacks<R>(&mut self, f: impl FnOnce(VMCallbacks) -> R) -> R;
+}
+```
+
+**Benefits:**
+- ✅ **Clear ownership boundaries**: Callbacks owned by VM
+- ✅ **Flexible integration**: Easy to add new VM operations
+- ✅ **Type safety**: Compile-time verification of callback signatures
+
+### **Migration Strategy Recommendations**
+
+#### **Phase 1: Proof of Concept (1-2 weeks)**
+1. **Implement basic VMRequest/Response mechanism** for one operation (`pcall`)
+2. **Verify compilation succeeds** without E0596 errors
+3. **Test basic integration** with existing VM execution
+
+#### **Phase 2: Core Migration (2-3 weeks)**  
+1. **Replace ExecutionContext trait** with chosen pattern
+2. **Migrate essential standard library functions** to new architecture
+3. **Maintain existing component functionality**
+
+#### **Phase 3: Full Integration (1-2 weeks)**
+1. **Complete standard library implementation** using new pattern
+2. **Achieve full Lua 5.1 specification compliance**
+3. **Performance optimization and testing**
+
+### **Why the Current Architecture Cannot Be Fixed**
+
+**The dual-mutability constraint is not a bug—it's a fundamental design incompatibility:**
+
+1. **Rust's ownership model** prevents the pattern by design for memory safety
+2. **Workarounds fail**: Attempts to use `Cell`, `RefCell`, or other interior mutability patterns still hit borrowing conflicts during VM execution
+3. **Successful implementations prove** that proper architectures work within Rust's constraints
+4. **The pattern is an anti-pattern**: Other systems languages (C/C++) allow this dangerous pattern, but Rust correctly prevents it
+
+### **Development Guidance**
+
+#### **For Contributors**
+
+⚠️ **Critical Understanding**: This is **not a traditional debugging problem**. The remaining issues are symptoms of architectural incompatibility, not implementation bugs.
+
+**High-impact contributions:**
+- ✅ Implementing proven architectural patterns (Sequence, Proxy, Callback)
+- ✅ Architectural expertise and pattern migration
+- ✅ Integration testing with new patterns
+
+**Low-impact contributions:**
+- ❌ Bug fixes for failing tests (symptoms of architectural issue)
+- ❌ Standard library incremental improvements (blocked by architecture)
+- ❌ Performance optimizations (requires stable architecture first)
+
+#### **For Users**
+
+**Current capabilities:** The interpreter is **highly functional** for:
+- Basic Lua scripts and function execution
+- Simple Redis Lua integration scenarios
+- Table operations and control flow
+- Standard mathematical and string operations
+
+**Limitations:** Complex scenarios requiring VM-stdlib integration will fail until architectural migration is complete.
+
+This constraint represents a **learning opportunity** about language interpreter design in Rust and demonstrates the importance of **architecture-first design** when working within Rust's ownership constraints.
+
 ### 5. Lua VM Architecture (**UPDATED - Direct Execution Model**)
 
 The Lua VM has been completely refactored to use a unified Frame-based execution model:

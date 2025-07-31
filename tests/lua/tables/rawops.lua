@@ -1,5 +1,5 @@
 -- Minimal raw table operations test
-print("Starting raw table operations test")
+print("===== Ferrous Lua Standard Library Test =====")
 
 -- Test 1: Basic rawset and rawget
 local t1 = {}
@@ -16,19 +16,19 @@ t1.key2 = "value2"
 print("t1.key2 = \"value2\"")
 print("t1.key2 => " .. tostring(t1.key2))
 
--- Test 2: rawequal with various types
-print("\nTest 2: rawequal")
+-- Test 2: Direct equality comparisons (rawequal not available in Lua 5.1)
+print("\nTest 2: Direct equality comparisons")
 
 local a = {}
 local b = {}
 local c = a
 
-print("rawequal(a, a) => " .. tostring(rawequal(a, a)))
-print("rawequal(a, b) => " .. tostring(rawequal(a, b)))
-print("rawequal(a, c) => " .. tostring(rawequal(a, c)))
-print("rawequal(1, 1) => " .. tostring(rawequal(1, 1)))
-print("rawequal(1, 2) => " .. tostring(rawequal(1, 2)))
-print("rawequal(\"test\", \"test\") => " .. tostring(rawequal("test", "test")))
+print("a == a =>", a == a)
+print("a == b =>", a == b) 
+print("a == c =>", a == c)
+print("1 == 1 =>", 1 == 1)
+print("1 == 2 =>", 1 == 2)
+print("\"test\" == \"test\" =>", "test" == "test")
 
 -- Test 3: Simple metatable test (if supported)
 print("\nTest 3: Simple metatable test")

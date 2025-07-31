@@ -370,6 +370,8 @@ impl LuaString {
         // Calculate content hash for string interning
         let content_hash = Self::calculate_content_hash(&bytes);
         
+        eprintln!("DEBUG LuaString::from_str: Creating string '{}' with hash {}", s, content_hash);
+        
         Ok(LuaString {
             bytes,
             content_hash,
@@ -381,6 +383,9 @@ impl LuaString {
         let s = s.into();
         let bytes = s.into_bytes();
         let content_hash = Self::calculate_content_hash(&bytes);
+        
+        eprintln!("DEBUG LuaString::new: Creating string with {} bytes, hash {}", bytes.len(), content_hash);
+        
         LuaString {
             bytes,
             content_hash,
@@ -390,6 +395,8 @@ impl LuaString {
     /// Create a new Lua string from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let content_hash = Self::calculate_content_hash(bytes);
+        
+        eprintln!("DEBUG LuaString::from_bytes: Creating string from {} bytes, hash {}", bytes.len(), content_hash);
         
         LuaString {
             bytes: bytes.to_vec(),
@@ -401,7 +408,9 @@ impl LuaString {
     pub fn calculate_content_hash(bytes: &[u8]) -> u64 {
         let mut hasher = DefaultHasher::new();
         bytes.hash(&mut hasher);
-        hasher.finish()
+        let hash = hasher.finish();
+        eprintln!("DEBUG LuaString::calculate_content_hash: {} bytes -> hash {}", bytes.len(), hash);
+        hash
     }
     
     /// Get the bytes of this string
@@ -535,10 +544,24 @@ impl PartialEq for HashableValue {
                     return true;
                 }
                 
-                // Otherwise, compare content
-                let a_ref = a.borrow();
-                let b_ref = b.borrow();
-                a_ref.bytes == b_ref.bytes
+                // Use try_borrow to handle concurrent access gracefully
+                let a_borrowed = match a.try_borrow() {
+                    Ok(ref_a) => ref_a,
+                    Err(_) => return false, // Can't compare if one is mutably borrowed
+                };
+                
+                let b_borrowed = match b.try_borrow() {
+                    Ok(ref_b) => ref_b,
+                    Err(_) => return false, // Can't compare if one is mutably borrowed
+                };
+                
+                // Check content hash first for efficiency
+                if a_borrowed.content_hash != b_borrowed.content_hash {
+                    return false;
+                }
+                
+                // If hashes match, verify actual content
+                a_borrowed.bytes == b_borrowed.bytes
             },
             _ => false,
         }
@@ -643,23 +666,43 @@ impl Table {
     /// Get a field from the table (raw get, no metamethods).
     /// Distinguishes between a key not being present (`None`) and a key being present with a `nil` value (`Some(Value::Nil)`).
     pub fn get_field(&self, key: &Value) -> Option<Value> {
+        eprintln!("DEBUG Table::get_field: Called with key={:?}", key);
+        eprintln!("DEBUG Table::get_field: Table has {} array elements, {} map entries", 
+                 self.array.len(), self.map.len());
+        
         // Handle numeric keys which might access the array part.
         if let Value::Number(n) = key {
+            eprintln!("DEBUG Table::get_field: Numeric key n={}", n);
             // Check for integer value suitable for 1-based indexing.
             if n.fract() == 0.0 && *n >= 1.0 {
                 let index = *n as usize;
                 // If the index is within the bounds of our array part, the array is authoritative.
                 if index > 0 && index <= self.array.len() {
+                    let value = self.array[index - 1].clone();
+                    eprintln!("DEBUG Table::get_field: Found in array[{}]: {:?}", index - 1, value);
                     // The key is in the array part. Return its value, which might be Some(Nil).
-                    return Some(self.array[index - 1].clone());
+                    return Some(value);
+                } else {
+                    eprintln!("DEBUG Table::get_field: Numeric key {} outside array bounds (len={})", 
+                             index, self.array.len());
                 }
+            } else {
+                eprintln!("DEBUG Table::get_field: Non-integer numeric key or < 1: {}", n);
             }
         }
 
         // For non-integer numbers, strings, or integers outside the array part, check the map.
         match HashableValue::from_value(key) {
-            Ok(hashable) => self.map.get(&hashable).cloned(),
-            Err(_) => None, // Key is not a hashable type.
+            Ok(hashable) => {
+                eprintln!("DEBUG Table::get_field: Converted to hashable: {:?}", hashable);
+                let result = self.map.get(&hashable).cloned();
+                eprintln!("DEBUG Table::get_field: Map lookup result: {:?}", result.as_ref().map(|v| format!("{:?}", v)));
+                result
+            },
+            Err(e) => {
+                eprintln!("DEBUG Table::get_field: Key is not hashable: {:?}", e);
+                None // Key is not a hashable type.
+            }
         }
     }
     
@@ -929,6 +972,9 @@ pub struct Closure {
     
     /// Captured upvalues
     pub upvalues: Vec<UpvalueHandle>,
+    
+    /// Function environment (Lua 5.1 cl->env field) 
+    pub env: TableHandle,
 }
 
 impl fmt::Debug for Closure {
@@ -936,6 +982,7 @@ impl fmt::Debug for Closure {
         f.debug_struct("Closure")
             .field("proto", &self.proto)
             .field("upvalues", &self.upvalues)
+            .field("env", &self.env)
             .finish()
     }
 }

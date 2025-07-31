@@ -176,8 +176,8 @@ struct CodeGenContext {
     // Complete upvalue system
     upvalue_names: Vec<String>,
     upvalues: Vec<UpvalueInfo>,
-    parent_locals: Vec<String>,      // For upvalue resolution
-    parent_upvalues: Vec<String>,    // For nested upvalue resolution
+    parent_locals: Vec<(String, u8)>,    // For upvalue resolution
+    parent_upvalues: Vec<String>,        // For nested upvalue resolution
 }
 
 impl CodeGenContext {
@@ -189,7 +189,7 @@ impl CodeGenContext {
                 num_params: 0,
                 is_vararg: false,
                 max_stack_size: 2,
-                upvalues: vec![CompilationUpvalue { in_stack: false, index: 0 }],
+                upvalues: Vec::new(),
                 prototypes: Vec::new(),
                 debug_info: None,
             },
@@ -199,13 +199,14 @@ impl CodeGenContext {
             scope_level: 0,
             strings: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             break_targets: Vec::new(),
-            upvalue_names: vec!["_ENV".to_string()],
-            upvalues: vec![UpvalueInfo { name: "_ENV".to_string(), is_local: false, index: 0 }],
+            upvalue_names: Vec::new(),
+            upvalues: Vec::new(),
             parent_locals: Vec::new(),
-            parent_upvalues: vec!["_ENV".to_string()],
+            parent_upvalues: Vec::new(),
         }
     }
     
+    /// Create a child context for nested function compilation without synthetic environment injection
     fn new_child(&self) -> Self {
         let mut child = CodeGenContext {
             current_function: CompiledFunction {
@@ -214,7 +215,7 @@ impl CodeGenContext {
                 num_params: 0,
                 is_vararg: false,
                 max_stack_size: 2,
-                upvalues: vec![CompilationUpvalue { in_stack: false, index: 0 }],
+                upvalues: Vec::new(),
                 prototypes: Vec::new(),
                 debug_info: None,
             },
@@ -224,70 +225,76 @@ impl CodeGenContext {
             scope_level: 0,
             strings: std::rc::Rc::clone(&self.strings),
             break_targets: Vec::new(),
-            upvalue_names: vec!["_ENV".to_string()],
-            upvalues: vec![UpvalueInfo { name: "_ENV".to_string(), is_local: false, index: 0 }],
-            parent_locals: self.locals.iter().map(|l| l.name.clone()).collect(),
+            upvalue_names: Vec::new(),
+            upvalues: Vec::new(),
+            parent_locals: self.locals.iter().map(|l| (l.name.clone(), l.register)).collect(),
             parent_upvalues: self.upvalue_names.clone(),
         };
         child
     }
 
     fn allocate_register(&mut self) -> LuaResult<u8> {
-        for i in self.next_free_register as usize..=MAX_REGISTERS {
-            if i < self.register_states.len() && self.register_states[i] == RegisterState::Free {
-                self.register_states[i] = RegisterState::Reserved;
-                
-                if (i + 1) as u8 > self.current_function.max_stack_size {
-                    if i + 1 > MAX_REGISTERS {
-                        return Err(LuaError::CompileError("Stack overflow: register allocation exceeds maximum".to_string()));
-                    }
-                    self.current_function.max_stack_size = (i + 1) as u8;
-                }
-                self.next_free_register = (i + 1) as u8;
-                return Ok(i as u8);
-            }
+        let reg = self.next_free_register;
+        
+        if reg > MAX_REGISTERS as u8 {
+            return Err(LuaError::CompileError("Stack overflow: register allocation exceeds maximum".to_string()));
         }
-        Err(LuaError::CompileError("Too many registers in use".to_string()))
+        
+        // Ensure register states vector is large enough
+        if (reg as usize) >= self.register_states.len() {
+            self.register_states.resize((reg as usize) + 1, RegisterState::Free);
+        }
+        
+        // Mark as reserved (for tracking, but no reuse until scope exit)
+        self.register_states[reg as usize] = RegisterState::Reserved;
+        
+        // Update stack size if needed
+        if (reg + 1) > self.current_function.max_stack_size {
+            self.current_function.max_stack_size = reg + 1;
+        }
+        
+        // Simply increment for next allocation
+        self.next_free_register = reg + 1;
+        
+        Ok(reg)
     }
 
     fn free_register(&mut self, reg: u8) {
+        // Only mark for tracking, but don't reset next_free_register
         if (reg as usize) < self.register_states.len() {
             self.register_states[reg as usize] = RegisterState::Free;
-            if reg < self.next_free_register {
-                self.next_free_register = reg;
-            }
         }
     }
 
     fn reserve_consecutive_registers(&mut self, count: u8) -> LuaResult<u8> {
         if count == 0 { return Ok(0); }
         
-        for start in 0..=(MAX_REGISTERS.saturating_sub(count as usize)) {
-            if (0..count).all(|j| {
-                let idx = start + j as usize;
-                idx < self.register_states.len() && self.register_states[idx] == RegisterState::Free
-            }) {
-                for j in 0..count {
-                    self.register_states[start + j as usize] = RegisterState::Reserved;
-                }
-                
-                let required_size = start as u8 + count;
-                
-                if required_size > MAX_REGISTERS as u8 {
-                    return Err(LuaError::CompileError("Stack overflow: consecutive allocation exceeds maximum".to_string()));
-                }
-                
-                if required_size > self.current_function.max_stack_size {
-                    self.current_function.max_stack_size = required_size;
-                }
-                
-                if start + count as usize > self.next_free_register as usize {
-                    self.next_free_register = (start + count as usize) as u8;
-                }
-                return Ok(start as u8);
-            }
+        let start_reg = self.next_free_register;
+        
+        if start_reg + count > MAX_REGISTERS as u8 {
+            return Err(LuaError::CompileError("Stack overflow: consecutive allocation exceeds maximum".to_string()));
         }
-        Err(LuaError::CompileError(format!("Cannot allocate {} consecutive registers", count)))
+        
+        // Ensure register states vector is large enough
+        while (start_reg + count) as usize >= self.register_states.len() {
+            self.register_states.push(RegisterState::Free);
+        }
+        
+        // Mark all consecutive registers as reserved
+        for i in 0..count {
+            self.register_states[(start_reg + i) as usize] = RegisterState::Reserved;
+        }
+        
+        // Update function stack size
+        let required_size = start_reg + count;
+        if required_size > self.current_function.max_stack_size {
+            self.current_function.max_stack_size = required_size;
+        }
+        
+        // Move stack top past allocated registers
+        self.next_free_register = start_reg + count;
+        
+        Ok(start_reg)
     }
 
     fn allocate_local_register(&mut self, name: &str) -> LuaResult<u8> {
@@ -305,29 +312,36 @@ impl CodeGenContext {
         self.locals.iter().rev().find(|local| local.name == name).map(|local| local.register)
     }
 
-    // SPECIFICATION-COMPLIANT upvalue system
     fn lookup_upvalue(&mut self, name: &str) -> LuaResult<Option<u8>> {
         // Check if already an upvalue
         if let Some(pos) = self.upvalue_names.iter().position(|uv| uv == name) {
             return Ok(Some(pos as u8));
         }
         
-        // Check parent locals for capture
-        if let Some(pos) = self.parent_locals.iter().position(|local| local == name) {
-            if pos > 255 { return Err(LuaError::CompileError("Too many upvalues".to_string())); }
+        // Check parent locals for capture - SPECIFICATION ALIGNED BASE CALCULATION
+        if let Some((_, local_register)) = self.parent_locals.iter().find(|(local_name, _)| local_name == name) {
+            if *local_register > 255 { 
+                return Err(LuaError::CompileError("Too many upvalues".to_string())); 
+            }
             
             let upval_info = UpvalueInfo {
                 name: name.to_string(),
                 is_local: true,
-                index: pos as u8,
+                index: *local_register,
             };
             self.upvalues.push(upval_info);
             self.upvalue_names.push(name.to_string());
+            
+            let upvalue_index = (self.upvalue_names.len() - 1) as u8;
+            
+            // SPECIFICATION COMPLIANCE: Match VM's base register calculation
             self.current_function.upvalues.push(CompilationUpvalue {
                 in_stack: true,
-                index: pos as u8,
+                // Use local register index that VM will interpret relative to function base
+                index: *local_register,
             });
-            return Ok(Some((self.upvalue_names.len() - 1) as u8));
+            
+            return Ok(Some(upvalue_index));
         }
         
         // Check parent upvalues for nested capture
@@ -341,11 +355,15 @@ impl CodeGenContext {
             };
             self.upvalues.push(upval_info);
             self.upvalue_names.push(name.to_string());
+            
+            let upvalue_index = (self.upvalue_names.len() - 1) as u8;
+            
             self.current_function.upvalues.push(CompilationUpvalue {
                 in_stack: false,
                 index: pos as u8,
             });
-            return Ok(Some((self.upvalue_names.len() - 1) as u8));
+            
+            return Ok(Some(upvalue_index));
         }
         
         Ok(None)
@@ -753,20 +771,19 @@ fn compile_function_call(ctx: &mut CodeGenContext, call: &FunctionCall, target: 
     Ok(())
 }
 
-/// SPECIFICATION-COMPLIANT table constructor with proper SETLIST
 fn compile_table_constructor(ctx: &mut CodeGenContext, table: &TableConstructor, target: u8) -> LuaResult<()> {
     ctx.emit(Instruction::create_ABC(OpCode::NewTable, target as u32, 0, 0));
     
-    let mut list_index = 1u32;
-    let mut list_items = Vec::new();
+    let mut list_expressions = Vec::new();
+    let mut has_vararg = false;
     
     for field in &table.fields {
         match field {
             TableField::List(expr) => {
-                let value_reg = ctx.allocate_register()?;
-                compile_expression(ctx, expr, value_reg, false)?;
-                list_items.push((list_index, value_reg));
-                list_index += 1;
+                if matches!(expr, Expression::VarArg) {
+                    has_vararg = true;
+                }
+                list_expressions.push(expr);
             }
             TableField::Record { key, value } => {
                 let key_reg = ctx.allocate_register()?;
@@ -791,22 +808,70 @@ fn compile_table_constructor(ctx: &mut CodeGenContext, table: &TableConstructor,
         }
     }
     
-    // SPECIFICATION-COMPLIANT SETLIST implementation
-    if !list_items.is_empty() {
-        let batches = (list_items.len() + SETLIST_FIELDS_PER_FLUSH as usize - 1) / SETLIST_FIELDS_PER_FLUSH as usize;
-        
-        for batch in 0..batches {
-            let start_idx = batch * SETLIST_FIELDS_PER_FLUSH as usize;
-            let end_idx = ((batch + 1) * SETLIST_FIELDS_PER_FLUSH as usize).min(list_items.len());
-            let count = end_idx - start_idx;
+    // Handle list items with proper consecutive register placement and batching
+    if !list_expressions.is_empty() {
+        if has_vararg {
+            let needed_count = list_expressions.len() as u8;
+            let list_base = ctx.reserve_consecutive_registers(needed_count)?;
             
-            // FIXED: Correct SETLIST batching per Lua 5.1 spec
-            ctx.emit(Instruction::create_ABC(OpCode::SetList, target as u32, count as u32, (batch + 1) as u32));
-        }
-        
-        // Free the value registers
-        for (_, reg) in list_items {
-            ctx.free_register(reg);
+            // Evaluate expressions into consecutive positions
+            for (i, expr) in list_expressions.iter().enumerate() {
+                let dest = list_base + i as u8;
+                let is_last_and_vararg = i == list_expressions.len() - 1 && matches!(expr, Expression::VarArg);
+                compile_expression(ctx, expr, dest, is_last_and_vararg)?;
+            }
+            
+            // Move values to required positions R(A+1)...R(A+count) for SETLIST
+            for i in 0..needed_count {
+                let src = list_base + i;
+                let dest = target + 1 + i;
+                if src != dest {
+                    ctx.emit(Instruction::create_ABC(OpCode::Move, dest as u32, src as u32, 0));
+                }
+            }
+            
+            // Emit SETLIST B=0 (use all values to top)
+            ctx.emit(Instruction::create_ABC(OpCode::SetList, target as u32, 0, 1));
+            
+            // Free the allocated registers
+            for i in 0..needed_count {
+                ctx.free_register(list_base + i);
+            }
+        } else {
+            // Handle fixed list items with proper batching per Lua 5.1 specification
+            let total_items = list_expressions.len();
+            let batches = (total_items + SETLIST_FIELDS_PER_FLUSH as usize - 1) / SETLIST_FIELDS_PER_FLUSH as usize;
+            
+            for batch in 0..batches {
+                let start_idx = batch * SETLIST_FIELDS_PER_FLUSH as usize;
+                let end_idx = ((batch + 1) * SETLIST_FIELDS_PER_FLUSH as usize).min(total_items);
+                let count = end_idx - start_idx;
+                
+                let batch_base = ctx.reserve_consecutive_registers(count as u8)?;
+                
+                // Evaluate expressions into the consecutive positions
+                for (local_i, expr_idx) in (start_idx..end_idx).enumerate() {
+                    let dest = batch_base + local_i as u8;
+                    compile_expression(ctx, list_expressions[expr_idx], dest, false)?;
+                }
+                
+                // Move values to R(A+1)...R(A+count) positions required by SETLIST
+                for local_i in 0..count {
+                    let src = batch_base + local_i as u8;
+                    let dest = target + 1 + local_i as u8;
+                    if src != dest {
+                        ctx.emit(Instruction::create_ABC(OpCode::Move, dest as u32, src as u32, 0));
+                    }
+                }
+                
+                // Emit SETLIST for this batch
+                ctx.emit(Instruction::create_ABC(OpCode::SetList, target as u32, count as u32, (batch + 1) as u32));
+                
+                // Free the batch registers
+                for local_i in 0..count {
+                    ctx.free_register(batch_base + local_i as u8);
+                }
+            }
         }
     }
     
@@ -850,18 +915,15 @@ fn compile_function_definition(ctx: &mut CodeGenContext, parameters: &[String], 
     // Emit CLOSURE with Bx = const_idx (per Lua 5.1 §5.4)
     ctx.emit(Instruction::create_ABx(OpCode::Closure, target as u32, const_idx));
     
-    // Emit upvalue capture pseudo-instructions
+    // CANONICAL LUA 5.1: Generate pseudo-instructions for ALL upvalues
+    // The VM processes every upvalue via pseudo-instructions, including environment
     for upvalue in &proto_ctx.upvalues {
-        if upvalue.name == "_ENV" {
-            continue; // Skip _ENV, it's handled automatically
-        }
-        
         if upvalue.is_local {
-            // Capture local variable - emit MOVE pseudo-instruction
-            ctx.emit(Instruction::create_ABC(OpCode::Move, 0, upvalue.index as u32, 0));
+            // Generate MOVE pseudo-instruction: tells VM to capture local variable from register B into closure A 
+            ctx.emit(Instruction::create_ABC(OpCode::Move, target as u32, upvalue.index as u32, 0));
         } else {
-            // Capture parent upvalue - emit GETUPVAL pseudo-instruction
-            ctx.emit(Instruction::create_ABC(OpCode::GetUpval, 0, upvalue.index as u32, 0));
+            // Generate GETUPVAL pseudo-instruction: tells VM to capture parent upvalue B into closure A
+            ctx.emit(Instruction::create_ABC(OpCode::GetUpval, target as u32, upvalue.index as u32, 0));
         }
     }
     
@@ -1003,6 +1065,8 @@ fn compile_statement(ctx: &mut CodeGenContext, stmt: &Statement) -> LuaResult<()
             ctx.free_register(temp_reg);
         }
         Statement::Return { expressions } => {
+            ctx.emit(Instruction::create_ABC(OpCode::Close, 0, 0, 0));
+            
             if expressions.len() == 1 && matches!(expressions[0], Expression::FunctionCall(_)) {
                 // Tail call optimization
                 compile_expression(ctx, &expressions[0], 0, true)?;
@@ -1176,7 +1240,11 @@ fn compile_for_loop(ctx: &mut CodeGenContext, variable: &str, initial: &Expressi
     let forprep_pc = ctx.current_pc();
     ctx.emit(Instruction::create_AsBx(OpCode::ForPrep, base_reg as u32, 0));
     let body_start_pc = ctx.current_pc();
+    
+    ctx.enter_scope();
     compile_block(ctx, body)?;
+    ctx.exit_scope();
+    
     let forloop_pc = ctx.current_pc();
     ctx.emit(Instruction::create_AsBx(OpCode::ForLoop, base_reg as u32, (body_start_pc as i32 - forloop_pc as i32 - 1)));
     
@@ -1244,7 +1312,10 @@ fn compile_for_in_loop(ctx: &mut CodeGenContext, variables: &[String], iterators
     ctx.emit(Instruction::create_AsBx(OpCode::Jmp, 0, 0));
 
     let body_start = ctx.current_pc();
+    
+    ctx.enter_scope();
     compile_block(ctx, body)?;
+    ctx.exit_scope();
 
     let tfor_pc = ctx.current_pc();
     ctx.emit(Instruction::create_ABC(OpCode::TForLoop, iter_func_reg as u32, 0, nvars));
@@ -1275,6 +1346,7 @@ fn compile_repeat_statement(ctx: &mut CodeGenContext, body: &Block, condition: &
     ctx.break_targets.push(Vec::new());
     
     let body_start_pc = ctx.current_pc();
+    
     ctx.enter_scope();
     compile_block(ctx, body)?;
     ctx.exit_scope();

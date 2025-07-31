@@ -116,6 +116,37 @@ fn base_tostring(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     
     let value = ctx.get_arg(0)?;
     
+    // Check for __tostring metamethod first
+    if let Value::Table(ref table_handle) = value {
+        let table_ref = table_handle.borrow();
+        if let Some(ref metatable) = table_ref.metatable {
+            let tostring_key = ctx.create_string("__tostring")?;
+            let mt_ref = metatable.borrow();
+            if let Some(tostring_mm) = mt_ref.get_field(&Value::String(tostring_key)) {
+                if !tostring_mm.is_nil() {
+                    drop(mt_ref);
+                    drop(table_ref);
+                    // Call the __tostring metamethod
+                    match tostring_mm {
+                        Value::Closure(_) | Value::CFunction(_) => {
+                            // We need to call this metamethod and get its result
+                            // For now, we'll use a simplified approach
+                            return Err(LuaError::NotImplemented("__tostring metamethod calls not yet implemented".to_string()));
+                        },
+                        _ => {
+                            // __tostring metamethod must be a function
+                            return Err(LuaError::TypeError {
+                                expected: "function".to_string(),
+                                got: tostring_mm.type_name().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Default string representations
     let result_string = match &value {
         &Value::String(ref handle) => {
             let string_ref = handle.borrow();
@@ -291,7 +322,21 @@ fn base_getmetatable(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         Value::Table(table) => {
             let table_ref = table.borrow();
             if let Some(metatable) = &table_ref.metatable {
-                ctx.push_result(Value::Table(Rc::clone(metatable)))?;
+                // Check for __metatable protection
+                let metatable_key = ctx.create_string("__metatable")?;
+                let mt_ref = metatable.borrow();
+                if let Some(protected_value) = mt_ref.get_field(&Value::String(metatable_key)) {
+                    if !protected_value.is_nil() {
+                        // Return the __metatable value, not the actual metatable
+                        ctx.push_result(protected_value)?;
+                    } else {
+                        // __metatable is nil, return the actual metatable
+                        ctx.push_result(Value::Table(Rc::clone(metatable)))?;
+                    }
+                } else {
+                    // No __metatable field, return the actual metatable
+                    ctx.push_result(Value::Table(Rc::clone(metatable)))?;
+                }
             } else {
                 ctx.push_result(Value::Nil)?;
             }
@@ -304,7 +349,7 @@ fn base_getmetatable(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     Ok(1)
 }
 
-/// setmetatable(table, metatable) -> table
+/// setmetatable(table, metatable) -> table with complete protection
 fn base_setmetatable(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     if ctx.arg_count() < 2 {
         return Err(LuaError::RuntimeError("setmetatable expects 2 arguments".to_string()));
@@ -323,10 +368,34 @@ fn base_setmetatable(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         }
     };
     
+    // Check if current metatable is protected
+    {
+        let table_ref = table.borrow();
+        if let Some(ref current_metatable) = table_ref.metatable {
+            let metatable_key = ctx.create_string("__metatable")?;
+            let mt_ref = current_metatable.borrow();
+            if let Some(protected_value) = mt_ref.get_field(&Value::String(metatable_key)) {
+                if !protected_value.is_nil() {
+                    return Err(LuaError::RuntimeError("cannot change a protected metatable".to_string()));
+                }
+            }
+        }
+    }
+    
+    // Check if NEW metatable has protection
     match metatable_val {
-        Value::Table(metatable) => {
+        Value::Table(ref mt) => {
+            let metatable_key = ctx.create_string("__metatable")?;
+            let mt_ref = mt.borrow();
+            if let Some(protected_value) = mt_ref.get_field(&Value::String(metatable_key)) {
+                if !protected_value.is_nil() {
+                    return Err(LuaError::RuntimeError("cannot change a protected metatable".to_string()));
+                }
+            }
+            drop(mt_ref);
+            
             let mut table_ref = table.borrow_mut();
-            table_ref.metatable = Some(Rc::clone(&metatable));
+            table_ref.metatable = Some(Rc::clone(mt));
         },
         Value::Nil => {
             let mut table_ref = table.borrow_mut();
@@ -344,7 +413,7 @@ fn base_setmetatable(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     Ok(1)
 }
 
-/// rawget(table, index) -> value
+/// rawget(table, index) -> value (MUST bypass metamethods)
 fn base_rawget(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     if ctx.arg_count() < 2 {
         return Err(LuaError::RuntimeError("rawget expects 2 arguments".to_string()));
@@ -363,6 +432,7 @@ fn base_rawget(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         }
     };
     
+    // Use raw field access to bypass metamethods
     let table_ref = table.borrow();
     let value = table_ref.get_field(&key).unwrap_or(Value::Nil);
     
@@ -370,7 +440,7 @@ fn base_rawget(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     Ok(1)
 }
 
-/// rawset(table, index, value) -> table
+/// rawset(table, index, value) -> table (MUST bypass metamethods)
 fn base_rawset(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     if ctx.arg_count() < 3 {
         return Err(LuaError::RuntimeError("rawset expects 3 arguments".to_string()));
@@ -390,8 +460,9 @@ fn base_rawset(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
         }
     };
     
-    let mut table_mut = table.borrow_mut();
-    table_mut.set_field(key.clone(), value.clone())?;
+    // Use raw field setting to bypass metamethods
+    let mut table_ref = table.borrow_mut();
+    table_ref.set_field(key, value)?;
     
     ctx.push_result(Value::Table(Rc::clone(table)))?;
     Ok(1)
@@ -587,14 +658,19 @@ fn ipairs_iter(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     
     let next_index = index + 1;
     
-    let value = ctx.get_table_field(table, &Value::Number(next_index as f64))?;
+    let table_ref = table.borrow();
+    let value = if next_index > 0 && next_index <= table_ref.array.len() {
+        let array_value = table_ref.array[next_index - 1].clone();
+        array_value
+    } else {
+        Value::Nil
+    };
+    drop(table_ref);
     
     if value.is_nil() {
-        // End iteration at first nil encountered
         ctx.push_result(Value::Nil)?;
         Ok(1)
     } else {
-        // Continue iteration with index, value
         ctx.push_result(Value::Number(next_index as f64))?;
         ctx.push_result(value)?;
         Ok(2)
@@ -730,7 +806,7 @@ fn base_xpcall(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     Ok(1)
 }
 
-/// getfenv implementation
+/// getfenv implementation - proper closure.env access
 fn base_getfenv(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     let f = if ctx.arg_count() > 0 {
         ctx.get_arg(0)?
@@ -743,13 +819,22 @@ fn base_getfenv(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
             if level.fract() != 0.0 || level < 0.0 {
                 return Err(LuaError::RuntimeError("bad argument #1 to 'getfenv' (level must be non-negative)".to_string()));
             }
-            // For level-based access, return global environment
+            // For level-based access, return current function's environment
             let globals = ctx.globals_handle()?;
             ctx.push_result(Value::Table(globals))?;
             Ok(1)
         },
-        Value::Closure(_) | Value::CFunction(_) => {
-            // For function-based access, return global environment
+        Value::Closure(closure_handle) => {
+            // Access closure.env field directly
+            let env = {
+                let closure_ref = closure_handle.borrow();
+                Rc::clone(&closure_ref.env)
+            };
+            ctx.push_result(Value::Table(env))?;
+            Ok(1)
+        },
+        Value::CFunction(_) => {
+            // C functions use global environment
             let globals = ctx.globals_handle()?;
             ctx.push_result(Value::Table(globals))?;
             Ok(1)
@@ -763,7 +848,7 @@ fn base_getfenv(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     }
 }
 
-/// setfenv implementation  
+/// setfenv implementation - proper closure.env modification
 fn base_setfenv(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     if ctx.arg_count() < 2 {
         return Err(LuaError::RuntimeError("setfenv expects 2 arguments".to_string()));
@@ -772,24 +857,36 @@ fn base_setfenv(ctx: &mut dyn ExecutionContext) -> LuaResult<i32> {
     let f = ctx.get_arg(0)?;
     let table = ctx.get_arg(1)?;
     
-    if !matches!(table, Value::Table(_)) {
-        return Err(LuaError::TypeError {
-            expected: "table".to_string(),
-            got: table.type_name().to_string(),
-        });
-    }
+    let new_env = match table {
+        Value::Table(ref handle) => handle,
+        _ => {
+            return Err(LuaError::TypeError {
+                expected: "table".to_string(),
+                got: table.type_name().to_string(),
+            });
+        }
+    };
     
     match f {
         Value::Number(level) => {
             if level.fract() != 0.0 || level <= 0.0 {
                 return Err(LuaError::RuntimeError("bad argument #1 to 'setfenv' (level must be positive)".to_string()));
             }
-            // For level-based setting, return the function/level (basic implementation)
+            // For level-based setting, return the function/level
             ctx.push_result(f)?;
             Ok(1)
         },
-        Value::Closure(_) | Value::CFunction(_) => {
-            // For function-based setting, return the function (basic implementation)  
+        Value::Closure(ref closure_handle) => {
+            // Set closure.env field directly
+            {
+                let mut closure_ref = closure_handle.borrow_mut();
+                closure_ref.env = Rc::clone(new_env);
+            }
+            ctx.push_result(f)?;
+            Ok(1)
+        },
+        Value::CFunction(_) => {
+            // C functions cannot change environment, return function
             ctx.push_result(f)?;
             Ok(1)
         },
