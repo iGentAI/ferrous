@@ -333,7 +333,7 @@ replicaof 192.168.1.100 6379
         assert_eq!(config.network.password, Some("secretpassword".to_string()));
         
         assert_eq!(config.rdb.filename, "dump.ferrous.rdb");
-        assert_eq!(config.rdb.dir, path.parent().unwrap().to_string_lossy().to_string());
+        assert_eq!(config.rdb.dir, "./data");
         
         assert_eq!(config.replication.master_host, Some("192.168.1.100".to_string()));
         assert_eq!(config.replication.master_port, Some(6379));

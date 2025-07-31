@@ -1,6 +1,7 @@
-//! Ferrous - A Redis-compatible in-memory database server written in pure Rust
+//! Ferrous - A Redis-compatible in-memory database server written in Rust
 //! 
 //! This is the main entry point for the Ferrous server.
+//! Now uses MLua for Lua 5.1 scripting compatibility with Redis.
 
 mod config;
 mod error;
@@ -10,8 +11,6 @@ mod storage;
 mod pubsub;
 mod replication;
 mod monitor;
-// Replace the old lua module with the new implementation
-mod lua_new;
 
 use std::process;
 use error::Result;
@@ -26,7 +25,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    println!("Starting Ferrous - Redis-compatible server in Rust");
+    println!("Starting Ferrous - Redis-compatible server in Rust with MLua Lua 5.1 scripting");
     println!("Version: {}", env!("CARGO_PKG_VERSION"));
     
     // Parse command-line arguments
@@ -54,7 +53,9 @@ fn run() -> Result<()> {
         println!("Authentication enabled with password: '{}'", password);
     }
     
-    println!("Ferrous listening on {}:{}", config.network.bind_addr, config.network.port);
+    println!("Ferrous with MLua Lua 5.1 scripting listening on {}:{}", 
+             config.network.bind_addr, config.network.port);
+    println!("Lua scripting: EVAL, EVALSHA, SCRIPT commands available");
     
     // Create and run server
     let mut server = Server::from_config(config)?;

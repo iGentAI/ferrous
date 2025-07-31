@@ -60,7 +60,7 @@ impl MemoryManager {
     /// Add memory usage
     pub fn add_memory(&self, bytes: usize) -> bool {
         let old_usage = self.used_memory.fetch_add(bytes, Ordering::Relaxed);
-        let new_usage = old_usage + bytes;
+        let new_usage = old_usage.saturating_add(bytes);
         
         // Check if we exceeded the limit
         if self.max_memory > 0 && new_usage > self.max_memory {

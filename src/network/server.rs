@@ -19,9 +19,6 @@ use crate::pubsub::{PubSubManager, format_message, format_pmessage,
 use crate::replication::{ReplicationManager, ReplicationConfig};
 use super::{Listener, Connection, ConnectionState, NetworkConfig};
 use crate::Config as FerrousConfig;
-// Replace lua imports with new lua_new imports
-use crate::lua_new::ScriptExecutor;
-use crate::storage::commands::lua as lua_command;
 
 /// Connection ID generator
 static CONN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -190,8 +187,6 @@ pub struct Server {
     monitor_subscribers: Arc<MonitorSubscribers>,
     /// Clients paused until this time
     clients_paused_until: Arc<Mutex<SystemTime>>,
-    /// Script executor for Lua scripts
-    script_executor: Arc<ScriptExecutor>,
 }
 
 impl Server {
@@ -263,9 +258,6 @@ impl Server {
         // Initialize client pause to UNIX_EPOCH (not paused)
         let clients_paused_until = Arc::new(Mutex::new(UNIX_EPOCH));
         
-        // Create script executor
-        let script_executor = Arc::new(ScriptExecutor::new(Arc::clone(&storage)));
-        
         // Load existing RDB if available
         if let Err(e) = rdb_engine.load(&storage) {
             eprintln!("Failed to load RDB file: {}", e);
@@ -308,7 +300,6 @@ impl Server {
             slowlog,
             monitor_subscribers,
             clients_paused_until,
-            script_executor,
         })
     }
     
@@ -1058,7 +1049,7 @@ impl Server {
             // Add the Lua script commands
             "EVAL" => {
                 println!("[SERVER DEBUG] Processing EVAL command");
-                match lua_command::handle_eval(&self.storage, &self.script_executor, db, parts) {
+                match crate::storage::commands::lua::handle_lua_command(&self.storage, "eval", parts) {
                     Ok(resp) => {
                         println!("[SERVER DEBUG] EVAL executed successfully");
                         Ok(resp)
@@ -1072,7 +1063,7 @@ impl Server {
             },
             "EVALSHA" => {
                 println!("[SERVER DEBUG] Processing EVALSHA command");
-                match lua_command::handle_evalsha(&self.storage, &self.script_executor, db, parts) {
+                match crate::storage::commands::lua::handle_lua_command(&self.storage, "evalsha", parts) {
                     Ok(resp) => {
                         println!("[SERVER DEBUG] EVALSHA executed successfully");
                         Ok(resp)
@@ -1086,7 +1077,7 @@ impl Server {
             },
             "SCRIPT" => {
                 println!("[SERVER DEBUG] Processing SCRIPT command");
-                match lua_command::handle_script(&self.storage, &self.script_executor, db, parts) {
+                match crate::storage::commands::lua::handle_lua_command(&self.storage, "script", parts) {
                     Ok(resp) => {
                         println!("[SERVER DEBUG] SCRIPT executed successfully");
                         Ok(resp)

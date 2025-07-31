@@ -8,6 +8,7 @@ use crate::error::{FerrousError, Result};
 use super::resp::RespFrame;
 
 /// Parser state for incremental RESP parsing
+#[derive(Clone)]
 pub struct RespParser {
     buffer: Vec<u8>,
     position: usize,
@@ -361,7 +362,9 @@ mod tests {
     fn test_parse_bulk_string() {
         let data = b"$6\r\nfoobar\r\n";
         let result = parse_resp_frame(data).unwrap();
-        assert!(matches!(result, Some((RespFrame::BulkString(Some(_)), 13))));
+        
+        // $6\r\n (4) + foobar (6) + \r\n (2) = 12 bytes total
+        assert!(matches!(result, Some((RespFrame::BulkString(Some(_)), 12))));
         
         let data = b"$-1\r\n";
         let result = parse_resp_frame(data).unwrap();
@@ -372,7 +375,9 @@ mod tests {
     fn test_parse_array() {
         let data = b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         let result = parse_resp_frame(data).unwrap();
-        assert!(matches!(result, Some((RespFrame::Array(Some(arr)), 23)) if arr.len() == 2));
+        
+        // *2\r\n (4) + $3\r\nfoo\r\n (8) + $3\r\nbar\r\n (8) + ... = 22 bytes
+        assert!(matches!(result, Some((RespFrame::Array(Some(arr)), 22)) if arr.len() == 2));
         
         let data = b"*-1\r\n";
         let result = parse_resp_frame(data).unwrap();

@@ -3,23 +3,38 @@ name = "ferrous"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ferrous Contributors"]
-description = "A Redis-compatible in-memory database server written in pure Rust"
+description = "A Redis-compatible in-memory database server written in Rust with MLua-based Lua 5.1 scripting"
 repository = "https://github.com/ferrous-db/ferrous"
 license = "MIT OR Apache-2.0"
-keywords = ["redis", "database", "cache", "nosql"]
+keywords = ["redis", "database", "cache", "nosql", "lua"]
 categories = ["database", "caching"]
 
+[[bin]]
+name = "lua_cli"
+path = "src/bin/lua_cli.rs"
+
 [dependencies]
+# Core dependencies
 lazy_static = "1.4"
 rand = "0.8.5"
 thiserror = "1.0"
-futures = "0.3" # For async/await support
-sha1 = "0.10.5" # For Lua script SHA1 computation
-uuid = { version = "1.3.0", features = ["v4"] } # For transaction IDs
-tokio = { version = "1.0", features = ["rt", "time"] } # For async operations and timeouts
+futures = "0.3"
+tokio = { version = "1.0", features = ["rt", "time"] }
+uuid = { version = "1.3.0", features = ["v4"] }
+
+# Lua 5.1 scripting via MLua (replaces custom Lua VM)
+mlua = { version = "0.11", features = [
+    "lua51",           # Lua 5.1 support for Redis compatibility
+    "vendored",        # Include Lua 5.1 C library
+    "send",            # Thread safety  
+    "serialize"        # For KEYS/ARGV serialization
+] }
+
+# Cryptography for script hashing
+sha1 = "0.10.5"
+hex = "0.4.3"
 
 [dev-dependencies]
-# Only for testing and benchmarking
 tempfile = "3.5.0"
 
 [profile.release]

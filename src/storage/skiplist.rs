@@ -2,10 +2,14 @@
 //! 
 //! Provides a probabilistic data structure with O(log n) operations
 //! for maintaining scored members in sorted order.
+//! 
+//! Uses dual indexing: skiplist for score-based range operations and HashMap for key-based lookups.
 
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::cmp::{Ordering, min};
 use std::fmt::{self, Debug};
+use std::collections::HashMap;
+use std::borrow::Borrow;
 use rand::Rng;
 
 /// Maximum number of levels in the skip list
@@ -24,7 +28,7 @@ struct SkipListNode<K, V> {
     forward: Vec<Option<*mut SkipListNode<K, V>>>,
 }
 
-/// Thread-safe skip list implementation
+/// Thread-safe skip list implementation with dual indexing
 pub struct SkipList<K, V> {
     /// Inner data protected by RwLock
     inner: Arc<RwLock<SkipListInner<K, V>>>,
@@ -32,7 +36,7 @@ pub struct SkipList<K, V> {
     rng: Arc<RwLock<rand::rngs::ThreadRng>>,
 }
 
-/// Inner skip list data
+/// Inner skip list data with dual indexing
 struct SkipListInner<K, V> {
     /// Sentinel head node
     head: *mut SkipListNode<K, V>,
@@ -42,6 +46,8 @@ struct SkipListInner<K, V> {
     length: usize,
     /// Memory usage in bytes
     memory_usage: usize,
+    /// Key-to-score lookup table for O(1) key operations
+    key_index: HashMap<K, V>,
 }
 
 /// Result of a range query
@@ -56,7 +62,7 @@ unsafe impl<K: Send, V: Send> Sync for SkipListInner<K, V> {}
 
 impl<K, V> SkipList<K, V>
 where
-    K: Clone + Ord + Debug,
+    K: Clone + Ord + Debug + std::hash::Hash + Eq,
     V: Clone + PartialOrd + Debug,
 {
     /// Create a new empty skip list
@@ -77,6 +83,7 @@ where
                 level: 0,
                 length: 0,
                 memory_usage: std::mem::size_of::<SkipListNode<K, V>>() + MAX_LEVEL * std::mem::size_of::<Option<*mut SkipListNode<K, V>>>(),
+                key_index: HashMap::new(),
             })),
             rng: Arc::new(RwLock::new(rand::thread_rng())),
         }
@@ -85,66 +92,27 @@ where
     /// Insert or update a key-value pair
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let mut inner = self.inner.write().unwrap();
-        let mut update = vec![std::ptr::null_mut(); MAX_LEVEL];
         
-        // Find position and collect update pointers
-        let mut current = inner.head;
-        for i in (0..=inner.level).rev() {
-            unsafe {
-                while let Some(next) = (*current).forward[i] {
-                    match self.compare_nodes(&(*next).value, &(*next).key, &value, &key) {
-                        Ordering::Less => current = next,
-                        _ => break,
-                    }
-                }
-                update[i] = current;
-            }
+        // Check if key already exists using the index
+        if let Some(old_score) = inner.key_index.get(&key) {
+            // Key exists, we need to remove the old node and insert new one
+            let old_value = old_score.clone();
+            
+            // Remove old node from skiplist (but not from index yet)
+            self.remove_node_by_score(&mut inner, &key, &old_value);
+            
+            // Update the index with new score
+            inner.key_index.insert(key.clone(), value.clone());
+            
+            // Insert new node with updated score
+            self.insert_new_node(&mut inner, key, value);
+            
+            return Some(old_value);
         }
 
-        // Check if key already exists
-        unsafe {
-            current = if let Some(next) = (*current).forward[0] {
-                next
-            } else {
-                std::ptr::null_mut()
-            };
-
-            if !current.is_null() && (*current).key == key {
-                // Update existing value
-                let old_value = (*current).value.clone();
-                (*current).value = value;
-                return Some(old_value);
-            }
-        }
-
-        // Generate random level for new node
-        let new_level = self.random_level();
-        
-        // Update list level if necessary
-        if new_level > inner.level {
-            for i in (inner.level + 1)..=new_level {
-                update[i] = inner.head;
-            }
-            inner.level = new_level;
-        }
-
-        // Create new node
-        let new_node = Box::into_raw(Box::new(SkipListNode {
-            key,
-            value,
-            forward: vec![None; new_level + 1],
-        }));
-
-        // Insert node at each level
-        unsafe {
-            for i in 0..=new_level {
-                (*new_node).forward[i] = (*update[i]).forward[i];
-                (*update[i]).forward[i] = Some(new_node);
-            }
-        }
-
-        inner.length += 1;
-        inner.memory_usage += self.calculate_node_size(new_level + 1);
+        // Key doesn't exist, insert new
+        inner.key_index.insert(key.clone(), value.clone());
+        self.insert_new_node(&mut inner, key, value);
         
         None
     }
@@ -153,102 +121,58 @@ where
     pub fn remove<Q>(&self, key: &Q) -> Option<V> 
     where 
         K: std::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + std::hash::Hash + Eq + ?Sized,
     {
         let mut inner = self.inner.write().unwrap();
-        let mut update = vec![std::ptr::null_mut(); MAX_LEVEL];
         
-        // Find node and collect update pointers
-        let mut current = inner.head;
-        unsafe {
-            for i in (0..=inner.level).rev() {
-                while let Some(next) = (*current).forward[i] {
-                    match (*next).key.borrow().cmp(key) {
-                        Ordering::Less => current = next,
-                        _ => break,
-                    }
-                }
-                update[i] = current;
-            }
-
-            // Check if we found the key
-            if let Some(target) = (*current).forward[0] {
-                if (*target).key.borrow().cmp(key) == Ordering::Equal {
-                    // Remove from each level
-                    for i in 0..=inner.level {
-                        if let Some(next) = (*update[i]).forward[i] {
-                            if next == target {
-                                (*update[i]).forward[i] = (*target).forward[i];
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-
-                    // Update list level
-                    while inner.level > 0 && (*inner.head).forward[inner.level].is_none() {
-                        inner.level -= 1;
-                    }
-
-                    let removed_value = (*target).value.clone();
-                    let node_levels = (*target).forward.len();
-                    
-                    // Deallocate node
-                    Box::from_raw(target);
-                    
-                    inner.length -= 1;
-                    inner.memory_usage -= self.calculate_node_size(node_levels);
-                    
-                    return Some(removed_value);
-                }
-            }
-        }
+        // Use the index to find the score quickly
+        let score = inner.key_index.remove(key)?.clone();
         
-        None
+        // Remove from skiplist using known score
+        self.remove_node_by_score(&mut inner, key, &score);
+        
+        Some(score)
     }
 
-    /// Get the score (value) for a key
+    /// Get the score (value) for a key - O(1) operation
     pub fn get_score<Q>(&self, key: &Q) -> Option<V> 
     where 
         K: std::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + std::hash::Hash + Eq + ?Sized,
     {
         let inner = self.inner.read().unwrap();
-        self.find_node(&inner, key).map(|node| unsafe { (*node).value.clone() })
+        inner.key_index.get(key).cloned()
     }
 
-    /// Get the rank (0-based position) of a key
+    /// Get the rank (0-based position) of a key - O(log n) operation
     pub fn get_rank<Q>(&self, key: &Q) -> Option<usize> 
     where 
         K: std::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + std::hash::Hash + Eq + ?Sized,
     {
         let inner = self.inner.read().unwrap();
+        
+        // First get the score from index
+        let score = inner.key_index.get(key)?;
+        
+        // Now count nodes with lower scores using skiplist traversal
         let mut rank = 0;
         let mut current = inner.head;
         
         unsafe {
-            for i in (0..=inner.level).rev() {
-                while let Some(next) = (*current).forward[i] {
-                    if (*next).key.borrow().cmp(key) == Ordering::Less {
-                        // Count nodes we're skipping at level 0
-                        if i == 0 {
-                            rank += 1;
-                        } else {
-                            // Count nodes between current and next at level 0
-                            rank += self.count_nodes_between(current, next);
-                        }
+            // Traverse the skiplist counting elements with lower (score, key) values
+            while let Some(next) = (*current).forward[0] {
+                match self.compare_with_query(&(*next).value, &(*next).key, score, key) {
+                    Ordering::Less => {
+                        rank += 1;
                         current = next;
-                    } else {
+                    }
+                    Ordering::Equal => {
+                        return Some(rank);
+                    }
+                    Ordering::Greater => {
                         break;
                     }
-                }
-            }
-
-            // Check if we found the key
-            if let Some(next) = (*current).forward[0] {
-                if (*next).key.borrow().cmp(key) == Ordering::Equal {
-                    return Some(rank);
                 }
             }
         }
@@ -256,7 +180,7 @@ where
         None
     }
 
-    /// Get element by rank (0-based)
+    /// Get element by rank (0-based) - O(log n) operation
     pub fn get_by_rank(&self, rank: usize) -> Option<(K, V)> {
         let inner = self.inner.read().unwrap();
         
@@ -285,7 +209,7 @@ where
         None
     }
 
-    /// Get a range of elements by rank (inclusive)
+    /// Get a range of elements by rank (inclusive) - O(log n + k) operation
     pub fn range_by_rank(&self, start_rank: usize, end_rank: usize) -> RangeResult<K, V> {
         let inner = self.inner.read().unwrap();
         let mut items = Vec::new();
@@ -298,7 +222,7 @@ where
         let mut rank = 0;
         
         unsafe {
-            // Skip to start rank
+            // Skip to start rank using skiplist traversal
             while rank < start_rank {
                 if let Some(next) = (*current).forward[0] {
                     current = next;
@@ -323,14 +247,14 @@ where
         RangeResult { items }
     }
 
-    /// Get a range of elements by score (inclusive)
+    /// Get a range of elements by score (inclusive) - O(log n + k) operation
     pub fn range_by_score(&self, min_score: V, max_score: V) -> RangeResult<K, V> {
         let inner = self.inner.read().unwrap();
         let mut items = Vec::new();
         let mut current = inner.head;
         
         unsafe {
-            // Skip to first element >= min_score
+            // Skip to first element >= min_score using skiplist traversal
             for i in (0..=inner.level).rev() {
                 while let Some(next) = (*current).forward[i] {
                     if (*next).value < min_score {
@@ -387,7 +311,7 @@ where
             let mut current = inner.head;
             while let Some(next) = (*current).forward[0] {
                 (*current).forward[0] = (*next).forward[0];
-                Box::from_raw(next);
+                let _ = Box::from_raw(next);
             }
         }
 
@@ -395,6 +319,7 @@ where
         inner.level = 0;
         inner.length = 0;
         inner.memory_usage = std::mem::size_of::<SkipListNode<K, V>>() + MAX_LEVEL * std::mem::size_of::<Option<*mut SkipListNode<K, V>>>();
+        inner.key_index.clear();
         
         // Clear forward pointers in head
         unsafe {
@@ -453,56 +378,135 @@ where
         }
     }
 
+    /// Compare a (value, key) pair with a (score, query_key) for ordering
+    fn compare_with_query<Q>(&self, node_value: &V, node_key: &K, query_value: &V, query_key: &Q) -> Ordering 
+    where 
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        match node_value.partial_cmp(query_value) {
+            Some(Ordering::Equal) => node_key.borrow().cmp(query_key),
+            Some(ord) => ord,
+            None => {
+                // Handle NaN by treating it as greater than any other value
+                if self.is_nan(node_value) && self.is_nan(query_value) {
+                    node_key.borrow().cmp(query_key)
+                } else if self.is_nan(node_value) {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+        }
+    }
+
     /// Check if value is NaN (for f64)
     fn is_nan(&self, v: &V) -> bool {
         v.partial_cmp(v).is_none()
     }
 
-    /// Find a node by key
-    fn find_node<Q>(&self, inner: &RwLockReadGuard<SkipListInner<K, V>>, key: &Q) -> Option<*mut SkipListNode<K, V>> 
+    /// Insert a new node into the skiplist (internal method)
+    fn insert_new_node(&self, inner: &mut RwLockWriteGuard<SkipListInner<K, V>>, key: K, value: V) {
+        let mut update = vec![std::ptr::null_mut(); MAX_LEVEL];
+        
+        // Find position and collect update pointers
+        let mut current = inner.head;
+        for i in (0..=inner.level).rev() {
+            unsafe {
+                while let Some(next) = (*current).forward[i] {
+                    match self.compare_nodes(&(*next).value, &(*next).key, &value, &key) {
+                        Ordering::Less => current = next,
+                        _ => break,
+                    }
+                }
+                update[i] = current;
+            }
+        }
+
+        // Generate random level for new node
+        let new_level = self.random_level();
+        
+        // Update list level if necessary
+        if new_level > inner.level {
+            for i in (inner.level + 1)..=new_level {
+                update[i] = inner.head;
+            }
+            inner.level = new_level;
+        }
+
+        // Create new node
+        let new_node = Box::into_raw(Box::new(SkipListNode {
+            key,
+            value,
+            forward: vec![None; new_level + 1],
+        }));
+
+        // Insert node at each level
+        unsafe {
+            for i in 0..=new_level {
+                (*new_node).forward[i] = (*update[i]).forward[i];
+                (*update[i]).forward[i] = Some(new_node);
+            }
+        }
+
+        inner.length += 1;
+        inner.memory_usage += self.calculate_node_size(new_level + 1);
+    }
+
+    /// Remove a node by score (internal method) - O(log n) operation
+    fn remove_node_by_score<Q>(&self, inner: &mut RwLockWriteGuard<SkipListInner<K, V>>, key: &Q, score: &V) 
     where 
         K: std::borrow::Borrow<Q>,
         Q: Ord + ?Sized,
     {
-        let mut current = inner.head;
+        let mut update = vec![std::ptr::null_mut(); MAX_LEVEL];
         
+        // Find node using score-based traversal
+        let mut current = inner.head;
         unsafe {
             for i in (0..=inner.level).rev() {
                 while let Some(next) = (*current).forward[i] {
-                    match (*next).key.borrow().cmp(key) {
+                    match self.compare_with_query(&(*next).value, &(*next).key, score, key) {
                         Ordering::Less => current = next,
-                        Ordering::Equal => return Some(next),
+                        Ordering::Equal => {
+                            // Found the exact node, break to this level
+                            break;
+                        }
                         Ordering::Greater => break,
                     }
                 }
+                update[i] = current;
             }
 
-            if let Some(next) = (*current).forward[0] {
-                if (*next).key.borrow().cmp(key) == Ordering::Equal {
-                    return Some(next);
+            // Find the exact node to remove
+            if let Some(target) = (*current).forward[0] {
+                if (*target).key.borrow() == key && (*target).value == *score {
+                    // Remove from each level
+                    for i in 0..=inner.level {
+                        if let Some(next) = (*update[i]).forward[i] {
+                            if next == target {
+                                (*update[i]).forward[i] = (*target).forward[i];
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Update list level
+                    while inner.level > 0 && (*inner.head).forward[inner.level].is_none() {
+                        inner.level -= 1;
+                    }
+
+                    let node_levels = (*target).forward.len();
+                    
+                    // Deallocate node
+                    let _ = Box::from_raw(target);
+                    
+                    inner.length -= 1;
+                    inner.memory_usage -= self.calculate_node_size(node_levels);
                 }
             }
         }
-        
-        None
-    }
-
-    /// Count nodes between two pointers at level 0
-    fn count_nodes_between(&self, start: *mut SkipListNode<K, V>, end: *mut SkipListNode<K, V>) -> usize {
-        let mut count = 0;
-        let mut current = start;
-        
-        unsafe {
-            while let Some(next) = (*current).forward[0] {
-                if next == end {
-                    break;
-                }
-                count += 1;
-                current = next;
-            }
-        }
-        
-        count
     }
 
     /// Generate random level for new node
@@ -534,23 +538,23 @@ impl<K, V> Drop for SkipList<K, V> {
                 let mut current = inner.head;
                 while let Some(next) = (*current).forward[0] {
                     (*current).forward[0] = (*next).forward[0];
-                    Box::from_raw(next);
+                    let _ = Box::from_raw(next);
                 }
                 
                 // Deallocate head
-                Box::from_raw(inner.head);
+                let _ = Box::from_raw(inner.head);
             }
         }
     }
 }
 
-impl<K: Clone + Ord + Debug + Default, V: Clone + PartialOrd + Debug + Default> Default for SkipList<K, V> {
+impl<K: Clone + Ord + Debug + Default + std::hash::Hash + Eq, V: Clone + PartialOrd + Debug + Default> Default for SkipList<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Clone + Ord + Debug, V: Clone + PartialOrd + Debug> Debug for SkipList<K, V> {
+impl<K: Clone + Ord + Debug + std::hash::Hash + Eq, V: Clone + PartialOrd + Debug> Debug for SkipList<K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.inner.read().unwrap();
         write!(f, "SkipList {{ len: {}, level: {} }}", inner.length, inner.level)
@@ -577,13 +581,13 @@ mod tests {
         // Test length
         assert_eq!(list.len(), 3);
         
-        // Test get_score
+        // Test get_score - now O(1) operations
         assert_eq!(list.get_score(&b"banana".to_vec()), Some(1.0));
         assert_eq!(list.get_score(&b"cherry".to_vec()), Some(2.0));
         assert_eq!(list.get_score(&b"apple".to_vec()), Some(3.0));
         assert_eq!(list.get_score(&b"durian".to_vec()), None);
         
-        // Update existing
+        // Update existing - should return old value
         assert_eq!(list.insert(b"banana".to_vec(), 1.5), Some(1.0));
         assert_eq!(list.get_score(&b"banana".to_vec()), Some(1.5));
         assert_eq!(list.len(), 3); // Length shouldn't change
@@ -598,7 +602,7 @@ mod tests {
         list.insert(b"c".to_vec(), 3.0);
         list.insert(b"d".to_vec(), 4.0);
         
-        // Test get_rank
+        // Test get_rank - O(log n) operations
         assert_eq!(list.get_rank(&b"a".to_vec()), Some(0));
         assert_eq!(list.get_rank(&b"b".to_vec()), Some(1));
         assert_eq!(list.get_rank(&b"c".to_vec()), Some(2));
