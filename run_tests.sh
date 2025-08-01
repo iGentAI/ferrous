@@ -63,6 +63,21 @@ run_default_tests() {
     ./integration/test_basic.sh
     echo ""
     
+    # Run command tests including new commands
+    echo "Running command tests..."
+    ./integration/test_commands.sh
+    echo ""
+    
+    # Run tests for newly implemented commands
+    echo "Running tests for newly implemented commands..."
+    ./integration/test_new_commands.sh
+    echo ""
+    
+    # Run tests for blocking operations
+    echo "Running blocking operations tests..."
+    ./integration/test_blocking_operations.sh
+    echo ""
+    
     # Run protocol compliance tests
     echo "Running protocol compliance tests..."
     python3 protocol/test_comprehensive.py
@@ -72,7 +87,7 @@ run_default_tests() {
     echo "Running comprehensive feature validation..."
     python3 features/pubsub/test_pubsub_comprehensive.py
     echo ""
-    python3 features/persistence/test_persistence_integration.py
+    python3 features/persistence/test_persistence_integration_clean.py
     echo ""
     python3 features/transactions/test_transactions_comprehensive.py
     echo ""

@@ -9,9 +9,10 @@ use std::time::Instant;
 use crate::error::{FerrousError, Result};
 use crate::protocol::{RespParser, RespFrame, serialize_resp_frame};
 use crate::storage::commands::transactions::TransactionState;
+use crate::storage::DatabaseIndex;
 
 /// Connection state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionState {
     /// Connected but not authenticated (if auth is required)
     Connected,
@@ -20,10 +21,41 @@ pub enum ConnectionState {
     Authenticated,
     
     /// Blocked on a blocking operation
-    Blocked,
+    Blocked(BlockedState),
     
     /// Connection is closing
     Closing,
+}
+
+/// State information for blocked connections
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockedState {
+    /// Keys being monitored (multiple for BLPOP key1 key2 ...)
+    pub keys: Vec<(DatabaseIndex, Vec<u8>)>,
+    /// Timeout deadline
+    pub deadline: Option<Instant>,
+    /// Operation type
+    pub op_type: BlockingOp,
+}
+
+/// Type of blocking operation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockingOp {
+    /// BLPOP - blocking left pop
+    BLPop,
+    /// BRPOP - blocking right pop  
+    BRPop,
+    /// Future: BLMOVE - blocking list move
+    BLMove { dest_key: Vec<u8>, direction: Direction },
+}
+
+/// Direction for list move operations
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Direction {
+    LeftToLeft,
+    LeftToRight,
+    RightToLeft,
+    RightToRight,
 }
 
 /// Represents a client connection
