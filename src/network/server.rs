@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH, Instant};
 use std::thread;
 use std::path::PathBuf;
+use rand;
 use crate::error::{FerrousError, Result};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, GetResult, RdbEngine, StorageMonitor, RdbConfig};
@@ -20,6 +21,8 @@ use crate::pubsub::{PubSubManager, format_message, format_pmessage,
 use crate::replication::{ReplicationManager, ReplicationConfig};
 use super::{Listener, Connection, ConnectionState, NetworkConfig};
 use super::monitoring::{PerformanceMonitoring, MonitoringConfig};
+use super::blocking::{BlockingManager, WakeupRequest};
+use super::connection::{BlockedState, BlockingOp};
 use crate::Config as FerrousConfig;
 
 /// Connection ID generator
@@ -193,6 +196,8 @@ pub struct Server {
     monitoring: Arc<dyn PerformanceMonitoring>,
     /// Global Lua script cache
     script_cache: Arc<dyn ScriptCaching>,
+    /// Blocking operations manager
+    blocking_manager: Arc<BlockingManager>,
 }
 
 impl Server {
@@ -290,6 +295,9 @@ impl Server {
         // Create global script cache
         let script_cache: Arc<dyn ScriptCaching> = Arc::new(GlobalScriptCache::new());
         
+        // Create blocking manager with number of databases
+        let blocking_manager = Arc::new(BlockingManager::new(16)); // Default 16 databases
+        
         // Configure SLOWLOG settings from config
         slowlog.set_threshold_micros(config.monitoring.slowlog_threshold_micros);
         slowlog.set_max_len(config.monitoring.slowlog_max_len);
@@ -338,6 +346,7 @@ impl Server {
             clients_paused_until,
             monitoring,
             script_cache,
+            blocking_manager,
         })
     }
     
@@ -361,6 +370,9 @@ impl Server {
         loop {
             let mut did_work = false;
             
+            // Process wake-up queue first (very fast, lock-free)
+            did_work |= self.process_wakeups()?;
+            
             // Accept new connections with a limit per iteration
             for _ in 0..10 { // Process up to 10 new connections per iteration
                 if self.accept_single_connection()? {
@@ -370,8 +382,13 @@ impl Server {
                 }
             }
             
-            // Process existing connections
+            // Process existing connections (skip blocked ones)
             if self.process_connections()? {
+                did_work = true;
+            }
+            
+            // Process timeouts for blocked clients
+            if self.process_blocked_timeouts()? {
                 did_work = true;
             }
             
@@ -441,6 +458,72 @@ impl Server {
         }
     }
     
+    /// Process wake-up requests for blocked clients
+    fn process_wakeups(&self) -> Result<bool> {
+        let wakeups = self.blocking_manager.process_wakeups();
+        if wakeups.is_empty() {
+            return Ok(false);
+        }
+        
+        for wakeup in wakeups {
+            self.wake_client(wakeup)?;
+        }
+        
+        Ok(true)
+    }
+    
+    /// Wake up a specific blocked client with data
+    fn wake_client(&self, wakeup: WakeupRequest) -> Result<()> {
+        self.connections.with_connection(wakeup.conn_id, |conn| -> Result<()> {
+            // Only wake if still in blocked state
+            if let ConnectionState::Blocked(_) = conn.state {
+                // Send the response
+                let response = RespFrame::Array(Some(vec![
+                    RespFrame::from_bytes(wakeup.key),
+                    RespFrame::from_bytes(wakeup.value),
+                ]));
+                
+                conn.send_frame(&response)?;
+                
+                // Return connection to authenticated state
+                conn.state = ConnectionState::Authenticated;
+            }
+            Ok(())
+        });
+        
+        Ok(())
+    }
+    
+    /// Process timeouts for blocked clients
+    fn process_blocked_timeouts(&self) -> Result<bool> {
+        let expired_clients = self.blocking_manager.process_timeouts();
+        if expired_clients.is_empty() {
+            return Ok(false);
+        }
+        
+        for conn_id in expired_clients {
+            self.connections.with_connection(conn_id, |conn| -> Result<()> {
+                if let ConnectionState::Blocked(_) = conn.state {
+                    // Send null response for timeout
+                    conn.send_frame(&RespFrame::null_array())?;
+                    
+                    // Return to authenticated state
+                    conn.state = ConnectionState::Authenticated;
+                }
+                Ok(())
+            });
+        }
+        
+        Ok(true)
+    }
+    
+    /// Check if connection is blocked (for skipping in main processing)
+    fn is_connection_blocked(&self, conn_id: u64) -> bool {
+        self.connections.with_connection(conn_id, |conn| {
+            matches!(conn.state, ConnectionState::Blocked(_))
+        }).unwrap_or(false)
+    }
+    
     /// Accept new connections
     fn accept_connections(&mut self) -> Result<()> {
         while self.accept_single_connection()? {}
@@ -454,8 +537,11 @@ impl Server {
         let mut connections_with_writes = Vec::new();
         let mut did_work = false;
         
-        // Get all connection IDs
-        let conn_ids = self.connections.all_connection_ids();
+        // Get all connection IDs, filtering out blocked connections for performance
+        let conn_ids: Vec<u64> = self.connections.all_connection_ids()
+            .into_iter()
+            .filter(|&id| !self.is_connection_blocked(id))
+            .collect();
         
         for id in conn_ids {
             // Process each connection
@@ -700,11 +786,12 @@ impl Server {
                 let _is_sync_command = matches!(command.as_str(), "SYNC" | "PSYNC");
                 
                 // Get connection state
-                let conn_state = self.connections.with_connection(conn_id, |conn| {
-                    (conn.db_index, conn.transaction_state.in_transaction, conn.state)
-                }).unwrap_or((0, false, ConnectionState::Closing));
-                
-                let (db_index, in_transaction, conn_status) = conn_state;
+                let (db_index, in_transaction, conn_status) = match self.connections.with_connection(conn_id, |conn| {
+                    (conn.db_index, conn.transaction_state.in_transaction, conn.state.clone())
+                }) {
+                    Some(state) => state,
+                    None => return Ok(RespFrame::error("ERR connection not found")),
+                };
                 
                 // Check if authentication is required
                 if self.config.password.is_some() && conn_status != ConnectionState::Authenticated {
@@ -923,10 +1010,18 @@ impl Server {
             "INCR" => self.handle_incr(parts, db),
             "DECR" => self.handle_decr(parts, db),
             "INCRBY" => self.handle_incrby(parts, db),
+            "DECRBY" => self.handle_decrby(parts, db),
             "DEL" => self.handle_del(parts, db),
             "EXISTS" => self.handle_exists(parts, db),
             "EXPIRE" => self.handle_expire(parts, db),
             "TTL" => self.handle_ttl(parts, db),
+            "SELECT" => self.handle_select(parts, conn_id),
+            "FLUSHDB" => self.handle_flushdb(parts, db),
+            "FLUSHALL" => self.handle_flushall(parts),
+            "DBSIZE" => self.handle_dbsize(parts, db),
+            "SETNX" => self.handle_setnx(parts, db),
+            "SETEX" => self.handle_setex(parts, db),
+            "PSETEX" => self.handle_psetex(parts, db),
             // Special test commands
             "SLEEP" => {
                 // Special command that intentionally sleeps to test SLOWLOG
@@ -1009,13 +1104,53 @@ impl Server {
             "SETRANGE" => crate::storage::commands::strings::handle_setrange(&self.storage, db, parts),
             "TYPE" => crate::storage::commands::strings::handle_type(&self.storage, db, parts),
             "RENAME" => crate::storage::commands::strings::handle_rename(&self.storage, db, parts),
+            "RENAMENX" => self.handle_renamenx(parts, db),
+            "RANDOMKEY" => self.handle_randomkey(parts, db),
+            "BLPOP" => self.handle_blpop(parts, db, conn_id),
+            "BRPOP" => self.handle_brpop(parts, db, conn_id),
             "KEYS" => crate::storage::commands::strings::handle_keys(&self.storage, db, parts),
             "PEXPIRE" => crate::storage::commands::strings::handle_pexpire(&self.storage, db, parts),
             "PTTL" => crate::storage::commands::strings::handle_pttl(&self.storage, db, parts),
             "PERSIST" => crate::storage::commands::strings::handle_persist(&self.storage, db, parts),
             // List commands
-            "LPUSH" => crate::storage::commands::lists::handle_lpush(&self.storage, db, parts),
-            "RPUSH" => crate::storage::commands::lists::handle_rpush(&self.storage, db, parts),
+            "LPUSH" => {
+                let result = crate::storage::commands::lists::handle_lpush(&self.storage, db, parts);
+                
+                // Notify blocked clients if LPUSH was successful
+                if let Ok(RespFrame::Integer(count)) = &result {
+                    if *count > 0 && parts.len() >= 3 {
+                        if let RespFrame::BulkString(Some(key_bytes)) = &parts[1] {
+                            if self.blocking_manager.has_blocked_clients(db, key_bytes) {
+                                // Get the first element that was added (from left)
+                                if let Ok(Some(first_element)) = self.storage.lindex(db, key_bytes, 0) {
+                                    self.blocking_manager.notify_key_ready(db, key_bytes, first_element, true);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                result
+            },
+            "RPUSH" => {
+                let result = crate::storage::commands::lists::handle_rpush(&self.storage, db, parts);
+                
+                // Notify blocked clients if RPUSH was successful
+                if let Ok(RespFrame::Integer(count)) = &result {
+                    if *count > 0 && parts.len() >= 3 {
+                        if let RespFrame::BulkString(Some(key_bytes)) = &parts[1] {
+                            if self.blocking_manager.has_blocked_clients(db, key_bytes) {
+                                // Get the last element that was added (from right)
+                                if let Ok(Some(last_element)) = self.storage.lindex(db, key_bytes, (*count - 1) as isize) {
+                                    self.blocking_manager.notify_key_ready(db, key_bytes, last_element, false);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                result
+            },
             "LPOP" => crate::storage::commands::lists::handle_lpop(&self.storage, db, parts),
             "RPOP" => crate::storage::commands::lists::handle_rpop(&self.storage, db, parts),
             "LLEN" => crate::storage::commands::lists::handle_llen(&self.storage, db, parts),
@@ -1240,12 +1375,13 @@ impl Server {
             false
         } else {
             matches!(command,
-                "SET" | "DEL" | "EXPIRE" | "INCR" | "DECR" | "INCRBY" |
+                "SET" | "DEL" | "EXPIRE" | "INCR" | "DECR" | "INCRBY" | "DECRBY" |
+                "SETNX" | "SETEX" | "PSETEX" | "FLUSHDB" | "FLUSHALL" |
                 "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET" | "LREM" | "LTRIM" |
                 "SADD" | "SREM" | "SPOP" | 
                 "HSET" | "HDEL" | "HINCRBY" |
                 "ZADD" | "ZREM" | "ZINCRBY" |
-                "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "PERSIST" | "EVAL" | "EVALSHA"
+                "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "RENAMENX" | "PERSIST" | "EVAL" | "EVALSHA"
             )
         }
     }
@@ -2268,6 +2404,349 @@ impl Server {
         }
     }
     
+    /// Handle SELECT command to switch databases
+    fn handle_select(&self, parts: &[RespFrame], conn_id: u64) -> Result<RespFrame> {
+        if parts.len() != 2 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'select' command"));
+        }
+        
+        let db_index = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match String::from_utf8_lossy(bytes).parse::<usize>() {
+                    Ok(n) => {
+                        if n >= self.storage.database_count() {
+                            return Ok(RespFrame::error("ERR DB index is out of range"));
+                        }
+                        n
+                    }
+                    Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR invalid database index format")),
+        };
+        
+        // Update connection's database index
+        self.connections.with_connection(conn_id, |conn| {
+            conn.db_index = db_index;
+        });
+        
+        Ok(RespFrame::ok())
+    }
+    
+    /// Handle FLUSHDB command
+    fn handle_flushdb(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 1 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'flushdb' command"));
+        }
+        
+        match self.storage.flush_db(db) {
+            Ok(_) => Ok(RespFrame::ok()),
+            Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
+        }
+    }
+    
+    /// Handle FLUSHALL command
+    fn handle_flushall(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+        if parts.len() != 1 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'flushall' command"));
+        }
+        
+        // Flush all databases
+        for db in 0..self.storage.database_count() {
+            if let Err(e) = self.storage.flush_db(db) {
+                return Ok(RespFrame::error(format!("ERR {}", e)));
+            }
+        }
+        
+        Ok(RespFrame::ok())
+    }
+    
+    /// Handle DBSIZE command
+    fn handle_dbsize(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 1 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'dbsize' command"));
+        }
+        
+        let keys = self.storage.get_all_keys(db)?;
+        let size = keys.len() as i64;
+        Ok(RespFrame::Integer(size))
+    }
+    
+    /// Handle SETNX command (set if not exists)
+    fn handle_setnx(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'setnx' command"));
+        }
+        
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        let value = match &parts[2] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid value format")),
+        };
+        
+        // Check if key exists
+        if self.storage.exists(db, &key)? {
+            Ok(RespFrame::Integer(0)) // Key exists, not set
+        } else {
+            self.storage.set_string(db, key, value)?;
+            Ok(RespFrame::Integer(1)) // Key set
+        }
+    }
+    
+    /// Handle SETEX command (set with expiration in seconds)
+    fn handle_setex(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 4 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'setex' command"));
+        }
+        
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        let seconds = match &parts[2] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match String::from_utf8_lossy(bytes).parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR invalid expiration format")),
+        };
+        
+        let value = match &parts[3] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid value format")),
+        };
+        
+        self.storage.set_string_ex(db, key, value, std::time::Duration::from_secs(seconds))?;
+        Ok(RespFrame::ok())
+    }
+    
+    /// Handle PSETEX command (set with expiration in milliseconds)
+    fn handle_psetex(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 4 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'psetex' command"));
+        }
+        
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        let millis = match &parts[2] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match String::from_utf8_lossy(bytes).parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR invalid expiration format")),
+        };
+        
+        let value = match &parts[3] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid value format")),
+        };
+        
+        self.storage.set_string_ex(db, key, value, std::time::Duration::from_millis(millis))?;
+        Ok(RespFrame::ok())
+    }
+    
+    /// Handle DECRBY command
+    fn handle_decrby(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'decrby' command"));
+        }
+        
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        let decrement = match &parts[2] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match String::from_utf8_lossy(bytes).parse::<i64>() {
+                    Ok(n) => n,
+                    Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR invalid decrement format")),
+        };
+        
+        match self.storage.incr_by(db, key, -decrement) {
+            Ok(new_value) => Ok(RespFrame::Integer(new_value)),
+            Err(e) => Ok(RespFrame::error(e.to_string())),
+        }
+    }
+    
+    /// Handle RENAMENX command (rename only if new key doesn't exist)
+    fn handle_renamenx(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'renamenx' command"));
+        }
+        
+        let old_key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+            _ => return Ok(RespFrame::error("ERR invalid old key format")),
+        };
+        
+        let new_key = match &parts[2] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid new key format")),
+        };
+        
+        // Check if old key exists
+        if !self.storage.exists(db, old_key)? {
+            return Ok(RespFrame::error("ERR no such key"));
+        }
+        
+        // Check if new key already exists
+        if self.storage.exists(db, &new_key)? {
+            return Ok(RespFrame::Integer(0)); // New key exists, rename not performed
+        }
+        
+        // Perform the rename
+        match self.storage.rename(db, old_key, new_key) {
+            Ok(_) => Ok(RespFrame::Integer(1)), // Rename successful
+            Err(e) => Ok(RespFrame::error(e.to_string())),
+        }
+    }
+    
+    /// Handle BLPOP command (blocking left pop)
+    fn handle_blpop(&self, parts: &[RespFrame], db_index: usize, conn_id: u64) -> Result<RespFrame> {
+        if parts.len() < 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'blpop' command"));
+        }
+        
+        // Parse timeout (last argument)
+        let timeout = match &parts[parts.len() - 1] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match String::from_utf8_lossy(bytes).parse::<u64>() {
+                    Ok(0) => None, // 0 means block forever
+                    Ok(n) => Some(std::time::Duration::from_secs(n)),
+                    Err(_) => return Ok(RespFrame::error("ERR timeout is not a float or out of range")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR timeout is not a float or out of range")),
+        };
+        
+        // Extract keys (all arguments except command and timeout)
+        let mut keys = Vec::new();
+        for i in 1..parts.len()-1 {
+            match &parts[i] {
+                RespFrame::BulkString(Some(bytes)) => {
+                    keys.push(bytes.as_ref().clone());
+                }
+                _ => return Ok(RespFrame::error("ERR invalid key format")),
+            }
+        }
+        
+        // Try non-blocking first (fast path)
+        for key in &keys {
+            if let Some(value) = self.storage.lpop(db_index, key)? {
+                return Ok(RespFrame::Array(Some(vec![
+                    RespFrame::from_bytes(key.clone()),
+                    RespFrame::from_bytes(value),
+                ])));
+            }
+        }
+        
+        // No data available, register as blocked
+        let deadline = timeout.map(|t| Instant::now() + t);
+        self.blocking_manager.register_blocked(db_index, conn_id, keys.clone(), BlockingOp::BLPop, deadline)?;
+        
+        // Move connection to blocked state
+        self.connections.with_connection(conn_id, |conn| {
+            conn.state = ConnectionState::Blocked(BlockedState {
+                keys: keys.into_iter().map(|k| (db_index, k)).collect(),
+                deadline,
+                op_type: BlockingOp::BLPop,
+            });
+        });
+        
+        // Return null to indicate blocking (client will get response when woken)
+        Ok(RespFrame::null_array())
+    }
+    
+    /// Handle BRPOP command (blocking right pop)  
+    fn handle_brpop(&self, parts: &[RespFrame], db_index: usize, conn_id: u64) -> Result<RespFrame> {
+        if parts.len() < 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'brpop' command"));
+        }
+        
+        // Parse timeout (last argument)
+        let timeout = match &parts[parts.len() - 1] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match String::from_utf8_lossy(bytes).parse::<u64>() {
+                    Ok(0) => None, // 0 means block forever
+                    Ok(n) => Some(std::time::Duration::from_secs(n)),
+                    Err(_) => return Ok(RespFrame::error("ERR timeout is not a float or out of range")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR timeout is not a float or out of range")),
+        };
+        
+        // Extract keys (all arguments except command and timeout)
+        let mut keys = Vec::new();
+        for i in 1..parts.len()-1 {
+            match &parts[i] {
+                RespFrame::BulkString(Some(bytes)) => {
+                    keys.push(bytes.as_ref().clone());
+                }
+                _ => return Ok(RespFrame::error("ERR invalid key format")),
+            }
+        }
+        
+        // Try non-blocking first (fast path)  
+        for key in &keys {
+            if let Some(value) = self.storage.rpop(db_index, key)? {
+                return Ok(RespFrame::Array(Some(vec![
+                    RespFrame::from_bytes(key.clone()),
+                    RespFrame::from_bytes(value),
+                ])));
+            }
+        }
+        
+        // No data available, register as blocked
+        let deadline = timeout.map(|t| Instant::now() + t);
+        self.blocking_manager.register_blocked(db_index, conn_id, keys.clone(), BlockingOp::BRPop, deadline)?;
+        
+        // Move connection to blocked state
+        self.connections.with_connection(conn_id, |conn| {
+            conn.state = ConnectionState::Blocked(BlockedState {
+                keys: keys.into_iter().map(|k| (db_index, k)).collect(),
+                deadline,
+                op_type: BlockingOp::BRPop,
+            });
+        });
+        
+        // Return null to indicate blocking (client will get response when woken)
+        Ok(RespFrame::null_array())
+    }
+    
+    /// Handle RANDOMKEY command
+    fn handle_randomkey(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() != 1 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'randomkey' command"));
+        }
+        
+        let keys = self.storage.get_all_keys(db)?;
+        
+        if keys.is_empty() {
+            Ok(RespFrame::null_bulk()) // No keys in database
+        } else {
+            // Select random key
+            let random_index = rand::random::<usize>() % keys.len();
+            let random_key = &keys[random_index];
+            Ok(RespFrame::from_bytes(random_key.clone()))
+        }
+    }
+    
     /// Handle EVALSHA command with global script cache
     fn handle_evalsha_command(&self, parts: &[RespFrame]) -> Result<RespFrame> {
         if parts.len() < 3 {
@@ -2452,6 +2931,13 @@ impl Server {
         for id in to_remove {
             if let Some(conn) = self.connections.remove(id) {
                 println!("Client {} disconnected from {}", id, conn.addr);
+                
+                // Clean up any blocking operations
+                for db in 0..self.storage.database_count() {
+                    if let Err(e) = self.blocking_manager.unregister_client(db, id) {
+                        eprintln!("Error cleaning up blocking operations for connection {}: {}", id, e);
+                    }
+                }
                 
                 // Clean up any pub/sub subscriptions
                 if let Err(e) = self.pubsub.unsubscribe_all(id) {
