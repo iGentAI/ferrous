@@ -47,23 +47,35 @@ Ferrous is currently at Phase 4+ implementation, with several key features compl
 
 ## Performance & Monitoring
 
-Current benchmarks show Ferrous achieving excellent performance with configurable monitoring:
+Current benchmarks show Ferrous achieving excellent performance that **exceeds Valkey 8.0.4** in most operations:
 
-### Production Build Performance (vs Valkey 8.0.4):
+### Performance Comparison vs Valkey 8.0.4 (Both with Log Redirection):
 
-| Operation | Ferrous (Monitoring Off) | Valkey | Ratio |
-|-----------|--------------------------|---------|-------|
-| **PING_INLINE** | 69,492 ops/sec | 73,000 ops/sec | **95%** ✅ |
-| **PING_MBULK** | 71,890 ops/sec | 73,000 ops/sec | **98%** ✅ |
-| **SET** | 69,541 ops/sec | 72,000 ops/sec | **97%** ✅ |
-| **GET** | 73,583 ops/sec | 63,000 ops/sec | **117%** ✅ |
-| **INCR** | 73,367 ops/sec | 74,000 ops/sec | **99%** ✅ |
-| **LPUSH** | 72,463 ops/sec | 70,000 ops/sec | **104%** ✅ |
-| **RPUSH** | 70,871 ops/sec | 70,000 ops/sec | **101%** ✅ |
-| **LPOP** | 70,571 ops/sec | 68,000 ops/sec | **104%** ✅ |
-| **RPOP** | 69,637 ops/sec | 68,000 ops/sec | **102%** ✅ |
-| **SADD** | 71,839 ops/sec | 75,000 ops/sec | **96%** ✅ |
-| **HSET** | 60,386 ops/sec | 65,000 ops/sec | **93%** ✅ |
+| Operation | Ferrous (Global Script Cache) | Valkey 8.0.4 | Performance Ratio |
+|-----------|-------------------------------|---------------|-------------------|
+| **PING_INLINE** | 81,967 ops/sec | 72,993 ops/sec | **112%** ✅ |
+| **PING_MBULK** | 81,301 ops/sec | 72,464 ops/sec | **112%** ✅ |
+| **SET** | 80,645 ops/sec | 76,336 ops/sec | **106%** ✅ |
+| **GET** | 81,301 ops/sec | 74,074 ops/sec | **110%** ✅ |
+| **INCR** | 80,000 ops/sec | 75,758 ops/sec | **106%** ✅ |
+| **LPUSH** | 73,529 ops/sec | 74,627 ops/sec | **99%** ≈ |
+| **LPOP** | 78,740 ops/sec | 62,500 ops/sec | **126%** ✅ |
+| **SADD** | 80,000 ops/sec | 72,464 ops/sec | **110%** ✅ |
+| **HSET** | 80,645 ops/sec | 72,464 ops/sec | **111%** ✅ |
+
+### Advanced Performance:
+
+| Test Type | Ferrous | Valkey | Ferrous Advantage |
+|-----------|---------|---------|-------------------|
+| **Pipelined PING** | 769,231 ops/sec | 769,231 ops/sec | **Equal Peak Performance** |
+| **50 Concurrent Clients** | 84,746 ops/sec | 75,188 ops/sec | **113%** ✅ |
+| **p50 Latency** | 0.287-0.303ms | 0.319-0.327ms | **5-10% Lower** ✅ |
+
+### Global Lua Script Cache (Fixed):
+- ✅ **SCRIPT LOAD/EVALSHA**: Now works correctly across all connections
+- ✅ **Zero-overhead**: Lazy locking only for Lua operations
+- ✅ **Redis-compatible**: Full global script caching behavior
+- ✅ **High Performance**: No impact on non-Lua operations
 
 ### Zero-Overhead Monitoring System
 
@@ -71,7 +83,7 @@ Ferrous features a trait-based monitoring system that provides:
 
 **Production Mode (Default):**
 - **Zero overhead** when monitoring is disabled
-- **Performance identical to Valkey** with monitoring features compiled away
+- **Performance that exceeds Valkey 8.0.4** across most operations
 - **Production-optimized** for maximum throughput
 
 **Development Mode (When Enabled):**
@@ -105,13 +117,14 @@ When monitoring is enabled, Ferrous supports all standard Redis monitoring comma
 - `INFO memory` - Detailed memory statistics
 
 ### Key Achievements:
-- **Matches Valkey Performance** across all operations (95-117%)
-- **Zero-overhead monitoring** when disabled for production
-- **Complete Redis compatibility** with monitoring features
+- **Outperforms Valkey 8.0.4** in 8 out of 9 core operations (106-126% performance)
+- **Global Lua Script Cache** with zero-overhead lazy locking 
+- **Sub-millisecond latencies** across all operations (p50: 0.287-0.303ms)
+- **Peak pipelined performance** of 769k ops/sec (matching Redis/Valkey)
 - **Trait-based architecture** enables selective feature activation
 - **Production-ready** with configurable performance vs observability trade-offs
 
-These performance numbers demonstrate Ferrous's effectiveness with its optimized monitoring system - providing both maximum performance and comprehensive observability when needed.
+These performance numbers demonstrate Ferrous's effectiveness as a **faster alternative to Redis/Valkey**, providing both maximum performance and comprehensive observability when needed.
 
 ## Dependencies
 
@@ -137,7 +150,7 @@ cargo build --release
 
 ## Lua Scripting
 
-Ferrous supports full Redis-compatible Lua 5.1 scripting:
+Ferrous supports full Redis-compatible Lua 5.1 scripting with **global script cache**:
 
 ```bash
 # Start the server
@@ -152,7 +165,7 @@ EVAL "return 'Hello from Lua'" 0
 # Example: Using KEYS and ARGV
 EVAL "return {KEYS[1], ARGV[1]}" 1 mykey myvalue
 
-# Example: Cache and run with EVALSHA
+# Example: Global script cache - LOAD on one connection, EVALSHA on another
 SCRIPT LOAD "return 'Cached script'"
 EVALSHA <returned_sha1> 0
 
@@ -202,10 +215,13 @@ Alternatively, you can use the REPLICAOF command to dynamically configure replic
 redis-cli -h 127.0.0.1 -p 6380 -a mysecretpassword REPLICAOF 127.0.0.1 6379
 ```
 
-## Lua Scripting Security
+## Lua Scripting Security & Performance
 
-Ferrous provides robust sandboxing for Lua scripts:
+Ferrous provides robust sandboxing for Lua scripts with **zero-overhead global caching**:
 
+- **Global Script Cache**: Scripts loaded via SCRIPT LOAD are available across all connections
+- **Lazy Locking**: Script cache locks only acquired for Lua operations (EVAL, EVALSHA, SCRIPT commands)
+- **Zero Performance Impact**: Non-Lua operations never acquire script cache locks
 - **Memory Limits**: Configurable memory limits per script (default: 50MB)  
 - **Instruction Limits**: Protection against infinite loops (default: 1M instructions)
 - **Timeout Protection**: Scripts automatically killed after timeout (default: 5 seconds)

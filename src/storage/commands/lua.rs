@@ -12,6 +12,7 @@ use mlua::{Lua, Result as LuaResult};
 use crate::error::{Result, FerrousError};
 use crate::protocol::resp::RespFrame;
 use crate::storage::StorageEngine;
+use crate::storage::lua_cache::ScriptCaching;
 
 fn create_sandboxed_lua(_storage: Arc<StorageEngine>, keys: Vec<Vec<u8>>, args: Vec<Vec<u8>>) -> LuaResult<Lua> {
     let lua = Lua::new();

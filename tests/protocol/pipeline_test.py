@@ -5,13 +5,12 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-# Authentication password
-PASSWORD = 'mysecretpassword'
+# PASSWORD = 'mysecretpassword'
 
 def run_pipeline_test(pipeline_size=100):
     """Run simple pipeline test and report performance"""
-    # Connect to our server with password authentication
-    client = redis.Redis(host='127.0.0.1', port=6379, password=PASSWORD)
+    # Connect to our server without password authentication
+    client = redis.Redis(host='127.0.0.1', port=6379)
     
     # Pipeline test
     pipeline = client.pipeline(transaction=False)
@@ -46,7 +45,7 @@ def run_concurrent_test(num_clients=10, pipeline_size=10):
     
     def client_worker(client_id):
         try:
-            client = redis.Redis(host='127.0.0.1', port=6379, password=PASSWORD)
+            client = redis.Redis(host='127.0.0.1', port=6379)
             
             # Pipeline test for this client
             pipeline = client.pipeline(transaction=False)

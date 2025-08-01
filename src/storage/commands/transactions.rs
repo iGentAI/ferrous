@@ -7,7 +7,7 @@ use crate::protocol::RespFrame;
 use crate::storage::StorageEngine;
 use crate::network::Connection;
 use std::sync::Arc;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 /// Transaction state for a connection
 #[derive(Debug, Default)]
@@ -16,8 +16,8 @@ pub struct TransactionState {
     pub in_transaction: bool,
     /// Queued commands
     pub queued_commands: VecDeque<Vec<RespFrame>>,
-    /// Watched keys
-    pub watched_keys: HashSet<Vec<u8>>,
+    /// Watched keys with their baseline modification counters (key -> counter when watched)
+    pub watched_keys: HashMap<Vec<u8>, u64>,
     /// Whether the transaction is aborted due to watched key changes
     pub aborted: bool,
 }
@@ -56,8 +56,8 @@ pub fn handle_exec(
     }
     
     // Check watched keys
-    for key in &conn.transaction_state.watched_keys {
-        if storage.was_modified(conn.db_index, key)? {
+    for (key, baseline_counter) in &conn.transaction_state.watched_keys {
+        if storage.was_modified_since(conn.db_index, key, *baseline_counter)? {
             conn.transaction_state.watched_keys.clear();
             return Ok(RespFrame::null_array());
         }
@@ -93,7 +93,7 @@ pub fn handle_discard(conn: &mut Connection) -> Result<RespFrame> {
 }
 
 /// Handle WATCH command - Watch keys for changes
-pub fn handle_watch(conn: &mut Connection, parts: &[RespFrame]) -> Result<RespFrame> {
+pub fn handle_watch(conn: &mut Connection, parts: &[RespFrame], storage: &Arc<StorageEngine>) -> Result<RespFrame> {
     if parts.len() < 2 {
         return Ok(RespFrame::error("ERR wrong number of arguments for 'watch' command"));
     }
@@ -102,11 +102,14 @@ pub fn handle_watch(conn: &mut Connection, parts: &[RespFrame]) -> Result<RespFr
         return Ok(RespFrame::error("ERR WATCH inside MULTI is not allowed"));
     }
     
-    // Add keys to watch set
+    // Add keys to watch set with current modification counters
     for i in 1..parts.len() {
         match &parts[i] {
             RespFrame::BulkString(Some(bytes)) => {
-                conn.transaction_state.watched_keys.insert(bytes.as_ref().clone());
+                let key = bytes.as_ref().clone();
+                // Get current modification counter for this key
+                let baseline_counter = storage.get_modification_counter(conn.db_index, &key)?;
+                conn.transaction_state.watched_keys.insert(key, baseline_counter);
             }
             _ => return Ok(RespFrame::error("ERR invalid key format")),
         }

@@ -7,17 +7,12 @@ import socket
 import time
 import sys
 
-def send_command(command, host='127.0.0.1', port=6379, password='mysecretpassword'):
+def send_command(command, host='127.0.0.1', port=6379):
     """Send a Redis command and return the response"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((host, port))
     
-    # Authenticate
-    auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len(password)}\r\n{password}\r\n"
-    s.sendall(auth_cmd.encode())
-    auth_resp = s.recv(1024)
-    
-    # Send command
+    # Send command directly without auth
     s.sendall(command.encode())
     resp = s.recv(4096)
     
