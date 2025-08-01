@@ -5,16 +5,11 @@ import threading
 import sys
 
 # Function to send Redis command and get response
-def redis_command(cmd, host='127.0.0.1', port=6379, password='mysecretpassword'):
+def redis_command(cmd, host='127.0.0.1', port=6379):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((host, port))
     
-    # First authenticate
-    auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len(password)}\r\n{password}\r\n"
-    s.sendall(auth_cmd.encode())
-    auth_resp = s.recv(1024)
-    
-    # Send command
+    # Send command directly without auth
     s.sendall(cmd.encode())
     resp = s.recv(4096)
     s.close()
@@ -26,12 +21,7 @@ def monitor_redis():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(('127.0.0.1', 6379))
     
-    # Authenticate
-    auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len('mysecretpassword')}\r\nmysecretpassword\r\n"
-    s.sendall(auth_cmd.encode())
-    auth_resp = s.recv(1024)
-    
-    # Start monitoring
+    # Start monitoring directly
     s.sendall(b"*1\r\n$7\r\nMONITOR\r\n")
     monitor_resp = s.recv(1024)
     print(f"MONITOR response: {monitor_resp}")

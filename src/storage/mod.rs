@@ -11,6 +11,7 @@ pub mod rdb;
 pub mod monitor;
 pub mod aof;
 pub mod commands;
+pub mod lua_cache;
 
 pub use engine::{StorageEngine, GetResult};
 pub use value::{Value, ValueType, StringEncoding, StoredValue, ValueMetadata};

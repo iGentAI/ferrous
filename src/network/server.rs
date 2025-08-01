@@ -12,6 +12,7 @@ use crate::storage::{StorageEngine, GetResult, RdbEngine, StorageMonitor, RdbCon
 use crate::storage::commands::{transactions, aof};
 use crate::storage::{aof::AofEngine, AofConfig};
 use crate::storage::commands::slowlog::Slowlog;
+use crate::storage::lua_cache::{GlobalScriptCache, ScriptCaching};
 use crate::monitor::MonitorSubscribers;
 use crate::pubsub::{PubSubManager, format_message, format_pmessage, 
                     format_subscribe_response, format_psubscribe_response,
@@ -190,6 +191,8 @@ pub struct Server {
     clients_paused_until: Arc<Mutex<SystemTime>>,
     /// Zero-overhead performance monitoring backend
     monitoring: Arc<dyn PerformanceMonitoring>,
+    /// Global Lua script cache
+    script_cache: Arc<dyn ScriptCaching>,
 }
 
 impl Server {
@@ -284,6 +287,9 @@ impl Server {
             )
         };
         
+        // Create global script cache
+        let script_cache: Arc<dyn ScriptCaching> = Arc::new(GlobalScriptCache::new());
+        
         // Configure SLOWLOG settings from config
         slowlog.set_threshold_micros(config.monitoring.slowlog_threshold_micros);
         slowlog.set_max_len(config.monitoring.slowlog_max_len);
@@ -331,6 +337,7 @@ impl Server {
             monitor_subscribers,
             clients_paused_until,
             monitoring,
+            script_cache,
         })
     }
     
@@ -741,7 +748,7 @@ impl Server {
                     }
                     "WATCH" => {
                         return self.connections.with_connection(conn_id, |conn| {
-                            transactions::handle_watch(conn, parts)
+                            transactions::handle_watch(conn, parts, &self.storage)
                         }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
                     }
                     "UNWATCH" => {
@@ -804,7 +811,40 @@ impl Server {
     
     /// Handle EXEC command - execute queued transaction commands
     fn handle_exec(&mut self, conn_id: u64) -> Result<RespFrame> {
-        // Get queued commands and clear transaction state
+        // First check if any watched keys were modified before clearing transaction state
+        let watch_violation = self.connections.with_connection(conn_id, |conn| {
+            if !conn.transaction_state.in_transaction {
+                return Err("ERR EXEC without MULTI".to_string());
+            }
+            
+            // Check watched keys BEFORE clearing transaction state
+            for (key, baseline_counter) in &conn.transaction_state.watched_keys {
+                if let Ok(modified) = self.storage.was_modified_since(conn.db_index, key, *baseline_counter) {
+                    if modified {
+                        return Ok(true); // Watch violation detected
+                    }
+                }
+            }
+            Ok(false) // No watch violations
+        });
+        
+        // Handle watch violations
+        match watch_violation {
+            Some(Ok(true)) => {
+                // Clear transaction state and return null array (transaction aborted)
+                self.connections.with_connection(conn_id, |conn| {
+                    conn.transaction_state.in_transaction = false;
+                    conn.transaction_state.watched_keys.clear();
+                    conn.transaction_state.queued_commands.clear();
+                    conn.transaction_state.aborted = false;
+                });
+                return Ok(RespFrame::null_array());
+            }
+            Some(Err(e)) => return Ok(RespFrame::error(e)),
+            _ => {} // No violation, continue with execution
+        }
+
+        // Get queued commands and clear transaction state (only after WATCH check passes)
         let (commands, db_index, aborted) = {
             let result = self.connections.with_connection(conn_id, |conn| {
                 if !conn.transaction_state.in_transaction {
@@ -1078,21 +1118,13 @@ impl Server {
                     }
                 }
             },
-            "EVALSHA" | "SCRIPT" => {
-                // These commands need per-connection script cache access
-                let response = self.connections.with_connection(conn_id, |conn| -> Result<RespFrame> {
-                    crate::storage::commands::lua::handle_lua_command_with_cache(
-                        &self.storage, 
-                        command_name.to_lowercase().as_str(), 
-                        parts, 
-                        &mut conn.script_cache
-                    )
-                });
-                
-                match response {
-                    Some(resp) => resp,
-                    None => Ok(RespFrame::error("ERR connection not found")),
-                }
+            "EVALSHA" => {
+                // EVALSHA needs script cache access
+                self.handle_evalsha_command(parts)
+            },
+            "SCRIPT" => {
+                // SCRIPT commands need script cache access
+                self.handle_script_command(parts)
             },
             _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", command_name))),
         };
@@ -2236,6 +2268,120 @@ impl Server {
         }
     }
     
+    /// Handle EVALSHA command with global script cache
+    fn handle_evalsha_command(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+        if parts.len() < 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'evalsha' command"));
+        }
+        
+        // Extract SHA1
+        let sha1 = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return Ok(RespFrame::error("ERR invalid SHA1 hash")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR invalid SHA1 hash")),
+        };
+        
+        // Get script from cache
+        let script = match self.script_cache.get(&sha1) {
+            Ok(Some(script)) => script,
+            Ok(None) => return Ok(RespFrame::error("NOSCRIPT No matching script. Please use EVAL.")),
+            Err(e) => return Ok(RespFrame::error(format!("ERR script cache error: {}", e))),
+        };
+        
+        // Create new parts array with the script instead of SHA1
+        let mut eval_parts = vec![
+            RespFrame::BulkString(Some(std::sync::Arc::new(b"EVAL".to_vec()))),
+            RespFrame::BulkString(Some(std::sync::Arc::new(script.into_bytes()))),
+        ];
+        eval_parts.extend_from_slice(&parts[2..]);
+        
+        // Execute as EVAL
+        crate::storage::commands::lua::handle_eval(&self.storage, &eval_parts)
+    }
+    
+    /// Handle SCRIPT command with global script cache
+    fn handle_script_command(&self, parts: &[RespFrame]) -> Result<RespFrame> {
+        if parts.len() < 2 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'script' command"));
+        }
+        
+        let subcommand = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => {
+                match std::str::from_utf8(bytes) {
+                    Ok(s) => s.to_lowercase(),
+                    Err(_) => return Ok(RespFrame::error("ERR invalid subcommand")),
+                }
+            }
+            _ => return Ok(RespFrame::error("ERR invalid subcommand")),
+        };
+        
+        match subcommand.as_str() {
+            "load" => {
+                match crate::storage::commands::lua::handle_script_load(&self.storage, &parts[1..]) {
+                    Ok((sha1, script)) => {
+                        if let Err(e) = self.script_cache.insert(sha1.clone(), script) {
+                            return Ok(RespFrame::error(format!("ERR failed to cache script: {}", e)));
+                        }
+                        Ok(RespFrame::bulk_string(sha1))
+                    }
+                    Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
+                }
+            },
+            "exists" => {
+                if parts.len() < 3 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'script exists' command"));
+                }
+                
+                let mut results = Vec::new();
+                for i in 2..parts.len() {
+                    let sha1 = match &parts[i] {
+                        RespFrame::BulkString(Some(bytes)) => {
+                            match std::str::from_utf8(bytes) {
+                                Ok(s) => s.to_string(),
+                                Err(_) => {
+                                    results.push(RespFrame::Integer(0));
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {
+                            results.push(RespFrame::Integer(0));
+                            continue;
+                        }
+                    };
+                    
+                    match self.script_cache.contains_key(&sha1) {
+                        Ok(true) => results.push(RespFrame::Integer(1)),
+                        Ok(false) => results.push(RespFrame::Integer(0)),
+                        Err(_) => results.push(RespFrame::Integer(0)),
+                    }
+                }
+                Ok(RespFrame::Array(Some(results)))
+            },
+            "flush" => {
+                if parts.len() != 2 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'script flush' command"));
+                }
+                
+                match self.script_cache.clear() {
+                    Ok(_) => Ok(RespFrame::SimpleString(std::sync::Arc::new(b"OK".to_vec()))),
+                    Err(e) => Ok(RespFrame::error(format!("ERR failed to flush scripts: {}", e))),
+                }
+            },
+            "kill" => {
+                if parts.len() != 2 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'script kill' command"));
+                }
+                Ok(RespFrame::SimpleString(std::sync::Arc::new(b"OK".to_vec())))
+            },
+            _ => Ok(RespFrame::error(format!("ERR Unknown subcommand '{}'", subcommand))),
+        }
+    }
+
     /// Handle SYNC/PSYNC commands that need connection access
     fn handle_sync_command(&mut self, command: &str, parts: &[RespFrame], conn_id: u64) -> Result<RespFrame> {
         match command {

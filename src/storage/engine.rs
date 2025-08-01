@@ -1674,12 +1674,28 @@ impl StorageEngine {
         }
     }
 
-    /// Check if a key was modified (for WATCH command)
-    pub fn was_modified(&self, db: DatabaseIndex, _key: &[u8]) -> Result<bool> {
-        let _database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
+    /// Get the current modification counter for a key (for WATCH baseline)
+    pub fn get_modification_counter(&self, db: DatabaseIndex, key: &[u8]) -> Result<u64> {
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap();
         
-        // For now, always return false (no tracking implemented)
-        // In a full implementation, we'd check the modification counter
+        // Return the current modification counter for this key, or 0 if never modified
+        Ok(shard_guard.modified_keys.get(key).copied().unwrap_or(0))
+    }
+    
+    /// Check if a key was modified since a specific baseline counter (for WATCH command)
+    pub fn was_modified_since(&self, db: DatabaseIndex, key: &[u8], baseline_counter: u64) -> Result<bool> {
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap();
+        
+        // Check if the key's current modification counter is greater than the baseline
+        let current_counter = shard_guard.modified_keys.get(key).copied().unwrap_or(0);
+        Ok(current_counter > baseline_counter)
+    }
+
+    /// Check if a key was modified (for WATCH command) - kept for backward compatibility
+    pub fn was_modified(&self, db: DatabaseIndex, key: &[u8]) -> Result<bool> {
+        let _database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
         Ok(false)
     }
 

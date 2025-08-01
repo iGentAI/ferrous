@@ -4,16 +4,11 @@ import time
 import threading
 
 # Function to send Redis command and get response
-def redis_command(cmd, host='127.0.0.1', port=6379, password='mysecretpassword'):
+def redis_command(cmd, host='127.0.0.1', port=6379):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((host, port))
     
-    # First authenticate
-    auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len(password)}\r\n{password}\r\n"
-    s.sendall(auth_cmd.encode())
-    auth_resp = s.recv(1024)
-    
-    # Send command
+    # Send command directly without auth
     s.sendall(cmd.encode())
     resp = s.recv(4096)
     s.close()
@@ -79,11 +74,6 @@ print("6. Testing CLIENT KILL BY ID\n")
 def keep_connection_open():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(('127.0.0.1', 6379))
-    
-    # Authenticate
-    auth_cmd = f"*2\r\n$4\r\nAUTH\r\n${len('mysecretpassword')}\r\nmysecretpassword\r\n"
-    s.sendall(auth_cmd.encode())
-    auth_resp = s.recv(1024)
     
     # Set a name on this connection for easy identification
     name_cmd = "*3\r\n$6\r\nCLIENT\r\n$7\r\nSETNAME\r\n$10\r\ntarget-conn\r\n"
