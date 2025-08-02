@@ -14,7 +14,7 @@ mod tests {
         
         // Add entry with auto-generated ID
         let id1 = engine.xadd(0, b"sensor:1".to_vec(), fields.clone()).unwrap();
-        assert!(id1.millis > 0);
+        assert!(id1.millis() > 0);
         
         // Add another entry
         let id2 = engine.xadd(0, b"sensor:1".to_vec(), fields).unwrap();

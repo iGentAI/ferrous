@@ -846,7 +846,7 @@ impl Server {
                     }
                     "UNWATCH" => {
                         return self.connections.with_connection(conn_id, |conn| {
-                            transactions::handle_unwatch(conn)
+                            transactions::handle_unwatch(conn, &self.storage)
                         }).unwrap_or_else(|| Ok(RespFrame::error("ERR connection not found")));
                     }
                     "PUBLISH" => return self.handle_publish(parts),

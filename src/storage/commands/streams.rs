@@ -23,13 +23,14 @@ pub fn handle_xadd(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
     };
     
     // Extract ID
-    let id_str = match &parts[2] {
-        RespFrame::BulkString(Some(bytes)) => String::from_utf8_lossy(bytes),
+    let id_bytes = match &parts[2] {
+        RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
         _ => return Ok(RespFrame::error("ERR invalid ID format")),
     };
     
-    // Parse field-value pairs
-    let mut fields = HashMap::new();
+    // Parse field-value pairs with pre-allocated capacity
+    let num_fields = (parts.len() - 3) / 2;
+    let mut fields = HashMap::with_capacity(num_fields);
     for i in (3..parts.len()).step_by(2) {
         let field = match &parts[i] {
             RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
@@ -45,18 +46,20 @@ pub fn handle_xadd(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
     }
     
     // Add to stream
-    let result_id = if id_str == "*" {
+    let result_id = if id_bytes.len() == 1 && id_bytes[0] == b'*' {
         // Auto-generate ID
         storage.xadd(db, key, fields)?
     } else {
-        // Parse specific ID
-        let id = match StreamId::from_string(&id_str) {
+        // Parse specific ID using optimized parsing
+        let id_str = unsafe { std::str::from_utf8_unchecked(id_bytes) };
+        
+        let id = match StreamId::from_string(id_str) {
             Some(id) => id,
             None => return Ok(RespFrame::error("ERR Invalid stream ID specified as stream command argument")),
         };
         
-        // Validate ID format
-        if id.millis == 0 && id.seq == 0 {
+        // Validate ID format using methods
+        if id.millis() == 0 && id.seq() == 0 {
             return Ok(RespFrame::error("ERR The ID specified in XADD must be greater than 0-0"));
         }
         
@@ -77,7 +80,7 @@ pub fn handle_xadd(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         }
     };
     
-    Ok(RespFrame::BulkString(Some(std::sync::Arc::new(result_id.to_string().into_bytes()))))
+    Ok(RespFrame::BulkString(Some(Arc::new(result_id.to_string().into_bytes()))))
 }
 
 /// Handle XRANGE command - Get entries in a range

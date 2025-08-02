@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Instant, Duration};
 use std::sync::Arc;
-use std::fmt::Debug;
 use crate::storage::skiplist::SkipList;
 use crate::storage::stream::Stream;
 
@@ -27,8 +26,8 @@ pub enum Value {
     /// Sorted set value using skip list implementation
     SortedSet(Arc<SkipList<Vec<u8>, f64>>),
     
-    /// Stream value for time-series data
-    Stream(Arc<Stream>),
+    /// Stream value for time-series data - direct storage for integrated architecture
+    Stream(Stream),
 }
 
 /// Value type enumeration
@@ -143,9 +142,9 @@ impl Value {
         Value::SortedSet(Arc::new(SkipList::new()))
     }
     
-    /// Create an empty stream
+    /// Create an empty stream value for size calculation
     pub fn empty_stream() -> Self {
-        Value::Stream(Arc::new(Stream::new()))
+        Value::Stream(Stream::new())
     }
 }
 
