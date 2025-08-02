@@ -41,22 +41,12 @@ pub struct BlockedState {
 /// Type of blocking operation
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockingOp {
-    /// BLPOP - blocking left pop
     BLPop,
-    /// BRPOP - blocking right pop  
     BRPop,
-    /// Future: BLMOVE - blocking list move
-    BLMove { dest_key: Vec<u8>, direction: Direction },
+    XReadBlock(Vec<(DatabaseIndex, Vec<u8>, String)>), // (db, key, last_id)
 }
 
-/// Direction for list move operations
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Direction {
-    LeftToLeft,
-    LeftToRight,
-    RightToLeft,
-    RightToRight,
-}
+
 
 /// Represents a client connection
 pub struct Connection {

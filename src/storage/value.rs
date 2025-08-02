@@ -7,6 +7,7 @@ use std::time::{Instant, Duration};
 use std::sync::Arc;
 use std::fmt::Debug;
 use crate::storage::skiplist::SkipList;
+use crate::storage::stream::Stream;
 
 /// All possible Redis value types
 #[derive(Debug, Clone)]
@@ -25,6 +26,9 @@ pub enum Value {
     
     /// Sorted set value using skip list implementation
     SortedSet(Arc<SkipList<Vec<u8>, f64>>),
+    
+    /// Stream value for time-series data
+    Stream(Arc<Stream>),
 }
 
 /// Value type enumeration
@@ -35,6 +39,7 @@ pub enum ValueType {
     Set,
     Hash,
     SortedSet,
+    Stream,
 }
 
 /// String encoding optimization
@@ -83,6 +88,7 @@ impl Value {
             Value::Set(_) => ValueType::Set,
             Value::Hash(_) => ValueType::Hash,
             Value::SortedSet(_) => ValueType::SortedSet,
+            Value::Stream(_) => ValueType::Stream,
         }
     }
     
@@ -135,6 +141,11 @@ impl Value {
     /// Create an empty sorted set
     pub fn empty_sorted_set() -> Self {
         Value::SortedSet(Arc::new(SkipList::new()))
+    }
+    
+    /// Create an empty stream
+    pub fn empty_stream() -> Self {
+        Value::Stream(Arc::new(Stream::new()))
     }
 }
 

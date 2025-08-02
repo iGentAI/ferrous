@@ -9,7 +9,7 @@ use std::time::Instant;
 use crossbeam::queue::SegQueue;
 use crate::error::Result;
 use crate::storage::DatabaseIndex;
-use super::connection::{BlockingOp, Direction};
+use super::connection::{BlockingOp};
 
 /// Information about a blocked client
 #[derive(Debug, Clone)]

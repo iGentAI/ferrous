@@ -17,6 +17,8 @@ pub mod monitor_cmd;
 pub mod client;
 pub mod memory;
 pub mod lua;          // MLua-based Lua 5.1 scripting
+pub mod streams;
+pub mod consumer_groups;
 
 // Re-export all handlers for easy access
 pub use lists::*;
@@ -34,3 +36,5 @@ pub use monitor_cmd::*;
 pub use client::*;
 pub use memory::*;
 pub use lua::*;       // Export new MLua-based Lua commands
+pub use streams::*;      // Export stream commands
+pub use consumer_groups::*; // Export consumer group commands

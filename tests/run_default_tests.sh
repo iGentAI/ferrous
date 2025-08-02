@@ -51,6 +51,22 @@ else
     echo "❌ Global Lua script cache test failed: $RESULT"
 fi
 
+# Run comprehensive feature tests  
+echo "Running comprehensive feature validation..."
+python3 features/pubsub/test_pubsub_comprehensive.py
+echo ""
+python3 features/persistence/test_persistence_integration_clean.py
+echo ""
+python3 features/transactions/test_transactions_comprehensive.py
+echo ""
+
+# Run comprehensive Stream testing including edge cases
+echo "Running comprehensive Stream validation..."
+python3 features/streams/test_streams_complete.py
+echo ""
+python3 features/streams/test_streams_edge_cases.py
+echo ""
+
 echo ""
 echo "======================================"
 echo "DEFAULT CONFIGURATION TESTS COMPLETE"

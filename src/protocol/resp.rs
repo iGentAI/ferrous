@@ -127,6 +127,23 @@ impl RespFrame {
             RespFrame::Array(None)
         )
     }
+    
+    /// Get the string representation of this frame
+    pub fn as_string(&self) -> Option<String> {
+        match self {
+            RespFrame::SimpleString(bytes) => Some(String::from_utf8_lossy(bytes).to_string()),
+            RespFrame::BulkString(Some(bytes)) => Some(String::from_utf8_lossy(bytes).to_string()),
+            _ => None,
+        }
+    }
+    
+    /// Get bulk string content as lossy UTF-8 string
+    pub fn as_bulk_string_lossy(&self) -> Option<String> {
+        match self {
+            RespFrame::BulkString(Some(bytes)) => Some(String::from_utf8_lossy(bytes).to_string()),
+            _ => None,
+        }
+    }
 }
 
 impl From<String> for RespFrame {

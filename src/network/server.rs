@@ -25,6 +25,8 @@ use super::blocking::{BlockingManager, WakeupRequest};
 use super::connection::{BlockedState, BlockingOp};
 use crate::Config as FerrousConfig;
 
+
+
 /// Connection ID generator
 static CONN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -777,9 +779,13 @@ impl Server {
                 let cmd_frame = &parts[0];
                 let command = match cmd_frame {
                     RespFrame::BulkString(Some(bytes)) => {
-                        String::from_utf8_lossy(bytes).to_uppercase()
+                        let cmd_raw = String::from_utf8_lossy(bytes);
+                        let cmd_clean = cmd_raw.trim().to_uppercase();
+                        cmd_clean
                     }
-                    _ => return Ok(RespFrame::error("ERR invalid command format")),
+                    _ => {
+                        return Ok(RespFrame::error("ERR invalid command format"));
+                    }
                 };
                 
                 // Check if this is a replication command that needs special handling
@@ -898,60 +904,79 @@ impl Server {
     
     /// Handle EXEC command - execute queued transaction commands
     fn handle_exec(&mut self, conn_id: u64) -> Result<RespFrame> {
-        // First check if any watched keys were modified before clearing transaction state
-        let watch_violation = self.connections.with_connection(conn_id, |conn| {
-            if !conn.transaction_state.in_transaction {
-                return Err("ERR EXEC without MULTI".to_string());
-            }
-            
-            // Check watched keys BEFORE clearing transaction state
-            for (key, baseline_counter) in &conn.transaction_state.watched_keys {
-                if let Ok(modified) = self.storage.was_modified_since(conn.db_index, key, *baseline_counter) {
-                    if modified {
-                        return Ok(true); // Watch violation detected
-                    }
-                }
-            }
-            Ok(false) // No watch violations
-        });
-        
-        // Handle watch violations
-        match watch_violation {
-            Some(Ok(true)) => {
-                // Clear transaction state and return null array (transaction aborted)
-                self.connections.with_connection(conn_id, |conn| {
-                    conn.transaction_state.in_transaction = false;
-                    conn.transaction_state.watched_keys.clear();
-                    conn.transaction_state.queued_commands.clear();
-                    conn.transaction_state.aborted = false;
-                });
-                return Ok(RespFrame::null_array());
-            }
-            Some(Err(e)) => return Ok(RespFrame::error(e)),
-            _ => {} // No violation, continue with execution
-        }
-
-        // Get queued commands and clear transaction state (only after WATCH check passes)
-        let (commands, db_index, aborted) = {
-            let result = self.connections.with_connection(conn_id, |conn| {
+        // Extract watched keys and transaction state from connection
+        let (watched_keys, db_index, commands, in_transaction) = {
+            let extracted = self.connections.with_connection(conn_id, |conn| {
                 if !conn.transaction_state.in_transaction {
                     return None;
                 }
                 
-                let commands = std::mem::take(&mut conn.transaction_state.queued_commands);
-                let db_index = conn.db_index;
-                let aborted = conn.transaction_state.aborted;
+                // Extract all needed data while we have the connection lock
+                let watched = conn.transaction_state.watched_keys.clone();
+                let db = conn.db_index;
+                let cmds = conn.transaction_state.queued_commands.clone();
+                let in_trans = conn.transaction_state.in_transaction;
+                
+                Some((watched, db, cmds, in_trans))
+            });
+            
+            match extracted {
+                Some(Some(data)) => data,
+                _ => {
+                    return Ok(RespFrame::error("ERR EXEC without MULTI"));
+                }
+            }
+        };
+        
+        // Check watched keys against storage (no connection lock held)
+        for (key, baseline_counter) in &watched_keys {
+            match self.storage.was_modified_since(db_index, key, *baseline_counter) {
+                Ok(true) => {
+                    // Clear transaction state
+                    self.connections.with_connection(conn_id, |conn| {
+                        conn.transaction_state.in_transaction = false;
+                        conn.transaction_state.watched_keys.clear();
+                        conn.transaction_state.queued_commands.clear();
+                        conn.transaction_state.aborted = false;
+                    });
+                    
+                    return Ok(RespFrame::null_array());
+                }
+                Ok(false) => {
+                    // No violation, continue checking
+                }
+                Err(_) => {
+                    // Clear state and abort on errors
+                    self.connections.with_connection(conn_id, |conn| {
+                        conn.transaction_state.in_transaction = false;
+                        conn.transaction_state.watched_keys.clear();
+                        conn.transaction_state.queued_commands.clear();
+                        conn.transaction_state.aborted = false;
+                    });
+                    
+                    return Ok(RespFrame::null_array());
+                }
+            }
+        }
+        
+        // Clear watched keys and get commands for execution
+        let (commands_to_execute, aborted) = {
+            let result = self.connections.with_connection(conn_id, |conn| {
+                let cmds = std::mem::take(&mut conn.transaction_state.queued_commands);
+                let abort = conn.transaction_state.aborted;
                 
                 conn.transaction_state.in_transaction = false;
                 conn.transaction_state.watched_keys.clear();
                 conn.transaction_state.aborted = false;
                 
-                Some((commands, db_index, aborted))
+                (cmds, abort)
             });
             
             match result {
-                Some(Some(data)) => data,
-                _ => return Ok(RespFrame::error("ERR EXEC without MULTI")),
+                Some(data) => data,
+                None => {
+                    return Ok(RespFrame::error("ERR connection not found"));
+                }
             }
         };
         
@@ -959,12 +984,14 @@ impl Server {
             return Ok(RespFrame::null_array());
         }
         
-        // Execute all commands
+        // Execute commands
         let mut results = Vec::new();
-        for cmd_parts in commands {
+        for cmd_parts in commands_to_execute.iter() {
             match self.process_command_parts(&cmd_parts, db_index) {
                 Ok(response) => results.push(response),
-                Err(e) => results.push(RespFrame::error(e.to_string())),
+                Err(e) => {
+                    results.push(RespFrame::error(e.to_string()));
+                }
             }
         }
         
@@ -1194,6 +1221,24 @@ impl Server {
             "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(parts, db),
             "ZCOUNT" => self.handle_zcount(parts, db),
             "ZINCRBY" => self.handle_zincrby(parts, db),
+            
+            // Stream commands
+            "XADD" => crate::storage::commands::streams::handle_xadd(&self.storage, db, parts),
+            "XRANGE" => crate::storage::commands::streams::handle_xrange(&self.storage, db, parts),
+            "XREVRANGE" => crate::storage::commands::streams::handle_xrevrange(&self.storage, db, parts),
+            "XLEN" => crate::storage::commands::streams::handle_xlen(&self.storage, db, parts),
+            "XREAD" => crate::storage::commands::streams::handle_xread(&self.storage, db, parts),
+            "XTRIM" => crate::storage::commands::streams::handle_xtrim(&self.storage, db, parts),
+            "XDEL" => crate::storage::commands::streams::handle_xdel(&self.storage, db, parts),
+            
+            // Consumer group commands
+            "XGROUP" => crate::storage::commands::consumer_groups::handle_xgroup(&self.storage, db, parts),
+            "XREADGROUP" => crate::storage::commands::consumer_groups::handle_xreadgroup(&self.storage, db, parts),
+            "XACK" => crate::storage::commands::consumer_groups::handle_xack(&self.storage, db, parts),
+            "XCLAIM" => crate::storage::commands::consumer_groups::handle_xclaim(&self.storage, db, parts),
+            "XPENDING" => crate::storage::commands::consumer_groups::handle_xpending(&self.storage, db, parts),
+            "XINFO" => crate::storage::commands::consumer_groups::handle_xinfo(&self.storage, db, parts),
+            
             // RDB commands
             "SAVE" => self.handle_save(parts),
             "BGSAVE" => self.handle_bgsave(parts),
@@ -1240,10 +1285,8 @@ impl Server {
             "QUIT" => Ok(RespFrame::ok()),
             // Add the Lua script commands
             "EVAL" => {
-                println!("[SERVER DEBUG] Processing EVAL command");
                 match crate::storage::commands::lua::handle_eval(&self.storage, parts) {
                     Ok(resp) => {
-                        println!("[SERVER DEBUG] EVAL executed successfully");
                         Ok(resp)
                     },
                     Err(e) => {
@@ -1290,13 +1333,7 @@ impl Server {
         if self.is_write_command(&command_name) {
             if let Ok(resp) = &result {
                 if !resp.is_error() {
-                    println!("Propagating command {} to replicas", command_name);
-                    
                     if let Ok(replica_ids) = self.replication.propagate_command(&RespFrame::Array(Some(parts.to_vec()))) {
-                        if !replica_ids.is_empty() {
-                            println!("Propagating to {} replicas", replica_ids.len());
-                        }
-                        
                         for replica_id in replica_ids {
                             let propagated = self.connections.with_connection(replica_id, |conn| -> Result<()> {
                                 conn.send_frame(&RespFrame::Array(Some(parts.to_vec())))?;
@@ -1381,6 +1418,8 @@ impl Server {
                 "SADD" | "SREM" | "SPOP" | 
                 "HSET" | "HDEL" | "HINCRBY" |
                 "ZADD" | "ZREM" | "ZINCRBY" |
+                "XADD" | "XTRIM" | "XDEL" |  // Stream write commands
+                "XGROUP" | "XACK" | "XCLAIM" |  // Consumer group write commands
                 "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "RENAMENX" | "PERSIST" | "EVAL" | "EVALSHA"
             )
         }
@@ -2910,6 +2949,8 @@ impl Server {
         }
     }
     
+
+
 
 
     /// Clean up closed connections

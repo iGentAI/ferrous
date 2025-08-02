@@ -118,7 +118,7 @@ pub fn handle_replconf(
             let offset = match &parts[2] {
                 RespFrame::BulkString(Some(bytes)) => {
                     String::from_utf8_lossy(bytes).parse::<u64>()
-                        .map_err(|_| CommandError::InvalidArgument)?
+                        .map_err(|_| FerrousError::Command(CommandError::Generic("invalid offset".to_string())))?
                 }
                 _ => return Ok(RespFrame::error("ERR invalid offset format")),
             };

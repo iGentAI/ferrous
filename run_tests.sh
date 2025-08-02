@@ -21,7 +21,7 @@ show_help() {
     echo ""
     echo "Examples:"
     echo "  $0 default  # Most common - basic functionality tests"
-    echo "  $0 perf     # For benchmarking against Valkey"
+    echo "  $0 perf     # For benchmarking against Redis/Valkey"
     echo "  $0 auth     # For replication testing"
     echo ""
 }
@@ -89,7 +89,22 @@ run_default_tests() {
     echo ""
     python3 features/persistence/test_persistence_integration_clean.py
     echo ""
+    
+    # Run CORRECTED transaction tests with fixed WATCH mechanism
+    echo "Running corrected transaction system tests..."
     python3 features/transactions/test_transactions_comprehensive.py
+    echo ""
+    
+    # Run corrected WATCH mechanism tests using proper redis-py patterns
+    echo "Running corrected WATCH mechanism tests..."
+    python3 features/transactions/test_watch_corrected_usage.py
+    echo ""
+    
+    # Run comprehensive Stream testing
+    echo "Running comprehensive Stream validation..."
+    python3 features/streams/test_streams_complete.py
+    echo ""
+    python3 features/streams/test_streams_edge_cases.py
     echo ""
     
     cd ..
@@ -120,35 +135,75 @@ run_auth_tests() {
     echo "========================================="
     echo "RUNNING AUTHENTICATED CONFIGURATION TESTS" 
     echo "========================================="
-    echo "Starting server: ./target/release/ferrous master.conf"
+    
+    # Kill any existing Ferrous servers to ensure clean state
+    echo "Cleaning up any existing Ferrous servers..."
+    pkill -f "ferrous" || true
+    sleep 2
+    
+    # Ensure data directories exist
+    mkdir -p data/master data/replica
     echo ""
     
-    # Ensure data directory exists
-    mkdir -p data/master
+    # Start master server (port 6379)
+    echo "Starting master server: ./target/release/ferrous master.conf"
+    ./target/release/ferrous master.conf > /tmp/ferrous-master.log 2>&1 &
+    MASTER_PID=$!
     
-    # Start server 
-    ./target/release/ferrous master.conf > /tmp/ferrous-auth.log 2>&1 &
-    SERVER_PID=$!
-    sleep 3
+    # Wait for master to start
+    sleep 4
     
-    # Verify server is running with auth
-    if ! redis-cli -p 6379 -a mysecretpassword PING > /dev/null 2>&1; then
-        echo "❌ Authenticated server failed to start"
-        kill $SERVER_PID 2>/dev/null || true
+    # Verify master is running with auth
+    if ! redis-cli -h 127.0.0.1 -p 6379 -a mysecretpassword PING > /dev/null 2>&1; then
+        echo "❌ Master server failed to start or authenticate"
+        echo "Master server log:"
+        cat /tmp/ferrous-master.log | tail -10
+        kill $MASTER_PID 2>/dev/null || true
         exit 1
     fi
     
-    echo "✅ Authenticated server running on port 6379"
+    echo "✅ Master server running on port 6379 with authentication"
+    
+    # Start replica server (port 6380) 
+    echo "Starting replica server: ./target/release/ferrous replica.conf"
+    ./target/release/ferrous replica.conf > /tmp/ferrous-replica.log 2>&1 &
+    REPLICA_PID=$!
+    
+    # Wait for replica to start and connect to master
+    sleep 5
+    
+    # Verify replica is running (may or may not require auth depending on config)
+    if redis-cli -h 127.0.0.1 -p 6380 PING > /dev/null 2>&1; then
+        echo "✅ Replica server running on port 6380"
+    elif redis-cli -h 127.0.0.1 -p 6380 -a mysecretpassword PING > /dev/null 2>&1; then
+        echo "✅ Replica server running on port 6380 with authentication"
+    else
+        echo "⚠️ Replica server may not be accessible (replication features may be limited)"
+        echo "Replica server log:"
+        cat /tmp/ferrous-replica.log | tail -10
+    fi
+    
     echo ""
     
     # Run replication tests
     cd tests
-    echo "Running replication tests..."
+    echo "Running replication tests with both master and replica servers..."
     ./integration/test_replication.sh
     cd ..
     
-    # Cleanup
-    kill $SERVER_PID
+    # Proper cleanup of both servers
+    echo ""
+    echo "Cleaning up servers..."
+    kill $MASTER_PID 2>/dev/null || true
+    kill $REPLICA_PID 2>/dev/null || true
+    
+    # Give servers time to clean shutdown
+    sleep 3
+    
+    # Force kill any remaining processes
+    pkill -f "ferrous master.conf" || true
+    pkill -f "ferrous replica.conf" || true
+    
     echo ""
     echo "✅ Authenticated tests completed successfully"
 }
@@ -174,9 +229,19 @@ run_perf_tests() {
     echo "✅ Performance-optimized server running"
     echo ""
     
-    # Run benchmarks
+    # Run comprehensive benchmarks
     cd tests
+    echo "Running core operations benchmarks..."
     ./performance/test_benchmark.sh
+    echo ""
+    echo "Running Stream operations benchmarks..."
+    ./performance/test_stream_benchmarks.sh
+    echo ""
+    echo "Running comprehensive feature benchmarks..."
+    ./performance/test_comprehensive_benchmarks.sh
+    echo ""
+    echo "Running Stream edge case validation..." 
+    python3 features/streams/test_streams_edge_cases.py
     cd ..
     
     # Cleanup

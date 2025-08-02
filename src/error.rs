@@ -69,7 +69,28 @@ pub enum CommandError {
     InvalidState(String),
     
     /// Invalid argument for command
-    InvalidArgument,
+    InvalidArgument(String),
+    
+    /// Invalid stream ID
+    InvalidStreamId,
+    
+    /// Stream ID is equal or smaller than the target
+    StreamIdTooSmall,
+    
+    /// Stream is empty
+    StreamEmpty,
+    
+    /// Consumer group already exists
+    ConsumerGroupExists,
+    
+    /// Consumer group does not exist
+    NoSuchConsumerGroup,
+    
+    /// Consumer does not exist
+    NoSuchConsumer,
+    
+    /// Stream ID already exists
+    StreamIdExists,
     
     /// Generic command error with message
     Generic(String),
@@ -156,8 +177,29 @@ impl fmt::Display for CommandError {
             CommandError::InvalidState(msg) => {
                 write!(f, "ERR {}", msg)
             }
-            CommandError::InvalidArgument => {
-                write!(f, "ERR invalid argument")
+            CommandError::InvalidArgument(msg) => {
+                write!(f, "ERR invalid argument: {}", msg)
+            }
+            CommandError::InvalidStreamId => {
+                write!(f, "ERR Invalid stream ID specified as stream command argument")
+            }
+            CommandError::StreamIdTooSmall => {
+                write!(f, "ERR The ID specified in XADD is equal or smaller than the target stream top item")
+            }
+            CommandError::StreamEmpty => {
+                write!(f, "ERR stream is empty")
+            }
+            CommandError::ConsumerGroupExists => {
+                write!(f, "BUSYGROUP Consumer Group name already exists")
+            }
+            CommandError::NoSuchConsumerGroup => {
+                write!(f, "NOGROUP No such key or consumer group")
+            }
+            CommandError::NoSuchConsumer => {
+                write!(f, "ERR no such consumer")
+            }
+            CommandError::StreamIdExists => {
+                write!(f, "ERR stream ID already exists")
             }
             CommandError::Generic(msg) => {
                 write!(f, "ERR {}", msg)
