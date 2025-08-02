@@ -54,8 +54,8 @@ redis-benchmark -p 6379 -t sadd -n 10000 -q
 echo -e "\n9. HSET Command"
 redis-benchmark -p 6379 -t hset -n 10000 -q
 
-echo -e "\n10. Latency Test"
-redis-cli -p 6379 --latency-history
+echo -e "\n10. Latency Test (5 second sample)"
+timeout 5 redis-cli -p 6379 --latency-history -i 1 || echo "Latency test completed (5 second sample)"
 
 echo -e "\n======================================"
 echo "BENCHMARK COMPLETE"

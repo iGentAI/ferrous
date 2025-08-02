@@ -403,75 +403,81 @@ impl StorageEngine {
     
     /// Stream operations
     
-    /// Add an entry to a stream with auto-generated ID
+    /// Add an entry to a stream with auto-generated ID - NO CLONING!
     pub fn xadd(&self, db: DatabaseIndex, key: Key, fields: HashMap<Vec<u8>, Vec<u8>>) -> Result<StreamId> {
         let shard = self.get_shard(db, &key)?;
         let mut shard_guard = shard.write().unwrap();
         
-        let id = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
-            match &mut stored_value.value {
-                Value::Stream(stream) => {
-                    let id = stream.add_auto(fields);
-                    // NO touch() call - no access time tracking overhead
-                    shard_guard.mark_modified(&key);
-                    id
+        let id = match shard_guard.data.get_mut(&key) {
+            Some(stored_value) => {
+                match &mut stored_value.value {
+                    Value::Stream(stream) => {
+                        let id = stream.add_auto(fields);
+                        shard_guard.mark_modified(&key);
+                        id
+                    }
+                    _ => return Err(StorageError::WrongType.into()),
                 }
-                _ => return Err(StorageError::WrongType.into()),
             }
-        } else {
-            // Create a new stream
-            let stream = Stream::new();
-            let id = stream.add_auto(fields);
-            
-            let memory_size = self.calculate_value_size(&key, &Value::empty_stream()) +
-                             stream.memory_usage();
-            
-            if !self.memory_manager.add_memory(memory_size) {
-                return Err(StorageError::OutOfMemory.into());
+            None => {
+                // Create new stream
+                let mut new_stream = Stream::new();
+                let id = new_stream.add_auto(fields);
+                
+                let memory_size = self.calculate_value_size(&key, &Value::empty_stream()) +
+                                 new_stream.memory_usage();
+                
+                if !self.memory_manager.add_memory(memory_size) {
+                    return Err(StorageError::OutOfMemory.into());
+                }
+                
+                let stored_value = StoredValue::new(Value::Stream(new_stream));
+                shard_guard.data.insert(key.clone(), stored_value);
+                shard_guard.mark_modified(&key);
+                
+                id
             }
-            
-            let stored_value = StoredValue::new(Value::Stream(Arc::new(stream)));
-            shard_guard.data.insert(key.clone(), stored_value);
-            shard_guard.mark_modified(&key);
-            id
         };
         
         Ok(id)
     }
     
-    /// Add an entry to a stream with specific ID
+    /// Add an entry to a stream with specific ID - NO CLONING!
     pub fn xadd_with_id(&self, db: DatabaseIndex, key: Key, id: StreamId, fields: HashMap<Vec<u8>, Vec<u8>>) -> Result<StreamId> {
         let shard = self.get_shard(db, &key)?;
         let mut shard_guard = shard.write().unwrap();
         
-        let result_id = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
-            match &mut stored_value.value {
-                Value::Stream(stream) => {
-                    stream.add_with_id(id.clone(), fields)
-                        .map_err(|e| FerrousError::Command(CommandError::Generic(e.to_string())))?;
-                    // NO touch() call - no access time tracking overhead
-                    shard_guard.mark_modified(&key);
-                    id
+        let result_id = match shard_guard.data.get_mut(&key) {
+            Some(stored_value) => {
+                match &mut stored_value.value {
+                    Value::Stream(stream) => {
+                        stream.add_with_id(id.clone(), fields)
+                            .map_err(|e| FerrousError::Command(CommandError::Generic(e.to_string())))?;
+                        shard_guard.mark_modified(&key);
+                        id
+                    }
+                    _ => return Err(StorageError::WrongType.into()),
                 }
-                _ => return Err(StorageError::WrongType.into()),
             }
-        } else {
-            // Create a new stream
-            let stream = Stream::new();
-            stream.add_with_id(id.clone(), fields)
-                .map_err(|e| FerrousError::Command(CommandError::Generic(e.to_string())))?;
-            
-            let memory_size = self.calculate_value_size(&key, &Value::empty_stream()) +
-                             stream.memory_usage();
-            
-            if !self.memory_manager.add_memory(memory_size) {
-                return Err(StorageError::OutOfMemory.into());
+            None => {
+                // Create new stream
+                let mut stream = Stream::new();
+                stream.add_with_id(id.clone(), fields)
+                    .map_err(|e| FerrousError::Command(CommandError::Generic(e.to_string())))?;
+                
+                let memory_size = self.calculate_value_size(&key, &Value::empty_stream()) +
+                                 stream.memory_usage();
+                
+                if !self.memory_manager.add_memory(memory_size) {
+                    return Err(StorageError::OutOfMemory.into());
+                }
+                
+                let stored_value = StoredValue::new(Value::Stream(stream));
+                shard_guard.data.insert(key.clone(), stored_value);
+                shard_guard.mark_modified(&key);
+                
+                id
             }
-            
-            let stored_value = StoredValue::new(Value::Stream(Arc::new(stream)));
-            shard_guard.data.insert(key.clone(), stored_value);
-            shard_guard.mark_modified(&key);
-            id
         };
         
         Ok(result_id)
@@ -480,18 +486,16 @@ impl StorageEngine {
     /// Get entries from a stream in a range of IDs
     pub fn xrange(&self, db: DatabaseIndex, key: &[u8], start: StreamId, end: StreamId, count: Option<usize>) -> Result<Vec<StreamEntry>> {
         let shard = self.get_shard(db, key)?;
-        let mut shard_guard = shard.write().unwrap();
+        let shard_guard = shard.read().unwrap();
         
-        if let Some(stored_value) = shard_guard.data.get_mut(key) {
-            let entries = match &stored_value.value {
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            match &stored_value.value {
                 Value::Stream(stream) => {
                     let result = stream.range(&start, &end, count, false);
-                    result.entries
+                    Ok(result.entries)
                 }
-                _ => return Err(StorageError::WrongType.into()),
-            };
-            
-            Ok(entries)
+                _ => Err(StorageError::WrongType.into()),
+            }
         } else {
             Ok(Vec::new())
         }
@@ -500,34 +504,31 @@ impl StorageEngine {
     /// Get entries from a stream in reverse order
     pub fn xrevrange(&self, db: DatabaseIndex, key: &[u8], start: StreamId, end: StreamId, count: Option<usize>) -> Result<Vec<StreamEntry>> {
         let shard = self.get_shard(db, key)?;
-        let mut shard_guard = shard.write().unwrap();
+        let shard_guard = shard.read().unwrap();
         
-        if let Some(stored_value) = shard_guard.data.get_mut(key) {
-            let entries = match &stored_value.value {
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            match &stored_value.value {
                 Value::Stream(stream) => {
                     let result = stream.range(&start, &end, count, true);
-                    result.entries
+                    Ok(result.entries)
                 }
-                _ => return Err(StorageError::WrongType.into()),
-            };
-            
-            Ok(entries)
+                _ => Err(StorageError::WrongType.into()),
+            }
         } else {
             Ok(Vec::new())
         }
     }
     
-    /// Get the number of entries in a stream
+    /// Get stream length using lock-free atomic operations
     pub fn xlen(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
         let shard = self.get_shard(db, key)?;
-        let mut shard_guard = shard.write().unwrap();
+        let shard_guard = shard.read().unwrap();
         
-        if let Some(stored_value) = shard_guard.data.get_mut(key) {
-            let len = match &stored_value.value {
-                Value::Stream(stream) => stream.len(),
-                _ => return Err(StorageError::WrongType.into()),
-            };
-            Ok(len)
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            match &stored_value.value {
+                Value::Stream(stream) => Ok(stream.len()),
+                _ => Err(StorageError::WrongType.into()),
+            }
         } else {
             Ok(0)
         }
@@ -545,16 +546,15 @@ impl StorageEngine {
         
         for (key, after_id) in keys_and_ids {
             let shard = self.get_shard(db, key)?;
-            let mut shard_guard = shard.write().unwrap();
+            let shard_guard = shard.read().unwrap();
             
-            if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            if let Some(stored_value) = shard_guard.data.get(key) {
                 match &stored_value.value {
                     Value::Stream(stream) => {
                         let result = stream.range_after(&after_id, count);
                         if !result.entries.is_empty() {
                             results.push((key.to_vec(), result.entries));
                         }
-                        // NO touch() call - no access time tracking overhead
                     }
                     _ => return Err(StorageError::WrongType.into()),
                 }
@@ -2028,6 +2028,27 @@ impl StorageEngine {
     pub fn was_modified(&self, db: DatabaseIndex, key: &[u8]) -> Result<bool> {
         let _database = self.databases.get(db).ok_or(StorageError::InvalidDatabase)?;
         Ok(false)
+    }
+
+    /// Register a WATCH on a key and return the baseline modification counter
+    pub fn register_watch(&self, db: DatabaseIndex, key: &[u8]) -> Result<u64> {
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap();
+        
+        // Register the watch and get baseline counter
+        let baseline_counter = shard_guard.watch_tracker.register_watch();
+        
+        Ok(baseline_counter)
+    }
+    
+    /// Unregister WATCH for keys (when UNWATCH or EXEC called)
+    pub fn unregister_watch(&self, db: DatabaseIndex, key: &[u8]) -> Result<()> {
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap();
+        
+        shard_guard.watch_tracker.unregister_watch();
+        
+        Ok(())
     }
 
     /// Get the current database ID

@@ -108,15 +108,22 @@ pub fn handle_watch(conn: &mut Connection, parts: &[RespFrame], storage: &Arc<St
             RespFrame::BulkString(Some(bytes)) => {
                 let key = bytes.as_ref().clone();
                 
-                // Get current atomic modification counter for baseline
-                match storage.get_modification_counter(conn.db_index, &key) {
+                // Register the watch with storage engine
+                match storage.register_watch(conn.db_index, &key) {
                     Ok(baseline_counter) => {
-                        // Store the atomic counter value as baseline
+                        // Store the baseline counter for violation detection
                         conn.transaction_state.watched_keys.insert(key, baseline_counter);
                     }
                     Err(_) => {
-                        // If we can't get the counter, use 0 as fallback
-                        conn.transaction_state.watched_keys.insert(key, 0);
+                        // If we can't register, use fallback counter
+                        match storage.get_modification_counter(conn.db_index, &key) {
+                            Ok(baseline_counter) => {
+                                conn.transaction_state.watched_keys.insert(key, baseline_counter);
+                            }
+                            Err(_) => {
+                                conn.transaction_state.watched_keys.insert(key, 0);
+                            }
+                        }
                     }
                 }
             }
@@ -130,7 +137,12 @@ pub fn handle_watch(conn: &mut Connection, parts: &[RespFrame], storage: &Arc<St
 }
 
 /// Handle UNWATCH command - Unwatch all keys
-pub fn handle_unwatch(conn: &mut Connection) -> Result<RespFrame> {
+pub fn handle_unwatch(conn: &mut Connection, storage: &Arc<StorageEngine>) -> Result<RespFrame> {
+    // Unregister all watches
+    for key in conn.transaction_state.watched_keys.keys() {
+        let _ = storage.unregister_watch(conn.db_index, key);
+    }
+    
     conn.transaction_state.watched_keys.clear();
     Ok(RespFrame::ok())
 }
