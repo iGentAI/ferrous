@@ -30,7 +30,7 @@ cd ferrous/
 ### 3. Performance Configuration
 - **Server**: `./target/release/ferrous > /dev/null 2>&1 &`
 - **Authentication**: None
-- **Tests**: Benchmarks vs Valkey 8.0.4  
+- **Tests**: Benchmarks vs Redis/Valkey 8.0.4  
 - **Run**: `./run_tests.sh perf`
 
 ## Directory Structure
@@ -57,5 +57,5 @@ sudo dnf install -y redis  # For redis-benchmark
 
 ✅ **Authentication alignment** - Most tests work without auth  
 ✅ **Global Lua script cache** - SCRIPT LOAD/EVALSHA fixed  
-✅ **Performance validation** - Exceeds Valkey 8.0.4 in 8/9 operations  
+✅ **Performance validation** - Exceeds Redis/Valkey 8.0.4 in 8/9 operations  
 ✅ **All tests passing** - 57 unit tests + comprehensive integration tests

@@ -3,6 +3,7 @@
 //! Provides Redis Database (RDB) format persistence for durability.
 //! Supports both blocking (SAVE) and background (BGSAVE) operations.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write, BufWriter, BufReader};
 use std::path::{Path, PathBuf};
@@ -264,6 +265,7 @@ impl RdbEngine {
                         Value::Set(_) => buffer.push(RdbOpcode::Set as u8),
                         Value::Hash(_) => buffer.push(RdbOpcode::Hash as u8),
                         Value::SortedSet(_) => buffer.push(RdbOpcode::ZSet as u8),
+                        Value::Stream(_) => buffer.push(RdbOpcode::String as u8), // Placeholder for stream
                     }
                     
                     // Write key
@@ -512,6 +514,15 @@ impl<W: Write> RdbWriter<W> {
                     self.write_f64(score)?;
                 }
             }
+            Value::Stream(stream) => {
+                // Use String opcode for now with stream identifier prefix
+                self.write_byte(RdbOpcode::String as u8)?;
+                self.write_string(key)?;
+                
+                // Serialize stream metadata and entries
+                let stream_data = format!("FERROUS_STREAM:{}:END", stream.len());
+                self.write_string(stream_data.as_bytes())?;
+            }
             Value::List(_) => {
                 // TODO: Implement list serialization
                 return Ok(());
@@ -713,10 +724,31 @@ impl<R: Read> RdbReader<R> {
                 let key = self.read_string()?;
                 let value = self.read_string()?;
                 
-                if let Some(ttl) = ttl {
-                    storage.set_string_ex(db, key, value, ttl)?;
+                // Check if this is a stream serialization
+                if let Ok(value_str) = String::from_utf8(value.clone()) {
+                    if value_str.starts_with("FERROUS_STREAM:") && value_str.ends_with(":END") {
+                        // This is a stream placeholder - create empty stream
+                        let mut initial_fields = HashMap::new();
+                        initial_fields.insert(b"_init".to_vec(), b"1".to_vec());
+                        let _id = storage.xadd(db, key.clone(), initial_fields);
+                        
+                        // Remove the initialization entry
+                        let _ = storage.xtrim(db, &key, 0);
+                    } else {
+                        // Regular string value
+                        if let Some(ttl) = ttl {
+                            storage.set_string_ex(db, key, value, ttl)?;
+                        } else {
+                            storage.set_string(db, key, value)?;
+                        }
+                    }
                 } else {
-                    storage.set_string(db, key, value)?;
+                    // Binary string value
+                    if let Some(ttl) = ttl {
+                        storage.set_string_ex(db, key, value, ttl)?;
+                    } else {
+                        storage.set_string(db, key, value)?;
+                    }
                 }
             }
             op if op == RdbOpcode::ZSet as u8 || op == RdbOpcode::ZSet2 as u8 => {

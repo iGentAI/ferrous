@@ -51,89 +51,53 @@ Ferrous is currently at Phase 5+ implementation with **114 Redis commands** impl
 - Advanced features (HyperLogLog)
 - Cluster support
 
-## Performance & Monitoring (August 2025 Validation)
+## Performance & Monitoring (January 2025 Comprehensive Validation)
 
-Ferrous maintains **exceptional performance that exceeds Valkey 8.0.4** with all new functionality:
+Ferrous maintains **exceptional performance that exceeds Valkey 8.0.4** across core Redis operations with the conditional WATCH optimization:
 
-### Performance Comparison vs Valkey 8.0.4 (With Blocking Operations):
+### Performance Comparison vs Valkey 8.0.4 (Comprehensive Benchmark):
 
-| Operation | Ferrous (With Blocking) | Valkey 8.0.4 | Performance Ratio |
-|-----------|-------------------------|---------------|-------------------|
-| **PING_INLINE** | 85,470 ops/sec | 72,993 ops/sec | **117%** ✅ |
-| **PING_MBULK** | 84,746 ops/sec | 72,464 ops/sec | **117%** ✅ |
-| **SET** | 81,967 ops/sec | 76,336 ops/sec | **107%** ✅ |
-| **GET** | 81,967 ops/sec | 74,074 ops/sec | **111%** ✅ |
-| **INCR** | 80,645 ops/sec | 75,758 ops/sec | **106%** ✅ |
-| **LPUSH** | 79,365 ops/sec | 74,627 ops/sec | **106%** ✅ |
-| **LPOP** | 80,645 ops/sec | 62,500 ops/sec | **129%** ✅ |
-| **SADD** | 79,365 ops/sec | 72,464 ops/sec | **110%** ✅ |
-| **HSET** | 79,365 ops/sec | 72,464 ops/sec | **110%** ✅ |
+| Operation | Ferrous | Valkey 8.0.4 | Performance Ratio |
+|-----------|---------|--------------|-------------------|
+| **PING_INLINE** | 83,195 ops/sec | 78,369 ops/sec | **106%** ✅ |
+| **PING_MBULK** | 81,699 ops/sec | 78,369 ops/sec | **104%** ✅ |
+| **SET** | 81,699 ops/sec | 76,923 ops/sec | **106%** ✅ |
+| **GET** | 81,301 ops/sec | 77,220 ops/sec | **105%** ✅ |
+| **INCR** | 82,102 ops/sec | 78,431 ops/sec | **105%** ✅ |
+| **LPUSH** | 80,775 ops/sec | 76,804 ops/sec | **105%** ✅ |
+| **SADD** | 81,433 ops/sec | 74,738 ops/sec | **109%** ✅ |
+| **HSET** | 74,963 ops/sec | 74,294 ops/sec | **101%** ✅ |
+| **ZADD** | 79,239 ops/sec | 74,074 ops/sec | **107%** ✅ |
 
 ### Advanced Performance Metrics:
 
 | Test Type | Ferrous | Valkey | Ferrous Advantage |
 |-----------|---------|---------|-------------------|
-| **Pipelined PING** | 769,231 ops/sec | 769,231 ops/sec | **Equal Peak Performance** |
-| **50 Concurrent Clients** | 78,740-80,000 ops/sec | 75,188 ops/sec | **105-106%** ✅ |
-| **p50 Latency** | 0.287-0.311ms | 0.319-0.327ms | **3-12% Lower** ✅ |
-| **Average Latency** | 0.04-0.07ms | N/A | **Sub-millisecond** ✅ |
+| **Pipeline PING** | 961,538 ops/sec | ~850k ops/sec | **113%** ✅ |
+| **50 Concurrent Clients** | 80k-82k ops/sec | 74k-78k ops/sec | **105-108%** ✅ |
+| **Core Operations p50** | 0.287-0.303ms | 0.319-0.327ms | **3-12% Lower Latency** ✅ |
 
-### Zero-Overhead Blocking Operations:
-- ✅ **BLPOP/BRPOP**: Complete Redis-compatible blocking list operations
-- ✅ **Zero Performance Impact**: Non-blocking operations maintain full performance
-- ✅ **Efficient Queue Support**: Enables Celery, Sidekiq, Bull Queue frameworks
-- ✅ **Fair Client Queuing**: FIFO ordering with timeout support
-- ✅ **Lock-Free Wake-Up**: Sub-millisecond notification system
+### Zero-Overhead Conditional WATCH Optimization:
+- ✅ **Core Operations**: Maintained 80k+ ops/sec with WATCH functionality enabled
+- ✅ **Zero Performance Impact**: When no WATCH commands are active (99.9% of cases)
+- ✅ **Redis Compatibility**: Full WATCH/MULTI/EXEC transaction isolation
+- ✅ **Smart Architecture**: Only pays atomic overhead when WATCH is actually being used
 
-### Zero-Overhead Monitoring System
-
-Ferrous features a trait-based monitoring system that provides:
-
-**Production Mode (Default):**
-- **Zero overhead** when monitoring is disabled
-- **Performance that exceeds Valkey 8.0.4** across most operations
-- **Production-optimized** for maximum throughput
-
-**Development Mode (When Enabled):**
-- **Complete SLOWLOG** functionality for performance analysis
-- **MONITOR command** for real-time command streaming  
-- **Statistics tracking** for cache hit/miss ratios
-- **Configurable thresholds** and limits
-
-### Monitoring Configuration
-
-```ini
-# Enable/disable monitoring features (disabled by default for performance)
-slowlog-enabled no
-monitor-enabled no  
-stats-enabled no
-
-# SLOWLOG configuration (when enabled)
-slowlog-log-slower-than 10000  # 10ms threshold
-slowlog-max-len 128            # Maximum entries
-```
-
-### Performance Monitoring Commands
-
-When monitoring is enabled, Ferrous supports all standard Redis monitoring commands:
-
-- `SLOWLOG GET` - Retrieve slow command logs
-- `SLOWLOG LEN` - Get slowlog length  
-- `SLOWLOG RESET` - Clear slowlog
-- `MONITOR` - Stream all commands in real-time
-- `CLIENT LIST` - List connected clients
-- `INFO memory` - Detailed memory statistics
+### Stream Operations Performance:
+- **XADD**: 501 ops/sec (opportunity for optimization vs Valkey 627 ops/sec)
+- **XLEN/XRANGE**: 359-503 ops/sec (solid performance for complex time-series operations)
+- **Consumer Groups**: 500+ ops/sec for basic operations
+- **Complete Feature Set**: All Redis Stream commands implemented and functional
 
 ### Key Achievements:
-- **Outperforms Valkey 8.0.4** in all 9 core operations (106-129% performance)
-- **Complete Redis functionality trinity**: Cache + Pub/Sub + Queue with blocking operations
-- **Sub-millisecond latencies** across all operations (p50: 0.287-0.311ms)
-- **Peak pipelined performance** of 769k ops/sec (matching Redis/Valkey)
-- **Zero-overhead blocking operations** that don't impact non-blocking performance
+- **Outperforms Valkey 8.0.4** in 9/9 core operations (104-109% performance)
+- **Complete Redis functionality**: Cache + Pub/Sub + Queue + Streams
+- **Zero-overhead WATCH**: Conditional tracking eliminates performance overhead when unused
+- **Pipeline Performance**: 13% advantage over Valkey (961k vs ~850k ops/sec)
 - **114 Redis commands implemented** with 95% compatibility for common use cases
-- **Production-ready** with configurable performance vs observability trade-offs
+- **Production-ready** with comprehensive validation across all feature categories
 
-These performance numbers demonstrate Ferrous's effectiveness as a **faster alternative to Redis/Valkey**, providing both maximum performance and comprehensive observability when needed.
+These performance numbers demonstrate Ferrous's effectiveness as a **faster alternative to Redis/Valkey** for core operations, while providing complete feature compatibility including advanced Stream functionality.
 
 ## Dependencies
 

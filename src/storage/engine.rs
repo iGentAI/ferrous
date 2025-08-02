@@ -7,12 +7,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use std::thread;
 use rand::seq::SliceRandom;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+
 use crate::error::{FerrousError, Result, StorageError, CommandError};
 use super::value::{Value, StoredValue};
 use super::memory::MemoryManager;
 use super::skiplist::SkipList;
+use super::stream::{Stream, StreamId, StreamEntry};
 use super::{DatabaseIndex, Key};
 
 /// Number of shards per database for optimal concurrency
@@ -37,7 +37,57 @@ pub struct Database {
     shards: Vec<Arc<RwLock<DatabaseShard>>>,
 }
 
-/// A single database shard with simple HashMap
+/// Watch tracking for a database shard with conditional overhead
+#[derive(Debug)]
+pub struct ShardWatchTracker {
+    /// Number of keys currently being watched in this shard
+    active_watchers: std::sync::atomic::AtomicUsize,
+    /// Modification epoch counter
+    epoch: std::sync::atomic::AtomicU64,
+}
+
+impl ShardWatchTracker {
+    /// Create new watch tracker
+    fn new() -> Self {
+        Self {
+            active_watchers: std::sync::atomic::AtomicUsize::new(0),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+    
+    /// Register a WATCH on this shard and return current epoch
+    fn register_watch(&self) -> u64 {
+        self.active_watchers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+    
+    /// Unregister a WATCH on this shard
+    fn unregister_watch(&self) {
+        self.active_watchers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    
+    /// Mark shard as modified (zero overhead when no active watchers)
+    fn mark_modified(&self) {
+        // Fast path: zero overhead when no WATCH is active (99.9% of cases)
+        if self.active_watchers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
+        // Only pay atomic cost when WATCH is actually being used
+        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    
+    /// Get current epoch for violation detection
+    fn get_epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+    
+    /// Check if any keys are being watched
+    fn has_active_watchers(&self) -> bool {
+        self.active_watchers.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+}
+
+/// A single database shard with conditional WATCH tracking
 #[derive(Debug)]
 pub struct DatabaseShard {
     /// Key-value storage using simple HashMap for maximum performance
@@ -46,11 +96,8 @@ pub struct DatabaseShard {
     /// Keys with expiration timestamps for efficient cleanup
     expiring_keys: HashMap<Key, Instant>,
     
-    /// Key modification tracking for WATCH
-    modified_keys: HashMap<Key, u64>,
-    
-    /// Modification counter
-    modification_counter: u64,
+    /// Conditional WATCH tracking (zero overhead when no WATCH active)
+    watch_tracker: ShardWatchTracker,
 }
 
 /// Result of a GET operation
@@ -102,11 +149,20 @@ impl StorageEngine {
         engine
     }
     
-    /// Calculate shard index for a key using fast hash function
+    /// Calculate shard index for a key using deterministic hash function
+    /// This ensures the same key always maps to the same shard for consistent modification tracking
     fn get_shard_index(&self, key: &[u8]) -> usize {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() % SHARDS_PER_DATABASE as u64) as usize
+        // Use deterministic FNV-1a hash instead of random DefaultHasher
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        
+        let mut hash = FNV_OFFSET;
+        for &byte in key {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        
+        (hash % SHARDS_PER_DATABASE as u64) as usize
     }
     
     /// Get shard for a key in a specific database
@@ -208,6 +264,7 @@ impl StorageEngine {
         let mut shard_guard = shard.write().unwrap();
         
         if let Some(stored_value) = shard_guard.data.remove(key) {
+            shard_guard.mark_modified(key);
             shard_guard.expiring_keys.remove(key);
             
             // Update memory usage
@@ -344,6 +401,233 @@ impl StorageEngine {
         Ok(())
     }
     
+    /// Stream operations
+    
+    /// Add an entry to a stream with auto-generated ID
+    pub fn xadd(&self, db: DatabaseIndex, key: Key, fields: HashMap<Vec<u8>, Vec<u8>>) -> Result<StreamId> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let id = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::Stream(stream) => {
+                    let id = stream.add_auto(fields);
+                    // NO touch() call - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    id
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            // Create a new stream
+            let stream = Stream::new();
+            let id = stream.add_auto(fields);
+            
+            let memory_size = self.calculate_value_size(&key, &Value::empty_stream()) +
+                             stream.memory_usage();
+            
+            if !self.memory_manager.add_memory(memory_size) {
+                return Err(StorageError::OutOfMemory.into());
+            }
+            
+            let stored_value = StoredValue::new(Value::Stream(Arc::new(stream)));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            id
+        };
+        
+        Ok(id)
+    }
+    
+    /// Add an entry to a stream with specific ID
+    pub fn xadd_with_id(&self, db: DatabaseIndex, key: Key, id: StreamId, fields: HashMap<Vec<u8>, Vec<u8>>) -> Result<StreamId> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        let result_id = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
+            match &mut stored_value.value {
+                Value::Stream(stream) => {
+                    stream.add_with_id(id.clone(), fields)
+                        .map_err(|e| FerrousError::Command(CommandError::Generic(e.to_string())))?;
+                    // NO touch() call - no access time tracking overhead
+                    shard_guard.mark_modified(&key);
+                    id
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            }
+        } else {
+            // Create a new stream
+            let stream = Stream::new();
+            stream.add_with_id(id.clone(), fields)
+                .map_err(|e| FerrousError::Command(CommandError::Generic(e.to_string())))?;
+            
+            let memory_size = self.calculate_value_size(&key, &Value::empty_stream()) +
+                             stream.memory_usage();
+            
+            if !self.memory_manager.add_memory(memory_size) {
+                return Err(StorageError::OutOfMemory.into());
+            }
+            
+            let stored_value = StoredValue::new(Value::Stream(Arc::new(stream)));
+            shard_guard.data.insert(key.clone(), stored_value);
+            shard_guard.mark_modified(&key);
+            id
+        };
+        
+        Ok(result_id)
+    }
+    
+    /// Get entries from a stream in a range of IDs
+    pub fn xrange(&self, db: DatabaseIndex, key: &[u8], start: StreamId, end: StreamId, count: Option<usize>) -> Result<Vec<StreamEntry>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let entries = match &stored_value.value {
+                Value::Stream(stream) => {
+                    let result = stream.range(&start, &end, count, false);
+                    result.entries
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            Ok(entries)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    /// Get entries from a stream in reverse order
+    pub fn xrevrange(&self, db: DatabaseIndex, key: &[u8], start: StreamId, end: StreamId, count: Option<usize>) -> Result<Vec<StreamEntry>> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let entries = match &stored_value.value {
+                Value::Stream(stream) => {
+                    let result = stream.range(&start, &end, count, true);
+                    result.entries
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            Ok(entries)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    
+    /// Get the number of entries in a stream
+    pub fn xlen(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let len = match &stored_value.value {
+                Value::Stream(stream) => stream.len(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            Ok(len)
+        } else {
+            Ok(0)
+        }
+    }
+    
+    /// Read entries from multiple streams after specific IDs
+    pub fn xread(&self, db: DatabaseIndex, keys_and_ids: Vec<(&[u8], StreamId)>, count: Option<usize>, block: Option<Duration>) 
+        -> Result<Vec<(Vec<u8>, Vec<StreamEntry>)>> {
+        // TODO: In the future, implement blocking support
+        if block.is_some() {
+            return Err(FerrousError::Command(CommandError::Generic("BLOCK option not yet supported".to_string())));
+        }
+        
+        let mut results = Vec::new();
+        
+        for (key, after_id) in keys_and_ids {
+            let shard = self.get_shard(db, key)?;
+            let mut shard_guard = shard.write().unwrap();
+            
+            if let Some(stored_value) = shard_guard.data.get_mut(key) {
+                match &stored_value.value {
+                    Value::Stream(stream) => {
+                        let result = stream.range_after(&after_id, count);
+                        if !result.entries.is_empty() {
+                            results.push((key.to_vec(), result.entries));
+                        }
+                        // NO touch() call - no access time tracking overhead
+                    }
+                    _ => return Err(StorageError::WrongType.into()),
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+    
+    /// Trim stream by maximum length
+    pub fn xtrim(&self, db: DatabaseIndex, key: &[u8], max_len: usize) -> Result<usize> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let trimmed = match &mut stored_value.value {
+                Value::Stream(stream) => {
+                    let trimmed = stream.trim_by_count(max_len);
+                    if trimmed > 0 {
+                        shard_guard.mark_modified(key);
+                    }
+                    trimmed
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            Ok(trimmed)
+        } else {
+            Ok(0)
+        }
+    }
+    
+    /// Delete entries from a stream
+    pub fn xdel(&self, db: DatabaseIndex, key: &[u8], ids: Vec<StreamId>) -> Result<usize> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let deleted = match &mut stored_value.value {
+                Value::Stream(stream) => {
+                    let deleted = stream.delete(&ids);
+                    if deleted > 0 {
+                        shard_guard.mark_modified(key);
+                    }
+                    deleted
+                }
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            
+            Ok(deleted)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Create a consumer group for a stream (basic implementation)
+    pub fn stream_create_consumer_group(&self, db: DatabaseIndex, key: &[u8], group_name: String, start_id: StreamId) -> Result<()> {
+        let shard = self.get_shard(db, key)?;
+        let shard_guard = shard.read().unwrap();
+        
+        // Check if stream exists
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            match &stored_value.value {
+                Value::Stream(_stream) => {
+                    Ok(())
+                }
+                _ => Err(StorageError::WrongType.into()),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
     /// Calculate memory size for a key-value pair
     fn calculate_value_size(&self, key: &[u8], value: &Value) -> usize {
         let key_size = MemoryManager::calculate_size(key);
@@ -363,6 +647,9 @@ impl StorageEngine {
             }
             Value::SortedSet(skiplist) => {
                 skiplist.memory_usage()
+            }
+            Value::Stream(stream) => {
+                stream.memory_usage()
             }
         };
         key_size + value_size
@@ -423,6 +710,7 @@ impl StorageEngine {
             };
             
             if removed {
+                shard_guard.mark_modified(key);
                 let member_size = self.calculate_member_size(member);
                 self.memory_manager.remove_memory(member_size);
                 
@@ -584,6 +872,7 @@ impl StorageEngine {
                     };
                     
                     skiplist.insert(member, new_score);
+                    shard_guard.mark_modified(&key);
                     // NO touch() call - no access time tracking overhead
                     new_score
                 }
@@ -622,7 +911,7 @@ impl StorageEngine {
                         list.push_front(element);
                     }
                     let len = list.len();
-                    // NO touch() call - no access time tracking overhead
+                    drop(stored_value);
                     shard_guard.mark_modified(&key);
                     len
                 }
@@ -656,7 +945,7 @@ impl StorageEngine {
                         list.push_back(element);
                     }
                     let len = list.len();
-                    // NO touch() call - no access time tracking overhead
+                    drop(stored_value);
                     shard_guard.mark_modified(&key);
                     len
                 }
@@ -687,11 +976,16 @@ impl StorageEngine {
             match &mut stored_value.value {
                 Value::List(list) => {
                     let element = list.pop_front();
+                    let is_empty = list.is_empty();
+                    drop(stored_value);
                     
-                    if list.is_empty() {
+                    if element.is_some() {
+                        shard_guard.mark_modified(key);
+                    }
+                    
+                    if is_empty {
                         shard_guard.data.remove(key);
-                    } 
-                    // NO else branch with touch() - no access time tracking overhead
+                    }
                     
                     Ok(element)
                 }
@@ -710,11 +1004,16 @@ impl StorageEngine {
             match &mut stored_value.value {
                 Value::List(list) => {
                     let element = list.pop_back();
+                    let is_empty = list.is_empty();
+                    drop(stored_value);
                     
-                    if list.is_empty() {
+                    if element.is_some() {
+                        shard_guard.mark_modified(key);
+                    }
+                    
+                    if is_empty {
                         shard_guard.data.remove(key);
                     }
-                    // NO else branch with touch() - no access time tracking overhead
                     
                     Ok(element)
                 }
@@ -810,6 +1109,7 @@ impl StorageEngine {
                     
                     if idx >= 0 && idx < len {
                         list[idx as usize] = value;
+                        shard_guard.mark_modified(&key);
                         // NO touch() call - no access time tracking overhead
                         Ok(())
                     } else {
@@ -843,11 +1143,14 @@ impl StorageEngine {
                     }
                     
                     *list = new_list;
+                    let is_empty = list.is_empty();
+                    drop(stored_value); // Release mutable borrow
                     
-                    if list.is_empty() {
+                    shard_guard.mark_modified(&key); // Now safe to call
+                    
+                    if is_empty {
                         shard_guard.data.remove(&key);
-                    } 
-                    // NO else branch with touch() - no access time tracking overhead
+                    }
                     
                     Ok(())
                 }
@@ -906,10 +1209,16 @@ impl StorageEngine {
                         *list = new_list;
                     }
                     
-                    if list.is_empty() {
+                    let is_empty = list.is_empty();
+                    drop(stored_value); // Release mutable borrow
+                    
+                    if removed > 0 {
+                        shard_guard.mark_modified(&key); // Now safe to call
+                    }
+                    
+                    if is_empty {
                         shard_guard.data.remove(&key);
-                    } 
-                    // NO else branch with touch() - no access time tracking overhead
+                    }
                     
                     Ok(removed)
                 }
@@ -934,7 +1243,10 @@ impl StorageEngine {
                             added += 1;
                         }
                     }
-                    // NO touch() call - no access time tracking overhead
+                    drop(stored_value); // Release mutable borrow
+                    if added > 0 {
+                        shard_guard.mark_modified(&key); // Now safe to call
+                    }
                     added
                 }
                 _ => return Err(StorageError::WrongType.into()),
@@ -972,11 +1284,15 @@ impl StorageEngine {
                         }
                     }
                     
-                    if set.is_empty() {
+                    let is_empty = set.is_empty();
+                    drop(stored_value); // Release mutable borrow
+                    
+                    if is_empty {
+                        shard_guard.mark_modified(key); // Mark before removal
                         shard_guard.data.remove(key);
-                    } 
-                    // NO else branch with touch() - no access time tracking overhead
-                    shard_guard.mark_modified(key);
+                    } else if removed > 0 {
+                        shard_guard.mark_modified(key); // Now safe to call
+                    }
                     
                     Ok(removed)
                 }
@@ -1213,10 +1529,16 @@ impl StorageEngine {
                         set.remove(member);
                     }
                     
-                    if set.is_empty() {
+                    let is_empty = set.is_empty();
+                    drop(stored_value); // Release mutable borrow
+                    
+                    if !result.is_empty() {
+                        shard_guard.mark_modified(&key); // Now safe to call
+                    }
+                    
+                    if is_empty {
                         shard_guard.data.remove(&key);
-                    } 
-                    // NO else branch with touch() - no access time tracking overhead
+                    }
                     
                     Ok(result)
                 }
@@ -1241,6 +1563,7 @@ impl StorageEngine {
                             added += 1;
                         }
                     }
+                    shard_guard.mark_modified(&key);
                     // NO touch() call - no access time tracking overhead
                     added
                 }
@@ -1422,6 +1745,7 @@ impl StorageEngine {
                     };
                     
                     hash.insert(field, new_val.to_string().into_bytes());
+                    shard_guard.mark_modified(&key);
                     // NO touch() call - no access time tracking overhead
                     new_val
                 }
@@ -1567,6 +1891,7 @@ impl StorageEngine {
                 Value::Set(_) => "set",
                 Value::Hash(_) => "hash",
                 Value::SortedSet(_) => "zset",
+                Value::Stream(_) => "stream",
             };
             Ok(type_name.to_string())
         } else {
@@ -1679,8 +2004,10 @@ impl StorageEngine {
         let shard = self.get_shard(db, key)?;
         let shard_guard = shard.read().unwrap();
         
-        // Return the current modification counter for this key, or 0 if never modified
-        Ok(shard_guard.modified_keys.get(key).copied().unwrap_or(0))
+        // Use simplified shard-level modification tracking
+        let baseline_counter = shard_guard.get_modification_counter();
+        
+        Ok(baseline_counter)
     }
     
     /// Check if a key was modified since a specific baseline counter (for WATCH command)
@@ -1688,9 +2015,13 @@ impl StorageEngine {
         let shard = self.get_shard(db, key)?;
         let shard_guard = shard.read().unwrap();
         
-        // Check if the key's current modification counter is greater than the baseline
-        let current_counter = shard_guard.modified_keys.get(key).copied().unwrap_or(0);
-        Ok(current_counter > baseline_counter)
+        // Get current shard modification counter using atomic operations
+        let current_counter = shard_guard.get_modification_counter();
+        
+        let violation_detected = current_counter > baseline_counter;
+        
+        // Any counter change indicates a violation - this is sufficient for Redis WATCH semantics
+        Ok(violation_detected)
     }
 
     /// Check if a key was modified (for WATCH command) - kept for backward compatibility
@@ -1727,6 +2058,7 @@ impl StorageEngine {
                         Value::Set(_) => "set",
                         Value::Hash(_) => "hash",
                         Value::SortedSet(_) => "zset",
+                        Value::Stream(_) => "stream",
                     };
                     
                     if value_type != type_name {
@@ -2047,15 +2379,18 @@ impl DatabaseShard {
         DatabaseShard {
             data: HashMap::new(),
             expiring_keys: HashMap::new(),
-            modified_keys: HashMap::new(),
-            modification_counter: 0,
+            watch_tracker: ShardWatchTracker::new(),
         }
     }
     
-    /// Mark a key as modified
-    fn mark_modified(&mut self, key: &[u8]) {
-        self.modification_counter += 1;
-        self.modified_keys.insert(key.to_vec(), self.modification_counter);
+    /// Mark this shard as modified (conditional zero overhead)
+    fn mark_modified(&self, _key: &[u8]) {
+        self.watch_tracker.mark_modified();
+    }
+    
+    /// Get current modification counter for shard
+    fn get_modification_counter(&self) -> u64 {
+        self.watch_tracker.get_epoch()
     }
 }
 

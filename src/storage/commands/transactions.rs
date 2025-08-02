@@ -107,11 +107,22 @@ pub fn handle_watch(conn: &mut Connection, parts: &[RespFrame], storage: &Arc<St
         match &parts[i] {
             RespFrame::BulkString(Some(bytes)) => {
                 let key = bytes.as_ref().clone();
-                // Get current modification counter for this key
-                let baseline_counter = storage.get_modification_counter(conn.db_index, &key)?;
-                conn.transaction_state.watched_keys.insert(key, baseline_counter);
+                
+                // Get current atomic modification counter for baseline
+                match storage.get_modification_counter(conn.db_index, &key) {
+                    Ok(baseline_counter) => {
+                        // Store the atomic counter value as baseline
+                        conn.transaction_state.watched_keys.insert(key, baseline_counter);
+                    }
+                    Err(_) => {
+                        // If we can't get the counter, use 0 as fallback
+                        conn.transaction_state.watched_keys.insert(key, 0);
+                    }
+                }
             }
-            _ => return Ok(RespFrame::error("ERR invalid key format")),
+            _ => {
+                return Ok(RespFrame::error("ERR invalid key format"));
+            }
         }
     }
     

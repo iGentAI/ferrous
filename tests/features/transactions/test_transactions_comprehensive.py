@@ -8,6 +8,7 @@ import socket
 import time
 import threading
 import sys
+import redis
 
 class TransactionTester:
     def __init__(self, host='127.0.0.1', port=6379):
@@ -60,38 +61,68 @@ def test_watch_violation():
     """Test WATCH key violations causing transaction abort"""
     print("Testing WATCH key violations...")
     
-    tester = TransactionTester()
+    # Use proper redis-py WATCH patterns with connection consistency
+    pool = redis.ConnectionPool(host='localhost', port=6379, db=0)
+    r1 = redis.Redis(connection_pool=pool, decode_responses=True)  # WATCH/EXEC connection
+    r2 = redis.Redis(host='localhost', port=6379, decode_responses=True)  # External modifier
     
-    # Clear any stale test state
-    tester.send_commands_single_connection([
-        b"*2\r\n$3\r\nDEL\r\n$7\r\nwatched\r\n"
-    ])
+    test_key = 'watch_violation_test'
     
-    # Use single connection for entire WATCH sequence to preserve state
-    watch_commands = [
-        b"*3\r\n$3\r\nSET\r\n$7\r\nwatched\r\n$7\r\ninitial\r\n",  # Set initial value
-        b"*2\r\n$5\r\nWATCH\r\n$7\r\nwatched\r\n",  # Start watching
-        b"*3\r\n$3\r\nSET\r\n$7\r\nwatched\r\n$8\r\nmodified\r\n",  # External modification
-        b"*1\r\n$5\r\nMULTI\r\n",  # Start transaction  
-        b"*3\r\n$3\r\nSET\r\n$7\r\nwatched\r\n$11\r\ntransaction\r\n",  # Queue SET
-        b"*1\r\n$4\r\nEXEC\r\n",  # Execute - should be aborted
-        b"*2\r\n$3\r\nGET\r\n$7\r\nwatched\r\n"  # Check final value
-    ]
+    print("Step 1: Set initial key value")
+    r1.set(test_key, 'initial_value')
     
-    responses = tester.send_commands_single_connection(watch_commands)
+    print("Step 2: Use CORRECTED WATCH pattern with connection consistency")
+    try:
+        with r1.pipeline() as pipe:
+            # WATCH on the same connection that will execute the transaction
+            pipe.watch(test_key)
+            
+            print("Step 3: External modification on different connection")
+            r2.set(test_key, 'external_modification')
+            
+            print("Step 4: Execute transaction on SAME connection as WATCH")  
+            pipe.multi()
+            pipe.set(test_key, 'transaction_value')
+            pipe.set('watch_violation_indicator', 'transaction_executed')
+            result = pipe.execute()
+            
+            print(f"Transaction result: {result}")
+            
+            # Check if transaction was properly aborted
+            if result is None:
+                final_value = r1.get(test_key)
+                # Handle both string and bytes for redis-py pipeline behavior
+                expected_values = ['external_modification', b'external_modification']
+                if final_value in expected_values:
+                    print("✅ WATCH violation correctly detected (transaction aborted)")
+                    success = True
+                else:
+                    print(f"❌ Wrong final value: {final_value}")
+                    success = False
+            else:
+                indicator_exists = r1.exists('watch_violation_indicator')
+                print(f"❌ Transaction executed when should abort. Indicator exists: {indicator_exists}")
+                success = False
+                
+    except redis.WatchError:
+        print("✅ WATCH violation correctly detected (WatchError exception)")
+        final_value = r1.get(test_key)
+        # Handle both bytes and string for redis-py pipeline behavior
+        expected_values = ['external_modification', b'external_modification']
+        success = (final_value in expected_values)
+        
+    except Exception as e:
+        print(f"❌ Unexpected error in WATCH test: {e}")
+        success = False
     
-    # The EXEC response should be null array (aborted) and GET should show "modified"
-    exec_response = responses[-2]  # EXEC response
-    get_response = responses[-1]   # GET response
+    # Cleanup
+    r1.delete(test_key, 'watch_violation_indicator')
     
-    if exec_response == b"*-1\r\n":  # Null array means transaction aborted
-        print("✅ WATCH violation correctly aborted transaction")
-        return True
-    elif b"modified" in get_response and b"transaction" not in get_response:
-        print("✅ WATCH violation correctly aborted transaction (verified by key value)")
+    if success:
+        print("✅ WATCH violation test passed\n")
         return True
     else:
-        print(f"❌ WATCH violation test failed. EXEC response: {exec_response}, GET response: {get_response}")
+        print("❌ WATCH violation test failed\n")
         return False
 
 def test_discard():
