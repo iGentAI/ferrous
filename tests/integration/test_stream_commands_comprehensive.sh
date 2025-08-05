@@ -59,11 +59,26 @@ echo "Final length: $final_length"
 
 # Test 8: Consumer Groups (basic)
 echo -e "\nTest 8: Consumer Groups..."
-group_create=$(redis-cli -p 6379 XGROUP CREATE comprehensive:stream testgroup 0-0 2>/dev/null || echo "NOGROUP")
-echo "Group creation: $group_create"
+group_create=$(redis-cli -p 6379 XGROUP CREATE comprehensive:stream testgroup 0-0 2>&1)
+create_exit_code=$?
 
-group_destroy=$(redis-cli -p 6379 XGROUP DESTROY comprehensive:stream testgroup 2>/dev/null || echo "NOGROUP")
-echo "Group destroy: $group_destroy"
+if [ $create_exit_code -eq 0 ]; then
+    echo "Group creation: $group_create"
+    
+    # Only try to destroy if creation succeeded
+    group_destroy=$(redis-cli -p 6379 XGROUP DESTROY comprehensive:stream testgroup 2>&1)
+    destroy_exit_code=$?
+    
+    if [ $destroy_exit_code -eq 0 ]; then
+        echo "Group destroy: $group_destroy"
+    else
+        echo "❌ ERROR: Group destroy failed: $group_destroy"
+    fi
+else
+    echo "⚠️  Consumer group creation not supported or failed"
+    echo "Error: $group_create"
+    echo "Note: Consumer groups may not be implemented yet"
+fi
 
 # Test 9: TYPE verification
 echo -e "\nTest 9: TYPE verification..."

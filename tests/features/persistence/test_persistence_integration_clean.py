@@ -36,8 +36,13 @@ def test_rdb_save_load():
         if os.path.exists(rdb_path):
             try:
                 os.remove(rdb_path)
-            except:
-                pass
+                print(f"Cleaned up existing RDB file: {rdb_path}")
+            except PermissionError as e:
+                print(f"❌ ERROR: Permission denied removing RDB file: {e}")
+                return False
+            except Exception as e:
+                print(f"❌ ERROR: Failed to remove RDB file: {e}")
+                return False
         
         # Clear the database first
         redis_command("*1\r\n$7\r\nFLUSHDB\r\n")
@@ -62,8 +67,8 @@ def test_rdb_save_load():
             # Clean up after test
             try:
                 os.remove(rdb_path)
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to remove RDB file after test: {e}")
             return True
         else:
             print(f"❌ RDB file not found at {rdb_path}")
@@ -86,8 +91,13 @@ def test_background_save():
         if os.path.exists(rdb_path):
             try:
                 os.remove(rdb_path)
-            except:
-                pass
+                print(f"Cleaned up existing RDB file: {rdb_path}")
+            except PermissionError as e:
+                print(f"❌ ERROR: Permission denied removing RDB file: {e}")
+                return False
+            except Exception as e:
+                print(f"❌ ERROR: Failed to remove RDB file: {e}")
+                return False
         
         # Clear the database
         redis_command("*1\r\n$7\r\nFLUSHDB\r\n")
@@ -126,8 +136,8 @@ def test_background_save():
                     if os.path.exists(rdb_path):
                         try:
                             os.remove(rdb_path)
-                        except:
-                            pass
+                        except Exception as e:
+                            print(f"⚠️  Warning: Failed to remove RDB file after background save: {e}")
                     return True
             
             # If we get here, save didn't complete in time - but that's not necessarily a failure
@@ -168,8 +178,13 @@ def test_data_types_persistence():
         if os.path.exists(rdb_path):
             try:
                 os.remove(rdb_path)
-            except:
-                pass
+                print(f"Cleaned up existing RDB file: {rdb_path}")
+            except PermissionError as e:
+                print(f"❌ ERROR: Permission denied removing RDB file: {e}")
+                return False
+            except Exception as e:
+                print(f"❌ ERROR: Failed to remove RDB file: {e}")
+                return False
         
         # Clear the database
         redis_command("*1\r\n$7\r\nFLUSHDB\r\n")
@@ -199,8 +214,8 @@ def test_data_types_persistence():
         if os.path.exists(rdb_path):
             try:
                 os.remove(rdb_path)
-            except:
-                pass
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to remove RDB file after data types test: {e}")
             
         print("✅ All data types persistence test setup completed")
         return True
@@ -210,8 +225,8 @@ def cleanup_test_data():
     # Flush all databases to ensure clean state
     try:
         redis_command("*1\r\n$7\r\nFLUSHDB\r\n")
-    except:
-        pass
+    except Exception as e:
+        print(f"⚠️  Warning: Failed to flush database during cleanup: {e}")
     
     # Clean up RDB file in server directory
     server_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -219,8 +234,9 @@ def cleanup_test_data():
     if os.path.exists(rdb_path):
         try:
             os.remove(rdb_path)
-        except:
-            pass
+            print(f"Cleaned up RDB file: {rdb_path}")
+        except Exception as e:
+            print(f"⚠️  Warning: Failed to remove RDB file during cleanup: {e}")
 
 def main():
     print("=" * 60)
@@ -233,8 +249,8 @@ def main():
         if b"PONG" not in resp:
             print("❌ Server not responding")
             sys.exit(1)
-    except:
-        print("❌ Cannot connect to server")
+    except Exception as e:
+        print(f"❌ Cannot connect to server: {e}")
         sys.exit(1)
         
     print("✅ Server connection verified")

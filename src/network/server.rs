@@ -14,6 +14,7 @@ use crate::storage::commands::{transactions, aof};
 use crate::storage::{aof::AofEngine, AofConfig};
 use crate::storage::commands::slowlog::Slowlog;
 use crate::storage::lua_cache::{GlobalScriptCache, ScriptCaching};
+
 use crate::monitor::MonitorSubscribers;
 use crate::pubsub::{PubSubManager, format_message, format_pmessage, 
                     format_subscribe_response, format_psubscribe_response,
@@ -772,9 +773,6 @@ impl Server {
     fn process_frame(&mut self, frame: RespFrame, conn_id: u64) -> Result<RespFrame> {
         let result = match &frame {
             RespFrame::Array(Some(parts)) if !parts.is_empty() => {
-                // Zero-overhead command counting using correct trait method
-                self.monitoring.record_command_count();
-                
                 // Extract command name
                 let cmd_frame = &parts[0];
                 let command = match cmd_frame {
@@ -1016,8 +1014,12 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid command format")),
         };
         
-        // Zero-overhead timing start using correct trait method
-        let start_time = self.monitoring.start_timing();
+        // Zero-overhead timing start - ONLY when monitoring enabled
+        let start_time = if self.monitoring.is_enabled() {
+            Some(self.monitoring.start_timing())
+        } else {
+            None
+        };
         
         // Log to AOF for write commands
         if let Some(aof) = &self.aof_engine {
@@ -1283,14 +1285,11 @@ impl Server {
             "SYNC" => crate::replication::handle_sync(&self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
             "PSYNC" => crate::replication::handle_psync(parts, &self.replication, &self.storage, &self.rdb_engine.as_ref().unwrap()),
             "QUIT" => Ok(RespFrame::ok()),
-            // Add the Lua script commands
             "EVAL" => {
-                match crate::storage::commands::lua::handle_eval(&self.storage, parts) {
-                    Ok(resp) => {
-                        Ok(resp)
-                    },
+                use crate::storage::commands::lua::handle_eval_with_db;
+                match handle_eval_with_db(&self.storage, parts, db) {
+                    Ok(resp) => Ok(resp),
                     Err(e) => {
-                        // Log the error but return it as a Redis error response instead of propagating
                         eprintln!("[SERVER ERROR] Lua EVAL error: {}", e);
                         Ok(RespFrame::error(format!("ERR Lua execution error: {}", e)))
                     }
@@ -1316,17 +1315,22 @@ impl Server {
             }
         }
         
-        // Zero-overhead monitoring completion using correct trait methods
-        if self.monitoring.is_enabled() {
-            let client_addr = self.connections.with_connection(conn_id, |conn| {
-                conn.addr.to_string()
-            }).unwrap_or_else(|| "127.0.0.1:unknown".to_string());
-            
-            // Use correct trait method for timing completion
-            self.monitoring.record_command_timing(start_time, &command_name, parts, &client_addr);
-            
-            // Use correct trait method for monitor broadcasting with proper signature
-            self.monitoring.broadcast_to_monitors(parts, conn_id, db, SystemTime::now());
+        // Zero-overhead monitoring completion - only when enabled and timing started
+        if let Some(start_time) = start_time {
+            if self.monitoring.is_enabled() {
+                let client_addr = self.connections.with_connection(conn_id, |conn| {
+                    conn.addr.to_string()
+                }).unwrap_or_else(|| "127.0.0.1:unknown".to_string());
+                
+                // Record command count inside conditional
+                self.monitoring.record_command_count();
+                
+                // Use correct trait method for timing completion
+                self.monitoring.record_command_timing(start_time, &command_name, parts, &client_addr);
+                
+                // Use correct trait method for monitor broadcasting with proper signature
+                self.monitoring.broadcast_to_monitors(parts, conn_id, db, SystemTime::now());
+            }
         }
         
         // Replication propagation for write commands
@@ -2269,13 +2273,15 @@ impl Server {
         // Get the value
         match self.storage.get_string(db, key)? {
             Some(value) => {
-                // Zero-overhead cache hit recording using correct trait method
-                self.monitoring.record_cache_hit(true);
+                if self.monitoring.is_enabled() {
+                    self.monitoring.record_cache_hit(true);
+                }
                 Ok(RespFrame::from_bytes(value))
             }
             None => {
-                // Zero-overhead cache miss recording using correct trait method
-                self.monitoring.record_cache_hit(false);
+                if self.monitoring.is_enabled() {
+                    self.monitoring.record_cache_hit(false);
+                }
                 Ok(RespFrame::null_bulk())
             }
         }
@@ -2380,9 +2386,13 @@ impl Server {
             
             if self.storage.exists(db, key)? {
                 count += 1;
-                self.monitoring.record_cache_hit(true);
+                if self.monitoring.is_enabled() {
+                    self.monitoring.record_cache_hit(true);
+                }
             } else {
-                self.monitoring.record_cache_hit(false);
+                if self.monitoring.is_enabled() {
+                    self.monitoring.record_cache_hit(false);
+                }
             }
         }
         
@@ -2786,6 +2796,8 @@ impl Server {
         }
     }
     
+
+
     /// Handle EVALSHA command with global script cache
     fn handle_evalsha_command(&self, parts: &[RespFrame]) -> Result<RespFrame> {
         if parts.len() < 3 {
@@ -2803,7 +2815,7 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid SHA1 hash")),
         };
         
-        // Get script from cache
+        // Get script from global cache
         let script = match self.script_cache.get(&sha1) {
             Ok(Some(script)) => script,
             Ok(None) => return Ok(RespFrame::error("NOSCRIPT No matching script. Please use EVAL.")),

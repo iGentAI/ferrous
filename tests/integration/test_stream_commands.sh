@@ -45,10 +45,20 @@ echo -e "\nTest 8: XREAD (basic)..."
 redis-cli -p 6379 XREAD STREAMS test:stream 0-0
 echo "XREAD completed"
 
-# Test consumer group operations (if supported)
+# Test consumer group operations
 echo -e "\nTest 9: Consumer group operations..."
-group_result=$(redis-cli -p 6379 XGROUP CREATE test:stream group1 0-0 2>/dev/null || echo "Consumer groups not yet wired up")
-echo "Consumer group result: $group_result"
+group_result=$(redis-cli -p 6379 XGROUP CREATE test:stream group1 0-0 2>&1)
+exit_code=$?
+
+if [ $exit_code -eq 0 ]; then
+    echo "Consumer group result: $group_result"
+else
+    echo "❌ ERROR: Consumer group creation failed!"
+    echo "Error output: $group_result"
+    echo "Exit code: $exit_code"
+    # Note: Not exiting here as consumer groups might not be implemented yet
+    # but we're being transparent about the failure
+fi
 
 # Clean up
 redis-cli -p 6379 DEL test:stream >/dev/null 2>&1

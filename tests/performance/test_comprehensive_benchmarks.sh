@@ -131,13 +131,40 @@ echo "8. LUA SCRIPTING OPERATIONS"
 echo "======================================"
 
 # Test Lua scripting performance
-SCRIPT_SHA=$(redis-cli -p 6379 SCRIPT LOAD "return redis.call('GET', KEYS[1])" 2>/dev/null || echo "")
-if [ -n "$SCRIPT_SHA" ]; then
-    run_timed_test "EVAL" "redis-cli -p 6379 EVAL 'return 42' 0" 500
-    run_timed_test "EVALSHA" "redis-cli -p 6379 EVALSHA $SCRIPT_SHA 1 testkey" 500  
-else
-    echo "⚠️  Lua scripting not available for testing"
+SCRIPT_LOAD_OUTPUT=$(redis-cli -p 6379 SCRIPT LOAD "return redis.call('GET', KEYS[1])" 2>&1)
+if [ $? -ne 0 ]; then
+    echo "❌ CRITICAL ERROR: Lua SCRIPT LOAD failed!"
+    echo "Error output: $SCRIPT_LOAD_OUTPUT"
+    exit 1
 fi
+
+SCRIPT_SHA=$(echo "$SCRIPT_LOAD_OUTPUT" | tail -n1)
+if [ -z "$SCRIPT_SHA" ] || [[ "$SCRIPT_SHA" == *"ERR"* ]]; then
+    echo "❌ CRITICAL ERROR: Invalid SCRIPT SHA returned: '$SCRIPT_SHA'"
+    exit 1
+fi
+
+echo "✅ Lua SCRIPT LOAD successful: SHA=$SCRIPT_SHA"
+
+# Set up test key for EVALSHA test
+redis-cli -p 6379 SET testkey "testvalue" >/dev/null
+if [ $? -ne 0 ]; then
+    echo "❌ ERROR: Failed to set up test key for Lua tests"
+    exit 1
+fi
+
+# Run Lua performance tests
+run_timed_test "EVAL" "redis-cli -p 6379 EVAL 'return redis.call(\"PING\")' 0" 500
+run_timed_test "EVALSHA" "redis-cli -p 6379 EVALSHA $SCRIPT_SHA 1 testkey" 500
+
+# Validate that EVALSHA actually worked
+EVALSHA_RESULT=$(redis-cli -p 6379 EVALSHA $SCRIPT_SHA 1 testkey 2>&1)
+if [ "$EVALSHA_RESULT" != "testvalue" ]; then
+    echo "❌ ERROR: EVALSHA did not return expected value. Got: '$EVALSHA_RESULT'"
+    exit 1
+fi
+
+echo "✅ Lua scripting tests completed successfully"
 
 echo ""
 echo "9. KEY MANAGEMENT OPERATIONS"

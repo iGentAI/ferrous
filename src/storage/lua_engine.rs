@@ -1,0 +1,477 @@
+//! Redis-compatible Lua execution engine with proper error semantics
+//!
+//! This module implements proper Redis Lua behavior where:
+//! - redis.call errors immediately terminate the script and become the RESP response
+//! - redis.pcall errors return nil and allow the script to continue
+
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::time::Instant;
+use mlua::{Lua, Result as LuaResult, MultiValue, Value as LuaValue};
+use sha1::{Sha1, Digest};
+
+use crate::error::{Result, FerrousError};
+use crate::protocol::resp::RespFrame;
+use crate::storage::StorageEngine;
+
+/// Command execution context passed from server to Lua engine
+pub struct LuaCommandContext {
+    pub db_index: usize,
+    pub storage: Arc<StorageEngine>,
+}
+
+/// Special error type to handle redis.call immediate termination
+#[derive(Debug)]
+pub struct RedisCallError {
+    pub error_msg: String,
+}
+
+impl std::fmt::Display for RedisCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.error_msg)
+    }
+}
+
+impl std::error::Error for RedisCallError {}
+
+/// Single-threaded Lua execution engine with proper Redis semantics
+pub struct LuaEngine {
+    script_cache: Arc<Mutex<HashMap<String, String>>>,
+}
+
+impl LuaEngine {
+    pub fn new(_storage: Arc<StorageEngine>) -> Result<Self> {
+        Ok(LuaEngine {
+            script_cache: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+    
+    /// Execute a Lua script with proper command context
+    pub fn eval(&self, script: &str, keys: Vec<Vec<u8>>, args: Vec<Vec<u8>>, ctx: &LuaCommandContext) -> Result<RespFrame> {
+        let lua = self.create_lua_context(ctx)?;
+        self.setup_keys_and_args(&lua, keys, args)?;
+        
+        let start_time = Instant::now();
+        let result = lua.load(script).eval::<LuaValue>();
+        
+        match result {
+            Ok(value) => {
+                let elapsed = start_time.elapsed();
+                // if elapsed > std::time::Duration::from_millis(100) {
+                //     eprintln!("Slow Lua script execution: {:?}", elapsed);
+                // }
+                Ok(self.lua_value_to_resp(value))
+            }
+            Err(e) => {
+                match e {
+                    mlua::Error::RuntimeError(ref msg) => {
+                        // Robust extraction for REDIS_CALL_ABORT errors per comprehensive analysis
+                        if let Some(pos) = msg.find("REDIS_CALL_ABORT:") {
+                            let mut error_content = &msg[pos + "REDIS_CALL_ABORT:".len()..];
+                            // Skip any non-alphabetic chars after prefix (e.g., spaces, colons, numbers)
+                            error_content = error_content.trim_start_matches(|c: char| !c.is_alphabetic());
+                            // Find end: Up to first \n or end (strip suffixes like stack traces)
+                            let end_pos = error_content.find('\n').unwrap_or(error_content.len());
+                            let clean_error = error_content[..end_pos].trim().to_string();
+                            // Ensure starts with "ERR " (add if missing)
+                            let final_error = if clean_error.starts_with("ERR ") { 
+                                clean_error 
+                            } else { 
+                                format!("ERR {}", clean_error) 
+                            };
+                            Err(FerrousError::LuaError(final_error))
+                        } else {
+                            // This is a regular Lua runtime error
+                            Err(FerrousError::LuaError(format!("ERR Error running script: {}", msg)))
+                        }
+                    }
+                    mlua::Error::SyntaxError { message, .. } => {
+                        Err(FerrousError::LuaError(format!("ERR Error compiling script: {}", message)))
+                    }
+                    _ => {
+                        Err(FerrousError::LuaError(format!("ERR Script execution failed: {}", e)))
+                    }
+                }
+            }
+        }
+    }
+    
+    pub fn evalsha(&self, sha1: &str, keys: Vec<Vec<u8>>, args: Vec<Vec<u8>>, ctx: &LuaCommandContext) -> Result<RespFrame> {
+        let script = match self.script_cache.try_lock() {
+            Ok(cache) => {
+                cache.get(sha1).cloned().ok_or_else(|| {
+                    FerrousError::LuaError("NOSCRIPT No matching script. Please use EVAL.".to_string())
+                })?
+            }
+            Err(_) => {
+                return Err(FerrousError::LuaError("Script cache temporarily unavailable".to_string()));
+            }
+        };
+        
+        self.eval(&script, keys, args, ctx)
+    }
+    
+    pub fn script_load(&self, script: &str) -> Result<String> {
+        let lua = Lua::new();
+        lua.load(script).exec().map_err(|e| {
+            FerrousError::LuaError(format!("Script compilation error: {}", e))
+        })?;
+        
+        let sha1 = self.calculate_script_sha1(script);
+        
+        if let Ok(mut cache) = self.script_cache.try_lock() {
+            cache.insert(sha1.clone(), script.to_string());
+        }
+        
+        Ok(sha1)
+    }
+    
+    pub fn script_exists(&self, sha1s: &[String]) -> Result<Vec<bool>> {
+        match self.script_cache.try_lock() {
+            Ok(cache) => {
+                Ok(sha1s.iter().map(|sha1| cache.contains_key(sha1)).collect())
+            }
+            Err(_) => {
+                Ok(vec![false; sha1s.len()])
+            }
+        }
+    }
+    
+    pub fn script_flush(&self) -> Result<()> {
+        match self.script_cache.try_lock() {
+            Ok(mut cache) => {
+                cache.clear();
+                Ok(())
+            }
+            Err(_) => {
+                Err(FerrousError::LuaError("Script cache temporarily unavailable".to_string()))
+            }
+        }
+    }
+    
+    fn create_lua_context(&self, ctx: &LuaCommandContext) -> Result<Lua> {
+        let lua = Lua::new();
+        
+        // Remove dangerous functions for sandboxing
+        let globals = lua.globals();
+        let dangerous_functions = ["os", "io", "debug", "package", "require", "dofile", "loadfile", "load"];
+        for func in &dangerous_functions {
+            globals.set(*func, mlua::Nil).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        }
+        
+        // Create Redis API with proper error semantics
+        let redis_table = lua.create_table().map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        let storage_ref = ctx.storage.clone();
+        let db_index = ctx.db_index;
+        
+        // redis.call: Errors terminate the script immediately
+        let redis_call = lua.create_function(move |lua_ctx, cmd: MultiValue| -> LuaResult<LuaValue> {
+            Self::execute_redis_command(&storage_ref, lua_ctx, cmd, db_index, false)
+        }).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        let storage_ref_pcall = ctx.storage.clone();
+        // redis.pcall: Errors return nil, script continues
+        let redis_pcall = lua.create_function(move |lua_ctx, cmd: MultiValue| -> LuaResult<LuaValue> {
+            Self::execute_redis_command(&storage_ref_pcall, lua_ctx, cmd, db_index, true)
+        }).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        redis_table.set("call", redis_call).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        redis_table.set("pcall", redis_pcall).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        globals.set("redis", redis_table).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        Ok(lua)
+    }
+    
+    fn setup_keys_and_args(&self, lua: &Lua, keys: Vec<Vec<u8>>, args: Vec<Vec<u8>>) -> Result<()> {
+        let globals = lua.globals();
+        
+        let keys_table = lua.create_table().map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        for (i, key) in keys.iter().enumerate() {
+            let key_str = String::from_utf8_lossy(key).into_owned();
+            keys_table.set(i + 1, key_str).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        }
+        globals.set("KEYS", keys_table).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        let argv_table = lua.create_table().map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        for (i, arg) in args.iter().enumerate() {
+            let arg_str = String::from_utf8_lossy(arg).into_owned();
+            argv_table.set(i + 1, arg_str).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        }
+        globals.set("ARGV", argv_table).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        Ok(())
+    }
+    
+    /// Execute Redis command with proper error semantics
+    fn execute_redis_command(
+        storage: &Arc<StorageEngine>,
+        lua_ctx: &Lua,
+        cmd: MultiValue,
+        db_index: usize,
+        is_pcall: bool
+    ) -> LuaResult<LuaValue> {
+        // Parse command arguments
+        let mut args = Vec::new();
+        for value in cmd {
+            match value {
+                LuaValue::String(s) => {
+                    match s.to_str() {
+                        Ok(string_val) => args.push(string_val.to_string()),
+                        Err(_) => {
+                            return Self::handle_command_error_with_context(lua_ctx, "Invalid UTF-8 in command argument".to_string(), is_pcall);
+                        }
+                    }
+                }
+                LuaValue::Integer(i) => args.push(i.to_string()),
+                LuaValue::Number(n) => args.push(n.to_string()),
+                _ => {
+                    return Self::handle_command_error_with_context(lua_ctx, "Invalid argument type".to_string(), is_pcall);
+                }
+            }
+        }
+        
+        if args.is_empty() {
+            return Self::handle_command_error_with_context(lua_ctx, "No command specified".to_string(), is_pcall);
+        }
+        
+        let cmd_name = args[0].to_uppercase();
+        let cmd_args = &args[1..];
+        
+        // Execute the Redis command with proper error semantics
+        match cmd_name.as_str() {
+            "GET" => {
+                if cmd_args.len() != 1 {
+                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'get' command".to_string(), is_pcall);
+                }
+                
+                match storage.get_string(db_index, cmd_args[0].as_bytes()) {
+                    Ok(Some(value)) => {
+                        let value_str = String::from_utf8_lossy(&value);
+                        match lua_ctx.create_string(&*value_str) {
+                            Ok(lua_string) => Ok(LuaValue::String(lua_string)),
+                            Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                        }
+                    }
+                    Ok(None) => Ok(LuaValue::Nil),
+                    Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("GET operation failed: {}", e), is_pcall),
+                }
+            },
+            "SET" => {
+                if cmd_args.len() < 2 {
+                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'set' command".to_string(), is_pcall);
+                }
+                
+                match storage.set_string(db_index, cmd_args[0].as_bytes().to_vec(), cmd_args[1].as_bytes().to_vec()) {
+                    Ok(_) => {
+                        match lua_ctx.create_string("OK") {
+                            Ok(lua_string) => Ok(LuaValue::String(lua_string)),
+                            Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                        }
+                    }
+                    Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("SET operation failed: {}", e), is_pcall),
+                }
+            },
+            "DEL" => {
+                if cmd_args.is_empty() {
+                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'del' command".to_string(), is_pcall);
+                }
+                
+                let mut deleted_count = 0;
+                for key in cmd_args {
+                    match storage.delete(db_index, key.as_bytes()) {
+                        Ok(true) => deleted_count += 1,
+                        Ok(false) => {}, // Key didn't exist
+                        Err(e) => {
+                            return Self::handle_command_error_with_context(lua_ctx, format!("DEL operation failed: {}", e), is_pcall);
+                        }
+                    }
+                }
+                Ok(LuaValue::Integer(deleted_count))
+            },
+            "INCR" => {
+                if cmd_args.len() != 1 {
+                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'incr' command".to_string(), is_pcall);
+                }
+                
+                match storage.incr(db_index, cmd_args[0].as_bytes().to_vec()) {
+                    Ok(new_value) => Ok(LuaValue::Integer(new_value)),
+                    Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("INCR operation failed: {}", e), is_pcall),
+                }
+            },
+            "EXISTS" => {
+                if cmd_args.len() != 1 {
+                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'exists' command".to_string(), is_pcall);
+                }
+                
+                match storage.exists(db_index, cmd_args[0].as_bytes()) {
+                    Ok(true) => Ok(LuaValue::Integer(1)),
+                    Ok(false) => Ok(LuaValue::Integer(0)),
+                    Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("EXISTS operation failed: {}", e), is_pcall),
+                }
+            },
+            "PING" => {
+                if cmd_args.is_empty() {
+                    match lua_ctx.create_string("PONG") {
+                        Ok(lua_string) => Ok(LuaValue::String(lua_string)),
+                        Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                    }
+                } else if cmd_args.len() == 1 {
+                    match lua_ctx.create_string(&cmd_args[0]) {
+                        Ok(lua_string) => Ok(LuaValue::String(lua_string)),
+                        Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                    }
+                } else {
+                    Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'ping' command".to_string(), is_pcall)
+                }
+            },
+            // Block nested Lua execution (Redis behavior)
+            "EVAL" | "EVALSHA" | "SCRIPT" => {
+                Self::handle_command_error_with_context(lua_ctx, "Redis scripting commands are not allowed inside Lua scripts".to_string(), is_pcall)
+            },
+            _ => {
+                Self::handle_command_error_with_context(lua_ctx, format!("unknown command '{}'", cmd_name), is_pcall)
+            }
+        }
+    }
+    
+    /// Handle command errors with proper Redis semantics using lua context
+    fn handle_command_error_with_context(lua_ctx: &Lua, error_msg: String, is_pcall: bool) -> LuaResult<LuaValue> {
+        let formatted_error = if error_msg.starts_with("ERR ") {
+            error_msg
+        } else {
+            format!("ERR {}", error_msg)
+        };
+        
+        if is_pcall {
+            // redis.pcall: Return nil, script continues - CORRECT Redis behavior
+            Ok(LuaValue::Nil)
+        } else {
+            // redis.call: MUST abort script execution immediately - throw runtime error
+            // This ensures multi-statement scripts terminate instead of continuing
+            Err(mlua::Error::RuntimeError(format!("REDIS_CALL_ABORT:{}", formatted_error)))
+        }
+    }
+    
+    fn lua_value_to_resp(&self, value: LuaValue) -> RespFrame {
+        match value {
+            LuaValue::Nil => RespFrame::BulkString(None),
+            LuaValue::Boolean(b) => {
+                if b {
+                    RespFrame::Integer(1)
+                } else {
+                    RespFrame::Integer(0)
+                }
+            }
+            LuaValue::Integer(i) => RespFrame::Integer(i),
+            LuaValue::Number(n) => {
+                if n.is_nan() {
+                    RespFrame::BulkString(None)
+                } else if n.is_infinite() {
+                    let inf_str = if n.is_sign_positive() { "inf" } else { "-inf" };
+                    RespFrame::BulkString(Some(Arc::new(inf_str.as_bytes().to_vec())))
+                } else if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+                    RespFrame::Integer(n as i64)
+                } else {
+                    let formatted = format!("{:.17}", n);
+                    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+                    RespFrame::BulkString(Some(Arc::new(trimmed.as_bytes().to_vec())))
+                }
+            }
+            LuaValue::String(s) => {
+                RespFrame::BulkString(Some(Arc::new(s.as_bytes().to_vec())))
+            }
+            LuaValue::Table(table) => {
+                if let Ok(error_msg) = table.get::<String>("err") {
+                    return RespFrame::error(error_msg);
+                }
+                
+                let mut has_sequential_keys = false;
+                let mut has_associative_keys = false;
+                let mut max_sequential = 0i32;
+                let mut associative_pairs = Vec::new();
+                
+                for pair in table.pairs::<LuaValue, LuaValue>() {
+                    if let Ok((key, value)) = pair {
+                        match key {
+                            LuaValue::Integer(i) if i > 0 && i <= 1000 => {
+                                has_sequential_keys = true;
+                                max_sequential = max_sequential.max(i as i32);
+                            }
+                            LuaValue::String(_) | LuaValue::Integer(_) => {
+                                has_associative_keys = true;
+                                associative_pairs.push((key, value));
+                            }
+                            _ => {
+                                has_associative_keys = true;
+                                associative_pairs.push((key, value));
+                            }
+                        }
+                    }
+                }
+                
+                if has_associative_keys && !has_sequential_keys {
+                    let mut items = Vec::new();
+                    for (key, value) in associative_pairs {
+                        items.push(self.lua_value_to_resp(key));
+                        items.push(self.lua_value_to_resp(value));
+                    }
+                    
+                    if items.is_empty() {
+                        RespFrame::BulkString(None)
+                    } else {
+                        RespFrame::Array(Some(items))
+                    }
+                } else if has_sequential_keys {
+                    let mut items = Vec::new();
+                    
+                    for i in 1..=max_sequential {
+                        if let Ok(value) = table.get::<LuaValue>(i) {
+                            match value {
+                                LuaValue::Nil => break,
+                                _ => items.push(self.lua_value_to_resp(value)),
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    if items.is_empty() {
+                        RespFrame::BulkString(None)
+                    } else {
+                        RespFrame::Array(Some(items))
+                    }
+                } else {
+                    RespFrame::BulkString(None)
+                }
+            }
+            _ => RespFrame::BulkString(None),
+        }
+    }
+    
+    fn calculate_script_sha1(&self, script: &str) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(script.as_bytes());
+        hex::encode(hasher.finalize())
+    }
+}
+
+/// Global singleton Lua engine
+static mut LUA_ENGINE: Option<Arc<LuaEngine>> = None;
+static INIT: std::sync::Once = std::sync::Once::new();
+
+/// Get the global singleton Lua engine instance
+pub fn get_lua_engine(storage: Arc<StorageEngine>) -> Result<Arc<LuaEngine>> {
+    unsafe {
+        INIT.call_once(|| {
+            match LuaEngine::new(storage.clone()) {
+                Ok(engine) => LUA_ENGINE = Some(Arc::new(engine)),
+                Err(e) => eprintln!("Failed to initialize Lua engine: {}", e),
+            }
+        });
+        
+        LUA_ENGINE.clone().ok_or_else(|| {
+            FerrousError::LuaError("Lua engine not initialized".to_string())
+        })
+    }
+}

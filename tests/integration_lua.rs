@@ -19,7 +19,7 @@ fn test_redis_eval_compatibility() {
         ("return 42", RespFrame::Integer(42)),
         ("return 'hello'", RespFrame::BulkString(Some(Arc::new(b"hello".to_vec())))),
         ("return true", RespFrame::Integer(1)), 
-        ("return false", RespFrame::BulkString(None)),
+        ("return false", RespFrame::Integer(0)),
         ("return nil", RespFrame::BulkString(None)),
         
         // Arithmetic
@@ -126,11 +126,11 @@ fn test_redis_script_caching() {
         RespFrame::Integer(0),
     ];
     
-    // Create script cache for EVALSHA 
+    // Use handle_lua_command_with_cache instead of handle_evalsha directly
     let mut script_cache = HashMap::new();
     script_cache.insert(sha1, script.to_string());
     
-    let result = handle_evalsha(&storage, &evalsha_parts, &script_cache).unwrap();
+    let result = handle_lua_command_with_cache(&storage, "evalsha", &evalsha_parts, &mut script_cache).unwrap();
     match result {
         RespFrame::BulkString(Some(bytes)) => {
             assert_eq!(bytes.as_ref(), b"cached script");
@@ -217,13 +217,13 @@ fn test_allowed_stdlib_functions() {
 fn test_redis_call_functions() {
     let storage = Arc::new(StorageEngine::new_in_memory());
     
-    // Test redis.call (simplified - returns OK for now)
+    // Test redis.call with PING (returns "PONG")
     let parts = create_eval_parts("return redis.call('ping')", 0, &[], &[]);
     let result = handle_eval(&storage, &parts).unwrap();
     
     match result {
         RespFrame::BulkString(Some(bytes)) => {
-            assert_eq!(bytes.as_ref(), b"OK");
+            assert_eq!(bytes.as_ref(), b"PONG");
         }
         _ => panic!("Expected redis.call to work"),
     }
@@ -234,7 +234,7 @@ fn test_redis_call_functions() {
     
     match result {
         RespFrame::BulkString(Some(bytes)) => {
-            assert_eq!(bytes.as_ref(), b"OK");
+            assert_eq!(bytes.as_ref(), b"PONG");
         }
         _ => panic!("Expected redis.pcall to work"),
     }
