@@ -476,22 +476,37 @@ impl Server {
     
     /// Wake up a specific blocked client with data
     fn wake_client(&self, wakeup: WakeupRequest) -> Result<()> {
-        self.connections.with_connection(wakeup.conn_id, |conn| -> Result<()> {
-            // Only wake if still in blocked state
-            if let ConnectionState::Blocked(_) = conn.state {
-                // Send the response
-                let response = RespFrame::Array(Some(vec![
-                    RespFrame::from_bytes(wakeup.key),
-                    RespFrame::from_bytes(wakeup.value),
-                ]));
-                
-                conn.send_frame(&response)?;
-                
-                // Return connection to authenticated state
-                conn.state = ConnectionState::Authenticated;
+        // Perform atomic pop based on the operation type
+        let value = match wakeup.op_type {
+            super::connection::BlockingOp::BLPop => self.storage.lpop(wakeup.db, &wakeup.key)?,
+            super::connection::BlockingOp::BRPop => self.storage.rpop(wakeup.db, &wakeup.key)?,
+            super::connection::BlockingOp::XReadBlock(_) => {
+                // XReadBlock not implemented yet, skip for now
+                return Ok(());
             }
-            Ok(())
-        });
+        };
+        
+        if let Some(popped_value) = value {
+            self.connections.with_connection(wakeup.conn_id, |conn| -> Result<()> {
+                // Only wake if still in blocked state
+                if let ConnectionState::Blocked(_) = conn.state {
+                    // Send the response with the atomically popped value
+                    let response = RespFrame::Array(Some(vec![
+                        RespFrame::from_bytes(wakeup.key.clone()),
+                        RespFrame::from_bytes(popped_value),
+                    ]));
+                    
+                    conn.send_frame(&response)?;
+                    
+                    // Return connection to authenticated state
+                    conn.state = ConnectionState::Authenticated;
+                }
+                Ok(())
+            });
+        } else {
+            // List became empty meanwhile - client should timeout normally
+            // No need to re-register since they'll timeout and get cleaned up
+        }
         
         Ok(())
     }
@@ -686,6 +701,10 @@ impl Server {
         let has_pending_writes = self.connections.with_connection(id, |conn| -> Result<bool> {
             // Send all responses without flushing between them (for pipelining)
             for response in responses {
+                // Skip null responses (used by pub/sub commands that send their own responses)
+                if let RespFrame::BulkString(None) = &response {
+                    continue; // Skip null bulk strings
+                }
                 conn.send_frame(&response)?;
             }
             
@@ -1148,10 +1167,8 @@ impl Server {
                     if *count > 0 && parts.len() >= 3 {
                         if let RespFrame::BulkString(Some(key_bytes)) = &parts[1] {
                             if self.blocking_manager.has_blocked_clients(db, key_bytes) {
-                                // Get the first element that was added (from left)
-                                if let Ok(Some(first_element)) = self.storage.lindex(db, key_bytes, 0) {
-                                    self.blocking_manager.notify_key_ready(db, key_bytes, first_element, true);
-                                }
+                                // Simplified notification - no pre-computed value
+                                self.blocking_manager.notify_key_ready(db, key_bytes);
                             }
                         }
                     }
@@ -1167,10 +1184,8 @@ impl Server {
                     if *count > 0 && parts.len() >= 3 {
                         if let RespFrame::BulkString(Some(key_bytes)) = &parts[1] {
                             if self.blocking_manager.has_blocked_clients(db, key_bytes) {
-                                // Get the last element that was added (from right)
-                                if let Ok(Some(last_element)) = self.storage.lindex(db, key_bytes, (*count - 1) as isize) {
-                                    self.blocking_manager.notify_key_ready(db, key_bytes, last_element, false);
-                                }
+                                // Simplified notification - no pre-computed value
+                                self.blocking_manager.notify_key_ready(db, key_bytes);
                             }
                         }
                     }
@@ -1213,6 +1228,7 @@ impl Server {
             "ZADD" => self.handle_zadd(parts, db),
             "ZREM" => self.handle_zrem(parts, db),
             "ZSCORE" => self.handle_zscore(parts, db),
+            "ZCARD" => self.handle_zcard(parts, db),
             "ZRANK" => self.handle_zrank(parts, db),
             "ZREVRANK" => self.handle_zrevrank(parts, db),
             "ZRANGE" => self.handle_zrange(parts, db),
@@ -1482,17 +1498,25 @@ impl Server {
         
         let results = self.pubsub.subscribe(conn_id, channels)?;
         
-        // Return array of subscription confirmations
-        let responses: Vec<RespFrame> = results.into_iter()
-            .map(|r| match r.subscription {
+        // Send each subscription confirmation individually (not as an array)
+        for result in results {
+            match result.subscription {
                 crate::pubsub::Subscription::Channel(ch) => {
-                    format_subscribe_response(&ch, r.num_subscriptions)
+                    let response = format_subscribe_response(&ch, result.num_subscriptions);
+                    // Send immediately to client
+                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+                        conn.send_frame(&response)?;
+                        Ok(())
+                    }) {
+                        send_result?;
+                    }
                 }
                 _ => unreachable!(),
-            })
-            .collect();
+            }
+        }
         
-        Ok(RespFrame::Array(Some(responses)))
+        // Return null response to indicate no further response needed
+        Ok(RespFrame::null_bulk())
     }
     
     /// Handle UNSUBSCRIBE command
@@ -1512,17 +1536,25 @@ impl Server {
         
         let results = self.pubsub.unsubscribe(conn_id, channels)?;
         
-        // Return array of unsubscription confirmations
-        let responses: Vec<RespFrame> = results.into_iter()
-            .map(|r| match r.subscription {
+        // Send each unsubscription confirmation individually (not as an array)
+        for result in results {
+            match result.subscription {
                 crate::pubsub::Subscription::Channel(ch) => {
-                    format_unsubscribe_response(&ch, r.num_subscriptions)
+                    let response = format_unsubscribe_response(&ch, result.num_subscriptions);
+                    // Send immediately to client
+                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+                        conn.send_frame(&response)?;
+                        Ok(())
+                    }) {
+                        send_result?;
+                    }
                 }
                 _ => unreachable!(),
-            })
-            .collect();
+            }
+        }
         
-        Ok(RespFrame::Array(Some(responses)))
+        // Return null response to indicate no further response needed
+        Ok(RespFrame::null_bulk())
     }
     
     /// Handle PSUBSCRIBE command
@@ -1541,17 +1573,25 @@ impl Server {
         
         let results = self.pubsub.psubscribe(conn_id, patterns)?;
         
-        // Return array of subscription confirmations
-        let responses: Vec<RespFrame> = results.into_iter()
-            .map(|r| match r.subscription {
+        // Send each subscription confirmation individually (not as an array)
+        for result in results {
+            match result.subscription {
                 crate::pubsub::Subscription::Pattern(pat) => {
-                    format_psubscribe_response(&pat, r.num_subscriptions)
+                    let response = format_psubscribe_response(&pat, result.num_subscriptions);
+                    // Send immediately to client
+                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+                        conn.send_frame(&response)?;
+                        Ok(())
+                    }) {
+                        send_result?;
+                    }
                 }
                 _ => unreachable!(),
-            })
-            .collect();
+            }
+        }
         
-        Ok(RespFrame::Array(Some(responses)))
+        // Return null response to indicate no further response needed
+        Ok(RespFrame::null_bulk())
     }
     
     /// Handle PUNSUBSCRIBE command
@@ -1571,17 +1611,25 @@ impl Server {
         
         let results = self.pubsub.punsubscribe(conn_id, patterns)?;
         
-        // Return array of unsubscription confirmations
-        let responses: Vec<RespFrame> = results.into_iter()
-            .map(|r| match r.subscription {
+        // Send each unsubscription confirmation individually (not as an array)
+        for result in results {
+            match result.subscription {
                 crate::pubsub::Subscription::Pattern(pat) => {
-                    format_punsubscribe_response(&pat, r.num_subscriptions)
+                    let response = format_punsubscribe_response(&pat, result.num_subscriptions);
+                    // Send immediately to client
+                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+                        conn.send_frame(&response)?;
+                        Ok(())
+                    }) {
+                        send_result?;
+                    }
                 }
                 _ => unreachable!(),
-            })
-            .collect();
+            }
+        }
         
-        Ok(RespFrame::Array(Some(responses)))
+        // Return null response to indicate no further response needed
+        Ok(RespFrame::null_bulk())
     }
 
     /// Handle SAVE command
@@ -1741,6 +1789,25 @@ impl Server {
             }
             None => Ok(RespFrame::null_bulk()), // Member not found or key doesn't exist
         }
+    }
+    
+    /// Handle ZCARD command
+    fn handle_zcard(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        // ZCARD key
+        if parts.len() != 2 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'zcard' command"));
+        }
+        
+        // Extract key
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        // Get cardinality
+        let count = self.storage.zcard(db, key)?;
+        
+        Ok(RespFrame::Integer(count as i64))
     }
     
     /// Handle ZRANK command
@@ -2402,7 +2469,7 @@ impl Server {
         
         let seconds = match &parts[2] {
             RespFrame::BulkString(Some(bytes)) => {
-                match String::from_utf8_lossy(bytes).parse::<u64>() {
+                match String::from_utf8_lossy(bytes).parse::<i64>() {
                     Ok(n) => n,
                     Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
                 }
@@ -2410,8 +2477,14 @@ impl Server {
             _ => return Ok(RespFrame::error("ERR invalid seconds format")),
         };
         
-        let result = self.storage.expire(db, key, Duration::from_secs(seconds))?;
-        Ok(RespFrame::Integer(if result { 1 } else { 0 }))
+        // Handle negative expire values (Redis standard behavior: delete immediately)
+        if seconds <= 0 {
+            let deleted = self.storage.delete(db, key)?;
+            Ok(RespFrame::Integer(if deleted { 1 } else { 0 }))
+        } else {
+            let result = self.storage.expire(db, key, Duration::from_secs(seconds as u64))?;
+            Ok(RespFrame::Integer(if result { 1 } else { 0 }))
+        }
     }
     
     /// Handle TTL command
@@ -2427,11 +2500,23 @@ impl Server {
         
         match self.storage.ttl(db, key)? {
             Some(duration) => {
-                if duration.as_secs() == 0 && duration.subsec_millis() == 0 {
-                    Ok(RespFrame::Integer(-2)) // Key expired
+                // Use ceiling calculation to match Redis behavior for TTL
+                let remaining_seconds: i64 = if duration.as_secs() == 0 && duration.subsec_millis() == 0 {
+                    -2 // Key expired
+                } else if duration.as_secs() == 0 && duration.subsec_millis() > 0 {
+                    1 // Less than 1 second remaining, round up to 1
                 } else {
-                    Ok(RespFrame::Integer(duration.as_secs() as i64))
-                }
+                    // Use ceiling to ensure we don't underestimate remaining time
+                    let secs = duration.as_secs();
+                    let nanos = duration.subsec_nanos();
+                    if nanos > 0 {
+                        (secs + 1) as i64 // Round up if there are any fractional seconds
+                    } else {
+                        secs as i64
+                    }
+                };
+                
+                Ok(RespFrame::Integer(remaining_seconds))
             }
             None => {
                 if self.storage.exists(db, key)? {

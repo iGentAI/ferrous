@@ -26,8 +26,7 @@ pub struct WakeupRequest {
     pub conn_id: u64,
     pub db: DatabaseIndex,
     pub key: Vec<u8>,
-    pub value: Vec<u8>,
-    pub operation: BlockingOp,
+    pub op_type: BlockingOp,
 }
 
 /// Per-database blocking registry
@@ -200,39 +199,27 @@ impl BlockingManager {
     }
     
     /// Notify that a key has received data (called from LPUSH/RPUSH)
-    pub fn notify_key_ready(&self, db: DatabaseIndex, key: &[u8], value: Vec<u8>, from_left: bool) {
+    pub fn notify_key_ready(&self, db: DatabaseIndex, key: &[u8]) {
         if db >= self.registries.len() {
             return;
         }
         
-        let client = {
-            let mut registry = self.registries[db].write().unwrap();
-            registry.pop_first_waiter(key)
-        };
-        
-        if let Some(client) = client {
-            // Determine if this client should get the notification based on operation type
-            let should_wake = match (client.op_type.clone(), from_left) {
-                (BlockingOp::BLPop, true) => true,   // BLPOP wants items from left
-                (BlockingOp::BRPop, false) => true,  // BRPOP wants items from right
-                _ => false,
+        loop {
+            let client = {
+                let mut registry = self.registries[db].write().unwrap();
+                match registry.pop_first_waiter(key) {
+                    Some(c) => c,
+                    None => break, // No more clients waiting
+                }
             };
             
-            if should_wake {
-                self.wake_queue.push(WakeupRequest {
-                    conn_id: client.conn_id,
-                    db,
-                    key: key.to_vec(),
-                    value,
-                    operation: client.op_type,
-                });
-            } else {
-                // Put the client back at the front of the queue
-                let mut registry = self.registries[db].write().unwrap();
-                if let Some(clients) = registry.blocked_on_key.get_mut(key) {
-                    clients.push_front(client);
-                }
-            }
+            // In Redis, any push that makes the list non-empty should wake blocked clients
+            self.wake_queue.push(WakeupRequest {
+                conn_id: client.conn_id,
+                db,
+                key: key.to_vec(),
+                op_type: client.op_type,
+            });
         }
     }
     
