@@ -20,9 +20,9 @@ pub fn handle_lpush(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    // Extract elements to push
+    // Extract elements to push - process from RIGHT TO LEFT for correct Redis semantics  
     let mut elements = Vec::new();
-    for i in 2..parts.len() {
+    for i in (2..parts.len()).rev() {  // Iterate in reverse for correct multi-value LPUSH
         match &parts[i] {
             RespFrame::BulkString(Some(bytes)) => elements.push(bytes.as_ref().clone()),
             _ => return Ok(RespFrame::error("ERR invalid element format")),

@@ -87,6 +87,22 @@ run_default_tests() {
     echo "Running comprehensive feature validation..."
     python3 features/pubsub/test_pubsub_comprehensive.py
     echo ""
+    
+    # Run comprehensive pub/sub protocol validation tests
+    echo "Running pub/sub protocol validation..."
+    python3 features/pubsub/test_pubsub_protocol_validation.py
+    echo ""
+    
+    # Run ZCARD command tests
+    echo "Running ZCARD command validation..."
+    python3 features/sorted_sets/test_zcard.py
+    echo ""
+    
+    # Run comprehensive expiry tests
+    echo "Running comprehensive expiry operations tests..."
+    python3 features/expiry/test_expiry_comprehensive.py
+    echo ""
+    
     python3 features/persistence/test_persistence_integration_clean.py
     echo ""
     
