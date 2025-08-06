@@ -299,6 +299,9 @@ fn print_response(response: &RespFrame, verbose: bool) {
         RespFrame::Array(None) => {
             println!("(nil array)");
         }
+        RespFrame::NoResponse => {
+            println!("(no response - internal marker)");
+        }
         // Handle additional RESP3 variants
         RespFrame::Null => {
             println!("(null)");
@@ -354,6 +357,9 @@ fn print_response_inline(response: &RespFrame) {
         }
         RespFrame::Array(None) => {
             print!("(nil array)");
+        }
+        RespFrame::NoResponse => {
+            print!("(no response)");
         }
         RespFrame::Null => {
             print!("(null)");

@@ -16,6 +16,7 @@ show_help() {
     echo "  auth        Run tests with authentication (master.conf)"  
     echo "  perf        Run performance tests (log redirection)"
     echo "  unit        Run Rust unit tests only"
+    echo "  atomic      Run atomic operations and regression tests only"
     echo "  all         Run all test configurations"
     echo "  help        Show this help"
     echo ""
@@ -23,6 +24,7 @@ show_help() {
     echo "  $0 default  # Most common - basic functionality tests"
     echo "  $0 perf     # For benchmarking against Redis/Valkey"
     echo "  $0 auth     # For replication testing"
+    echo "  $0 atomic   # For atomic operations and regression prevention"
     echo ""
 }
 
@@ -126,6 +128,16 @@ run_default_tests() {
     # Run comprehensive RDB data type validation
     echo "Running comprehensive RDB data type validation..."
     ./integration/validate_rdb_all_types.sh
+    echo ""
+    
+    # Run atomic operations comprehensive tests
+    echo "Running atomic operations comprehensive tests..."
+    python3 features/atomic_operations/test_atomic_operations_comprehensive.py
+    echo ""
+    
+    # Run regression prevention tests
+    echo "Running regression prevention tests..."
+    python3 features/regression/test_merge_failure_prevention.py
     echo ""
     
     cd ..
@@ -283,6 +295,64 @@ run_unit_tests() {
     echo "✅ Unit tests completed successfully"
 }
 
+run_atomic_tests() {
+    echo "========================================="
+    echo "RUNNING ATOMIC OPERATIONS TESTS"
+    echo "========================================="
+    
+    # Check if server is already running
+    if redis-cli -p 6379 PING > /dev/null 2>&1; then
+        echo "✅ Using existing server on port 6379"
+        EXTERNAL_SERVER=true
+    else
+        echo "Starting server: ./target/release/ferrous"
+        
+        # Start server
+        ./target/release/ferrous > /tmp/ferrous-atomic.log 2>&1 &
+        SERVER_PID=$!
+        sleep 2
+        
+        # Verify server is running
+        if ! redis-cli -p 6379 PING > /dev/null 2>&1; then
+            echo "❌ Server failed to start"
+            kill $SERVER_PID 2>/dev/null || true
+            exit 1
+        fi
+        
+        echo "✅ Server running on port 6379"
+        EXTERNAL_SERVER=false
+    fi
+    
+    echo ""
+    
+    cd tests
+    
+    # Run atomic operations comprehensive tests
+    echo "Running atomic operations comprehensive tests..."
+    python3 features/atomic_operations/test_atomic_operations_comprehensive.py
+    echo ""
+    
+    # Run regression prevention tests
+    echo "Running regression prevention tests..."
+    python3 features/regression/test_merge_failure_prevention.py
+    echo ""
+    
+    # Run atomic integration tests
+    echo "Running atomic operations integration tests..."
+    ./integration/test_atomic_operations_integration.sh
+    echo ""
+    
+    cd ..
+    
+    # Cleanup only if we started the server
+    if [[ "$EXTERNAL_SERVER" == "false" ]]; then
+        kill $SERVER_PID 2>/dev/null || true
+    fi
+    
+    echo ""
+    echo "✅ Atomic operations tests completed"
+}
+
 case "${1:-help}" in
     default)
         run_default_tests
@@ -296,9 +366,13 @@ case "${1:-help}" in
     unit)
         run_unit_tests
         ;;
+    atomic)
+        run_atomic_tests
+        ;;
     all)
         run_unit_tests
         run_default_tests  
+        run_atomic_tests
         run_auth_tests
         run_perf_tests
         ;;

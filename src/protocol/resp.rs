@@ -25,6 +25,9 @@ pub enum RespFrame {
     /// Array: *2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n or *-1\r\n (null)
     Array(Option<Vec<RespFrame>>),
     
+    /// Internal marker for blocking operations - no response should be sent
+    NoResponse,
+    
     // RESP3 additions
     /// Null value: _\r\n
     Null,
@@ -88,14 +91,19 @@ impl RespFrame {
         RespFrame::Error(Arc::new(msg.into()))
     }
     
-    /// Create a null bulk string
+    /// Create a null bulk string (valid Redis response)
     pub fn null_bulk() -> Self {
         RespFrame::BulkString(None)
     }
     
-    /// Create a null array
+    /// Create a null array (valid Redis response)
     pub fn null_array() -> Self {
         RespFrame::Array(None)
+    }
+    
+    /// Create internal "no response" marker for blocking operations
+    pub fn no_response() -> Self {
+        RespFrame::NoResponse
     }
     
     /// Convert bytes to a frame
