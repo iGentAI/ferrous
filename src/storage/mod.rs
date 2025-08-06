@@ -14,6 +14,7 @@ pub mod monitor;
 pub mod aof;
 pub mod commands;
 pub mod lua_cache;
+pub mod lua_engine;  // Single-threaded Lua execution engine
 
 #[cfg(test)]
 mod stream_integration_tests;

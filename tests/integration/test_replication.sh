@@ -11,9 +11,27 @@ PASSWORD="mysecretpassword"
 # Clean up on exit
 function cleanup() {
     echo "Cleaning up..."
-    pkill -f "ferrous master.conf" || true
-    pkill -f "ferrous replica.conf" || true
-    echo "Done."
+    
+    # Kill master server
+    if ! pkill -f "ferrous master.conf"; then
+        echo "⚠️  Warning: Failed to kill master server process"
+    fi
+    
+    # Kill replica server
+    if ! pkill -f "ferrous replica.conf"; then
+        echo "⚠️  Warning: Failed to kill replica server process"
+    fi
+    
+    # Give processes time to terminate
+    sleep 1
+    
+    # Check if any ferrous processes are still running
+    if pgrep -f "ferrous" > /dev/null; then
+        echo "⚠️  Warning: Some Ferrous processes may still be running"
+        pgrep -f "ferrous" -l
+    fi
+    
+    echo "Cleanup completed."
 }
 
 trap cleanup EXIT

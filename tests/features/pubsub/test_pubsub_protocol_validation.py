@@ -1,235 +1,285 @@
 #!/usr/bin/env python3
 """
-Pub/Sub protocol validation test for Ferrous
-Tests RESP2 protocol compliance for pub/sub operations
+Ferrous Pub/Sub protocol validation test suite.
+
+This script performs protocol-level tests against a Ferrous (Redis-compatible)
+server to ensure that its PUB/SUB implementation conforms to the RESP2 wire
+format and is compatible with the official `redis-py` client.
+
+It covers:
+
+* Low-level RESP2 validation of SUBSCRIBE, PSUBSCRIBE and published messages
+* Publish/subscribe round-trip checks using raw sockets
+* Functional tests using the redis-py high-level client
+* Multi-channel subscription confirmation
+
+Exit status is **0** when all tests pass, otherwise **1**.
 """
 
-import redis
 import socket
+import sys
 import time
 import threading
+from typing import Any, List
 
-def test_subscribe_protocol_with_redis_py():
-    """Test SUBSCRIBE protocol compliance using redis-py client"""
-    print("Testing SUBSCRIBE protocol with redis-py...")
-    
-    try:
-        # Create redis-py client
-        r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=False)
-        
-        # Create pubsub object
-        pubsub = r.pubsub()
-        
-        # Try to subscribe to a channel
+import redis
+
+
+# ────────────────────────── RESP2 helpers ──────────────────────────
+class PubSubProtocolTester:
+    def __init__(self, host: str = "127.0.0.1", port: int = 6379) -> None:
+        self.host = host
+        self.port = port
+
+    # ------------------------ low-level parser ------------------------
+    def parse_resp(self, data: bytes) -> Any:
+        """Parse a single RESP2 value from *data* or return ``None`` if
+        the buffer is incomplete."""
+        if not data:
+            return None
+
+        kind = data[0:1]
+
+        # Simple string / Error / Integer
+        if kind in (b"+", b"-", b":"):
+            end = data.find(b"\r\n")
+            if end == -1:
+                return None
+            payload = data[1:end]
+            if kind == b"+":
+                return payload.decode()
+            if kind == b"-":
+                return f"ERROR: {payload.decode()}"
+            return int(payload)
+
+        # Bulk string
+        if kind == b"$":
+            end = data.find(b"\r\n")
+            if end == -1:
+                return None
+            length = int(data[1:end])
+            if length == -1:
+                return None  # NULL bulk string
+            start = end + 2
+            end_of_payload = start + length
+            if len(data) < end_of_payload + 2:
+                return None
+            return data[start:end_of_payload]
+
+        # Array
+        if kind == b"*":
+            end = data.find(b"\r\n")
+            if end == -1:
+                return None
+            count = int(data[1:end])
+            pos = end + 2
+            items: List[Any] = []
+            for _ in range(count):
+                elem_len = self._element_length(data[pos:])
+                if elem_len == -1:
+                    return None
+                items.append(self.parse_resp(data[pos : pos + elem_len]))
+                pos += elem_len
+            return items
+
+        return None
+
+    def _element_length(self, data: bytes) -> int:
+        """Return the byte length of the first RESP element in *data* (including
+        its terminator) or -1 if incomplete."""
+        if not data:
+            return -1
+
+        kind = data[0:1]
+
+        if kind in (b"+", b"-", b":"):
+            end = data.find(b"\r\n")
+            return -1 if end == -1 else end + 2
+
+        if kind == b"$":
+            end = data.find(b"\r\n")
+            if end == -1:
+                return -1
+            length = int(data[1:end])
+            if length == -1:
+                return end + 2
+            return end + 2 + length + 2
+
+        if kind == b"*":
+            end = data.find(b"\r\n")
+            if end == -1:
+                return -1
+            count = int(data[1:end])
+            pos = end + 2
+            for _ in range(count):
+                elem_len = self._element_length(data[pos:])
+                if elem_len == -1:
+                    return -1
+                pos += elem_len
+            return pos
+
+        return -1
+
+    # ----------------------------- tests -----------------------------
+    def test_subscribe_response_format(self) -> bool:
+        """SUBSCRIBE confirmation must be: ['subscribe', channel, <n>]"""
+        print("Testing SUBSCRIBE response format …")
+        with socket.create_connection((self.host, self.port), timeout=2) as s:
+            s.sendall(b"*2\r\n$9\r\nSUBSCRIBE\r\n$12\r\ntest_channel\r\n")
+            resp = s.recv(1024)
+            parsed = self.parse_resp(resp)
+            print("Parsed:", parsed)
+            ok = (
+                isinstance(parsed, list)
+                and len(parsed) >= 3
+                and parsed[0] in (b"subscribe", "subscribe")
+                and parsed[1] in (b"test_channel", "test_channel")
+                and isinstance(parsed[2], int)
+                and parsed[2] >= 1
+            )
+            print("✅" if ok else "❌", "SUBSCRIBE response format")
+            return ok
+
+    def test_publish_message_format(self) -> bool:
+        """Published payload must be: ['message', channel, data]"""
+        print("\nTesting PUBLISH message format …")
+        with socket.create_connection((self.host, self.port), timeout=3) as sub:
+            sub.sendall(b"*2\r\n$9\r\nSUBSCRIBE\r\n$11\r\npubsub_test\r\n")
+            _ = sub.recv(1024)  # ignore confirmation
+            time.sleep(0.3)
+
+            with socket.create_connection((self.host, self.port)) as pub:
+                pub.sendall(
+                    b"*3\r\n$7\r\nPUBLISH\r\n$11\r\npubsub_test\r\n$10\r\ntest_value\r\n"
+                )
+                _ = pub.recv(64)
+
+            msg = sub.recv(1024)
+            parsed = self.parse_resp(msg)
+            print("Parsed:", parsed)
+            ok = (
+                isinstance(parsed, list)
+                and len(parsed) >= 3
+                and parsed[0] in (b"message", "message")
+                and parsed[1] in (b"pubsub_test", "pubsub_test")
+                and parsed[2] in (b"test_value", "test_value")
+            )
+            print("✅" if ok else "❌", "PUBLISH message format")
+            return ok
+
+    def test_pattern_subscribe_format(self) -> bool:
+        """PSUBSCRIBE confirmation must be: ['psubscribe', pattern, <n>]"""
+        print("\nTesting PSUBSCRIBE response format …")
+        with socket.create_connection((self.host, self.port), timeout=2) as s:
+            s.sendall(b"*2\r\n$10\r\nPSUBSCRIBE\r\n$7\r\ntest:*\r\n")
+            parsed = self.parse_resp(s.recv(1024))
+            print("Parsed:", parsed)
+            ok = (
+                isinstance(parsed, list)
+                and len(parsed) >= 3
+                and parsed[0] in (b"psubscribe", "psubscribe")
+                and parsed[1] in (b"test:*", "test:*")
+                and isinstance(parsed[2], int)
+            )
+            print("✅" if ok else "❌", "PSUBSCRIBE response format")
+            return ok
+
+    def test_redis_py_compatibility(self) -> bool:
+        """High-level redis-py client must work end-to-end."""
+        print("\nTesting redis-py client compatibility …")
         try:
-            pubsub.subscribe('test_channel')
-            print("✅ Subscribe call succeeded")
-            
-            # Try to get the subscription confirmation message
-            message = pubsub.get_message(timeout=1.0)
-            if message:
-                print(f"✅ Got subscription message: {message}")
-                print(f"   Type: {message.get('type')}")
-                print(f"   Channel: {message.get('channel')}")
-                print(f"   Data: {message.get('data')}")
-            else:
-                print("❌ No subscription confirmation received")
-                
-        except IndexError as e:
-            print(f"❌ IndexError during subscription: {e}")
-            print("   This indicates RESP2 protocol format mismatch")
-            return False
-        except Exception as e:
-            print(f"❌ Unexpected error: {e}")
+            r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
+            pubsub = r.pubsub()
+            pubsub.subscribe("redis_py_test")
+
+            sub_msg = pubsub.get_message(timeout=2)
+            if not sub_msg or sub_msg.get("type") != "subscribe":
+                print("❌ No valid subscription confirmation")
+                return False
+
+            r.publish("redis_py_test", "hello from redis-py")
+            pub_msg = pubsub.get_message(timeout=2)
+            ok = pub_msg and pub_msg.get("type") == "message"
+            print("✅" if ok else "❌", "redis-py round-trip")
+            return ok
+        except Exception as exc:
+            print("❌ redis-py error:", exc)
             return False
         finally:
             try:
                 pubsub.close()
-            except:
+            except Exception:
                 pass
-                
-        return True
-        
-    except redis.ConnectionError:
-        print("❌ Cannot connect to Redis server")
-        return False
 
-def test_raw_subscribe_protocol():
-    """Test raw SUBSCRIBE protocol to see exact response format"""
-    print("\nTesting raw SUBSCRIBE protocol...")
-    
-    try:
-        # Connect using raw socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(('127.0.0.1', 6379))
-        s.settimeout(1.0)
-        
-        # Send SUBSCRIBE command
-        cmd = "*2\r\n$9\r\nSUBSCRIBE\r\n$12\r\ntest_channel\r\n"
-        s.sendall(cmd.encode())
-        
-        # Read response
-        response = s.recv(1024)
-        print(f"Raw response bytes: {response}")
-        print(f"Raw response repr: {repr(response)}")
-        
-        # Parse RESP
-        if response.startswith(b'*'):
-            # It's an array
-            lines = response.decode('utf-8', errors='ignore').split('\r\n')
-            array_size = int(lines[0][1:])
-            print(f"Response is array of size: {array_size}")
-            
-            # Check if it's a nested array (incorrect for pub/sub)
-            if lines[1].startswith('*'):
-                print("❌ Response contains nested array - this is incorrect!")
-                print("   Redis sends individual messages, not an array of arrays")
-                return False
-            else:
-                print("✅ Response format looks correct")
-                
-        s.close()
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error during raw protocol test: {e}")
-        return False
+    # ---------------------- run whole suite -------------------------
+    def run_all(self) -> List[bool]:
+        tests = [
+            self.test_subscribe_response_format,
+            self.test_publish_message_format,
+            self.test_pattern_subscribe_format,
+            self.test_redis_py_compatibility,
+        ]
+        return [t() for t in tests]
 
-def test_publish_subscribe_flow():
-    """Test complete pub/sub flow with redis-py"""
-    print("\nTesting complete publish/subscribe flow...")
-    
-    messages_received = []
-    
-    def subscriber_thread():
-        try:
-            r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=False)
-            pubsub = r.pubsub()
-            
-            # Subscribe
-            pubsub.subscribe('test_channel')
-            
-            # Listen for messages
-            for message in pubsub.listen():
-                messages_received.append(message)
-                if message['type'] == 'message':
-                    break
-                    
-        except Exception as e:
-            print(f"Subscriber error: {e}")
-            
-    # Start subscriber
-    sub_thread = threading.Thread(target=subscriber_thread)
-    sub_thread.start()
-    
-    # Wait for subscription
-    time.sleep(0.5)
-    
-    # Publish message
-    try:
-        r = redis.Redis(host='127.0.0.1', port=6379)
-        num_receivers = r.publish('test_channel', 'test message')
-        print(f"Published to {num_receivers} subscribers")
-    except Exception as e:
-        print(f"Publish error: {e}")
-        
-    # Wait for subscriber to finish
-    sub_thread.join(timeout=2.0)
-    
-    # Check results
-    if len(messages_received) >= 2:
-        print(f"✅ Received {len(messages_received)} messages")
-        for i, msg in enumerate(messages_received):
-            print(f"   Message {i}: type={msg.get('type')}, channel={msg.get('channel')}")
-        return True
-    else:
-        print(f"❌ Only received {len(messages_received)} messages")
-        return False
 
-def test_multiple_channel_subscribe():
-    """Test subscribing to multiple channels"""
-    print("\nTesting multiple channel subscription...")
-    
+# ───────────────────────── extra cross-check ─────────────────────────
+def test_multiple_channel_subscribe(
+    host: str = "127.0.0.1", port: int = 6379
+) -> bool:
+    """redis-py should return one confirmation per channel."""
+    print("\nTesting multi-channel subscribe …")
+    channels = ["ch1", "ch2", "ch3"]
+
     try:
-        r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=False)
+        r = redis.Redis(host=host, port=port, decode_responses=False)
         pubsub = r.pubsub()
-        
-        # Subscribe to multiple channels
-        channels = ['channel1', 'channel2', 'channel3']
         pubsub.subscribe(*channels)
-        
-        # Get all subscription confirmations
-        confirmations = []
-        for _ in range(len(channels)):
-            msg = pubsub.get_message(timeout=1.0)
-            if msg:
-                confirmations.append(msg)
-            else:
-                break
-                
-        if len(confirmations) == len(channels):
-            print(f"✅ Got all {len(channels)} subscription confirmations")
-            return True
-        else:
-            print(f"❌ Only got {len(confirmations)} out of {len(channels)} confirmations")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Error: {e}")
+
+        confirmations = [pubsub.get_message(timeout=1) for _ in channels]
+        confirmations = [m for m in confirmations if m]
+
+        ok = len(confirmations) == len(channels)
+        print("✅" if ok else "❌", f"{len(confirmations)}/{len(channels)} confirmations")
+        return ok
+    except Exception as exc:
+        print("❌ multi-channel error:", exc)
         return False
     finally:
         try:
             pubsub.close()
-        except:
+        except Exception:
             pass
 
-def main():
-    print("=" * 60)
-    print("FERROUS PUB/SUB PROTOCOL VALIDATION TEST")
-    print("=" * 60)
-    
-    # Check if server is running
+
+# ──────────────────────────────── main ────────────────────────────────
+def main() -> None:
+    print("=" * 70)
+    print("FERROUS PUB/SUB PROTOCOL VALIDATION TEST SUITE")
+    print("=" * 70)
+
+    # Quick connectivity ping
     try:
-        r = redis.Redis(host='127.0.0.1', port=6379)
-        r.ping()
+        with socket.create_connection(("127.0.0.1", 6379), timeout=1) as s:
+            s.sendall(b"*1\r\n$4\r\nPING\r\n")
+            if b"PONG" not in s.recv(16):
+                raise RuntimeError("PING failed")
         print("✅ Server connection verified\n")
-    except:
-        print("❌ Cannot connect to server on port 6379")
-        return
-    
-    # Run tests
-    results = []
-    
-    # Test 1: Basic subscribe with redis-py
-    results.append(('SUBSCRIBE with redis-py', test_subscribe_protocol_with_redis_py()))
-    
-    # Test 2: Raw protocol check
-    results.append(('Raw SUBSCRIBE protocol', test_raw_subscribe_protocol()))
-    
-    # Test 3: Full pub/sub flow
-    results.append(('Complete pub/sub flow', test_publish_subscribe_flow()))
-    
-    # Test 4: Multiple channel subscription
-    results.append(('Multiple channel subscribe', test_multiple_channel_subscribe()))
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("TEST SUMMARY")
-    print("=" * 60)
-    
-    passed = sum(1 for _, result in results if result)
+    except Exception as exc:
+        print("❌ Cannot connect to server:", exc)
+        sys.exit(1)
+
+    tester = PubSubProtocolTester()
+    results = tester.run_all()
+    results.append(test_multiple_channel_subscribe())
+
+    passed = sum(results)
     total = len(results)
-    
-    for test_name, result in results:
-        status = "✅ PASS" if result else "❌ FAIL"
-        print(f"{test_name}: {status}")
-    
-    print(f"\nTotal: {passed}/{total} tests passed")
-    
-    if passed < total:
-        print("\n⚠️ PUB/SUB PROTOCOL ISSUES DETECTED")
-        print("The server is likely returning subscription confirmations in an incorrect format.")
-        print("Redis-py expects individual messages, not an array of messages.")
+
+    print("\n" + "=" * 70)
+    print(f"RESULT: {passed}/{total} tests passed")
+    print("=" * 70)
+    sys.exit(0 if passed == total else 1)
+
 
 if __name__ == "__main__":
     main()

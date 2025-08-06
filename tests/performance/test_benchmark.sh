@@ -55,7 +55,17 @@ echo -e "\n9. HSET Command"
 redis-benchmark -p 6379 -t hset -n 10000 -q
 
 echo -e "\n10. Latency Test (5 second sample)"
-timeout 5 redis-cli -p 6379 --latency-history -i 1 || echo "Latency test completed (5 second sample)"
+if timeout 5 redis-cli -p 6379 --latency-history -i 1 2>&1; then
+    echo "Latency test completed successfully"
+else
+    exit_code=$?
+    if [ $exit_code -eq 124 ]; then
+        echo "Latency test completed (5 second timeout reached)"
+    else
+        echo "❌ ERROR: Latency test failed with exit code $exit_code"
+        exit 1
+    fi
+fi
 
 echo -e "\n======================================"
 echo "BENCHMARK COMPLETE"

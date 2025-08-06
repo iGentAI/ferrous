@@ -13,6 +13,37 @@ cd ferrous/
 ./run_tests.sh all      # Everything
 ```
 
+## 🔍 Validation Tests for Reported Issues
+
+We have comprehensive validation tests for reported compatibility issues:
+
+```bash
+cd ferrous/tests
+./run_validation_tests.sh  # Run all validation tests
+```
+
+The validation suite tests:
+1. **Pub/Sub Protocol Compliance** - RESP2 format validation, redis-py compatibility
+2. **Lua Scripting** - Atomic lock release, SCRIPT LOAD, hanging detection
+3. **Missing Commands** - ZCARD and other potentially missing commands
+4. **Event Bus Patterns** - Chainlit/Codemaestro compatibility scenarios
+
+### Individual Validation Tests
+
+```bash
+# Pub/Sub protocol validation
+python3 features/pubsub/test_pubsub_protocol_validation.py
+
+# Lua scripting comprehensive tests
+python3 features/lua/test_lua_comprehensive.py
+
+# Missing commands tests
+python3 features/commands/test_missing_commands.py
+
+# Event bus compatibility
+python3 features/event_bus/test_event_bus_compatibility.py
+```
+
 ## Test Configurations
 
 ### 1. Default Configuration (Most Tests)
@@ -38,13 +69,11 @@ cd ferrous/
 - **`integration/`**: End-to-end tests (basic commands, replication)
 - **`protocol/`**: RESP protocol compliance tests
 - **`features/`**: Specific Redis features (client, memory, monitoring)
+  - **`pubsub/`**: Pub/Sub tests including protocol validation
+  - **`lua/`**: Lua scripting tests including atomic patterns
+  - **`commands/`**: Command coverage and missing command tests
+  - **`event_bus/`**: Event bus pattern compatibility tests
 - **`performance/`**: Benchmarking suite
-
-## Manual Test Running
-
-All tests updated to work with default configuration except:
-- `integration/test_replication.sh` - needs `master.conf`
-- `features/auth/*` - authentication-specific tests
 
 ## Prerequisites
 
@@ -59,3 +88,4 @@ sudo dnf install -y redis  # For redis-benchmark
 ✅ **Global Lua script cache** - SCRIPT LOAD/EVALSHA fixed  
 ✅ **Performance validation** - Exceeds Redis/Valkey 8.0.4 in 8/9 operations  
 ✅ **All tests passing** - 57 unit tests + comprehensive integration tests
+✅ **Validation tests added** - Comprehensive tests for reported compatibility issues
