@@ -702,9 +702,10 @@ impl Server {
         let has_pending_writes = self.connections.with_connection(id, |conn| -> Result<bool> {
             // Send all responses without flushing between them (for pipelining)
             for response in responses {
-                // Skip null responses (used by pub/sub commands that send their own responses)
-                if let RespFrame::BulkString(None) = &response {
-                    continue; // Skip null bulk strings
+                // Skip NoResponse markers (internal markers for blocking operations)
+                // but allow null bulk strings and null arrays (valid Redis responses)
+                if let RespFrame::NoResponse = &response {
+                    continue; // Skip only NoResponse markers
                 }
                 conn.send_frame(&response)?;
             }
@@ -2299,31 +2300,48 @@ impl Server {
             }
         }
         
-        // Check NX condition
+        // Handle NX option (only set if key doesn't exist) - use atomic operation
         if nx {
-            if self.storage.exists(db, &key)? {
-                return Ok(RespFrame::null_bulk());
+            let result = match expiration {
+                Some(expires_in) => self.storage.set_string_nx_ex(db, key, value, expires_in)?,
+                None => self.storage.set_string_nx(db, key, value)?,
+            };
+            
+            if result {
+                Ok(RespFrame::ok())
+            } else {
+                Ok(RespFrame::null_bulk())
             }
         }
-        
-        // Check XX condition
-        if xx {
+        // Handle XX option (only set if key exists)
+        else if xx {
             if !self.storage.exists(db, &key)? {
                 return Ok(RespFrame::null_bulk());
             }
-        }
-        
-        // Set the value
-        match expiration {
-            Some(expires_in) => {
-                self.storage.set_string_ex(db, key, value, expires_in)?;
+            
+            // Key exists, proceed with normal set
+            match expiration {
+                Some(expires_in) => {
+                    self.storage.set_string_ex(db, key, value, expires_in)?;
+                }
+                None => {
+                    self.storage.set_string(db, key, value)?;
+                }
             }
-            None => {
-                self.storage.set_string(db, key, value)?;
-            }
+            Ok(RespFrame::ok())
         }
-        
-        Ok(RespFrame::ok())
+        // Normal SET without conditions
+        else {
+            match expiration {
+                Some(expires_in) => {
+                    self.storage.set_string_ex(db, key, value, expires_in)?;
+                }
+                None => {
+                    self.storage.set_string(db, key, value)?;
+                }
+            }
+            Ok(RespFrame::ok())
+        }
     }
     
     /// Handle GET command  
@@ -2803,8 +2821,8 @@ impl Server {
             });
         });
         
-        // Return null to indicate blocking (client will get response when woken)
-        Ok(RespFrame::null_array())
+        // Return the special NoResponse marker - this will not be sent to client
+        Ok(RespFrame::NoResponse)
     }
     
     /// Handle BRPOP command (blocking right pop)  
@@ -2859,8 +2877,8 @@ impl Server {
             });
         });
         
-        // Return null to indicate blocking (client will get response when woken)
-        Ok(RespFrame::null_array())
+        // Return the special NoResponse marker - this will not be sent to client
+        Ok(RespFrame::NoResponse)
     }
     
     /// Handle RANDOMKEY command

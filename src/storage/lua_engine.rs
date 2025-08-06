@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use mlua::{Lua, Result as LuaResult, MultiValue, Value as LuaValue};
 use sha1::{Sha1, Digest};
 
@@ -203,7 +203,7 @@ impl LuaEngine {
         Ok(())
     }
     
-    /// Execute Redis command with proper error semantics
+    /// Execute Redis command through proper server handlers with Lua-specific context
     fn execute_redis_command(
         storage: &Arc<StorageEngine>,
         lua_ctx: &Lua,
@@ -236,33 +236,136 @@ impl LuaEngine {
         }
         
         let cmd_name = args[0].to_uppercase();
-        let cmd_args = &args[1..];
         
-        // Execute the Redis command with proper error semantics
-        match cmd_name.as_str() {
-            "GET" => {
-                if cmd_args.len() != 1 {
-                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'get' command".to_string(), is_pcall);
-                }
-                
-                match storage.get_string(db_index, cmd_args[0].as_bytes()) {
-                    Ok(Some(value)) => {
-                        let value_str = String::from_utf8_lossy(&value);
-                        match lua_ctx.create_string(&*value_str) {
-                            Ok(lua_string) => Ok(LuaValue::String(lua_string)),
-                            Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
-                        }
-                    }
-                    Ok(None) => Ok(LuaValue::Nil),
-                    Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("GET operation failed: {}", e), is_pcall),
-                }
-            },
+        // Convert to RESP frames for server handler routing
+        let mut resp_parts = Vec::new();
+        for arg in &args {
+            resp_parts.push(RespFrame::from_string(arg.clone()));
+        }
+        
+        // Route through appropriate handler based on command type
+        let result = match cmd_name.as_str() {
+            // Commands forbidden in Lua scripts
+            "EVAL" | "EVALSHA" | "SCRIPT" => {
+                return Self::handle_command_error_with_context(
+                    lua_ctx, 
+                    "Redis scripting commands are not allowed inside Lua scripts".to_string(), 
+                    is_pcall
+                );
+            }
+            "SELECT" | "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => {
+                return Self::handle_command_error_with_context(
+                    lua_ctx,
+                    format!("'{}' command is not allowed inside Lua scripts", cmd_name),
+                    is_pcall
+                );
+            }
+            "BLPOP" | "BRPOP" | "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" => {
+                return Self::handle_command_error_with_context(
+                    lua_ctx,
+                    format!("'{}' command is not allowed inside Lua scripts", cmd_name),
+                    is_pcall
+                );
+            }
+            
+            // Route data manipulation commands to proper handlers
             "SET" => {
-                if cmd_args.len() < 2 {
+                if args.len() < 3 {
                     return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'set' command".to_string(), is_pcall);
                 }
                 
-                match storage.set_string(db_index, cmd_args[0].as_bytes().to_vec(), cmd_args[1].as_bytes().to_vec()) {
+                // Parse SET options (NX, XX, EX, PX)
+                let key = args[1].as_bytes().to_vec();
+                let value = args[2].as_bytes().to_vec();
+                
+                let mut nx = false;
+                let mut xx = false;
+                let mut ex_seconds: Option<u64> = None;
+                let mut px_millis: Option<u64> = None;
+                
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].to_uppercase().as_str() {
+                        "NX" => {
+                            nx = true;
+                            i += 1;
+                        }
+                        "XX" => {
+                            xx = true;
+                            i += 1;
+                        }
+                        "EX" => {
+                            if i + 1 < args.len() {
+                                if let Ok(seconds) = args[i + 1].parse::<u64>() {
+                                    ex_seconds = Some(seconds);
+                                    i += 2;
+                                } else {
+                                    return Self::handle_command_error_with_context(lua_ctx, "invalid expire time".to_string(), is_pcall);
+                                }
+                            } else {
+                                return Self::handle_command_error_with_context(lua_ctx, "syntax error".to_string(), is_pcall);
+                            }
+                        }
+                        "PX" => {
+                            if i + 1 < args.len() {
+                                if let Ok(millis) = args[i + 1].parse::<u64>() {
+                                    px_millis = Some(millis);
+                                    i += 2;
+                                } else {
+                                    return Self::handle_command_error_with_context(lua_ctx, "invalid expire time".to_string(), is_pcall);
+                                }
+                            } else {
+                                return Self::handle_command_error_with_context(lua_ctx, "syntax error".to_string(), is_pcall);
+                            }
+                        }
+                        _ => {
+                            return Self::handle_command_error_with_context(lua_ctx, "syntax error".to_string(), is_pcall);
+                        }
+                    }
+                }
+                
+                // Handle NX condition (only set if key doesn't exist)
+                if nx {
+                    match storage.exists(db_index, &key) {
+                        Ok(true) => {
+                            // Key exists, NX should fail - return nil
+                            return Ok(LuaValue::Nil);
+                        }
+                        Ok(false) => {
+                            // Key doesn't exist, proceed with set
+                        }
+                        Err(e) => {
+                            return Self::handle_command_error_with_context(lua_ctx, format!("EXISTS check failed: {}", e), is_pcall);
+                        }
+                    }
+                }
+                
+                // Handle XX condition (only set if key exists)
+                if xx {
+                    match storage.exists(db_index, &key) {
+                        Ok(false) => {
+                            // Key doesn't exist, XX should fail - return nil
+                            return Ok(LuaValue::Nil);
+                        }
+                        Ok(true) => {
+                            // Key exists, proceed with set
+                        }
+                        Err(e) => {
+                            return Self::handle_command_error_with_context(lua_ctx, format!("EXISTS check failed: {}", e), is_pcall);
+                        }
+                    }
+                }
+                
+                // Execute the SET operation with expiration if specified
+                let result = if let Some(seconds) = ex_seconds {
+                    storage.set_string_ex(db_index, key, value, std::time::Duration::from_secs(seconds))
+                } else if let Some(millis) = px_millis {
+                    storage.set_string_ex(db_index, key, value, std::time::Duration::from_millis(millis))
+                } else {
+                    storage.set_string(db_index, key, value)
+                };
+                
+                match result {
                     Ok(_) => {
                         match lua_ctx.create_string("OK") {
                             Ok(lua_string) => Ok(LuaValue::String(lua_string)),
@@ -271,66 +374,350 @@ impl LuaEngine {
                     }
                     Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("SET operation failed: {}", e), is_pcall),
                 }
-            },
+            }
+            "GET" => {
+                crate::storage::commands::strings::handle_mget(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
             "DEL" => {
-                if cmd_args.is_empty() {
-                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'del' command".to_string(), is_pcall);
+                Self::route_to_server_handler(storage, &resp_parts, db_index, "DEL")
+            }
+            "EXISTS" => {
+                Self::route_to_server_handler(storage, &resp_parts, db_index, "EXISTS")
+            }
+            "INCR" => {
+                Self::route_to_server_handler(storage, &resp_parts, db_index, "INCR")
+            }
+            "DECR" => {
+                Self::route_to_server_handler(storage, &resp_parts, db_index, "DECR")
+            }
+            "INCRBY" => {
+                Self::route_to_server_handler(storage, &resp_parts, db_index, "INCRBY")
+            }
+            "DECRBY" => {
+                Self::route_to_server_handler(storage, &resp_parts, db_index, "DECRBY")
+            }
+            
+            // List operations
+            "LPUSH" => {
+                crate::storage::commands::lists::handle_lpush(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "RPUSH" => {
+                crate::storage::commands::lists::handle_rpush(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "LPOP" => {
+                crate::storage::commands::lists::handle_lpop(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "RPOP" => {
+                crate::storage::commands::lists::handle_rpop(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "LLEN" => {
+                crate::storage::commands::lists::handle_llen(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "LRANGE" => {
+                crate::storage::commands::lists::handle_lrange(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            
+            // Set operations  
+            "SADD" => {
+                crate::storage::commands::sets::handle_sadd(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "SREM" => {
+                crate::storage::commands::sets::handle_srem(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "SCARD" => {
+                crate::storage::commands::sets::handle_scard(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "SMEMBERS" => {
+                crate::storage::commands::sets::handle_smembers(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "SISMEMBER" => {
+                crate::storage::commands::sets::handle_sismember(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            
+            // Hash operations
+            "HSET" => {
+                crate::storage::commands::hashes::handle_hset(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HGET" => {
+                crate::storage::commands::hashes::handle_hget(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HDEL" => {
+                crate::storage::commands::hashes::handle_hdel(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HLEN" => {
+                crate::storage::commands::hashes::handle_hlen(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HGETALL" => {
+                crate::storage::commands::hashes::handle_hgetall(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HEXISTS" => {
+                crate::storage::commands::hashes::handle_hexists(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HKEYS" => {
+                crate::storage::commands::hashes::handle_hkeys(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HVALS" => {
+                crate::storage::commands::hashes::handle_hvals(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            "HINCRBY" => {
+                crate::storage::commands::hashes::handle_hincrby(storage, db_index, &resp_parts)
+                    .map_err(|e| FerrousError::LuaError(e.to_string()))
+                    .and_then(|resp| Ok(resp))
+            }
+            
+            "PING" => {
+                if args.len() == 1 {
+                    RespFrame::SimpleString(Arc::new(b"PONG".to_vec()))
+                } else if args.len() == 2 {
+                    RespFrame::from_string(args[1].clone())
+                } else {
+                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'ping' command".to_string(), is_pcall);
+                }
+            }
+            
+            _ => {
+                return Self::handle_command_error_with_context(lua_ctx, format!("unknown command '{}'", cmd_name), is_pcall);
+            }
+        };
+        
+        // Convert server handler result to Lua value
+        Self::resp_to_lua_value(lua_ctx, result, is_pcall)
+    }
+    
+    /// Route command to appropriate server handler
+    fn route_to_server_handler(
+        storage: &Arc<StorageEngine>, 
+        parts: &[RespFrame], 
+        db_index: usize, 
+        cmd_name: &str
+    ) -> Result<RespFrame> {
+        match cmd_name {
+            "SET" => {
+                Self::handle_lua_set(storage, db_index, parts)
+            }
+            "DEL" => {
+                if parts.len() < 2 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'del' command"));
                 }
                 
-                let mut deleted_count = 0;
-                for key in cmd_args {
-                    match storage.delete(db_index, key.as_bytes()) {
-                        Ok(true) => deleted_count += 1,
-                        Ok(false) => {}, // Key didn't exist
-                        Err(e) => {
-                            return Self::handle_command_error_with_context(lua_ctx, format!("DEL operation failed: {}", e), is_pcall);
+                let mut deleted = 0;
+                for i in 1..parts.len() {
+                    if let RespFrame::BulkString(Some(key_bytes)) = &parts[i] {
+                        if storage.delete(db_index, key_bytes.as_ref())? {
+                            deleted += 1;
                         }
                     }
                 }
-                Ok(LuaValue::Integer(deleted_count))
-            },
-            "INCR" => {
-                if cmd_args.len() != 1 {
-                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'incr' command".to_string(), is_pcall);
-                }
-                
-                match storage.incr(db_index, cmd_args[0].as_bytes().to_vec()) {
-                    Ok(new_value) => Ok(LuaValue::Integer(new_value)),
-                    Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("INCR operation failed: {}", e), is_pcall),
-                }
-            },
+                Ok(RespFrame::Integer(deleted))
+            }
             "EXISTS" => {
-                if cmd_args.len() != 1 {
-                    return Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'exists' command".to_string(), is_pcall);
+                if parts.len() < 2 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'exists' command"));
                 }
                 
-                match storage.exists(db_index, cmd_args[0].as_bytes()) {
-                    Ok(true) => Ok(LuaValue::Integer(1)),
-                    Ok(false) => Ok(LuaValue::Integer(0)),
-                    Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("EXISTS operation failed: {}", e), is_pcall),
-                }
-            },
-            "PING" => {
-                if cmd_args.is_empty() {
-                    match lua_ctx.create_string("PONG") {
-                        Ok(lua_string) => Ok(LuaValue::String(lua_string)),
-                        Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                let mut count = 0;
+                for i in 1..parts.len() {
+                    if let RespFrame::BulkString(Some(key_bytes)) = &parts[i] {
+                        if storage.exists(db_index, key_bytes.as_ref())? {
+                            count += 1;
+                        }
                     }
-                } else if cmd_args.len() == 1 {
-                    match lua_ctx.create_string(&cmd_args[0]) {
-                        Ok(lua_string) => Ok(LuaValue::String(lua_string)),
-                        Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                }
+                Ok(RespFrame::Integer(count))
+            }
+            "INCR" => {
+                if parts.len() != 2 {
+                    return Ok(RespFrame::error("ERR wrong number of arguments for 'incr' command"));
+                }
+                
+                if let RespFrame::BulkString(Some(key_bytes)) = &parts[1] {
+                    match storage.incr(db_index, key_bytes.as_ref().clone()) {
+                        Ok(new_value) => Ok(RespFrame::Integer(new_value)),
+                        Err(e) => Ok(RespFrame::error(e.to_string())),
                     }
                 } else {
-                    Self::handle_command_error_with_context(lua_ctx, "wrong number of arguments for 'ping' command".to_string(), is_pcall)
+                    Ok(RespFrame::error("ERR invalid key format"))
                 }
-            },
-            // Block nested Lua execution (Redis behavior)
-            "EVAL" | "EVALSHA" | "SCRIPT" => {
-                Self::handle_command_error_with_context(lua_ctx, "Redis scripting commands are not allowed inside Lua scripts".to_string(), is_pcall)
-            },
-            _ => {
-                Self::handle_command_error_with_context(lua_ctx, format!("unknown command '{}'", cmd_name), is_pcall)
+            }
+            _ => Ok(RespFrame::error(format!("ERR unknown command '{}'", cmd_name))),
+        }
+    }
+    
+    /// Handle SET command with ALL options for Lua context
+    fn handle_lua_set(storage: &Arc<StorageEngine>, db_index: usize, parts: &[RespFrame]) -> Result<RespFrame> {
+        if parts.len() < 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'set' command"));
+        }
+        
+        // Extract key and value
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        let value = match &parts[2] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref().clone(),
+            _ => return Ok(RespFrame::error("ERR invalid value format")),
+        };
+        
+        // Parse SET options (EX, PX, NX, XX)
+        let mut expiration = None;
+        let mut nx = false;
+        let mut xx = false;
+        
+        let mut i = 3;
+        while i < parts.len() {
+            match &parts[i] {
+                RespFrame::BulkString(Some(option_bytes)) => {
+                    let option_str = String::from_utf8_lossy(option_bytes).to_uppercase();
+                    match option_str.as_str() {
+                        "EX" => {
+                            if i + 1 >= parts.len() {
+                                return Ok(RespFrame::error("ERR syntax error"));
+                            }
+                            if let RespFrame::BulkString(Some(seconds_bytes)) = &parts[i + 1] {
+                                if let Ok(seconds) = String::from_utf8_lossy(seconds_bytes).parse::<u64>() {
+                                    expiration = Some(Duration::from_secs(seconds));
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                            return Ok(RespFrame::error("ERR invalid expire time"));
+                        }
+                        "PX" => {
+                            if i + 1 >= parts.len() {
+                                return Ok(RespFrame::error("ERR syntax error"));
+                            }
+                            if let RespFrame::BulkString(Some(millis_bytes)) = &parts[i + 1] {
+                                if let Ok(millis) = String::from_utf8_lossy(millis_bytes).parse::<u64>() {
+                                    expiration = Some(Duration::from_millis(millis));
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                            return Ok(RespFrame::error("ERR invalid expire time"));
+                        }
+                        "NX" => {
+                            nx = true;
+                            i += 1;
+                        }
+                        "XX" => {
+                            xx = true;
+                            i += 1;
+                        }
+                        _ => return Ok(RespFrame::error("ERR syntax error")),
+                    }
+                }
+                _ => return Ok(RespFrame::error("ERR syntax error")),
+            }
+        }
+        
+        // Handle NX option (only set if key doesn't exist)
+        if nx {
+            if storage.exists(db_index, &key)? {
+                return Ok(RespFrame::BulkString(None)); // Key exists, return nil
+            }
+        }
+        
+        // Handle XX option (only set if key exists)
+        if xx {
+            if !storage.exists(db_index, &key)? {
+                return Ok(RespFrame::BulkString(None)); // Key doesn't exist, return nil
+            }
+        }
+        
+        // Execute the SET operation
+        match expiration {
+            Some(expires_in) => {
+                storage.set_string_ex(db_index, key, value, expires_in)?;
+            }
+            None => {
+                storage.set_string(db_index, key, value)?;
+            }
+        }
+        
+        Ok(RespFrame::SimpleString(Arc::new(b"OK".to_vec())))
+    }
+    
+    /// Convert server RESP response to Lua value
+    fn resp_to_lua_value(lua_ctx: &Lua, resp: Result<RespFrame>, is_pcall: bool) -> LuaResult<LuaValue> {
+        match resp {
+            Ok(frame) => {
+                match frame {
+                    RespFrame::SimpleString(bytes) => {
+                        let string_val = String::from_utf8_lossy(&bytes);
+                        match lua_ctx.create_string(&string_val) {
+                            Ok(lua_string) => Ok(LuaValue::String(lua_string)),
+                            Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                        }
+                    }
+                    RespFrame::BulkString(Some(bytes)) => {
+                        let string_val = String::from_utf8_lossy(&bytes);
+                        match lua_ctx.create_string(&string_val) {
+                            Ok(lua_string) => Ok(LuaValue::String(lua_string)),
+                            Err(e) => Self::handle_command_error_with_context(lua_ctx, format!("String creation failed: {}", e), is_pcall),
+                        }
+                    }
+                    RespFrame::BulkString(None) => Ok(LuaValue::Nil),
+                    RespFrame::Integer(i) => Ok(LuaValue::Integer(i)),
+                    RespFrame::Array(Some(frames)) => {
+                        let table = lua_ctx.create_table().map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                        for (idx, frame) in frames.iter().enumerate() {
+                            let lua_val = Self::resp_to_lua_value(lua_ctx, Ok(frame.clone()), is_pcall)?;
+                            table.set(idx + 1, lua_val).map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                        }
+                        Ok(LuaValue::Table(table))
+                    }
+                    RespFrame::Array(None) => Ok(LuaValue::Nil),
+                    RespFrame::Error(bytes) => {
+                        let error_msg = String::from_utf8_lossy(&bytes);
+                        Self::handle_command_error_with_context(lua_ctx, error_msg.to_string(), is_pcall)
+                    }
+                    _ => Ok(LuaValue::Nil),
+                }
+            }
+            Err(e) => {
+                Self::handle_command_error_with_context(lua_ctx, e.to_string(), is_pcall)
             }
         }
     }

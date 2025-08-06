@@ -182,6 +182,60 @@ impl StorageEngine {
         self.set_value(db, key, Value::string(value), Some(expires_in))
     }
     
+    /// Set a string value only if the key doesn't exist (atomic operation)
+    pub fn set_string_nx(&self, db: DatabaseIndex, key: Key, value: Vec<u8>) -> Result<bool> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        // Check and set atomically while holding the write lock
+        if let Some(stored_value) = shard_guard.data.get(&key) {
+            // Key exists, check if expired
+            if !stored_value.is_expired() {
+                return Ok(false); // Key exists and not expired
+            }
+        }
+        
+        // Key doesn't exist or is expired, set it
+        let memory_size = self.calculate_value_size(&key, &Value::String(value.clone()));
+        if !self.memory_manager.add_memory(memory_size) {
+            return Err(StorageError::OutOfMemory.into());
+        }
+        
+        let stored_value = StoredValue::new(Value::String(value));
+        shard_guard.data.insert(key.clone(), stored_value);
+        shard_guard.mark_modified(&key);
+        
+        Ok(true)
+    }
+    
+    /// Set a string value with expiration only if the key doesn't exist (atomic operation)
+    pub fn set_string_nx_ex(&self, db: DatabaseIndex, key: Key, value: Vec<u8>, expires_in: Duration) -> Result<bool> {
+        let shard = self.get_shard(db, &key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        // Check and set atomically while holding the write lock
+        if let Some(stored_value) = shard_guard.data.get(&key) {
+            // Key exists, check if expired
+            if !stored_value.is_expired() {
+                return Ok(false); // Key exists and not expired
+            }
+        }
+        
+        // Key doesn't exist or is expired, set it with expiration
+        let memory_size = self.calculate_value_size(&key, &Value::String(value.clone()));
+        if !self.memory_manager.add_memory(memory_size) {
+            return Err(StorageError::OutOfMemory.into());
+        }
+        
+        let stored_value = StoredValue::with_expiration(Value::String(value), expires_in);
+        let expires_at = Instant::now() + expires_in;
+        shard_guard.expiring_keys.insert(key.clone(), expires_at);
+        shard_guard.data.insert(key.clone(), stored_value);
+        shard_guard.mark_modified(&key);
+        
+        Ok(true)
+    }
+    
     /// Set any value - optimized with sharded simple structure, no access time tracking
     pub fn set_value(&self, db: DatabaseIndex, key: Key, value: Value, expires_in: Option<Duration>) -> Result<()> {
         let shard = self.get_shard(db, &key)?;

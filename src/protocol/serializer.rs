@@ -59,6 +59,14 @@ pub fn serialize_resp_frame<W: Write>(frame: &RespFrame, writer: &mut W) -> Resu
             }
         }
         
+        RespFrame::NoResponse => {
+            // NoResponse is an internal marker - should never be serialized
+            // This indicates a programming error
+            return Err(crate::error::FerrousError::Protocol(
+                "Cannot serialize NoResponse frame - this is an internal marker".into()
+            ));
+        }
+        
         RespFrame::Null => {
             writer.write_all(b"_\r\n")?;
         }
