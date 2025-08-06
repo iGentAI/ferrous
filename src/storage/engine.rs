@@ -899,6 +899,22 @@ impl StorageEngine {
         Ok(new_score)
     }
 
+    /// Get the cardinality (number of elements) of a sorted set
+    pub fn zcard(&self, db: DatabaseIndex, key: &[u8]) -> Result<usize> {
+        let shard = self.get_shard(db, key)?;
+        let mut shard_guard = shard.write().unwrap();
+        
+        if let Some(stored_value) = shard_guard.data.get_mut(key) {
+            let cardinality = match &stored_value.value {
+                Value::SortedSet(skiplist) => skiplist.len(),
+                _ => return Err(StorageError::WrongType.into()),
+            };
+            Ok(cardinality)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Push elements to the head of a list - NO access time tracking
     pub fn lpush(&self, db: DatabaseIndex, key: Key, elements: Vec<Vec<u8>>) -> Result<usize> {
         let shard = self.get_shard(db, &key)?;
@@ -907,7 +923,7 @@ impl StorageEngine {
         let list_len = if let Some(stored_value) = shard_guard.data.get_mut(&key) {
             match &mut stored_value.value {
                 Value::List(list) => {
-                    for element in elements.into_iter().rev() {
+                    for element in elements {
                         list.push_front(element);
                     }
                     let len = list.len();
@@ -920,7 +936,7 @@ impl StorageEngine {
         } else {
             // Create new list
             let mut list = VecDeque::new();
-            for element in elements.into_iter().rev() {
+            for element in elements {
                 list.push_front(element);
             }
             let len = list.len();

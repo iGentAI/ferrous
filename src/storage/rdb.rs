@@ -134,15 +134,8 @@ impl RdbEngine {
     
     /// Perform blocking save
     pub fn save(&self, storage: &Arc<StorageEngine>) -> Result<()> {
-        // Check if background save is in progress
-        {
-            let bgsave = self.bgsave_in_progress.lock().unwrap();
-            if *bgsave {
-                return Err(FerrousError::Internal(
-                    "Background save already in progress".into()
-                ));
-            }
-        }
+        // Note: We don't check bgsave_in_progress here because save() can be called
+        // from within bgsave() thread. The caller is responsible for managing concurrency.
         
         // Create temporary file
         let temp_path = self.file_path.with_extension("tmp");
@@ -265,7 +258,7 @@ impl RdbEngine {
                         Value::Set(_) => buffer.push(RdbOpcode::Set as u8),
                         Value::Hash(_) => buffer.push(RdbOpcode::Hash as u8),
                         Value::SortedSet(_) => buffer.push(RdbOpcode::ZSet as u8),
-                        Value::Stream(_) => buffer.push(RdbOpcode::String as u8), // Placeholder for stream
+                        Value::Stream(_) => buffer.push(RdbOpcode::List as u8), // Streams use List opcode with marker
                     }
                     
                     // Write key
@@ -278,10 +271,81 @@ impl RdbEngine {
                             self.write_length(&mut buffer, bytes.len())?;
                             buffer.extend_from_slice(bytes.as_ref());
                         }
-                        _ => {
-                            // Simplified handling - just write a placeholder for now
-                            // For production code, you'd want to properly encode each type
-                            buffer.push(0); // Empty value for now
+                        Value::List(list) => {
+                            self.write_length(&mut buffer, list.len())?;
+                            for item in list {
+                                self.write_length(&mut buffer, item.len())?;
+                                buffer.extend_from_slice(&item);
+                            }
+                        }
+                        Value::Set(set) => {
+                            self.write_length(&mut buffer, set.len())?;
+                            for member in set {
+                                self.write_length(&mut buffer, member.len())?;
+                                buffer.extend_from_slice(&member);
+                            }
+                        }
+                        Value::Hash(hash) => {
+                            self.write_length(&mut buffer, hash.len())?;
+                            for (field, value) in hash {
+                                self.write_length(&mut buffer, field.len())?;
+                                buffer.extend_from_slice(&field);
+                                self.write_length(&mut buffer, value.len())?;
+                                buffer.extend_from_slice(&value);
+                            }
+                        }
+                        Value::SortedSet(skiplist) => {
+                            let items = skiplist.range_by_rank(0, skiplist.len() - 1).items;
+                            self.write_length(&mut buffer, items.len())?;
+                            for (member, score) in items {
+                                self.write_length(&mut buffer, member.len())?;
+                                buffer.extend_from_slice(&member);
+                                buffer.extend_from_slice(&score.to_le_bytes());
+                            }
+                        }
+                        Value::Stream(stream) => {
+                            // Get all stream entries for replication
+                            let range_result = stream.range(
+                                &crate::storage::stream::StreamId::min(),
+                                &crate::storage::stream::StreamId::max(),
+                                None,
+                                false
+                            );
+                            
+                            let entries = &range_result.entries;
+                            // Calculate correct total items: 1 marker + sum(2 + 2*field_count) for each entry
+                            let mut total_items = 1; // Stream marker
+                            for entry in entries {
+                                total_items += 2; // ID string + field count string
+                                total_items += entry.fields.len() * 2; // field-value pairs
+                            }
+                            self.write_length(&mut buffer, total_items)?;
+                            
+                            // Write stream marker
+                            let marker = b"__FERROUS_STREAM_MARKER__";
+                            self.write_length(&mut buffer, marker.len())?;
+                            buffer.extend_from_slice(marker);
+                            
+                            // Write each entry
+                            for entry in entries {
+                                // Write entry ID
+                                let id_str = entry.id.to_string();
+                                self.write_length(&mut buffer, id_str.len())?;
+                                buffer.extend_from_slice(id_str.as_bytes());
+                                
+                                // Write field count
+                                let field_count_str = entry.fields.len().to_string();
+                                self.write_length(&mut buffer, field_count_str.len())?;
+                                buffer.extend_from_slice(field_count_str.as_bytes());
+                                
+                                // Write field-value pairs
+                                for (field, value) in &entry.fields {
+                                    self.write_length(&mut buffer, field.len())?;
+                                    buffer.extend_from_slice(field);
+                                    self.write_length(&mut buffer, value.len())?;
+                                    buffer.extend_from_slice(value);
+                                }
+                            }
                         }
                     }
                 }
@@ -515,25 +579,83 @@ impl<W: Write> RdbWriter<W> {
                 }
             }
             Value::Stream(stream) => {
-                // Use String opcode for now with stream identifier prefix
-                self.write_byte(RdbOpcode::String as u8)?;
+                // Serialize streams properly by saving all entries
+                self.write_byte(RdbOpcode::List as u8)?;
                 self.write_string(key)?;
                 
-                // Serialize stream metadata and entries
-                let stream_data = format!("FERROUS_STREAM:{}:END", stream.len());
-                self.write_string(stream_data.as_bytes())?;
+                // Use XRANGE to get all stream entries
+                let range_result = stream.range(
+                    &crate::storage::stream::StreamId::min(),
+                    &crate::storage::stream::StreamId::max(),
+                    None,
+                    false
+                );
+                
+                let entries = &range_result.entries;
+                // Calculate total number of items to write
+                let mut total_items = 1; // +1 for the stream marker
+                for entry in entries {
+                    total_items += 2; // ID string + field count string
+                    total_items += entry.fields.len() * 2; // field-value pairs
+                }
+                self.write_length(total_items)?;
+                
+                // Write stream marker to identify this as a stream during load
+                self.write_string(b"__FERROUS_STREAM_MARKER__")?;
+                
+                // Write each stream entry as: ID string, field count, field-value pairs
+                for entry in entries {
+                    // Write entry ID as string
+                    let id_str = entry.id.to_string();
+                    self.write_string(id_str.as_bytes())?;
+                    
+                    // Write number of fields
+                    let field_count_str = entry.fields.len().to_string();
+                    self.write_string(field_count_str.as_bytes())?;
+                    
+                    // Write each field-value pair as separate strings
+                    for (field, value) in &entry.fields {
+                        self.write_string(field)?;
+                        self.write_string(value)?;
+                    }
+                }
             }
-            Value::List(_) => {
-                // TODO: Implement list serialization
-                return Ok(());
+            Value::List(list) => {
+                self.write_byte(RdbOpcode::List as u8)?;
+                self.write_string(key)?;
+                
+                // Write list length
+                self.write_length(list.len())?;
+                
+                // Write each list element
+                for item in list {
+                    self.write_string(item)?;
+                }
             }
-            Value::Set(_) => {
-                // TODO: Implement set serialization
-                return Ok(());
+            Value::Set(set) => {
+                self.write_byte(RdbOpcode::Set as u8)?;
+                self.write_string(key)?;
+                
+                // Write set size
+                self.write_length(set.len())?;
+                
+                // Write each set member
+                for member in set {
+                    self.write_string(member)?;
+                }
             }
-            Value::Hash(_) => {
-                // TODO: Implement hash serialization
-                return Ok(());
+            Value::Hash(hash) => {
+                self.write_byte(RdbOpcode::Hash as u8)?;
+                self.write_string(key)?;
+                
+                // Write hash size
+                self.write_length(hash.len())?;
+                
+                // Write each field-value pair
+                for (field, value) in hash {
+                    self.write_string(field)?;
+                    self.write_string(value)?;
+                }
             }
         }
         
@@ -724,31 +846,10 @@ impl<R: Read> RdbReader<R> {
                 let key = self.read_string()?;
                 let value = self.read_string()?;
                 
-                // Check if this is a stream serialization
-                if let Ok(value_str) = String::from_utf8(value.clone()) {
-                    if value_str.starts_with("FERROUS_STREAM:") && value_str.ends_with(":END") {
-                        // This is a stream placeholder - create empty stream
-                        let mut initial_fields = HashMap::new();
-                        initial_fields.insert(b"_init".to_vec(), b"1".to_vec());
-                        let _id = storage.xadd(db, key.clone(), initial_fields);
-                        
-                        // Remove the initialization entry
-                        let _ = storage.xtrim(db, &key, 0);
-                    } else {
-                        // Regular string value
-                        if let Some(ttl) = ttl {
-                            storage.set_string_ex(db, key, value, ttl)?;
-                        } else {
-                            storage.set_string(db, key, value)?;
-                        }
-                    }
+                if let Some(ttl) = ttl {
+                    storage.set_string_ex(db, key, value, ttl)?;
                 } else {
-                    // Binary string value
-                    if let Some(ttl) = ttl {
-                        storage.set_string_ex(db, key, value, ttl)?;
-                    } else {
-                        storage.set_string(db, key, value)?;
-                    }
+                    storage.set_string(db, key, value)?;
                 }
             }
             op if op == RdbOpcode::ZSet as u8 || op == RdbOpcode::ZSet2 as u8 => {
@@ -760,6 +861,112 @@ impl<R: Read> RdbReader<R> {
                     let score = self.read_f64()?;
                     storage.zadd(db, key.clone(), member, score)?;
                 }
+                
+                if let Some(ttl) = ttl {
+                    storage.expire(db, &key, ttl)?;
+                }
+            }
+            op if op == RdbOpcode::List as u8 => {
+                let key = self.read_string()?;
+                let count = self.read_length()?;
+                
+                // Check if this is a stream marker
+                if count >= 1 {
+                    let first_element = self.read_string()?;
+                    if first_element == b"__FERROUS_STREAM_MARKER__" {
+                        // This is a stream - reconstruct it
+                        let remaining_count = count - 1;
+                        let mut entry_idx = 0;
+                        
+                        while entry_idx < remaining_count {
+                            if entry_idx + 2 >= remaining_count {
+                                break; // Not enough data for a complete entry
+                            }
+                            
+                            // Read entry ID
+                            let id_str = self.read_string()?;
+                            entry_idx += 1;
+                            
+                            // Read field count
+                            let field_count_str = self.read_string()?;
+                            entry_idx += 1;
+                            
+                            let field_count: usize = match std::str::from_utf8(&field_count_str) {
+                                Ok(s) => s.parse().unwrap_or(0),
+                                Err(_) => 0,
+                            };
+                            
+                            // Check if we have enough remaining data for all fields
+                            if entry_idx + (field_count * 2) > remaining_count {
+                                break; // Not enough data for all field-value pairs
+                            }
+                            
+                            // Read field-value pairs
+                            let mut fields = HashMap::new();
+                            for _ in 0..field_count {
+                                let field = self.read_string()?;
+                                let value = self.read_string()?;
+                                fields.insert(field, value);
+                                entry_idx += 2;
+                            }
+                            
+                            // Parse stream ID and add entry to stream
+                            if let Some(stream_id) = crate::storage::stream::StreamId::from_string(
+                                std::str::from_utf8(&id_str).unwrap_or("")
+                            ) {
+                                let _ = storage.xadd_with_id(db, key.clone(), stream_id, fields);
+                            }
+                        }
+                        
+                        if let Some(ttl) = ttl {
+                            storage.expire(db, &key, ttl)?;
+                        }
+                        return Ok(());
+                    } else {
+                        // Regular list - first element already read
+                        storage.rpush(db, key.clone(), vec![first_element])?;
+                        
+                        // Read remaining list elements
+                        for _ in 1..count {
+                            let element = self.read_string()?;
+                            storage.rpush(db, key.clone(), vec![element])?;
+                        }
+                    }
+                } else {
+                    // Empty list - do nothing
+                }
+                
+                if let Some(ttl) = ttl {
+                    storage.expire(db, &key, ttl)?;
+                }
+            }
+            op if op == RdbOpcode::Set as u8 => {
+                let key = self.read_string()?;
+                let count = self.read_length()?;
+                
+                // Read all set members
+                let mut members = Vec::new();
+                for _ in 0..count {
+                    members.push(self.read_string()?);
+                }
+                storage.sadd(db, key.clone(), members)?;
+                
+                if let Some(ttl) = ttl {
+                    storage.expire(db, &key, ttl)?;
+                }
+            }
+            op if op == RdbOpcode::Hash as u8 => {
+                let key = self.read_string()?;
+                let count = self.read_length()?;
+                
+                // Read all hash field-value pairs
+                let mut field_values = Vec::new();
+                for _ in 0..count {
+                    let field = self.read_string()?;
+                    let value = self.read_string()?;
+                    field_values.push((field, value));
+                }
+                storage.hset(db, key.clone(), field_values)?;
                 
                 if let Some(ttl) = ttl {
                     storage.expire(db, &key, ttl)?;
