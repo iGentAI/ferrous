@@ -1240,6 +1240,8 @@ impl Server {
             "ZREVRANGEBYSCORE" => self.handle_zrevrangebyscore(parts, db),
             "ZCOUNT" => self.handle_zcount(parts, db),
             "ZINCRBY" => self.handle_zincrby(parts, db),
+            "ZPOPMIN" => self.handle_zpopmin(parts, db),
+            "ZPOPMAX" => self.handle_zpopmax(parts, db),
             
             // Stream commands
             "XADD" => crate::storage::commands::streams::handle_xadd(&self.storage, db, parts),
@@ -1438,7 +1440,7 @@ impl Server {
                 "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET" | "LREM" | "LTRIM" |
                 "SADD" | "SREM" | "SPOP" | 
                 "HSET" | "HDEL" | "HINCRBY" |
-                "ZADD" | "ZREM" | "ZINCRBY" |
+                "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" |
                 "XADD" | "XTRIM" | "XDEL" |  // Stream write commands
                 "XGROUP" | "XACK" | "XCLAIM" |  // Consumer group write commands
                 "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "RENAMENX" | "PERSIST" | "EVAL" | "EVALSHA"
@@ -2201,6 +2203,102 @@ impl Server {
         
         // Return new score as bulk string (Redis protocol format)
         Ok(RespFrame::from_string(new_score.to_string()))
+    }
+    
+    /// Handle ZPOPMIN command
+    fn handle_zpopmin(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() < 2 || parts.len() > 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'zpopmin' command"));
+        }
+        
+        // Extract key
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        // Extract optional count
+        let count = if parts.len() == 3 {
+            match &parts[2] {
+                RespFrame::BulkString(Some(bytes)) => {
+                    match String::from_utf8_lossy(bytes).parse::<usize>() {
+                        Ok(n) => n,
+                        Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                    }
+                }
+                _ => return Ok(RespFrame::error("ERR invalid count format")),
+            }
+        } else {
+            1
+        };
+        
+        // Pop members with atomic operations
+        let mut results = Vec::new();
+        for _ in 0..count {
+            let members = self.storage.zrange(db, key, 0, 0, false)?;
+            if let Some((member, score)) = members.into_iter().next() {
+                if self.storage.zrem(db, key, &member)? {
+                    results.push(RespFrame::from_bytes(member));
+                    results.push(RespFrame::from_string(score.to_string()));
+                }
+            } else {
+                break;
+            }
+        }
+        
+        if results.is_empty() {
+            Ok(RespFrame::null_array())
+        } else {
+            Ok(RespFrame::Array(Some(results)))
+        }
+    }
+    
+    /// Handle ZPOPMAX command  
+    fn handle_zpopmax(&self, parts: &[RespFrame], db: usize) -> Result<RespFrame> {
+        if parts.len() < 2 || parts.len() > 3 {
+            return Ok(RespFrame::error("ERR wrong number of arguments for 'zpopmax' command"));
+        }
+        
+        // Extract key
+        let key = match &parts[1] {
+            RespFrame::BulkString(Some(bytes)) => bytes.as_ref(),
+            _ => return Ok(RespFrame::error("ERR invalid key format")),
+        };
+        
+        // Extract optional count
+        let count = if parts.len() == 3 {
+            match &parts[2] {
+                RespFrame::BulkString(Some(bytes)) => {
+                    match String::from_utf8_lossy(bytes).parse::<usize>() {
+                        Ok(n) => n,
+                        Err(_) => return Ok(RespFrame::error("ERR value is not an integer or out of range")),
+                    }
+                }
+                _ => return Ok(RespFrame::error("ERR invalid count format")),
+            }
+        } else {
+            1
+        };
+        
+        // Pop members with atomic operations
+        let mut results = Vec::new();
+        for _ in 0..count {
+            let members = self.storage.zrange(db, key, -1, -1, false)?;
+            if let Some((member, score)) = members.into_iter().next() {
+                if self.storage.zrem(db, key, &member)? {
+                    results.push(RespFrame::from_bytes(member));
+                    results.push(RespFrame::from_string(score.to_string()));
+                }
+            } else {
+                break;
+            }
+        }
+        
+        if results.is_empty() {
+            Ok(RespFrame::null_array())
+        } else {
+            Ok(RespFrame::Array(Some(results)))
+        }
     }
     
     /// Handle PING command

@@ -241,19 +241,20 @@ class AtomicOperationsTester:
             
             # Execute transaction (should fail due to WATCH violation)
             start_time = time.time()
-            result = pipe.execute()
-            elapsed = time.time() - start_time
             
-            if elapsed > 0.5:
-                print(f"❌ WATCH transaction took too long ({elapsed:.2f}s)")
-                return False
-                
-            if result is not None:  # Should return None due to violation
+            try:
+                result = pipe.execute()
+                # If we get here without exception, WATCH violation wasn't detected
                 print(f"❌ WATCH violation not detected: {result}")
                 return False
-            
-            print("✅ WATCH mechanism working correctly")
-            return True
+            except redis.exceptions.WatchError:
+                # This is the CORRECT behavior for WATCH violations
+                elapsed = time.time() - start_time
+                if elapsed > 0.5:
+                    print(f"❌ WATCH transaction took too long ({elapsed:.2f}s)")
+                    return False
+                print("✅ WATCH mechanism working correctly")
+                return True
             
         except Exception as e:
             print(f"❌ WATCH test failed: {e}")

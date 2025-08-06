@@ -373,7 +373,7 @@ pub fn handle_xpending(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFra
 }
 
 /// Handle XCLAIM command - Claim ownership of pending messages
-pub fn handle_xclaim(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]) -> Result<RespFrame> {
+pub fn handle_xclaim(_storage: &Arc<StorageEngine>, _db: usize, parts: &[RespFrame]) -> Result<RespFrame> {
     if parts.len() < 6 {
         return Ok(RespFrame::error("ERR wrong number of arguments for 'xclaim' command"));
     }

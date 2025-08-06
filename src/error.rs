@@ -47,7 +47,7 @@ pub enum CommandError {
     /// Wrong number of arguments for command
     WrongNumberOfArgs(String),
     
-    /// Syntax error in command
+    /// Syntax error in command (with message)
     SyntaxError(String),
     
     /// Operation against wrong type
@@ -94,6 +94,30 @@ pub enum CommandError {
     
     /// Generic command error with message
     Generic(String),
+    
+    /// Empty command received (for unified architecture)
+    EmptyCommand,
+    
+    /// Wrong number of arguments with command name (for unified architecture)
+    WrongNumberOfArguments(String),
+    
+    /// Invalid command format (for unified architecture)
+    InvalidCommandFormat,
+    
+    /// Invalid argument type (for unified architecture)
+    InvalidArgumentType,
+    
+    /// Invalid UTF-8 in argument (for unified architecture)
+    InvalidUtf8,
+    
+    /// Invalid integer value (for unified architecture)
+    InvalidIntegerValue,
+    
+    /// Invalid floating point value (for ZSET commands)
+    InvalidFloatValue,
+    
+    /// Command not implemented (for unified architecture)
+    NotImplemented,
 }
 
 /// Storage-related errors
@@ -203,6 +227,30 @@ impl fmt::Display for CommandError {
             }
             CommandError::Generic(msg) => {
                 write!(f, "ERR {}", msg)
+            }
+            CommandError::EmptyCommand => {
+                write!(f, "ERR empty command")
+            }
+            CommandError::WrongNumberOfArguments(cmd) => {
+                write!(f, "ERR wrong number of arguments for '{}' command", cmd)
+            }
+            CommandError::InvalidCommandFormat => {
+                write!(f, "ERR invalid command format")
+            }
+            CommandError::InvalidArgumentType => {
+                write!(f, "ERR invalid argument type")
+            }
+            CommandError::InvalidUtf8 => {
+                write!(f, "ERR invalid UTF-8 in argument")
+            }
+            CommandError::InvalidIntegerValue => {
+                write!(f, "ERR invalid integer value")
+            }
+            CommandError::InvalidFloatValue => {
+                write!(f, "ERR invalid floating point value")
+            }
+            CommandError::NotImplemented => {
+                write!(f, "ERR command not implemented")
             }
         }
     }

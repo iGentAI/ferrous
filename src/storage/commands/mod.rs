@@ -19,6 +19,7 @@ pub mod memory;
 pub mod lua;          // MLua-based Lua 5.1 scripting
 pub mod streams;
 pub mod consumer_groups;
+pub mod executor;
 
 // Re-export all handlers for easy access
 pub use lists::*;
@@ -38,3 +39,11 @@ pub use memory::*;
 pub use lua::*;       // Export new MLua-based Lua commands
 pub use streams::*;      // Export stream commands
 pub use consumer_groups::*; // Export consumer group commands
+
+// Export unified command processing
+pub use executor::{
+    UnifiedCommandExecutor,
+    ServerCommandAdapter,
+    LuaCommandAdapter,
+    CommandParser,
+};

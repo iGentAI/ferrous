@@ -37,13 +37,15 @@ pub struct Database {
     shards: Vec<Arc<RwLock<DatabaseShard>>>,
 }
 
-/// Watch tracking for a database shard with conditional overhead
+/// Watch tracking for a database shard with key-level modification tracking
 #[derive(Debug)]
 pub struct ShardWatchTracker {
     /// Number of keys currently being watched in this shard
     active_watchers: std::sync::atomic::AtomicUsize,
-    /// Modification epoch counter
-    epoch: std::sync::atomic::AtomicU64,
+    /// Per-key modification counters for precise tracking
+    key_counters: std::sync::RwLock<HashMap<Vec<u8>, u64>>,
+    /// Global counter for generating unique modification values
+    global_counter: std::sync::atomic::AtomicU64,
 }
 
 impl ShardWatchTracker {
@@ -51,14 +53,18 @@ impl ShardWatchTracker {
     fn new() -> Self {
         Self {
             active_watchers: std::sync::atomic::AtomicUsize::new(0),
-            epoch: std::sync::atomic::AtomicU64::new(0),
+            key_counters: std::sync::RwLock::new(HashMap::new()),
+            global_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
     
-    /// Register a WATCH on this shard and return current epoch
-    fn register_watch(&self) -> u64 {
+    /// Register a WATCH on a specific key and return current modification counter
+    fn register_watch(&self, key: &[u8]) -> u64 {
         self.active_watchers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+        
+        // Get or initialize counter for this specific key
+        let counters = self.key_counters.read().unwrap();
+        counters.get(key).cloned().unwrap_or(0)
     }
     
     /// Unregister a WATCH on this shard
@@ -66,19 +72,23 @@ impl ShardWatchTracker {
         self.active_watchers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
     
-    /// Mark shard as modified (zero overhead when no active watchers)
-    fn mark_modified(&self) {
+    /// Mark specific key as modified
+    fn mark_key_modified(&self, key: &[u8]) {
         // Fast path: zero overhead when no WATCH is active (99.9% of cases)
         if self.active_watchers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return;
         }
-        // Only pay atomic cost when WATCH is actually being used
-        self.epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
+        // Update counter for this specific key only
+        let new_counter = self.global_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut counters = self.key_counters.write().unwrap();
+        counters.insert(key.to_vec(), new_counter);
     }
     
-    /// Get current epoch for violation detection
-    fn get_epoch(&self) -> u64 {
-        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    /// Get current modification counter for specific key
+    fn get_key_counter(&self, key: &[u8]) -> u64 {
+        let counters = self.key_counters.read().unwrap();
+        counters.get(key).cloned().unwrap_or(0)
     }
     
     /// Check if any keys are being watched
@@ -2080,18 +2090,16 @@ impl StorageEngine {
         Ok(baseline_counter)
     }
     
-    /// Check if a key was modified since a specific baseline counter (for WATCH command)
+    /// Check if a specific key was modified since baseline counter
     pub fn was_modified_since(&self, db: DatabaseIndex, key: &[u8], baseline_counter: u64) -> Result<bool> {
         let shard = self.get_shard(db, key)?;
         let shard_guard = shard.read().unwrap();
         
-        // Get current shard modification counter using atomic operations
-        let current_counter = shard_guard.get_modification_counter();
+        // Get current counter for this specific key
+        let current_counter = shard_guard.watch_tracker.get_key_counter(key);
         
-        let violation_detected = current_counter > baseline_counter;
-        
-        // Any counter change indicates a violation - this is sufficient for Redis WATCH semantics
-        Ok(violation_detected)
+        // Key was modified if its specific counter changed
+        Ok(current_counter > baseline_counter)
     }
 
     /// Check if a key was modified (for WATCH command) - kept for backward compatibility
@@ -2100,13 +2108,13 @@ impl StorageEngine {
         Ok(false)
     }
 
-    /// Register a WATCH on a key and return the baseline modification counter
+    /// Register a WATCH on a specific key and return baseline counter
     pub fn register_watch(&self, db: DatabaseIndex, key: &[u8]) -> Result<u64> {
         let shard = self.get_shard(db, key)?;
         let shard_guard = shard.read().unwrap();
         
-        // Register the watch and get baseline counter
-        let baseline_counter = shard_guard.watch_tracker.register_watch();
+        // Register watch and get baseline counter for this specific key
+        let baseline_counter = shard_guard.watch_tracker.register_watch(key);
         
         Ok(baseline_counter)
     }
@@ -2474,14 +2482,15 @@ impl DatabaseShard {
         }
     }
     
-    /// Mark this shard as modified (conditional zero overhead)
-    fn mark_modified(&self, _key: &[u8]) {
-        self.watch_tracker.mark_modified();
+    /// Mark specific key as modified
+    fn mark_modified(&self, key: &[u8]) {
+        self.watch_tracker.mark_key_modified(key);
     }
     
     /// Get current modification counter for shard
     fn get_modification_counter(&self) -> u64 {
-        self.watch_tracker.get_epoch()
+        // Use simplified shard-level counter for basic compatibility
+        self.watch_tracker.global_counter.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
