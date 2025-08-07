@@ -161,7 +161,7 @@ impl Connection {
         Ok(())
     }
     
-    /// Flush the write buffer
+    /// Flush the write buffer with improved error handling for pipelining
     pub fn flush(&mut self) -> Result<()> {
         if self.write_offset >= self.write_buffer.len() {
             // Nothing to write
@@ -171,7 +171,7 @@ impl Connection {
         }
         
         let mut attempts = 0;
-        const MAX_ATTEMPTS: usize = 3;
+        const MAX_ATTEMPTS: usize = 5; // Increased attempts for pipelining scenarios
         
         while self.write_offset < self.write_buffer.len() && attempts < MAX_ATTEMPTS {
             match self.stream.write(&self.write_buffer[self.write_offset..]) {
@@ -185,17 +185,42 @@ impl Connection {
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     // Can't write more right now, maintain offset
+                    // Improved backoff for pipelining scenarios
                     attempts += 1;
-                    // A short yield to give the socket a chance to become writable
-                    std::thread::yield_now();
-                    continue;
+                    if attempts < MAX_ATTEMPTS {
+                        // Progressive backoff for better pipelining handling
+                        let wait_time = std::time::Duration::from_millis(attempts as u64 * 10);
+                        std::thread::sleep(wait_time);
+                        continue;
+                    } else {
+                        // After max attempts, return error but don't close connection
+                        // This allows retry on next processing cycle
+                        return Err(FerrousError::Connection("Write would block after max attempts".into()));
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {
-                    // Retry
+                    // Retry interrupted operations
                     attempts += 1;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    // For pipelining, distinguish between recoverable and fatal errors
+                    match e.kind() {
+                        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => {
+                            return Err(e.into());
+                        },
+                        _ => {
+                            // Other errors might be recoverable in pipelining scenarios
+                            attempts += 1;
+                            if attempts < MAX_ATTEMPTS {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                                continue;
+                            } else {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
             }
         }
         

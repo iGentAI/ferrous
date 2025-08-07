@@ -287,6 +287,8 @@ impl StorageEngine {
             Some(stored_value) => {
                 // Check if expired
                 if stored_value.is_expired() {
+                    shard_guard.mark_modified(key);
+                    
                     // Remove expired key
                     shard_guard.data.remove(key);
                     shard_guard.expiring_keys.remove(key);
@@ -381,7 +383,7 @@ impl StorageEngine {
         self.incr_by(db, key, 1)
     }
     
-    /// Increment integer value by amount - optimized without access time tracking
+    /// Increment integer value by amount - with overflow protection for Redis compliance
     pub fn incr_by(&self, db: DatabaseIndex, key: Key, increment: i64) -> Result<i64> {
         let shard = self.get_shard(db, &key)?;
         let mut shard_guard = shard.write().unwrap();
@@ -390,11 +392,21 @@ impl StorageEngine {
             // Try to parse existing value as integer
             match stored_value.value.as_integer() {
                 Some(current) => {
-                    let new_val = current + increment;
-                    stored_value.value = Value::integer(new_val);
-                    // NO touch() call - matches Valkey's noeviction config
-                    shard_guard.mark_modified(&key);
-                    new_val
+                    // Check for overflow before performing the operation (Redis compliance)
+                    match current.checked_add(increment) {
+                        Some(new_val) => {
+                            stored_value.value = Value::integer(new_val);
+                            // NO touch() call - matches Valkey's noeviction config
+                            shard_guard.mark_modified(&key);
+                            new_val
+                        }
+                        None => {
+                            // Overflow detected - return Redis-compliant error
+                            return Err(FerrousError::Command(CommandError::Generic(
+                                "increment or decrement would overflow".to_string()
+                            )));
+                        }
+                    }
                 }
                 None => return Err(FerrousError::Command(CommandError::NotInteger)),
             }
@@ -2091,15 +2103,27 @@ impl StorageEngine {
     }
     
     /// Check if a specific key was modified since baseline counter
+    /// Redis 6.0.9+ compliance: key expiration counts as modification
     pub fn was_modified_since(&self, db: DatabaseIndex, key: &[u8], baseline_counter: u64) -> Result<bool> {
         let shard = self.get_shard(db, key)?;
         let shard_guard = shard.read().unwrap();
         
-        // Get current counter for this specific key
+        // First check explicit modification via counter
         let current_counter = shard_guard.watch_tracker.get_key_counter(key);
+        if current_counter > baseline_counter {
+            return Ok(true);
+        }
         
-        // Key was modified if its specific counter changed
-        Ok(current_counter > baseline_counter)
+        // Redis 6.0.9+ compliance: Check if key expired since WATCH was registered
+        // This ensures that key expiration triggers WATCH violations as per Redis spec
+        if let Some(stored_value) = shard_guard.data.get(key) {
+            if stored_value.is_expired() {
+                // Key exists but is expired - this counts as modification in Redis 6.0.9+
+                return Ok(true);
+            }
+        }
+        
+        Ok(false)
     }
 
     /// Check if a key was modified (for WATCH command) - kept for backward compatibility
@@ -2447,6 +2471,8 @@ impl StorageEngine {
                         for key in expired_keys {
                             if let Some(stored_value) = shard_guard.data.remove(&key) {
                                 shard_guard.expiring_keys.remove(&key);
+                                
+                                shard_guard.mark_modified(&key);
                                 
                                 // Update memory usage
                                 let memory_size = engine.calculate_value_size(&key, &stored_value.value);

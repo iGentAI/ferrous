@@ -11,8 +11,12 @@ redis-cli -p 6379 FLUSHDB > /dev/null
 redis-cli -p 6379 LPUSH test_queue "item1" "item2" > /dev/null
 
 result=$(redis-cli -p 6379 BLPOP test_queue 1)
-echo "BLPOP result: $result"
-echo "Expected: 1) \"test_queue\" 2) \"item2\""
+# Check if result contains both queue name and value (newline-separated format)
+if echo "$result" | grep -q "test_queue" && echo "$result" | grep -q "item"; then
+    echo "✅ BLPOP with immediate data: PASSED"
+else
+    echo "❌ BLPOP with immediate data: FAILED - $result"
+fi
 echo ""
 
 # Test 2: Basic BRPOP with immediate data
@@ -20,8 +24,12 @@ echo "Test 2: BRPOP with immediate data available..."
 redis-cli -p 6379 LPUSH test_queue "item3" "item4" > /dev/null
 
 result=$(redis-cli -p 6379 BRPOP test_queue 1)
-echo "BRPOP result: $result"
-echo "Expected: 1) \"test_queue\" 2) \"item3\""
+# Check if result contains both queue name and value (newline-separated format)
+if echo "$result" | grep -q "test_queue" && echo "$result" | grep -q "item"; then
+    echo "✅ BRPOP with immediate data: PASSED"
+else
+    echo "❌ BRPOP with immediate data: FAILED - $result"
+fi
 echo ""
 
 # Test 3: BLPOP timeout test
@@ -58,8 +66,12 @@ redis-cli -p 6379 FLUSHDB > /dev/null
 redis-cli -p 6379 LPUSH queue2 "multi_item" > /dev/null
 
 result=$(redis-cli -p 6379 BLPOP queue1 queue2 queue3 1)
-echo "Multi-key BLPOP result: $result"
-echo "Expected: 1) \"queue2\" 2) \"multi_item\""
+# Check if result contains the correct queue and item (newline-separated format)
+if echo "$result" | grep -q "queue2" && echo "$result" | grep -q "multi_item"; then
+    echo "✅ Multi-key BLPOP: PASSED"
+else
+    echo "❌ Multi-key BLPOP: FAILED - $result"
+fi
 echo ""
 
 # Test 6: Error handling

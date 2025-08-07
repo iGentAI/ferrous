@@ -204,23 +204,24 @@ impl BlockingManager {
             return;
         }
         
-        loop {
-            let client = {
-                let mut registry = self.registries[db].write().unwrap();
-                match registry.pop_first_waiter(key) {
-                    Some(c) => c,
-                    None => break, // No more clients waiting
-                }
-            };
-            
-            // In Redis, any push that makes the list non-empty should wake blocked clients
-            self.wake_queue.push(WakeupRequest {
-                conn_id: client.conn_id,
-                db,
-                key: key.to_vec(),
-                op_type: client.op_type,
-            });
-        }
+        // Only wake up one client at a time per key to prevent deadlock
+        // When an item is pushed, only the first waiting client should be notified
+        let client = {
+            let mut registry = self.registries[db].write().unwrap();
+            match registry.pop_first_waiter(key) {
+                Some(c) => c,
+                None => return, // No clients waiting on this key
+            }
+        };
+        
+        // Send single wake-up request
+        // Additional items pushed will wake additional clients one by one
+        self.wake_queue.push(WakeupRequest {
+            conn_id: client.conn_id,
+            db,
+            key: key.to_vec(),
+            op_type: client.op_type,
+        });
     }
     
     /// Process wake-up queue (called from main server loop)
