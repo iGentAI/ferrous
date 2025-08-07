@@ -4,8 +4,7 @@
 //! commands through the unified command executor, ensuring atomic operations
 //! and complete Redis compatibility.
 
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use mlua::{Lua, Result as LuaResult, MultiValue, Value as LuaValue};
 use sha1::{Sha1, Digest};
@@ -23,13 +22,13 @@ pub struct LuaCommandContext {
 
 /// Single-threaded Lua execution engine with unified command processing
 pub struct LuaEngine {
-    script_cache: Arc<Mutex<HashMap<String, String>>>,
+    // Removed local script_cache - using global cache at server level
 }
 
 impl LuaEngine {
     pub fn new(_storage: Arc<StorageEngine>) -> Result<Self> {
         Ok(LuaEngine {
-            script_cache: Arc::new(Mutex::new(HashMap::new())),
+            // No local cache needed
         })
     }
     
@@ -72,21 +71,6 @@ impl LuaEngine {
         }
     }
     
-    pub fn evalsha(&self, sha1: &str, keys: Vec<Vec<u8>>, args: Vec<Vec<u8>>, ctx: &LuaCommandContext) -> Result<RespFrame> {
-        let script = match self.script_cache.try_lock() {
-            Ok(cache) => {
-                cache.get(sha1).cloned().ok_or_else(|| {
-                    FerrousError::LuaError("NOSCRIPT No matching script. Please use EVAL.".to_string())
-                })?
-            }
-            Err(_) => {
-                return Err(FerrousError::LuaError("Script cache temporarily unavailable".to_string()));
-            }
-        };
-        
-        self.eval(&script, keys, args, ctx)
-    }
-    
     pub fn script_load(&self, script: &str) -> Result<String> {
         let lua = Lua::new();
         lua.load(script).exec().map_err(|e| {
@@ -95,34 +79,7 @@ impl LuaEngine {
         
         let sha1 = self.calculate_script_sha1(script);
         
-        if let Ok(mut cache) = self.script_cache.try_lock() {
-            cache.insert(sha1.clone(), script.to_string());
-        }
-        
         Ok(sha1)
-    }
-    
-    pub fn script_exists(&self, sha1s: &[String]) -> Result<Vec<bool>> {
-        match self.script_cache.try_lock() {
-            Ok(cache) => {
-                Ok(sha1s.iter().map(|sha1| cache.contains_key(sha1)).collect())
-            }
-            Err(_) => {
-                Ok(vec![false; sha1s.len()])
-            }
-        }
-    }
-    
-    pub fn script_flush(&self) -> Result<()> {
-        match self.script_cache.try_lock() {
-            Ok(mut cache) => {
-                cache.clear();
-                Ok(())
-            }
-            Err(_) => {
-                Err(FerrousError::LuaError("Script cache temporarily unavailable".to_string()))
-            }
-        }
     }
     
     /// Create Lua context with unified redis.call implementation

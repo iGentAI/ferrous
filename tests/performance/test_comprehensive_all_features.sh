@@ -34,8 +34,9 @@ run_timed_test() {
     done
     end_time=$(date +%s.%N)
     
-    duration=$(echo "$end_time - $start_time" | bc)
-    ops_per_sec=$(echo "scale=2; $iterations / $duration" | bc)
+    # Use Python instead of bc for calculations
+    duration=$(python3 -c "print(f'{$end_time - $start_time:.3f}')")
+    ops_per_sec=$(python3 -c "print(f'{$iterations / ($end_time - $start_time):.2f}')")
     echo "$name: ${ops_per_sec} ops/sec ($iterations operations in ${duration}s)"
 }
 
@@ -273,9 +274,10 @@ for i in {1..1000}; do
 done
 end_time=$(date +%s.%N)
 
-duration=$(echo "$end_time - $start_time" | bc)
+# Use Python instead of bc for calculations
+duration=$(python3 -c "print(f'{$end_time - $start_time:.3f}')")
 total_ops=5000  # 1000 iterations * 5 operations each
-mixed_ops_per_sec=$(echo "scale=2; $total_ops / $duration" | bc)
+mixed_ops_per_sec=$(python3 -c "print(f'{$total_ops / ($end_time - $start_time):.2f}')")
 
 echo "Mixed realistic workload: ${mixed_ops_per_sec} ops/sec (${total_ops} operations)"
 

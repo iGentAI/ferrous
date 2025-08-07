@@ -39,7 +39,8 @@ check_result "GET" "value" "$result"
 
 # Test QUIT
 echo "Testing QUIT..."
-result=$(echo "QUIT" | redis-cli -p 6379 | head -n1)
+# Use a different approach since QUIT terminates the connection
+result=$(redis-cli -p 6379 --raw QUIT)
 check_result "QUIT" "OK" "$result"
 
 echo ""

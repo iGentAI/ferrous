@@ -179,59 +179,16 @@ pub fn handle_evalsha_with_db(storage: &Arc<StorageEngine>, parts: &[RespFrame],
         Err(e) => return Ok(RespFrame::error(format!("ERR {}", e))),
     };
     
-    // Create command context
-    let ctx = LuaCommandContext {
-        db_index,
-        storage: storage.clone(),
-    };
-    
-    let lua_engine = match get_lua_engine(storage.clone()) {
-        Ok(engine) => engine,
-        Err(e) => return Ok(RespFrame::error(format!("ERR {}", e))),
-    };
-    
-    match lua_engine.evalsha(sha1, keys, args, &ctx) {
-        Ok(response) => Ok(response),
-        Err(e) => {
-            let error_msg = match e {
-                FerrousError::LuaError(ref msg) => {
-                    // Check if this contains REDIS_CALL_ABORT (should be handled by lua_engine.rs)
-                    if msg.contains("REDIS_CALL_ABORT:") {
-                        // Extract the clean error from the wrapped message
-                        if let Some(pos) = msg.find("REDIS_CALL_ABORT:") {
-                            let error_content = &msg[pos + "REDIS_CALL_ABORT:".len()..];
-                            let end_pos = error_content.find('\n').unwrap_or(error_content.len());
-                            let clean_error = error_content[..end_pos].trim();
-                            
-                            if clean_error.starts_with("ERR ") {
-                                clean_error.to_string()
-                            } else {
-                                format!("ERR {}", clean_error)
-                            }
-                        } else {
-                            if msg.starts_with("ERR ") { msg.clone() } else { format!("ERR {}", msg) }
-                        }
-                    } else {
-                        if msg.starts_with("ERR ") {
-                            msg.clone()
-                        } else {
-                            format!("ERR {}", msg)
-                        }
-                    }
-                }
-                _ => {
-                    format!("ERR {}", e)
-                },
-            };
-            
-            Ok(RespFrame::error(error_msg))
-        }
-    }
+    // EVALSHA is now handled at server level with global cache
+    // This function should not be called directly but we'll keep it for compatibility
+    Err(FerrousError::LuaError("EVALSHA should be handled at server level".to_string()))
 }
 
 /// Handle EVALSHA command (wrapper for compatibility) 
-pub fn handle_evalsha(storage: &Arc<StorageEngine>, parts: &[RespFrame]) -> Result<RespFrame> {
-    handle_evalsha_with_db(storage, parts, 0) // Default to database 0
+pub fn handle_evalsha(_storage: &Arc<StorageEngine>, _parts: &[RespFrame]) -> Result<RespFrame> {
+    // EVALSHA is now handled at server level with global cache
+    // This should not be called directly
+    Err(FerrousError::LuaError("EVALSHA should be handled at server level".to_string()))
 }
 
 /// Handle SCRIPT LOAD command
@@ -286,70 +243,18 @@ pub fn handle_lua_command_with_cache(
                 _ => return Ok(RespFrame::error("ERR invalid subcommand")),
             };
             
-            let lua_engine = match get_lua_engine(storage.clone()) {
-                Ok(engine) => engine,
-                Err(e) => return Ok(RespFrame::error(format!("ERR {}", e))),
-            };
-            
             match subcommand.as_str() {
                 "load" => {
-                    if parts.len() != 3 {
-                        return Ok(RespFrame::error("ERR wrong number of arguments for 'script load' command"));
-                    }
-                    
-                    let script = match &parts[2] {
-                        RespFrame::BulkString(Some(bytes)) => {
-                            match str::from_utf8(bytes) {
-                                Ok(s) => s,
-                                Err(_) => return Ok(RespFrame::error("ERR invalid script - not valid UTF-8")),
-                            }
-                        }
-                        _ => return Ok(RespFrame::error("ERR invalid script")),
-                    };
-                    
-                    match lua_engine.script_load(script) {
-                        Ok(sha1) => Ok(RespFrame::bulk_string(sha1)),
-                        Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
-                    }
+                    // SCRIPT LOAD should be handled at server level now
+                    Ok(RespFrame::error("ERR SCRIPT LOAD should be handled at server level"))
                 },
                 "exists" => {
-                    if parts.len() < 3 {
-                        return Ok(RespFrame::error("ERR wrong number of arguments for 'script exists' command"));
-                    }
-                    
-                    let mut sha1s = Vec::new();
-                    for i in 2..parts.len() {
-                        let sha1 = match &parts[i] {
-                            RespFrame::BulkString(Some(bytes)) => {
-                                match str::from_utf8(bytes) {
-                                    Ok(s) => s.to_string(),
-                                    Err(_) => continue,
-                                }
-                            }
-                            _ => continue,
-                        };
-                        sha1s.push(sha1);
-                    }
-                    
-                    match lua_engine.script_exists(&sha1s) {
-                        Ok(results) => {
-                            let resp_results: Vec<RespFrame> = results.into_iter()
-                                .map(|exists| RespFrame::Integer(if exists { 1 } else { 0 }))
-                                .collect();
-                            Ok(RespFrame::Array(Some(resp_results)))
-                        }
-                        Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
-                    }
+                    // SCRIPT EXISTS should be handled at server level now
+                    Ok(RespFrame::error("ERR SCRIPT EXISTS should be handled at server level"))
                 },
                 "flush" => {
-                    if parts.len() != 2 {
-                        return Ok(RespFrame::error("ERR wrong number of arguments for 'script flush' command"));
-                    }
-                    
-                    match lua_engine.script_flush() {
-                        Ok(_) => Ok(RespFrame::SimpleString(Arc::new(b"OK".to_vec()))),
-                        Err(e) => Ok(RespFrame::error(format!("ERR {}", e))),
-                    }
+                    // SCRIPT FLUSH should be handled at server level now
+                    Ok(RespFrame::error("ERR SCRIPT FLUSH should be handled at server level"))
                 },
                 "kill" => {
                     if parts.len() != 2 {

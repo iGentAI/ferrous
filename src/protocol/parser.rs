@@ -34,6 +34,19 @@ impl RespParser {
             return Ok(None);
         }
         
+        // Skip any leading whitespace or extra CRLF sequences for tolerance
+        while self.position < self.buffer.len() && 
+              (self.buffer[self.position] == b' ' || 
+               self.buffer[self.position] == b'\r' || 
+               self.buffer[self.position] == b'\n' ||
+               self.buffer[self.position] == b'\t') {
+            self.position += 1;
+        }
+        
+        if self.position >= self.buffer.len() {
+            return Ok(None);
+        }
+        
         // Special handling for raw protocol (e.g., redis-benchmark sometimes sends raw "PING")
         if self.position + 4 <= self.buffer.len() && 
            &self.buffer[self.position..self.position+4] == b"PING" {
@@ -58,6 +71,14 @@ impl RespParser {
         match parse_frame(&self.buffer[self.position..])? {
             Some((frame, consumed)) => {
                 self.position += consumed;
+                
+                // Skip any trailing extra CRLF sequences after the parsed frame
+                while self.position < self.buffer.len() && 
+                      (self.buffer[self.position] == b'\r' || 
+                       self.buffer[self.position] == b'\n') {
+                    self.position += 1;
+                }
+                
                 // If we've consumed more than half the buffer, compact it
                 if self.position > self.buffer.len() / 2 {
                     self.buffer.drain(..self.position);
