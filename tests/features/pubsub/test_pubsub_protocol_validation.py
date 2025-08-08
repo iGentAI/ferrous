@@ -171,7 +171,7 @@ class PubSubProtocolTester:
         """PSUBSCRIBE confirmation must be: ['psubscribe', pattern, <n>]"""
         print("\nTesting PSUBSCRIBE response format …")
         with socket.create_connection((self.host, self.port), timeout=2) as s:
-            s.sendall(b"*2\r\n$10\r\nPSUBSCRIBE\r\n$7\r\ntest:*\r\n")
+            s.sendall(b"*2\r\n$10\r\nPSUBSCRIBE\r\n$6\r\ntest:*\r\n")
             parsed = self.parse_resp(s.recv(1024))
             print("Parsed:", parsed)
             ok = (

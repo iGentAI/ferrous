@@ -50,9 +50,9 @@ pub fn handle_memory_usage(parts: &[RespFrame], storage: &Arc<StorageEngine>, db
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    // Check if key exists
+    // Check if key exists - return nil for non-existent keys (correct Redis behavior)
     if !storage.exists(db, key)? {
-        return Ok(RespFrame::error("ERR no such key"));
+        return Ok(RespFrame::null_bulk());
     }
     
     // Get the memory usage

@@ -2,7 +2,7 @@
 //! 
 //! Provides Redis-compatible hash operations for field-value pairs within a key.
 
-use crate::error::{FerrousError, Result, CommandError};
+use crate::error::{FerrousError, Result, CommandError, StorageError};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, Value};
 use std::collections::HashMap;
@@ -36,8 +36,16 @@ pub fn handle_hset(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         field_values.push((field, value));
     }
     
-    let fields_added = storage.hset(db, key, field_values)?;
-    Ok(RespFrame::Integer(fields_added as i64))
+    // Set hash fields and handle WrongType errors properly
+    match storage.hset(db, key, field_values) {
+        Ok(fields_added) => Ok(RespFrame::Integer(fields_added as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HGET command - Get hash field value
@@ -58,9 +66,16 @@ pub fn handle_hget(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         _ => return Ok(RespFrame::error("ERR invalid field format")),
     };
     
-    match storage.hget(db, key, field)? {
-        Some(value) => Ok(RespFrame::from_bytes(value)),
-        None => Ok(RespFrame::null_bulk()),
+    // Get field value and handle WrongType errors properly
+    match storage.hget(db, key, field) {
+        Ok(Some(value)) => Ok(RespFrame::from_bytes(value)),
+        Ok(None) => Ok(RespFrame::null_bulk()),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
     }
 }
 
@@ -92,8 +107,16 @@ pub fn handle_hmset(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         field_values.push((field, value));
     }
     
-    storage.hset(db, key, field_values)?;
-    Ok(RespFrame::ok())
+    // Set hash fields and handle WrongType errors properly
+    match storage.hset(db, key, field_values) {
+        Ok(_) => Ok(RespFrame::ok()),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HMGET command - Get multiple hash field values
@@ -117,15 +140,24 @@ pub fn handle_hmget(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         }
     }
     
-    let values = storage.hmget(db, key, &fields)?;
-    let frames: Vec<RespFrame> = values.into_iter()
-        .map(|opt| match opt {
-            Some(value) => RespFrame::from_bytes(value),
-            None => RespFrame::null_bulk(),
-        })
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get field values and handle WrongType errors properly
+    match storage.hmget(db, key, &fields) {
+        Ok(values) => {
+            let frames: Vec<RespFrame> = values.into_iter()
+                .map(|opt| match opt {
+                    Some(value) => RespFrame::from_bytes(value),
+                    None => RespFrame::null_bulk(),
+                })
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HGETALL command - Get all fields and values
@@ -140,15 +172,23 @@ pub fn handle_hgetall(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFram
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let field_values = storage.hgetall(db, key)?;
-    let mut frames = Vec::new();
-    
-    for (field, value) in field_values {
-        frames.push(RespFrame::from_bytes(field));
-        frames.push(RespFrame::from_bytes(value));
+    // Get all field-value pairs and handle WrongType errors properly
+    match storage.hgetall(db, key) {
+        Ok(field_values) => {
+            let mut frames = Vec::new();
+            for (field, value) in field_values {
+                frames.push(RespFrame::from_bytes(field));
+                frames.push(RespFrame::from_bytes(value));
+            }
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
     }
-    
-    Ok(RespFrame::Array(Some(frames)))
 }
 
 /// Handle HDEL command - Delete hash fields
@@ -172,8 +212,16 @@ pub fn handle_hdel(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         }
     }
     
-    let deleted = storage.hdel(db, key, &fields)?;
-    Ok(RespFrame::Integer(deleted as i64))
+    // Delete fields and handle WrongType errors properly
+    match storage.hdel(db, key, &fields) {
+        Ok(deleted) => Ok(RespFrame::Integer(deleted as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HLEN command - Get number of fields in hash
@@ -188,8 +236,16 @@ pub fn handle_hlen(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let len = storage.hlen(db, key)?;
-    Ok(RespFrame::Integer(len as i64))
+    // Get hash length and handle WrongType errors properly
+    match storage.hlen(db, key) {
+        Ok(len) => Ok(RespFrame::Integer(len as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HEXISTS command - Check if field exists in hash
@@ -210,8 +266,16 @@ pub fn handle_hexists(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFram
         _ => return Ok(RespFrame::error("ERR invalid field format")),
     };
     
-    let exists = storage.hexists(db, key, field)?;
-    Ok(RespFrame::Integer(if exists { 1 } else { 0 }))
+    // Check field existence and handle WrongType errors properly
+    match storage.hexists(db, key, field) {
+        Ok(exists) => Ok(RespFrame::Integer(if exists { 1 } else { 0 })),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HKEYS command - Get all field names
@@ -226,12 +290,21 @@ pub fn handle_hkeys(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let fields = storage.hkeys(db, key)?;
-    let frames: Vec<RespFrame> = fields.into_iter()
-        .map(|f| RespFrame::from_bytes(f))
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get field names and handle WrongType errors properly
+    match storage.hkeys(db, key) {
+        Ok(fields) => {
+            let frames: Vec<RespFrame> = fields.into_iter()
+                .map(|f| RespFrame::from_bytes(f))
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HVALS command - Get all values
@@ -246,12 +319,21 @@ pub fn handle_hvals(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let values = storage.hvals(db, key)?;
-    let frames: Vec<RespFrame> = values.into_iter()
-        .map(|v| RespFrame::from_bytes(v))
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get all values and handle WrongType errors properly
+    match storage.hvals(db, key) {
+        Ok(values) => {
+            let frames: Vec<RespFrame> = values.into_iter()
+                .map(|v| RespFrame::from_bytes(v))
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle HINCRBY command - Increment integer field value
@@ -283,6 +365,14 @@ pub fn handle_hincrby(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFram
         _ => return Ok(RespFrame::error("ERR invalid increment format")),
     };
     
-    let new_value = storage.hincrby(db, key, field, increment)?;
-    Ok(RespFrame::Integer(new_value))
+    // Increment field and handle WrongType errors properly
+    match storage.hincrby(db, key, field, increment) {
+        Ok(new_value) => Ok(RespFrame::Integer(new_value)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }

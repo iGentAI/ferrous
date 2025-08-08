@@ -803,8 +803,13 @@ impl Server {
             
             // Handle timeout - be less aggressive for pipelining clients
             if timeout_check {
-                // For pipelining, allow longer idle times by checking for pending operations
                 if !conn.has_pending_writes() && frames_processed_count == 0 {
+                    // Check if connection has active subscriptions before timing out
+                    if self.pubsub.is_subscribed(id) {
+                        // Skip timeout for pub/sub connections - they may be idle but listening
+                        return Ok(conn.has_pending_writes());
+                    }
+                    
                     conn.close()?;
                     return Err(FerrousError::Connection("Connection timed out".into()));
                 }
@@ -1395,6 +1400,14 @@ impl Server {
                 // EVALSHA needs script cache access
                 self.handle_evalsha_command(parts)
             },
+            "COMMAND" => {
+                // Redis introspection command for client compatibility
+                crate::network::admin_commands::handle_command(parts)
+            },
+            "SHUTDOWN" => {
+                // Graceful server shutdown with save option
+                crate::network::admin_commands::handle_shutdown(parts, &self.storage, self.rdb_engine.as_ref())
+            },
             "SCRIPT" => {
                 // SCRIPT commands need script cache access
                 self.handle_script_command(parts)
@@ -1582,25 +1595,22 @@ impl Server {
         
         let results = self.pubsub.subscribe(conn_id, channels)?;
         
-        // Send each subscription confirmation individually (not as an array)
-        for result in results {
-            match result.subscription {
-                crate::pubsub::Subscription::Channel(ch) => {
-                    let response = format_subscribe_response(&ch, result.num_subscriptions);
-                    // Send immediately to client
-                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+        // Send each subscription confirmation atomically
+        self.connections.with_connection(conn_id, |conn| -> Result<()> {
+            for result in results {
+                match result.subscription {
+                    crate::pubsub::Subscription::Channel(ch) => {
+                        let response = format_subscribe_response(&ch, result.num_subscriptions);
                         conn.send_frame(&response)?;
-                        Ok(())
-                    }) {
-                        send_result?;
                     }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
-        }
+            conn.flush()?; // Single flush for all confirmations
+            Ok(())
+        });
         
-        // Return null response to indicate no further response needed
-        Ok(RespFrame::null_bulk())
+        Ok(RespFrame::NoResponse)
     }
     
     /// Handle UNSUBSCRIBE command
@@ -1620,25 +1630,23 @@ impl Server {
         
         let results = self.pubsub.unsubscribe(conn_id, channels)?;
         
-        // Send each unsubscription confirmation individually (not as an array)
-        for result in results {
-            match result.subscription {
-                crate::pubsub::Subscription::Channel(ch) => {
-                    let response = format_unsubscribe_response(&ch, result.num_subscriptions);
-                    // Send immediately to client
-                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+        // Send each unsubscription confirmation atomically
+        self.connections.with_connection(conn_id, |conn| -> Result<()> {
+            for result in results {
+                match result.subscription {
+                    crate::pubsub::Subscription::Channel(ch) => {
+                        let response = format_unsubscribe_response(&ch, result.num_subscriptions);
                         conn.send_frame(&response)?;
-                        Ok(())
-                    }) {
-                        send_result?;
                     }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
-        }
+            conn.flush()?; // Single flush for all confirmations
+            Ok(())
+        });
         
-        // Return null response to indicate no further response needed
-        Ok(RespFrame::null_bulk())
+        // Return NoResponse to prevent double response transmission
+        Ok(RespFrame::NoResponse)
     }
     
     /// Handle PSUBSCRIBE command
@@ -1657,25 +1665,22 @@ impl Server {
         
         let results = self.pubsub.psubscribe(conn_id, patterns)?;
         
-        // Send each subscription confirmation individually (not as an array)
-        for result in results {
-            match result.subscription {
-                crate::pubsub::Subscription::Pattern(pat) => {
-                    let response = format_psubscribe_response(&pat, result.num_subscriptions);
-                    // Send immediately to client
-                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+        // Send each subscription confirmation atomically
+        self.connections.with_connection(conn_id, |conn| -> Result<()> {
+            for result in results {
+                match result.subscription {
+                    crate::pubsub::Subscription::Pattern(pat) => {
+                        let response = format_psubscribe_response(&pat, result.num_subscriptions);
                         conn.send_frame(&response)?;
-                        Ok(())
-                    }) {
-                        send_result?;
                     }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
-        }
+            conn.flush()?; // Single flush for all confirmations
+            Ok(())
+        });
         
-        // Return null response to indicate no further response needed
-        Ok(RespFrame::null_bulk())
+        Ok(RespFrame::NoResponse)
     }
     
     /// Handle PUNSUBSCRIBE command
@@ -1695,25 +1700,22 @@ impl Server {
         
         let results = self.pubsub.punsubscribe(conn_id, patterns)?;
         
-        // Send each unsubscription confirmation individually (not as an array)
-        for result in results {
-            match result.subscription {
-                crate::pubsub::Subscription::Pattern(pat) => {
-                    let response = format_punsubscribe_response(&pat, result.num_subscriptions);
-                    // Send immediately to client
-                    if let Some(send_result) = self.connections.with_connection(conn_id, |conn| -> Result<()> {
+        // Send each unsubscription confirmation atomically
+        self.connections.with_connection(conn_id, |conn| -> Result<()> {
+            for result in results {
+                match result.subscription {
+                    crate::pubsub::Subscription::Pattern(pat) => {
+                        let response = format_punsubscribe_response(&pat, result.num_subscriptions);
                         conn.send_frame(&response)?;
-                        Ok(())
-                    }) {
-                        send_result?;
                     }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
             }
-        }
+            conn.flush()?; // Single flush for all confirmations
+            Ok(())
+        });
         
-        // Return null response to indicate no further response needed
-        Ok(RespFrame::null_bulk())
+        Ok(RespFrame::NoResponse)
     }
 
     /// Handle SAVE command
@@ -3293,6 +3295,11 @@ impl Server {
             }).unwrap_or(false);
             
             if should_remove {
+                // Check if connection has active subscriptions before cleaning up
+                if self.pubsub.is_subscribed(id) {
+                    // Skip cleanup for connections with active subscriptions
+                    continue;
+                }
                 to_remove.push(id);
             }
         }

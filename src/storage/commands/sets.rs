@@ -3,7 +3,7 @@
 //! Provides Redis-compatible set operations including add, remove, membership testing,
 //! and set operations like union, intersection, and difference.
 
-use crate::error::{FerrousError, Result, CommandError};
+use crate::error::{FerrousError, Result, CommandError, StorageError};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, Value};
 use std::collections::HashSet;
@@ -30,8 +30,16 @@ pub fn handle_sadd(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         }
     }
     
-    let added = storage.sadd(db, key, members)?;
-    Ok(RespFrame::Integer(added as i64))
+    // Add members and handle WrongType errors properly
+    match storage.sadd(db, key, members) {
+        Ok(added) => Ok(RespFrame::Integer(added as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SREM command - Remove members from a set
@@ -55,8 +63,16 @@ pub fn handle_srem(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         }
     }
     
-    let removed = storage.srem(db, key, &members)?;
-    Ok(RespFrame::Integer(removed as i64))
+    // Remove members and handle WrongType errors properly
+    match storage.srem(db, key, &members) {
+        Ok(removed) => Ok(RespFrame::Integer(removed as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SMEMBERS command - Get all members of a set
@@ -71,12 +87,21 @@ pub fn handle_smembers(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFra
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let members = storage.smembers(db, key)?;
-    let frames: Vec<RespFrame> = members.into_iter()
-        .map(|m| RespFrame::from_bytes(m))
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get all members and handle WrongType errors properly
+    match storage.smembers(db, key) {
+        Ok(members) => {
+            let frames: Vec<RespFrame> = members.into_iter()
+                .map(|m| RespFrame::from_bytes(m))
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SISMEMBER command - Check if a member exists in a set
@@ -97,8 +122,16 @@ pub fn handle_sismember(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFr
         _ => return Ok(RespFrame::error("ERR invalid member format")),
     };
     
-    let exists = storage.sismember(db, key, member)?;
-    Ok(RespFrame::Integer(if exists { 1 } else { 0 }))
+    // Check membership and handle WrongType errors properly
+    match storage.sismember(db, key, member) {
+        Ok(exists) => Ok(RespFrame::Integer(if exists { 1 } else { 0 })),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SCARD command - Get the number of members in a set
@@ -113,8 +146,16 @@ pub fn handle_scard(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let count = storage.scard(db, key)?;
-    Ok(RespFrame::Integer(count as i64))
+    // Get cardinality and handle WrongType errors properly
+    match storage.scard(db, key) {
+        Ok(count) => Ok(RespFrame::Integer(count as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SUNION command - Get union of multiple sets
@@ -132,12 +173,21 @@ pub fn handle_sunion(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame
         }
     }
     
-    let union = storage.sunion(db, &keys)?;
-    let frames: Vec<RespFrame> = union.into_iter()
-        .map(|m| RespFrame::from_bytes(m))
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get union and handle WrongType errors properly  
+    match storage.sunion(db, &keys) {
+        Ok(union) => {
+            let frames: Vec<RespFrame> = union.into_iter()
+                .map(|m| RespFrame::from_bytes(m))
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SINTER command - Get intersection of multiple sets
@@ -155,12 +205,21 @@ pub fn handle_sinter(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame
         }
     }
     
-    let intersection = storage.sinter(db, &keys)?;
-    let frames: Vec<RespFrame> = intersection.into_iter()
-        .map(|m| RespFrame::from_bytes(m))
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get intersection and handle WrongType errors properly
+    match storage.sinter(db, &keys) {
+        Ok(intersection) => {
+            let frames: Vec<RespFrame> = intersection.into_iter()
+                .map(|m| RespFrame::from_bytes(m))
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SDIFF command - Get difference of multiple sets
@@ -178,12 +237,21 @@ pub fn handle_sdiff(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         }
     }
     
-    let diff = storage.sdiff(db, &keys)?;
-    let frames: Vec<RespFrame> = diff.into_iter()
-        .map(|m| RespFrame::from_bytes(m))
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get difference and handle WrongType errors properly
+    match storage.sdiff(db, &keys) {
+        Ok(diff) => {
+            let frames: Vec<RespFrame> = diff.into_iter()
+                .map(|m| RespFrame::from_bytes(m))
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SRANDMEMBER command - Get random members from a set
@@ -213,21 +281,35 @@ pub fn handle_srandmember(storage: &Arc<StorageEngine>, db: usize, parts: &[Resp
         None
     };
     
+    // Get random members and handle WrongType errors properly  
     match count {
         None => {
-            // Return single member
-            match storage.srandmember(db, key, 1)? {
-                members if members.is_empty() => Ok(RespFrame::null_bulk()),
-                mut members => Ok(RespFrame::from_bytes(members.pop().unwrap())),
+            match storage.srandmember(db, key, 1) {
+                Ok(members) if members.is_empty() => Ok(RespFrame::null_bulk()),
+                Ok(mut members) => Ok(RespFrame::from_bytes(members.pop().unwrap())),
+                Err(FerrousError::Storage(StorageError::WrongType)) => {
+                    Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+                },
+                Err(e) => {
+                    Ok(RespFrame::error(format!("ERR {}", e)))
+                }
             }
         }
         Some(n) => {
-            // Return multiple members
-            let members = storage.srandmember(db, key, n)?;
-            let frames: Vec<RespFrame> = members.into_iter()
-                .map(|m| RespFrame::from_bytes(m))
-                .collect();
-            Ok(RespFrame::Array(Some(frames)))
+            match storage.srandmember(db, key, n) {
+                Ok(members) => {
+                    let frames: Vec<RespFrame> = members.into_iter()
+                        .map(|m| RespFrame::from_bytes(m))
+                        .collect();
+                    Ok(RespFrame::Array(Some(frames)))
+                },
+                Err(FerrousError::Storage(StorageError::WrongType)) => {
+                    Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+                },
+                Err(e) => {
+                    Ok(RespFrame::error(format!("ERR {}", e)))
+                }
+            }
         }
     }
 }
@@ -259,19 +341,28 @@ pub fn handle_spop(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         1
     };
     
-    let members = storage.spop(db, key, count)?;
-    
-    if parts.len() == 2 && count == 1 {
-        // Single member response
-        match members.into_iter().next() {
-            Some(member) => Ok(RespFrame::from_bytes(member)),
-            None => Ok(RespFrame::null_bulk()),
+    // Pop members and handle WrongType errors properly
+    match storage.spop(db, key, count) {
+        Ok(members) => {
+            if parts.len() == 2 && count == 1 {
+                // Single member response
+                match members.into_iter().next() {
+                    Some(member) => Ok(RespFrame::from_bytes(member)),
+                    None => Ok(RespFrame::null_bulk()),
+                }
+            } else {
+                // Array response
+                let frames: Vec<RespFrame> = members.into_iter()
+                    .map(|m| RespFrame::from_bytes(m))
+                    .collect();
+                Ok(RespFrame::Array(Some(frames)))
+            }
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
         }
-    } else {
-        // Array response
-        let frames: Vec<RespFrame> = members.into_iter()
-            .map(|m| RespFrame::from_bytes(m))
-            .collect();
-        Ok(RespFrame::Array(Some(frames)))
     }
 }

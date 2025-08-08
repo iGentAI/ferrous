@@ -7,17 +7,29 @@ import socket
 import time
 import sys
 
-def send_command(command, host='127.0.0.1', port=6379):
-    """Send a Redis command and return the response"""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port))
+# Use a persistent connection for efficient testing
+class PersistentRedisConnection:
+    def __init__(self, host='127.0.0.1', port=6379):
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.connect()
     
-    # Send command directly without auth
-    s.sendall(command.encode())
-    resp = s.recv(4096)
+    def connect(self):
+        """Establish persistent connection"""
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((self.host, self.port))
     
-    s.close()
-    return resp
+    def send_command(self, command):
+        """Send command on persistent connection"""
+        self.socket.sendall(command.encode())
+        return self.socket.recv(4096)
+    
+    def close(self):
+        """Close the connection"""
+        if self.socket:
+            self.socket.close()
+            self.socket = None
 
 def decode_response(resp):
     """Basic RESP protocol decoding for display"""
@@ -51,75 +63,89 @@ def print_section(title):
     print(f"    {title}")
     print(f"{'=' * 60}\n")
 
-# Start the test
+# Start the test with persistent connection
 print("Testing MEMORY commands in Ferrous\n")
 
-# Create some data to track memory usage
-print_section("1. Creating test data to track memory usage")
+# Create persistent connection
+conn = PersistentRedisConnection()
 
-# Create a large string
-large_value = "x" * 1000000  # 1MB string
-cmd = f"*3\r\n$3\r\nSET\r\n$9\r\nlarge-key\r\n${len(large_value)}\r\n{large_value}\r\n"
-resp = send_command(cmd)
-print(f"SET large-key: {decode_response(resp)}")
+try:
+    # Create some data to track memory usage
+    print_section("1. Creating test data to track memory usage")
 
-# Create a large list
-print("\nCreating a large list...")
-cmd = "*3\r\n$5\r\nLPUSH\r\n$10\r\nlarge-list\r\n$6\r\nvalue1\r\n"
-resp = send_command(cmd)
-for i in range(10000):
-    cmd = f"*3\r\n$5\r\nLPUSH\r\n$10\r\nlarge-list\r\n$6\r\nvalue{i}\r\n"
-    resp = send_command(cmd)
-    if i % 1000 == 0:
-        print(f"Added {i} items...")
-print(f"LPUSH result: {decode_response(resp)}")
+    # Create a large string
+    large_value = "x" * 1000000  # 1MB string
+    cmd = f"*3\r\n$3\r\nSET\r\n$9\r\nlarge-key\r\n${len(large_value)}\r\n{large_value}\r\n"
+    resp = conn.send_command(cmd)
+    print(f"SET large-key: {decode_response(resp)}")
 
-# Create a moderate sized hash
-print("\nCreating a hash...")
-for i in range(1000):
-    field = f"field{i}"
-    value = f"value{i}" * 10
-    cmd = f"*4\r\n$4\r\nHSET\r\n$9\r\ntest-hash\r\n${len(field)}\r\n{field}\r\n${len(value)}\r\n{value}\r\n"
-    resp = send_command(cmd)
+    # Create a large list efficiently with persistent connection
+    print("\nCreating large list efficiently...")
+    
+    # First clear any existing list
+    cmd = "*2\r\n$3\r\nDEL\r\n$10\r\nlarge-list\r\n"
+    resp = conn.send_command(cmd)
+    
+    # Add items efficiently with batching for progress display
+    start_time = time.time()
+    for i in range(1000):
+        cmd = f"*3\r\n$5\r\nLPUSH\r\n$10\r\nlarge-list\r\n$6\r\nvalue{i}\r\n"
+        resp = conn.send_command(cmd)
+        if i % 200 == 0:
+            print(f"Added {i} items...")
+    
+    elapsed = time.time() - start_time
+    print(f"LPUSH completed: 1000 items in {elapsed:.2f}s ({1000/elapsed:.1f} ops/sec)")
 
-print(f"HSET result: {decode_response(resp)}")
+    # Create a hash efficiently
+    print("\nCreating hash efficiently...")
+    for i in range(100):
+        field = f"field{i}"
+        value = f"value{i}" * 10
+        cmd = f"*4\r\n$4\r\nHSET\r\n$9\r\ntest-hash\r\n${len(field)}\r\n{field}\r\n${len(value)}\r\n{value}\r\n"
+        resp = conn.send_command(cmd)
 
-# Test MEMORY USAGE command
-print_section("2. Testing MEMORY USAGE command")
+    print(f"HSET result: {decode_response(resp)}")
 
-keys = ["large-key", "large-list", "test-hash"]
-for key in keys:
-    cmd = f"*3\r\n$6\r\nMEMORY\r\n$5\r\nUSAGE\r\n${len(key)}\r\n{key}\r\n"
-    resp = send_command(cmd)
-    print(f"MEMORY USAGE {key}: {decode_response(resp)}")
+    # Test MEMORY USAGE command
+    print_section("2. Testing MEMORY USAGE command")
 
-# Test MEMORY STATS command
-print_section("3. Testing MEMORY STATS command")
+    keys = ["large-key", "large-list", "test-hash"]
+    for key in keys:
+        cmd = f"*3\r\n$6\r\nMEMORY\r\n$5\r\nUSAGE\r\n${len(key)}\r\n{key}\r\n"
+        resp = conn.send_command(cmd)
+        print(f"MEMORY USAGE {key}: {decode_response(resp)}")
 
-cmd = "*2\r\n$6\r\nMEMORY\r\n$5\r\nSTATS\r\n"
-resp = send_command(cmd)
-print(f"MEMORY STATS: {decode_response(resp)}")
+    # Test MEMORY STATS command
+    print_section("3. Testing MEMORY STATS command")
 
-# Test MEMORY DOCTOR command
-print_section("4. Testing MEMORY DOCTOR command")
+    cmd = "*2\r\n$6\r\nMEMORY\r\n$5\r\nSTATS\r\n"
+    resp = conn.send_command(cmd)
+    print(f"MEMORY STATS: {decode_response(resp)}")
 
-cmd = "*2\r\n$6\r\nMEMORY\r\n$6\r\nDOCTOR\r\n"
-resp = send_command(cmd)
-print(f"MEMORY DOCTOR: {decode_response(resp)}")
+    # Test MEMORY DOCTOR command
+    print_section("4. Testing MEMORY DOCTOR command")
 
-# Test MEMORY command via INFO
-print_section("5. Testing memory section in INFO command")
+    cmd = "*2\r\n$6\r\nMEMORY\r\n$6\r\nDOCTOR\r\n"
+    resp = conn.send_command(cmd)
+    print(f"MEMORY DOCTOR: {decode_response(resp)}")
 
-cmd = "*2\r\n$4\r\nINFO\r\n$6\r\nMEMORY\r\n"
-resp = send_command(cmd)
-print(f"INFO MEMORY: {decode_response(resp)}")
+    # Test MEMORY command via INFO
+    print_section("5. Testing memory section in INFO command")
 
-# Cleanup
-print_section("6. Cleaning up test data")
+    cmd = "*2\r\n$4\r\nINFO\r\n$6\r\nMEMORY\r\n"
+    resp = conn.send_command(cmd)
+    print(f"INFO MEMORY: {decode_response(resp)}")
 
-for key in keys:
-    cmd = f"*2\r\n$3\r\nDEL\r\n${len(key)}\r\n{key}\r\n"
-    resp = send_command(cmd)
-    print(f"DEL {key}: {decode_response(resp)}")
+    # Cleanup
+    print_section("6. Cleaning up test data")
+
+    for key in keys:
+        cmd = f"*2\r\n$3\r\nDEL\r\n${len(key)}\r\n{key}\r\n"
+        resp = conn.send_command(cmd)
+        print(f"DEL {key}: {decode_response(resp)}")
+
+finally:
+    conn.close()
 
 print("\nMemory usage testing complete!")

@@ -61,7 +61,18 @@ impl LuaEngine {
                         }
                     }
                     mlua::Error::SyntaxError { message, .. } => {
-                        Err(FerrousError::LuaError(format!("ERR Error compiling script: {}", message)))
+                        // Clean syntax error messages to remove file path information
+                        let clean_msg = if message.contains(".rs:") && message.contains(": ") {
+                            // Extract message after the file:line:col part
+                            if let Some(last_colon_space) = message.rfind(": ") {
+                                &message[last_colon_space + 2..]
+                            } else {
+                                &message
+                            }
+                        } else {
+                            &message
+                        };
+                        Err(FerrousError::LuaError(format!("ERR Error compiling script: {}", clean_msg)))
                     }
                     _ => {
                         Err(FerrousError::LuaError(format!("ERR Script execution failed: {}", e)))
@@ -72,11 +83,64 @@ impl LuaEngine {
     }
     
     pub fn script_load(&self, script: &str) -> Result<String> {
+        // Create a basic Lua context for syntax validation only
         let lua = Lua::new();
-        lua.load(script).exec().map_err(|e| {
-            FerrousError::LuaError(format!("Script compilation error: {}", e))
+        let globals = lua.globals();
+        
+        // Remove dangerous functions for sandboxing
+        let dangerous_functions = ["os", "io", "debug", "package", "require", "dofile", "loadfile", "load"];
+        for func in &dangerous_functions {
+            globals.set(*func, mlua::Nil).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        }
+        
+        // Create minimal Redis API table for validation
+        let redis_table = lua.create_table().map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        // Add dummy redis.call and redis.pcall for syntax validation
+        let dummy_call = lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<mlua::Value> {
+            Ok(mlua::Value::Nil)
+        }).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        redis_table.set("call", dummy_call.clone()).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        redis_table.set("pcall", dummy_call).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        globals.set("redis", redis_table).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        // Set up empty KEYS and ARGV arrays for syntax validation
+        let keys_table = lua.create_table().map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        globals.set("KEYS", keys_table).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        let argv_table = lua.create_table().map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        globals.set("ARGV", argv_table).map_err(|e| FerrousError::LuaError(e.to_string()))?;
+        
+        // Proper syntax validation: Load the chunk to validate compilation
+        // This will fail if there are syntax errors, but won't execute the script
+        let chunk = lua.load(script);
+        
+        // Attempt to create the function to validate syntax
+        // This catches compilation errors without executing
+        chunk.into_function().map_err(|e| {
+            // Completely strip internal file path information from mlua errors
+            let error_msg = e.to_string();
+            
+            // mlua error format: "src/storage/lua_engine.rs:41:1: '=' expected near 'lua'"
+            // We want to extract just: "'=' expected near 'lua'"
+            
+            // Find the last occurrence of ": " and take everything after it
+            let clean_error = if let Some(last_colon_space) = error_msg.rfind(": ") {
+                &error_msg[last_colon_space + 2..]
+            } else {
+                // If no pattern found, check if it's already a clean error
+                if error_msg.contains("expected") || error_msg.contains("unexpected") || error_msg.contains("syntax") {
+                    &error_msg
+                } else {
+                    "syntax error"
+                }
+            };
+            
+            FerrousError::LuaError(format!("ERR Error compiling script: {}", clean_error))
         })?;
         
+        // Generate SHA1 for the script
         let sha1 = self.calculate_script_sha1(script);
         
         Ok(sha1)

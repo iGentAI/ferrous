@@ -2,7 +2,7 @@
 //! 
 //! Provides Redis-compatible list operations including push, pop, range, and more.
 
-use crate::error::{FerrousError, Result, CommandError};
+use crate::error::{FerrousError, Result, CommandError, StorageError};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, Value};
 use std::collections::VecDeque;
@@ -20,9 +20,9 @@ pub fn handle_lpush(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    // Extract elements to push - process from RIGHT TO LEFT for correct Redis semantics  
+    // Extract elements to push
     let mut elements = Vec::new();
-    for i in (2..parts.len()).rev() {  // Iterate in reverse for correct multi-value LPUSH
+    for i in 2..parts.len() {
         match &parts[i] {
             RespFrame::BulkString(Some(bytes)) => elements.push(bytes.as_ref().clone()),
             _ => return Ok(RespFrame::error("ERR invalid element format")),
@@ -30,8 +30,15 @@ pub fn handle_lpush(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
     }
     
     // Push elements and get new length
-    let new_len = storage.lpush(db, key, elements)?;
-    Ok(RespFrame::Integer(new_len as i64))
+    match storage.lpush(db, key, elements) {
+        Ok(new_len) => Ok(RespFrame::Integer(new_len as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle RPUSH command - Insert elements at the tail of the list
@@ -56,8 +63,15 @@ pub fn handle_rpush(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
     }
     
     // Push elements and get new length
-    let new_len = storage.rpush(db, key, elements)?;
-    Ok(RespFrame::Integer(new_len as i64))
+    match storage.rpush(db, key, elements) {
+        Ok(new_len) => Ok(RespFrame::Integer(new_len as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle LPOP command - Remove and return element from head
@@ -72,9 +86,16 @@ pub fn handle_lpop(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    match storage.lpop(db, key)? {
-        Some(element) => Ok(RespFrame::from_bytes(element)),
-        None => Ok(RespFrame::null_bulk()),
+    // Pop element from head
+    match storage.lpop(db, key) {
+        Ok(Some(element)) => Ok(RespFrame::from_bytes(element)),
+        Ok(None) => Ok(RespFrame::null_bulk()),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
     }
 }
 
@@ -90,9 +111,16 @@ pub fn handle_rpop(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    match storage.rpop(db, key)? {
-        Some(element) => Ok(RespFrame::from_bytes(element)),
-        None => Ok(RespFrame::null_bulk()),
+    // Pop element from tail
+    match storage.rpop(db, key) {
+        Ok(Some(element)) => Ok(RespFrame::from_bytes(element)),
+        Ok(None) => Ok(RespFrame::null_bulk()),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
     }
 }
 
@@ -108,8 +136,16 @@ pub fn handle_llen(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let len = storage.llen(db, key)?;
-    Ok(RespFrame::Integer(len as i64))
+    // Get list length
+    match storage.llen(db, key) {
+        Ok(len) => Ok(RespFrame::Integer(len as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle LRANGE command - Get range of elements
@@ -146,12 +182,21 @@ pub fn handle_lrange(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame
         _ => return Ok(RespFrame::error("ERR invalid stop format")),
     };
     
-    let elements = storage.lrange(db, key, start, stop)?;
-    let frames: Vec<RespFrame> = elements.into_iter()
-        .map(|e| RespFrame::from_bytes(e))
-        .collect();
-    
-    Ok(RespFrame::Array(Some(frames)))
+    // Get range of elements
+    match storage.lrange(db, key, start, stop) {
+        Ok(elements) => {
+            let frames: Vec<RespFrame> = elements.into_iter()
+                .map(|e| RespFrame::from_bytes(e))
+                .collect();
+            Ok(RespFrame::Array(Some(frames)))
+        },
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle LINDEX command - Get element at index
@@ -177,9 +222,16 @@ pub fn handle_lindex(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame
         _ => return Ok(RespFrame::error("ERR invalid index format")),
     };
     
-    match storage.lindex(db, key, index)? {
-        Some(element) => Ok(RespFrame::from_bytes(element)),
-        None => Ok(RespFrame::null_bulk()),
+    // Get element at index
+    match storage.lindex(db, key, index) {
+        Ok(Some(element)) => Ok(RespFrame::from_bytes(element)),
+        Ok(None) => Ok(RespFrame::null_bulk()),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
     }
 }
 
@@ -212,8 +264,16 @@ pub fn handle_lset(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         _ => return Ok(RespFrame::error("ERR invalid value format")),
     };
     
-    storage.lset(db, key, index, value)?;
-    Ok(RespFrame::ok())
+    // Set element at index
+    match storage.lset(db, key, index, value) {
+        Ok(()) => Ok(RespFrame::ok()),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle LTRIM command - Trim list to specified range
@@ -250,8 +310,16 @@ pub fn handle_ltrim(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]
         _ => return Ok(RespFrame::error("ERR invalid stop format")),
     };
     
-    storage.ltrim(db, key, start, stop)?;
-    Ok(RespFrame::ok())
+    // Trim list to specified range
+    match storage.ltrim(db, key, start, stop) {
+        Ok(()) => Ok(RespFrame::ok()),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle LREM command - Remove elements from list
@@ -283,6 +351,14 @@ pub fn handle_lrem(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame])
         _ => return Ok(RespFrame::error("ERR invalid element format")),
     };
     
-    let removed = storage.lrem(db, key, count, element)?;
-    Ok(RespFrame::Integer(removed as i64))
+    // Remove elements from list
+    match storage.lrem(db, key, count, element) {
+        Ok(removed) => Ok(RespFrame::Integer(removed as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
