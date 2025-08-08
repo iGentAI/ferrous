@@ -4,7 +4,7 @@
 //! - Channel subscriptions (SUBSCRIBE/UNSUBSCRIBE)
 //! - Pattern subscriptions (PSUBSCRIBE/PUNSUBSCRIBE)
 //! - Message publishing (PUBLISH)
-//! - Thread-safe subscription management
+//! - Thread-safe subscription management with deadlock prevention
 //! - Efficient message delivery
 
 use std::collections::{HashMap, HashSet};
@@ -50,7 +50,7 @@ pub struct PublishResult {
     pub num_receivers: usize,
 }
 
-/// Manages all pub/sub subscriptions
+/// Manages all pub/sub subscriptions with deadlock-free concurrent access
 pub struct PubSubManager {
     /// Channel subscriptions: channel -> set of connection IDs
     channels: Mutex<HashMap<Vec<u8>, HashSet<u64>>>,
@@ -76,8 +76,9 @@ impl PubSubManager {
     pub fn subscribe(&self, connection_id: u64, channels: Vec<Vec<u8>>) -> Result<Vec<SubResult>> {
         let mut results = Vec::new();
         
-        let mut channel_subs = self.channels.lock().unwrap();
+        // DEADLOCK FIX: Always lock in consistent order: connections first, then data structures
         let mut conn_subs = self.connections.lock().unwrap();
+        let mut channel_subs = self.channels.lock().unwrap();
         
         // Ensure connection info exists  
         let conn_info = conn_subs.entry(connection_id).or_insert_with(|| {
@@ -116,8 +117,9 @@ impl PubSubManager {
     pub fn unsubscribe(&self, connection_id: u64, channels: Option<Vec<Vec<u8>>>) -> Result<Vec<SubResult>> {
         let mut results = Vec::new();
         
-        let mut channel_subs = self.channels.lock().unwrap();
+        // DEADLOCK FIX: Consistent lock ordering - connections first, then channels
         let mut conn_subs = self.connections.lock().unwrap();
+        let mut channel_subs = self.channels.lock().unwrap();
         
         let conn_info = match conn_subs.get_mut(&connection_id) {
             Some(info) => info,
@@ -164,8 +166,9 @@ impl PubSubManager {
     pub fn psubscribe(&self, connection_id: u64, patterns: Vec<Vec<u8>>) -> Result<Vec<SubResult>> {
         let mut results = Vec::new();
         
-        let mut pattern_subs = self.patterns.lock().unwrap();
+        // DEADLOCK FIX: Consistent lock ordering - connections first, then patterns
         let mut conn_subs = self.connections.lock().unwrap();
+        let mut pattern_subs = self.patterns.lock().unwrap();
         
         // Ensure connection info exists
         let conn_info = conn_subs.entry(connection_id).or_insert_with(|| {
@@ -204,8 +207,9 @@ impl PubSubManager {
     pub fn punsubscribe(&self, connection_id: u64, patterns: Option<Vec<Vec<u8>>>) -> Result<Vec<SubResult>> {
         let mut results = Vec::new();
         
-        let mut pattern_subs = self.patterns.lock().unwrap();
+        // DEADLOCK FIX: Consistent lock ordering - connections first, then patterns
         let mut conn_subs = self.connections.lock().unwrap();
+        let mut pattern_subs = self.patterns.lock().unwrap();
         
         let conn_info = match conn_subs.get_mut(&connection_id) {
             Some(info) => info,
@@ -285,45 +289,39 @@ impl PubSubManager {
     
     /// Remove all subscriptions for a connection
     pub fn unsubscribe_all(&self, connection_id: u64) -> Result<()> {
+        // DEADLOCK FIX: Consistent lock ordering - connections first, then remove from all
+        let mut conn_subs = self.connections.lock().unwrap();
+        let mut channel_subs = self.channels.lock().unwrap();
+        let mut pattern_subs = self.patterns.lock().unwrap();
+        
         // Remove from channel subscriptions
-        {
-            let mut channel_subs = self.channels.lock().unwrap();
-            let mut to_remove = Vec::new();
-            
-            for (channel, subscribers) in channel_subs.iter_mut() {
-                subscribers.remove(&connection_id);
-                if subscribers.is_empty() {
-                    to_remove.push(channel.clone());
-                }
+        let mut channels_to_remove = Vec::new();
+        for (channel, subscribers) in channel_subs.iter_mut() {
+            subscribers.remove(&connection_id);
+            if subscribers.is_empty() {
+                channels_to_remove.push(channel.clone());
             }
-            
-            for channel in to_remove {
-                channel_subs.remove(&channel);
-            }
+        }
+        
+        for channel in channels_to_remove {
+            channel_subs.remove(&channel);
         }
         
         // Remove from pattern subscriptions
-        {
-            let mut pattern_subs = self.patterns.lock().unwrap();
-            let mut to_remove = Vec::new();
-            
-            for (pattern, subscribers) in pattern_subs.iter_mut() {
-                subscribers.remove(&connection_id);
-                if subscribers.is_empty() {
-                    to_remove.push(pattern.clone());
-                }
-            }
-            
-            for pattern in to_remove {
-                pattern_subs.remove(&pattern);
+        let mut patterns_to_remove = Vec::new();
+        for (pattern, subscribers) in pattern_subs.iter_mut() {
+            subscribers.remove(&connection_id);
+            if subscribers.is_empty() {
+                patterns_to_remove.push(pattern.clone());
             }
         }
         
-        // Remove connection info
-        {
-            let mut conn_subs = self.connections.lock().unwrap();
-            conn_subs.remove(&connection_id);
+        for pattern in patterns_to_remove {
+            pattern_subs.remove(&pattern);
         }
+        
+        // Remove connection info
+        conn_subs.remove(&connection_id);
         
         Ok(())
     }

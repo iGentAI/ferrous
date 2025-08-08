@@ -2,7 +2,7 @@
 //! 
 //! Provides additional Redis-compatible string operations beyond basic SET/GET.
 
-use crate::error::{FerrousError, Result, CommandError};
+use crate::error::{FerrousError, Result, CommandError, StorageError};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, Value};
 use std::sync::Arc;
@@ -98,8 +98,16 @@ pub fn handle_append(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame
         _ => return Ok(RespFrame::error("ERR invalid value format")),
     };
     
-    let new_len = storage.append(db, key, value)?;
-    Ok(RespFrame::Integer(new_len as i64))
+    // Append and handle WrongType errors properly
+    match storage.append(db, key, value) {
+        Ok(new_len) => Ok(RespFrame::Integer(new_len as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle STRLEN command - Get string length
@@ -113,8 +121,16 @@ pub fn handle_strlen(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let len = storage.strlen(db, key)?;
-    Ok(RespFrame::Integer(len as i64))
+    // Get string length and handle WrongType errors properly
+    match storage.strlen(db, key) {
+        Ok(len) => Ok(RespFrame::Integer(len as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle GETRANGE command - Get substring of string
@@ -148,8 +164,16 @@ pub fn handle_getrange(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFra
         _ => return Ok(RespFrame::error("ERR invalid end format")),
     };
     
-    let substring = storage.getrange(db, key, start, end)?;
-    Ok(RespFrame::from_bytes(substring))
+    // Get substring and handle WrongType errors properly
+    match storage.getrange(db, key, start, end) {
+        Ok(substring) => Ok(RespFrame::from_bytes(substring)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle SETRANGE command - Overwrite part of string
@@ -178,8 +202,16 @@ pub fn handle_setrange(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFra
         _ => return Ok(RespFrame::error("ERR invalid value format")),
     };
     
-    let new_len = storage.setrange(db, key, offset, value)?;
-    Ok(RespFrame::Integer(new_len as i64))
+    // Set range and handle WrongType errors properly
+    match storage.setrange(db, key, offset, value) {
+        Ok(new_len) => Ok(RespFrame::Integer(new_len as i64)),
+        Err(FerrousError::Storage(StorageError::WrongType)) => {
+            Ok(RespFrame::error("WRONGTYPE Operation against a key holding the wrong kind of value"))
+        },
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }
 
 /// Handle TYPE command - Get key type
@@ -287,6 +319,11 @@ pub fn handle_persist(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFram
         _ => return Ok(RespFrame::error("ERR invalid key format")),
     };
     
-    let result = storage.persist(db, key)?;
-    Ok(RespFrame::Integer(if result { 1 } else { 0 }))
+    // Remove expiration and handle errors properly (PERSIST works on any key type)
+    match storage.persist(db, key) {
+        Ok(result) => Ok(RespFrame::Integer(if result { 1 } else { 0 })),
+        Err(e) => {
+            Ok(RespFrame::error(format!("ERR {}", e)))
+        }
+    }
 }

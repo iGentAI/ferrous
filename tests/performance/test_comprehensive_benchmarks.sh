@@ -139,7 +139,8 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-SCRIPT_SHA=$(echo "$SCRIPT_LOAD_OUTPUT" | tail -n1)
+# Remove quotes from redis-cli output (it returns JSON formatted string)
+SCRIPT_SHA=$(echo "$SCRIPT_LOAD_OUTPUT" | tail -n1 | tr -d '"')
 if [ -z "$SCRIPT_SHA" ] || [[ "$SCRIPT_SHA" == *"ERR"* ]]; then
     echo "❌ CRITICAL ERROR: Invalid SCRIPT SHA returned: '$SCRIPT_SHA'"
     exit 1

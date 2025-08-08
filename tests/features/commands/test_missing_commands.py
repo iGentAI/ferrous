@@ -237,6 +237,85 @@ class MissingCommandsTester:
                 
         return all_working
 
+    def test_command_introspection(self):
+        """Test the COMMAND command for Redis client compatibility"""
+        print("\nTesting COMMAND introspection...")
+        
+        try:
+            # Test COMMAND COUNT
+            count = self.r.execute_command('COMMAND', 'COUNT')
+            if isinstance(count, int) and count > 100:  # Should be 114+ 
+                print(f"  ✅ COMMAND COUNT: {count} commands")
+            else:
+                print(f"  ❌ COMMAND COUNT failed: got {count}")
+                return False
+                
+            # Test basic COMMAND (returns array of command info)
+            commands = self.r.execute_command('COMMAND')
+            if isinstance(commands, list) and len(commands) > 0:
+                print(f"  ✅ COMMAND: returned {len(commands)} command metadata entries")
+                
+                # Check that essential commands are included
+                command_names = []
+                for cmd_info in commands:
+                    if isinstance(cmd_info, list) and len(cmd_info) > 0:
+                        command_names.append(cmd_info[0])
+                
+                essential = ['ping', 'set', 'get', 'command']
+                found_essential = [cmd for cmd in essential if cmd in command_names] 
+                if len(found_essential) >= 3:
+                    print(f"  ✅ Essential commands found: {found_essential}")
+                else:
+                    print(f"  ⚠️  Some essential commands missing: {found_essential}")
+            else:
+                print(f"  ❌ COMMAND failed: got {type(commands)}")
+                return False
+                
+            return True
+            
+        except Exception as e:
+            print(f"  ❌ COMMAND test failed: {e}")
+            return False
+
+    def test_shutdown_command_last(self):
+        """Test SHUTDOWN command - MUST BE LAST TEST as it terminates the server"""
+        print("\nTesting SHUTDOWN command (server termination)...")
+        
+        try:
+            # Test SHUTDOWN NOSAVE (doesn't save data before shutdown)
+            print("  Executing SHUTDOWN NOSAVE (server will terminate)...")
+            
+            # This command should return OK then terminate the server
+            response = self.r.execute_command('SHUTDOWN', 'NOSAVE')
+            
+            if response == 'OK' or response == b'OK':
+                print("  ✅ SHUTDOWN NOSAVE returned OK")
+                
+                # Wait a moment for server to terminate
+                import time
+                time.sleep(0.2)
+                
+                # Try to ping - should fail since server is down
+                try:
+                    self.r.ping()
+                    print("  ❌ Server still responding after SHUTDOWN")
+                    return False
+                except Exception:
+                    print("  ✅ Server properly terminated after SHUTDOWN")
+                    return True
+            else:
+                print(f"  ❌ SHUTDOWN returned unexpected response: {response}")
+                return False
+                
+        except Exception as e:
+            # The connection might be closed by the shutdown - that's expected
+            if 'Connection closed' in str(e) or 'Connection reset' in str(e):
+                print("  ✅ Server terminated (connection closed as expected)")
+                return True
+            else:
+                print(f"  ❌ SHUTDOWN test failed: {e}")
+                return False
+
 def main():
     print("=" * 70)
     print("FERROUS MISSING COMMANDS TEST SUITE")
@@ -255,12 +334,14 @@ def main():
     
     tester = MissingCommandsTester()
     
-    # Run tests
+    # Run tests - SHUTDOWN MUST BE LAST
     results = []
     results.append(tester.test_zcard())
     results.append(tester.test_expiry_edge_cases())
     results.append(tester.test_distributed_lock_commands())
     results.append(tester.test_all_reported_commands())
+    results.append(tester.test_command_introspection())
+    results.append(tester.test_shutdown_command_last())
     
     # Summary
     passed = sum(results)
@@ -273,10 +354,10 @@ def main():
     
     if passed == total:
         print("🎉 All command tests passed!")
+        print("📝 Note: Server was shut down by SHUTDOWN test")
         sys.exit(0)
     else:
         print("❌ Some command tests failed")
-        print("   This may confirm missing commands like ZCARD")
         sys.exit(1)
 
 if __name__ == "__main__":

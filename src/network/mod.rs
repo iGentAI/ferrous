@@ -7,6 +7,7 @@ pub mod connection;
 pub mod server;
 pub mod monitoring;
 pub mod blocking;
+pub mod admin_commands;
 
 pub use listener::Listener;
 pub use monitoring::{PerformanceMonitoring, MonitoringConfig};

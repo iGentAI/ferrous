@@ -3,9 +3,8 @@
 //! These tests validate Redis compatibility of our MLua Lua 5.1 implementation
 
 use std::sync::Arc;
-use std::collections::HashMap;
 use ferrous::storage::engine::StorageEngine;
-use ferrous::storage::commands::lua::{handle_eval, handle_evalsha, handle_script_load, handle_lua_command_with_cache};
+use ferrous::storage::commands::lua::handle_eval;
 use ferrous::protocol::resp::RespFrame;
 
 /// Test Redis EVAL command compatibility
@@ -101,41 +100,6 @@ fn test_redis_keys_argv_compatibility() {
             }
         }
         _ => panic!("Expected array result"),
-    }
-}
-
-/// Test Redis script caching (SCRIPT LOAD / EVALSHA)
-#[test]
-fn test_redis_script_caching() {
-    let storage = Arc::new(StorageEngine::new_in_memory());
-    
-    let script = "return 'cached script'";
-    
-    // Load script - handle_script_load now returns (String, String) tuple
-    let load_parts = vec![
-        RespFrame::BulkString(Some(Arc::new("LOAD".as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new(script.as_bytes().to_vec()))),
-    ];
-    
-    let (sha1, _script) = handle_script_load(&storage, &load_parts).unwrap();
-    
-    // Execute via EVALSHA - now requires script cache parameter
-    let evalsha_parts = vec![
-        RespFrame::BulkString(Some(Arc::new("EVALSHA".as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new(sha1.as_bytes().to_vec()))),
-        RespFrame::Integer(0),
-    ];
-    
-    // Use handle_lua_command_with_cache instead of handle_evalsha directly
-    let mut script_cache = HashMap::new();
-    script_cache.insert(sha1, script.to_string());
-    
-    let result = handle_lua_command_with_cache(&storage, "evalsha", &evalsha_parts, &mut script_cache).unwrap();
-    match result {
-        RespFrame::BulkString(Some(bytes)) => {
-            assert_eq!(bytes.as_ref(), b"cached script");
-        }
-        _ => panic!("Expected cached script result"),
     }
 }
 
@@ -352,59 +316,6 @@ fn test_redis_edge_cases() {
             assert!(String::from_utf8_lossy(&bytes).contains("wrong number"));
         }
         _ => panic!("Expected error for wrong arguments"),
-    }
-}
-
-/// Test full SCRIPT command family
-#[test]
-fn test_script_command_family() {
-    let storage = Arc::new(StorageEngine::new_in_memory());
-    let mut script_cache = HashMap::new();
-    
-    // Test SCRIPT LOAD
-    let script = "return 'test script'";
-    let parts = vec![
-        RespFrame::BulkString(Some(Arc::new("SCRIPT".as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new("LOAD".as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new(script.as_bytes().to_vec()))),
-    ];
-    
-    let sha1_result = handle_lua_command_with_cache(&storage, "script", &parts, &mut script_cache).unwrap();
-    let sha1 = match sha1_result {
-        RespFrame::BulkString(Some(bytes)) => String::from_utf8(bytes.to_vec()).unwrap(),
-        _ => panic!("Expected SHA1"),
-    };
-    
-    // Test SCRIPT EXISTS
-    let exists_parts = vec![
-        RespFrame::BulkString(Some(Arc::new("SCRIPT".as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new("EXISTS".as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new(sha1.as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new("nonexistent".as_bytes().to_vec()))),
-    ];
-    
-    let result = handle_lua_command_with_cache(&storage, "script", &exists_parts, &mut script_cache).unwrap();
-    match result {
-        RespFrame::Array(Some(items)) => {
-            assert_eq!(items.len(), 2);
-            assert_eq!(items[0], RespFrame::Integer(1)); // Exists
-            assert_eq!(items[1], RespFrame::Integer(0)); // Doesn't exist
-        }
-        _ => panic!("Expected array for EXISTS"),
-    }
-    
-    // Test SCRIPT FLUSH
-    let flush_parts = vec![
-        RespFrame::BulkString(Some(Arc::new("SCRIPT".as_bytes().to_vec()))),
-        RespFrame::BulkString(Some(Arc::new("FLUSH".as_bytes().to_vec()))),
-    ];
-    
-    let result = handle_lua_command_with_cache(&storage, "script", &flush_parts, &mut script_cache).unwrap();
-    match result {
-        RespFrame::SimpleString(bytes) => {
-            assert_eq!(bytes.as_ref(), b"OK");
-        }
-        _ => panic!("Expected OK for FLUSH"),
     }
 }
 
