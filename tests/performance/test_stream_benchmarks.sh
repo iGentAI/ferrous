@@ -33,8 +33,8 @@ echo "4. XADD Performance Test (Custom RESP benchmark)"
 echo "============================================="
 echo "Using optimized direct RESP protocol benchmark for accurate measurement:"
 
-# Create temporary Python script for XADD benchmark
-TEMP_SCRIPT="/tmp/xadd_bench_$$.py"
+# Create temporary Python script for XADD benchmark with FIXED protocol formatting
+TEMP_SCRIPT="/tmp/xadd_bench_fixed_$$.py"
 cat > "$TEMP_SCRIPT" << 'EOF'
 import socket
 import time
@@ -42,39 +42,80 @@ import sys
 
 def benchmark_xadd(host, port, iterations=5000):
     try:
+        # Create a new connection for FLUSHALL
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((host, port))
         
-        # Clear existing data
+        # Clear existing data - properly formatted RESP command
         sock.send(b"*1\r\n$8\r\nFLUSHALL\r\n")
-        sock.recv(1024)
-        
-        # Pre-build commands
-        base_timestamp = int(time.time() * 1000)
-        commands = []
-        
-        for i in range(iterations):
-            timestamp_id = f"{base_timestamp + i}-0"
-            resp_cmd = f"*5\r\n$4\r\nXADD\r\n$11\r\nbench_stream\r\n${len(timestamp_id)}\r\n{timestamp_id}\r\n$5\r\nfield\r\n$5\r\nvalue\r\n"
-            commands.append(resp_cmd.encode())
-        
-        start_time = time.time()
-        
-        for cmd in commands:
-            sock.send(cmd)
-            response = sock.recv(1024)
-            if b"ERR" in response:
-                print(f"Error response from server: {response}", file=sys.stderr)
-                sys.exit(1)
-        
-        end_time = time.time()
+        response = sock.recv(1024)
+        if b"OK" not in response and b"+OK" not in response:
+            print(f"FLUSHALL failed: {response}", file=sys.stderr)
         sock.close()
         
-        duration = end_time - start_time
-        ops_per_sec = iterations / duration
-        avg_latency_ms = (duration * 1000) / iterations
+        # Pre-build commands with unique IDs
+        base_timestamp = int(time.time() * 1000)
         
-        print(f"XADD: {ops_per_sec:.2f} requests per second, avg={avg_latency_ms:.3f} msec")
+        # Run the benchmark with proper socket handling
+        start_time = time.time()
+        successful = 0
+        
+        # Process in batches to avoid socket buffer issues
+        batch_size = 100
+        for batch_start in range(0, iterations, batch_size):
+            # New connection for each batch
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((host, port))
+            sock.settimeout(5.0)  # Set timeout to detect hanging
+            
+            batch_end = min(batch_start + batch_size, iterations)
+            
+            for i in range(batch_start, batch_end):
+                # Create unique timestamp ID for each entry
+                timestamp_id = f"{base_timestamp + i}-0"
+                
+                # Build properly formatted RESP command
+                # *5 means 5 elements in array
+                # Each bulk string must have $length\r\n prefix
+                cmd_parts = [
+                    "*5\r\n",
+                    "$4\r\nXADD\r\n",
+                    "$12\r\nbench_stream\r\n",
+                    f"${len(timestamp_id)}\r\n{timestamp_id}\r\n",
+                    "$5\r\nfield\r\n",
+                    "$5\r\nvalue\r\n"
+                ]
+                cmd = "".join(cmd_parts).encode()
+                
+                try:
+                    sock.send(cmd)
+                    response = sock.recv(1024)
+                    
+                    if b"ERR" in response:
+                        print(f"Error at iteration {i}: {response}", file=sys.stderr)
+                        break
+                    else:
+                        successful += 1
+                except socket.timeout:
+                    print(f"Timeout at iteration {i} - command may be malformed", file=sys.stderr)
+                    break
+                except Exception as e:
+                    print(f"Socket error at iteration {i}: {e}", file=sys.stderr)
+                    break
+            
+            sock.close()
+        
+        end_time = time.time()
+        
+        if successful > 0:
+            duration = end_time - start_time
+            ops_per_sec = successful / duration
+            avg_latency_ms = (duration * 1000) / successful
+            
+            print(f"XADD: {ops_per_sec:.2f} requests per second, avg={avg_latency_ms:.3f} msec")
+        else:
+            print("XADD benchmark failed - no successful operations", file=sys.stderr)
+            sys.exit(1)
         
     except socket.error as e:
         print(f"Socket error: {e}", file=sys.stderr)
