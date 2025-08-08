@@ -1,13 +1,13 @@
 //! Synchronization protocol implementation (SYNC/PSYNC)
 
 use std::sync::Arc;
-use std::io::{Write, BufWriter};
+use std::io::Write;
 use std::net::TcpStream;
 use crate::error::{FerrousError, Result};
 use crate::protocol::{RespFrame, serialize_resp_frame};
 use crate::storage::{StorageEngine, RdbEngine};
 use crate::network::Connection;
-use super::{ReplicationManager, ReplicationRole, MasterLinkStatus};
+use super::{ReplicationManager, ReplicationRole};
 
 /// Result of PSYNC command
 #[derive(Debug)]

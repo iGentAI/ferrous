@@ -2,10 +2,9 @@
 //! 
 //! Provides Redis-compatible hash operations for field-value pairs within a key.
 
-use crate::error::{FerrousError, Result, CommandError, StorageError};
+use crate::error::{FerrousError, Result, StorageError};
 use crate::protocol::RespFrame;
-use crate::storage::{StorageEngine, Value};
-use std::collections::HashMap;
+use crate::storage::StorageEngine;
 use std::sync::Arc;
 
 /// Handle HSET command - Set hash field(s)

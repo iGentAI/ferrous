@@ -49,8 +49,8 @@ fn run() -> Result<()> {
     config.apply_cli_args(cli_args);
     
     // Check for password
-    if let Some(ref password) = config.network.password {
-        println!("Authentication enabled with password: '{}'", password);
+    if let Some(ref _password) = config.network.password {
+        println!("Authentication enabled");
     }
     
     println!("Ferrous with MLua Lua 5.1 scripting listening on {}:{}", 

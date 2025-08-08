@@ -3,9 +3,9 @@
 //! Provides Redis-compatible consumer group operations for streams including
 //! XGROUP commands, XREADGROUP, XACK, XCLAIM, and XPENDING.
 
-use std::collections::{HashMap, BTreeSet, VecDeque};
+use std::collections::{HashMap, BTreeSet};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
+use std::time::{SystemTime, Duration};
 use crate::storage::stream::{StreamId, StreamEntry};
 
 /// Consumer group information

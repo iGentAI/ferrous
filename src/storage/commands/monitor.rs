@@ -3,8 +3,8 @@
 //! Provides Redis-compatible monitoring commands including INFO, MONITOR, and SLOWLOG.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::Ordering;
+use std::time::SystemTime;
 use std::process;
 use std::fmt::Write;
 use crate::error::Result;

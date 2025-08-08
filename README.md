@@ -1,344 +1,209 @@
-# ferrous
-A Redis-compatible in-memory database server written in Rust with MLua-based Lua 5.1 scripting
+# Ferrous
 
-**Developed entirely by Maestro, an AI assistant by iGent AI**
+A Redis-compatible in-memory database server written in Rust with Lua 5.1 scripting support.
 
-*Note: Ferrous represents a comprehensive Redis-compatible database implementation created 100% through AI development, demonstrating advanced capabilities in systems programming, performance optimization, and architectural design. While developed in collaboration with human guidance, all code, documentation, and technical implementation was autonomously generated.*
+**Developed entirely by Maestro, an AI assistant by iGent AI, through conversational steering and human guidance.**
 
-## Project Status
+## Overview
 
-Ferrous has achieved **full production-ready status** after comprehensive validation and systematic bug resolution:
+Ferrous is a high-performance, Redis-compatible server that provides in-memory data storage with full RESP2 protocol compliance. It implements the core Redis functionality that most applications require, with strong focus on memory safety through Rust's ownership model and reliable concurrent operations.
 
-### **Production Readiness Validation (August 2025):**
+## Features
 
-**Core Capabilities:**
-- ✅ **Protocol Compliance**: 100% RESP2 specification compliance including edge cases
-- ✅ **Performance Excellence**: 85k+ ops/sec (PING, SET, GET) with 769k+ ops/sec pipelining
-- ✅ **Data Integrity**: Zero corruption under stress (1000 concurrent operations, 50K memory pressure)  
-- ✅ **Queue Operations**: Production-validated blocking operations with proper FIFO semantics
-- ✅ **Transaction Safety**: Redis 6.0.9+ compliant WATCH mechanism with proper expiry handling
-- ✅ **Connection Reliability**: Supports 10,000 concurrent connections with recovery mechanisms
-- ✅ **Edge Case Handling**: Comprehensive validation of limits, binary data, Unicode, large collections
+### Core Data Storage
+- **Data Structures**: Strings, Lists, Sets, Hashes, Sorted Sets, Streams
+- **Persistence**: RDB snapshots and AOF (Append-Only File) support
+- **Memory Management**: Efficient sharded storage with configurable limits
+- **Expiration**: Key TTL support with background cleanup
 
-**Systematic Validation Results:**
-- **Protocol Tests**: 22/22 passed (15 core + 7 edge cases)
-- **Blocking Operations**: 7/7 passed (concurrent workers, timeouts, FIFO ordering)
-- **Edge Cases & Limits**: 7/7 passed (key validation, numeric boundaries, memory pressure)
-- **Connection Management**: 3/3 passed (stress testing, recovery, malformed input handling)
-- **WATCH Mechanism**: 9/9 passed (concurrency, isolation, expiry compliance)
-- **Performance Benchmarks**: All targets met or exceeded
+### Redis Compatibility
+- **Protocol**: Full RESP2 specification compliance
+- **Commands**: 114+ Redis commands implemented
+- **Clients**: Compatible with redis-cli, redis-py, and other Redis client libraries
+- **Lua Scripting**: Lua 5.1 execution with Redis-compatible API (EVAL, EVALSHA, SCRIPT commands)
 
-### Production-Ready Features Validated:
-- ✅ **Cache Operations**: High-performance key-value storage with proper expiration
-- ✅ **Queue Processing**: BLPOP/BRPOP for production message queue patterns
-- ✅ **Pub/Sub Messaging**: Real-time message distribution with pattern matching
-- ✅ **Transaction Processing**: ACID guarantees with optimistic concurrency control
-- ✅ **Stream Processing**: Redis Streams for event sourcing and log aggregation
-- ✅ **Script Execution**: Lua 5.1 scripting with atomic operation guarantees
+### Networking & Performance
+- **Concurrent Connections**: Multi-threaded handling of thousands of simultaneous clients
+- **Pipelining**: Full command pipelining support
+- **Pub/Sub**: Real-time messaging with pattern matching
+- **Transactions**: MULTI/EXEC/WATCH for atomic operations
+- **Blocking Operations**: BLPOP/BRPOP for queue processing patterns
 
-**Performance vs Industry Standards:**
-- **12% faster** than Valkey 8.0.4
-- **50% faster** SET operations than baseline Redis implementations  
-- **Zero performance regression** through comprehensive bug fixing
+### Additional Features
+- **Master-slave replication** (basic implementation)
+- **Authentication** with password protection
+- **Configuration** via files or command-line arguments
+- **Monitoring** via MONITOR command and basic INFO sections
 
-### Core Implementation Status:
-- ✅ TCP Server with connection handling
-- ✅ Full RESP2 protocol implementation
-- ✅ Core data structures: Strings, Lists, Sets, Hashes, Sorted Sets
-- ✅ Complete key operations: GET, SET, DEL, EXISTS, EXPIRE, TTL, etc.
-- ✅ RDB persistence (SAVE, BGSAVE) 
-- ✅ Pub/Sub messaging system
-- ✅ Transaction support (MULTI/EXEC/DISCARD/WATCH)
-- ✅ AOF persistence
-- ✅ **Redis-compatible Lua 5.1 scripting with comprehensive command support**
-- ✅ **Blocking operations (BLPOP/BRPOP) for queue patterns**
-- ✅ Pipelined command processing
-- ✅ Concurrent client handling (50+ connections)
-- ✅ Configuration commands (CONFIG GET)
-- ✅ Enhanced RESP protocol parsing
-- ✅ Master-slave replication
-- ✅ SCAN command family for safe iteration
-- ✅ **Complete Redis functionality trinity: Cache + Pub/Sub + Queue**
+## Known Limitations
 
-### Command Implementation Status:
-**Total: 114 Redis commands implemented** (95% compatibility for common use cases)
+- **Clustering**: Not implemented - single-node deployment only
+- **Dynamic Configuration**: Server restart required for most config changes
+- **Advanced Replication**: Limited to basic master-slave setup
+- **Monitoring**: Some INFO sections and SLOWLOG features incomplete
+- **HyperLogLog**: Not implemented
+- **Modules**: No Redis module system support
 
-### Lua Scripting Features - COMPREHENSIVE REDIS COMPATIBILITY:
-- ✅ **EVAL command**: Execute Lua 5.1 scripts with KEYS and ARGV
-- ✅ **EVALSHA command**: Execute cached scripts by SHA1 hash
-- ✅ **SCRIPT LOAD**: Load and cache Lua scripts
-- ✅ **SCRIPT EXISTS**: Check if scripts exist in cache
-- ✅ **SCRIPT FLUSH**: Clear script cache
-- ✅ **SCRIPT KILL**: Kill running scripts
-- ✅ **COMPREHENSIVE REDIS COMMANDS**: 100+ commands available through redis.call() and redis.pcall()
-- ✅ **Multi-step Script Atomicity**: Complex scripts maintain transaction semantics across multiple commands
-- ✅ **Atomic Operations**: SET NX, conditional operations work correctly in Lua context
-- ✅ **Array Response Support**: Operations like ZPOPMIN, ZRANGE WITHSCORES return proper arrays
-- ✅ **Sandboxing**: Dangerous functions disabled (os, io, debug, etc.)
-- ✅ **Resource Limits**: Memory and instruction count limits
-- ✅ **Timeout Protection**: Script execution time limits
+## Quick Start
 
-### WIP: Unified Command Executor Migration
+### Building
 
-**Current Architecture (August 2025):**
-```
-Lua Interface (redis.call()):           Server Interface (redis-cli):
-┌─────────────────────────┐             ┌─────────────────────────┐
-│ 100+ Redis Commands     │             │ Original Command        │
-│ via Unified Executor    │             │ Handlers + Enhancements │
-│ (Phase 1: Complete)     │             │ (Enhanced Original)     │
-└─────────────────────────┘             └─────────────────────────┘
-            ↓                                       ↓
-┌─────────────────────────┐             ┌─────────────────────────┐
-│ UnifiedCommandExecutor  │             │ server.rs handlers +    │
-│ - COMPLETE coverage     │             │ - Original sophisticated│
-│ - Atomic guarantees     │             │ - ZPOPMIN/ZPOPMAX added │
-│ - Array responses fixed │             │ - NoResponse fixes      │
-└─────────────────────────┘             └─────────────────────────┘
+```bash
+git clone https://github.com/iGentAI/ferrous.git
+cd ferrous
+cargo build --release
 ```
 
-**Phase 1 Status: ✅ COMPLETE**
-- Lua interface validates comprehensive Redis compatibility through unified executor
-- 100+ Redis commands working correctly in single and multi-line scripts
-- Critical bugs resolved: SET NX atomicity, array responses, WATCH mechanism
-- Performance validated: 36,951 effective ops/sec for complex scripts
+### Running
 
-**Phase 2 Status: 🔄 PLANNED**
-- Server handlers will migrate to unified executor after Lua validation
-- Will eliminate final parallel processing system
-- Will achieve complete architectural unification
+```bash
+# Default configuration (port 6379, no auth)
+./target/release/ferrous
 
-### Coming Soon (Remaining Phase 4-6):
-- Production monitoring (INFO, SLOWLOG) ✅ **COMPLETED - Zero-overhead configurable monitoring system**
-- Complete server migration to unified executor (Phase 2)
-- Advanced features (HyperLogLog)
-- Cluster support
+# With authentication
+./target/release/ferrous --requirepass mypassword
+
+# Using configuration file
+./target/release/ferrous ferrous-production.conf
+```
+
+### Testing
+
+Install test dependencies:
+```bash
+pip install redis
+sudo dnf install -y redis  # For redis-benchmark
+```
+
+Run tests:
+```bash
+# Quick validation
+./run_tests.sh default
+
+# Full test suite  
+./run_tests.sh all
+
+# Performance benchmarks
+./run_tests.sh perf
+
+# Rust unit tests
+cargo test --release
+```
+
+### Example Usage
+
+```bash
+# Connect with redis-cli
+redis-cli -p 6379
+> SET mykey "Hello World"  
+> GET mykey
+"Hello World"
+
+# Lua scripting
+> EVAL "return redis.call('GET', KEYS[1])" 1 mykey
+"Hello World"
+
+# Pub/Sub messaging
+> SUBSCRIBE news
+> PUBLISH news "Breaking: Ferrous works great!"
+```
+
+## Configuration
+
+Ferrous supports configuration via files (Redis-compatible format) or command-line arguments:
+
+```bash
+# Command line
+./target/release/ferrous --port 6380 --requirepass secret --dir /data
+
+# Configuration file
+./target/release/ferrous my-config.conf
+```
+
+Example configuration:
+```
+port 6379
+bind 127.0.0.1
+requirepass mypassword
+maxclients 1000
+dir ./data
+save 900 1
+save 300 10
+save 60 10000
+```
+
+## Performance
+
+Ferrous delivers competitive performance with established Redis implementations based on standardized redis-benchmark testing:
+
+### Benchmark Results vs Valkey 8.0.4
+
+**Test Environment**: Same system, optimized configuration, logs redirected to /dev/null  
+**Test Size**: 10,000 requests per operation
+
+| Operation | Ferrous (ops/sec) | Valkey 8.0.4 (ops/sec) | Performance Ratio |
+|-----------|-------------------|-------------------------|-------------------|
+| PING      | 80,645           | 74,626                 | Ferrous 8% faster |
+| SET       | 76,336           | 71,942                 | Ferrous 6% faster |
+| GET       | 78,740           | 74,626                 | Ferrous 6% faster |
+| INCR      | 80,000           | 78,125                 | Ferrous 2% faster |
+| LPUSH     | 78,125           | 74,074                 | Ferrous 5% faster |
+| LPOP      | 79,365           | 74,074                 | Ferrous 7% faster |
+| SADD      | 71,942           | 71,942                 | Equal performance |
+| HSET      | 78,125           | 74,627                 | Ferrous 5% faster |
+
+**Pipelining Performance** (10 commands per pipeline):
+- PING: 833,333 ops/sec (Valkey: 666,667 ops/sec - Ferrous 25% faster)
+- SET: 303,030 ops/sec (Valkey: 588,235 ops/sec - Valkey 94% faster)
+
+### Performance Summary
+- **Single Command Operations**: Ferrous averages 5-8% faster than Valkey across core operations
+- **PING Pipeline Operations**: Ferrous outperforms Valkey by 25% (833k vs 667k ops/sec)
+- **SET Pipeline Operations**: Valkey outperforms Ferrous by 94% (588k vs 303k ops/sec)
+- **Latency**: Both servers achieve sub-millisecond response times (0.3-0.4ms median)
+- **Throughput**: Both servers handle 70,000+ operations per second for basic commands
+
+### Performance Notes
+- Results measured with optimized server configurations (logs to /dev/null)
+- Performance may vary based on hardware, workload patterns, and configuration
+- Ferrous excels at both single commands and PING pipelining
+- Valkey has better optimization for SET pipelining workloads
+- Both servers are suitable for high-performance Redis workloads
+
+## Architecture
+
+- **Language**: Rust for memory safety and performance
+- **Storage**: Sharded in-memory HashMap structures with atomic operations
+- **Networking**: Tokio-based async I/O with connection pooling
+- **Scripting**: MLua-based Lua 5.1 engine for Redis compatibility
+- **Concurrency**: Lock-free operations where possible, fine-grained locking elsewhere
 
 ## Dependencies
 
-Ferrous now uses MLua for Redis-compatible Lua 5.1 scripting, plus minimal pure Rust dependencies:
-- `mlua` - Lua 5.1 scripting support for Redis compatibility (uses vendored Lua 5.1)
-- `rand` - For skip list level generation and random eviction in Redis SET commands
-- `thiserror` - For ergonomic error handling
-- `tokio` - For async operations and timeouts
-- `sha1` + `hex` - For Lua script SHA1 hashing
+Ferrous maintains a minimal dependency footprint:
+- `mlua` - Lua 5.1 scripting engine
+- `tokio` - Async runtime
+- `rand` - Random number generation
+- `sha1` + `hex` - Script hashing
+- `thiserror` - Error handling
 
-## Lua Scripting - COMPLETE REDIS COMPATIBILITY
+## Contributing
 
-Ferrous supports **comprehensive Redis-compatible Lua 5.1 scripting** through the unified command executor:
+When contributing to Ferrous:
 
-```bash
-# Start the server
-./target/release/ferrous
+1. Ensure all tests pass: `./run_tests.sh all && cargo test`
+2. Follow Rust best practices and maintain memory safety
+3. Add tests for new functionality
+4. Update documentation for user-facing changes
 
-# Connect with redis-cli and run comprehensive Lua scripts
+## License
 
-# Example: Multi-line script with all Redis data types
-redis-cli -p 6379 EVAL "
--- String operations with full option support
-redis.call('SET', 'str_key', 'value', 'NX', 'EX', '100')
-local str_result = redis.call('GET', 'str_key')
+Dual licensed under:
+- Apache License, Version 2.0
+- MIT License
 
--- List operations
-redis.call('LPUSH', 'list_key', 'item1', 'item2', 'item3')
-local list_range = redis.call('LRANGE', 'list_key', '0', '2')
+## Development
 
--- Hash operations
-redis.call('HSET', 'hash_key', 'field1', 'value1', 'field2', 'value2')
-local hash_all = redis.call('HGETALL', 'hash_key')
+**Note**: Ferrous represents a comprehensive Redis-compatible implementation developed entirely through AI-assisted programming. While it implements the core Redis feature set with good compatibility, some advanced features and clustering capabilities are not yet available. The project prioritizes correctness and Redis compatibility over feature completeness.
 
--- Set operations
-redis.call('SADD', 'set_key', 'member1', 'member2', 'member3')
-local set_members = redis.call('SMEMBERS', 'set_key')
-
--- Sorted set operations with array responses
-redis.call('ZADD', 'zset_key', '1.0', 'low', '3.0', 'high')
-local zpopmin = redis.call('ZPOPMIN', 'zset_key')
-local zrange_scores = redis.call('ZRANGE', 'zset_key', '0', '0', 'WITHSCORES')
-
--- Stream operations
-redis.call('XADD', 'stream_key', '*', 'event', 'processed')
-local stream_len = redis.call('XLEN', 'stream_key')
-
--- Database operations
-local total_keys = redis.call('DBSIZE')
-
-return {
-    string_val = str_result,
-    list_items = list_range,
-    hash_data = hash_all,
-    set_data = set_members,
-    popped_min = zpopmin,
-    zrange_with_scores = zrange_scores,
-    stream_length = stream_len,
-    total_keys = total_keys
-}
-" 0
-
-# Result: All operations working in comprehensive multi-line atomic script
-```
-
-### Multi-line Script Performance (Validated):
-- **3,695 complex scripts/sec** (10+ commands each)
-- **36,951 effective ops/sec** for multi-command scripts
-- **Atomicity guaranteed** across all command sequences
-- **Array responses working** (ZPOPMIN, ZRANGE WITHSCORES return proper nested arrays)
-
-### Command Filtering (Correct Redis Behavior):
-```bash
-# Commands properly blocked in Lua scripts:
-WATCH, MULTI, EXEC    # Scripts are inherently atomic
-BLPOP, BRPOP          # Blocking operations not allowed
-SELECT, AUTH, QUIT    # Connection-specific operations
-EVAL, EVALSHA         # Prevents recursive script execution
-
-# All data manipulation commands allowed and working
-```
-
-## Current Migration Status
-
-### ✅ **Phase 5+ Complete: Production-Ready Status Achieved**
-
-**Core Infrastructure Validated:**
-- `server.rs` command dispatch → Enhanced with comprehensive bug fixes and Redis compliance
-- **All critical production issues resolved** through systematic testing and validation
-- **Complete Redis protocol compliance** including edge cases and error handling
-- **Performance excellence maintained** with 85k+ ops/sec core operations
-
-**Major Architecture Update (August 2025 - Session Fixes):**
-- ✅ **Critical Bug Fixes Applied**: SCRIPT LOAD hanging resolved, QUIT command implemented
-- ✅ **Redis Protocol Compliance**: Empty string key validation, protocol edge case tolerance  
-- ✅ **Production Data Safety**: Integer overflow protection, concurrent safety validation
-- ✅ **Blocking Operations Excellence**: Deadlock issues resolved, FIFO ordering fixed
-- ✅ **WATCH Redis 6.0.9+ Compliance**: Key expiration now properly triggers transaction aborts
-- ✅ **Timeout Precision**: Both float and integer timeout values properly supported
-- ✅ **Comprehensive Test Coverage**: 200+ tests spanning all production scenarios
-
-### Core Implementation Status:
-- ✅ TCP Server with robust connection handling (10,000 max concurrent)
-- ✅ Full RESP2 protocol implementation with 100% edge case compliance
-- ✅ Core data structures: Strings, Lists, Sets, Hashes, Sorted Sets (production-validated)
-- ✅ Complete key operations: GET, SET, DEL, EXISTS, EXPIRE, TTL, etc. (edge case tested)
-- ✅ RDB persistence (SAVE, BGSAVE) 
-- ✅ Pub/Sub messaging system
-- ✅ Transaction support (MULTI/EXEC/DISCARD/WATCH) with Redis 6.0.9+ compliance
-- ✅ AOF persistence
-- ✅ **Redis-compatible Lua 5.1 scripting with SCRIPT LOAD/EVALSHA working**
-- ✅ **Blocking operations (BLPOP/BRPOP) with production queue pattern validation**
-- ✅ Pipelined command processing with proper Redis protocol compliance
-- ✅ Concurrent client handling (validated up to 100 connections)
-- ✅ Configuration commands (CONFIG GET)
-- ✅ Enhanced RESP protocol parsing with proper error tolerance
-- ✅ Master-slave replication
-- ✅ SCAN command family for safe iteration
-- ✅ **Complete Redis functionality trinity: Cache + Pub/Sub + Queue (production-validated)**
-
-## 🔍 Testing and Production Validation
-
-### **Comprehensive Test Coverage (200+ Individual Tests)**
-
-Ferrous now maintains extensive test coverage through a unified test framework:
-
-#### **Test Categories:**
-```bash
-./run_tests.sh default    # Standard functionality (~150 tests)
-./run_tests.sh unit       # Rust unit tests (74 tests)  
-./run_tests.sh perf       # Performance benchmarks
-./run_tests.sh auth       # Authentication & replication
-./run_tests.sh monitoring # Slowlog, monitor, stats (requires config)
-./run_tests.sh load       # High-load stress testing
-./run_tests.sh all        # Complete validation (200+ tests)
-```
-
-#### **Comprehensive Test Framework:**
-- **48 Python test files** providing feature validation
-- **17 shell scripts** for integration and performance testing  
-- **74 Rust unit tests** for core functionality validation
-- **Protocol compliance testing** with RESP2 validation and edge cases
-- **Concurrency testing** for multi-threaded production scenarios
-- **Performance benchmarking** against Redis/Valkey baselines
-
-### **Critical Bug Fixes Validated:**
-
-**Protocol Compliance Issues Resolved:**
-- ✅ **WrongType errors**: Fixed connection closures, now return proper Redis error responses
-- ✅ **MEMORY USAGE**: Returns nil for non-existent keys instead of errors (protocol compliance)
-- ✅ **SCRIPT LOAD**: Syntax-only validation prevents hanging on scripts with redis.call()
-- ✅ **Lua error messages**: Cleaned to remove internal file path leakage
-
-**Functionality Fixes:**
-- ✅ **LPUSH ordering**: Correct LIFO order [c, b, a] for Redis compatibility
-- ✅ **Missing commands**: COMMAND and SHUTDOWN implemented for client compatibility
-- ✅ **Memory tests**: Efficient implementation (0.03s vs hours of hanging)
-
-**Concurrency Issues Resolved:**
-- ✅ **Pub/Sub concurrent registration**: Multiple subscribers to same channel work correctly
-- ✅ **Connection lifecycle**: Protected pub/sub connections from premature cleanup
-- ✅ **Concurrent operations**: All major Redis operations work under concurrent load
-
-## Performance & Reliability (August 2025 Validation)
-
-Ferrous demonstrates **exceptional performance** with comprehensive reliability validation:
-
-### Performance Comparison vs Valkey 8.0.4 (Validated):
-
-| Operation Context | Ferrous | Valkey 8.0.4 | Performance Ratio |
-|-------------------|---------|--------------|-------------------|
-| **Core Server Operations** | 82,000 ops/sec | 74,600 ops/sec | **110% (10% FASTER)** ✅ |
-| **Pipeline Operations** | 150,000+ ops/sec | ~130,000 ops/sec | **115% (15% FASTER)** ✅ |
-| **Concurrent Client Load** | 35,000+ ops/sec | ~30,000 ops/sec | **117% (17% FASTER)** ✅ |
-
-### **Comprehensive Validation Results:**
-- **Protocol Tests**: 15/15 passed (RESP2 specification compliance)
-- **Concurrency Tests**: 9/9 passed pub/sub, 7/7 passed blocking operations
-- **Edge Cases & Limits**: 7/7 passed (large data, Unicode, special characters) 
-- **Connection Management**: 3/3 passed (100 concurrent connections, recovery)
-- **Data Integrity**: 3/3 passed (cross-command safety, pipeline integrity)
-- **Performance**: All targets exceeded with stress testing validation
-
-### **Production Reliability Features:**
-- ✅ **Concurrent operation support**: Multi-threaded pub/sub, blocking operations
-- ✅ **Protocol compliance**: Comprehensive RESP validation, error handling
-- ✅ **Resource management**: Stress-tested cleanup, connection lifecycle protection
-- ✅ **Edge case resilience**: Unicode support, large values, binary data
-- ✅ **Performance validation**: Benchmarked against Redis/Valkey with superior results
-
-## Building and Testing
-
-```bash
-# Build the project
-cargo build --release
-
-# Run comprehensive test suite
-./run_tests.sh all          # Complete validation (200+ tests)
-./run_tests.sh default     # Standard functionality testing
-./run_tests.sh perf        # Performance benchmarking  
-
-# Configuration-dependent testing
-./run_tests.sh monitoring  # Requires monitoring config (slowlog, stats)
-./run_tests.sh load        # High-load stress testing
-
-# Run specific test categories
-cargo test --release       # Rust unit tests
-python3 tests/features/pubsub/test_pubsub_concurrency_comprehensive.py  # Pub/sub validation
-```
-
-### **Test Suite Organization:**
-- **Core functionality**: Protocol compliance, basic operations, data structures
-- **Advanced features**: Lua scripting, Streams, pub/sub messaging, transactions
-- **Performance validation**: Benchmarking, stress testing, concurrent load
-- **Edge case coverage**: Large data, Unicode, binary handling, error scenarios
-- **Configuration testing**: Monitoring features, authentication, replication
-
-The comprehensive test framework ensures production reliability and maintains Redis compatibility across all usage patterns and concurrent access scenarios.
-
-## Architecture Highlights
-
-- **Production-Ready Status**: Comprehensive validation through 200+ systematic tests
-- **Multi-threaded Performance**: Direct operations exceed Redis/Valkey baseline performance  
-- **Memory Safety**: Pure Rust implementation with safe MLua bindings
-- **Comprehensive Redis Lua Compatibility**: 100+ commands with full Lua 5.1 scripting compatibility  
-- **Production Ready**: Battle-tested MLua for reliable comprehensive Lua execution
-- **Atomic Operation Guarantees**: Prevents distributed coordination issues (SET NX atomicity fixed)
-- **High Availability**: Master-slave replication support
-- **Edge Case Resilience**: Complete protocol compliance including error tolerance
+For production deployment, thoroughly test your specific use cases and workloads. Ferrous works well for caching, queuing, pub/sub messaging, and basic Redis operations, but may not be suitable for all advanced Redis use cases.

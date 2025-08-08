@@ -4,10 +4,9 @@
 //! examining and managing client connections.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use crate::error::{Result, CommandError};
+use crate::error::Result;
 use crate::protocol::RespFrame;
 use crate::network::Connection;
-use std::collections::HashMap;
 
 /// Handle the CLIENT command and its various subcommands
 pub fn handle_client(

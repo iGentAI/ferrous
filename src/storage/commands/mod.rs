@@ -22,28 +22,8 @@ pub mod consumer_groups;
 pub mod executor;
 
 // Re-export all handlers for easy access
-pub use lists::*;
-pub use sets::*;
-pub use hashes::*;
-pub use strings::*;
-pub use transactions::*;
-pub use aof::*;
-pub use monitor::*;
-pub use config::*;
-pub use scan::*;
-pub use slowlog::*;
-pub use debug::*;
-pub use monitor_cmd::*;
-pub use client::*;
-pub use memory::*;
-pub use lua::*;       // Export new MLua-based Lua commands
-pub use streams::*;      // Export stream commands
-pub use consumer_groups::*; // Export consumer group commands
+       // Export new MLua-based Lua commands
+      // Export stream commands
+ // Export consumer group commands
 
 // Export unified command processing
-pub use executor::{
-    UnifiedCommandExecutor,
-    ServerCommandAdapter,
-    LuaCommandAdapter,
-    CommandParser,
-};

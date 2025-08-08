@@ -2,9 +2,9 @@
 //! 
 //! Provides additional Redis-compatible string operations beyond basic SET/GET.
 
-use crate::error::{FerrousError, Result, CommandError, StorageError};
+use crate::error::{FerrousError, Result, StorageError};
 use crate::protocol::RespFrame;
-use crate::storage::{StorageEngine, Value};
+use crate::storage::StorageEngine;
 use std::sync::Arc;
 
 /// Handle MGET command - Get multiple keys

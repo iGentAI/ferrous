@@ -10,10 +10,8 @@ pub mod blocking;
 pub mod admin_commands;
 
 pub use listener::Listener;
-pub use monitoring::{PerformanceMonitoring, MonitoringConfig};
 pub use server::Server;
 pub use connection::{Connection, ConnectionState};
-pub use blocking::{BlockingManager, WakeupRequest, BlockedClient};
 
 /// Network configuration
 #[derive(Debug, Clone)]

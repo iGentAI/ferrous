@@ -13,15 +13,14 @@ pub mod commands;
 mod backlog;
 mod client;
 
-pub use manager::{ReplicationManager, ReplicationRole, ReplicationState, MasterLinkStatus};
-pub use sync::{SyncProtocol, PsyncResult}; // Re-export SyncProtocol
-pub use commands::{handle_replicaof, handle_replconf, handle_slaveof, handle_sync, handle_psync};
+pub use manager::{ReplicationManager, ReplicationRole, MasterLinkStatus};
+ // Re-export SyncProtocol
+pub use commands::{handle_replicaof, handle_slaveof, handle_sync, handle_psync};
 pub use backlog::ReplicationBacklog;
-pub use client::{start_background_replication, ReplicationClientConfig};
 
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 use std::net::SocketAddr;
 
 /// Replication configuration

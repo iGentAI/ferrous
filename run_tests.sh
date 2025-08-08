@@ -128,10 +128,21 @@ run_default_tests() {
     python3 features/pubsub/test_pubsub_protocol_validation.py
     echo ""
     
-    # Run comprehensive pub/sub concurrency tests (CRITICAL for concurrent workloads)
+    # Run comprehensive pub/sub concurrency tests (SERIALIZED for clean server access)
     echo "Running pub/sub concurrency validation..."
+    echo "⚠️  SERIALIZED EXECUTION: Pub/sub concurrency tests require exclusive server access"
+    echo "   to prevent resource contention with other concurrent operations."
+    echo "   Running in isolation to ensure accurate timing validation..."
+    echo ""
+    
+    # Brief pause to ensure server is in clean state
+    sleep 2
     python3 features/pubsub/test_pubsub_concurrency_comprehensive.py
     echo ""
+    
+    # Important: Wait for pub/sub cleanup before continuing
+    echo "Waiting for pub/sub cleanup before continuing with other tests..."
+    sleep 2
     
     # Run ZCARD command tests
     echo "Running ZCARD command validation..."
@@ -161,10 +172,19 @@ run_default_tests() {
     python3 features/transactions/test_watch_comprehensive.py
     echo ""
     
-    # Run distributed locking pattern tests using WATCH
+    # Run distributed locking pattern tests (SERIALIZED for WATCH consistency)
     echo "Running distributed locking pattern tests..."
+    echo "⚠️  SERIALIZED EXECUTION: WATCH-based tests require clean server state"
+    echo "   to prevent interference from concurrent operations."
+    echo ""
+    
+    # Brief pause to ensure clean state for WATCH operations
+    sleep 1
     python3 features/transactions/test_distributed_locking.py
     echo ""
+    
+    # Wait for transaction cleanup
+    sleep 1
     
     # Run WATCH stress testing under extreme load
     echo "Running WATCH stress testing..."

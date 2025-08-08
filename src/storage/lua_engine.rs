@@ -12,7 +12,7 @@ use sha1::{Sha1, Digest};
 use crate::error::{Result, FerrousError};
 use crate::protocol::resp::RespFrame;
 use crate::storage::StorageEngine;
-use crate::storage::commands::executor::{UnifiedCommandExecutor, LuaCommandAdapter};
+use crate::storage::commands::executor::LuaCommandAdapter;
 
 /// Command execution context passed from server to Lua engine
 pub struct LuaCommandContext {

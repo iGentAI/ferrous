@@ -3,6 +3,16 @@
 Comprehensive Pub/Sub Concurrency Testing Framework for Ferrous
 Tests concurrent subscription management, deadlock prevention, and race condition handling
 Critical for validating pub/sub system as core Redis pillar
+
+ISOLATED TEST EXECUTION:
+Added UUID-based test namespacing to prevent interference between concurrent test processes.
+Each test run uses unique channel names to eliminate resource contention and timing issues.
+
+FIXED COORDINATION BUGS:
+- Replaced broken semaphore coordination with proper Event/counter pattern
+- Fixed message counting to include both 'message' and 'pmessage' types  
+- Improved confirmation waiting logic to be semantics-based not iteration-based
+- Added proper message count validation between publishers and subscribers
 """
 
 import redis
@@ -12,11 +22,15 @@ import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
+import uuid
 
 class PubSubConcurrencyTester:
     def __init__(self, host='127.0.0.1', port=6379):
         self.host = host
         self.port = port
+        # Generate unique test namespace to prevent cross-process interference
+        self.test_id = str(uuid.uuid4())[:8]
+        print(f"Test session ID: {self.test_id} (prevents channel name collisions)")
         
     def test_concurrent_subscriptions(self):
         """Test concurrent SUBSCRIBE/PSUBSCRIBE operations for deadlocks"""
@@ -26,8 +40,16 @@ class PubSubConcurrencyTester:
             try:
                 r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
                 pubsub = r.pubsub()
-                pubsub.subscribe(f'test_channel_{worker_id}')
-                confirmation = pubsub.get_message(timeout=2.0)
+                pubsub.subscribe(f'{self.test_id}_test_channel_{worker_id}')
+                
+                # FIXED: Wait for confirmation with deadline instead of single timeout
+                deadline = time.time() + 3.0
+                confirmation = None
+                while confirmation is None and time.time() < deadline:
+                    confirmation = pubsub.get_message(timeout=0.5)
+                    if confirmation and confirmation.get('type') == 'subscribe':
+                        break
+                
                 pubsub.close()
                 return worker_id, 'SUBSCRIBE_SUCCESS', confirmation is not None
             except Exception as e:
@@ -37,8 +59,16 @@ class PubSubConcurrencyTester:
             try:
                 r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
                 pubsub = r.pubsub()
-                pubsub.psubscribe(f'test_pattern_{worker_id}:*')
-                confirmation = pubsub.get_message(timeout=2.0)
+                pubsub.psubscribe(f'{self.test_id}_test_pattern_{worker_id}:*')
+                
+                # FIXED: Wait for confirmation with deadline 
+                deadline = time.time() + 3.0
+                confirmation = None
+                while confirmation is None and time.time() < deadline:
+                    confirmation = pubsub.get_message(timeout=0.5)
+                    if confirmation and confirmation.get('type') == 'psubscribe':
+                        break
+                        
                 pubsub.close()
                 return worker_id, 'PSUBSCRIBE_SUCCESS', confirmation is not None
             except Exception as e:
@@ -53,28 +83,33 @@ class PubSubConcurrencyTester:
                 futures.append(executor.submit(subscribe_worker, i))
                 futures.append(executor.submit(psubscribe_worker, i))
             
-            # Collect results
+            # FIXED: Remove timeout from as_completed and handle timeouts per future
             results = []
-            for future in as_completed(futures, timeout=10):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    results.append((None, 'TIMEOUT', str(e)))
+            try:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=15.0)  # Per-future timeout
+                        results.append(result)
+                    except Exception as e:
+                        results.append((None, 'TIMEOUT', str(e)))
+            except Exception as e:
+                # Handle any as_completed iterator errors
+                results.append((None, 'ITERATOR_ERROR', str(e)))
         
-        # Analyze results
-        subscribe_success = len([r for r in results if 'SUBSCRIBE_SUCCESS' in r[1]])
-        psubscribe_success = len([r for r in results if 'PSUBSCRIBE_SUCCESS' in r[1]])
-        total_operations = 20
+        # Analyze results - FIX: Use exact string matching to prevent PSUBSCRIBE from being counted as SUBSCRIBE
+        subscribe_success = len([r for r in results if len(r) >= 2 and r[1] == 'SUBSCRIBE_SUCCESS'])  # Defensive check
+        psubscribe_success = len([r for r in results if len(r) >= 2 and r[1] == 'PSUBSCRIBE_SUCCESS'])  # Defensive check
+        total_operations = 20  # 10 SUBSCRIBE + 10 PSUBSCRIBE = 20 total operations
+        total_success = subscribe_success + psubscribe_success
         
         print(f"  SUBSCRIBE operations: {subscribe_success}/10 successful")
         print(f"  PSUBSCRIBE operations: {psubscribe_success}/10 successful")
-        print(f"  Overall success rate: {(subscribe_success + psubscribe_success)}/20")
+        print(f"  Overall success rate: {total_success}/{total_operations}")
         
         if subscribe_success == 10 and psubscribe_success == 10:
             print("  ✅ Concurrent subscriptions working perfectly")
             return True
-        elif subscribe_success + psubscribe_success >= 16:  # Allow 80% success rate
+        elif total_success >= 16:  # Allow 80% success rate
             print("  ⚠️ Mostly working but some concurrency issues remain")
             return True
         else:
@@ -91,12 +126,24 @@ class PubSubConcurrencyTester:
                 s.settimeout(3.0)
                 s.connect((self.host, self.port))
                 
-                cmd = f'*2\r\n$9\r\nSUBSCRIBE\r\n$10\r\nraw_chan_{worker_id}\r\n'
+                channel_name = f'{self.test_id}_raw_chan_{worker_id}'
+                cmd = f'*2\r\n$9\r\nSUBSCRIBE\r\n${len(channel_name)}\r\n{channel_name}\r\n'
                 s.sendall(cmd.encode())
-                resp = s.recv(1024)
-                s.close()
                 
-                return worker_id, 'RAW_SUB_SUCCESS', len(resp) > 0
+                # FIXED: Proper RESP parsing instead of single recv()
+                buffer = b''
+                while len(buffer) < 100:  # Read enough to parse response
+                    data = s.recv(1024)
+                    if not data:
+                        break
+                    buffer += data
+                    # Check for subscribe confirmation pattern
+                    if b'*3\r\n$9\r\nsubscribe\r\n' in buffer:
+                        s.close()
+                        return worker_id, 'RAW_SUB_SUCCESS', True
+                
+                s.close()
+                return worker_id, 'RAW_SUB_SUCCESS', len(buffer) > 50  # Fallback check
             except Exception as e:
                 return worker_id, 'RAW_SUB_FAILED', str(e)
         
@@ -106,12 +153,24 @@ class PubSubConcurrencyTester:
                 s.settimeout(3.0)
                 s.connect((self.host, self.port))
                 
-                cmd = f'*2\r\n$10\r\nPSUBSCRIBE\r\n$11\r\nraw_pat_{worker_id}:*\r\n'
+                pattern_name = f'{self.test_id}_raw_pat_{worker_id}:*'
+                cmd = f'*2\r\n$10\r\nPSUBSCRIBE\r\n${len(pattern_name)}\r\n{pattern_name}\r\n'
                 s.sendall(cmd.encode())
-                resp = s.recv(1024)
-                s.close()
                 
-                return worker_id, 'RAW_PSUB_SUCCESS', len(resp) > 0
+                # FIXED: Proper RESP parsing instead of single recv()
+                buffer = b''
+                while len(buffer) < 100:  # Read enough to parse response
+                    data = s.recv(1024)
+                    if not data:
+                        break
+                    buffer += data
+                    # Check for psubscribe confirmation pattern
+                    if b'*3\r\n$10\r\npsubscribe\r\n' in buffer:
+                        s.close()
+                        return worker_id, 'RAW_PSUB_SUCCESS', True
+                
+                s.close()
+                return worker_id, 'RAW_PSUB_SUCCESS', len(buffer) > 50  # Fallback check
             except Exception as e:
                 return worker_id, 'RAW_PSUB_FAILED', str(e)
         
@@ -124,18 +183,21 @@ class PubSubConcurrencyTester:
                 futures.append(executor.submit(raw_subscribe_worker, i))
                 futures.append(executor.submit(raw_psubscribe_worker, i))
             
-            # Collect results
+            # FIXED: Remove timeout from as_completed
             results = []
-            for future in as_completed(futures, timeout=15):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    results.append((None, 'RAW_TIMEOUT', str(e)))
+            try:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=10.0)
+                        results.append(result)
+                    except Exception as e:
+                        results.append((None, 'RAW_TIMEOUT', str(e)))
+            except Exception as e:
+                results.append((None, 'ITERATOR_ERROR', str(e)))
         
         # Analyze results
-        raw_sub_success = len([r for r in results if 'RAW_SUB_SUCCESS' in r[1]])
-        raw_psub_success = len([r for r in results if 'RAW_PSUB_SUCCESS' in r[1]])
+        raw_sub_success = len([r for r in results if len(r) >= 2 and 'RAW_SUB_SUCCESS' in r[1]])
+        raw_psub_success = len([r for r in results if len(r) >= 2 and 'RAW_PSUB_SUCCESS' in r[1]])
         
         print(f"  Raw SUBSCRIBE: {raw_sub_success}/8 successful")
         print(f"  Raw PSUBSCRIBE: {raw_psub_success}/8 successful")
@@ -159,30 +221,33 @@ class PubSubConcurrencyTester:
                 r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
                 pubsub = r.pubsub()
                 
-                # Each worker does mixed subscriptions
+                # Each worker does mixed subscriptions with namespaced names
+                # FIXED: Make all branches expect exactly 2 confirmations for consistency
                 if worker_id % 3 == 0:
-                    # Channel subscription
-                    pubsub.subscribe(f'mixed_chan_{worker_id}')
-                    pubsub.psubscribe(f'mixed_pat_{worker_id}:*')
+                    # Channel + pattern subscription (2 expected)
+                    pubsub.subscribe(f'{self.test_id}_mixed_chan_{worker_id}')
+                    pubsub.psubscribe(f'{self.test_id}_mixed_pat_{worker_id}:*')
+                    expected_confirmations = 2
                 elif worker_id % 3 == 1:
-                    # Pattern first
-                    pubsub.psubscribe(f'mixed_pat_{worker_id}:*')
-                    pubsub.subscribe(f'mixed_chan_{worker_id}')
+                    # Pattern + channel subscription (2 expected)
+                    pubsub.psubscribe(f'{self.test_id}_mixed_pat_{worker_id}:*')
+                    pubsub.subscribe(f'{self.test_id}_mixed_chan_{worker_id}')
+                    expected_confirmations = 2
                 else:
-                    # Multiple patterns
-                    pubsub.psubscribe(f'pat1_{worker_id}:*', f'pat2_{worker_id}:*')
+                    # Two patterns (2 expected)
+                    pubsub.psubscribe(f'{self.test_id}_pat1_{worker_id}:*', f'{self.test_id}_pat2_{worker_id}:*')
+                    expected_confirmations = 2
                 
-                # Get confirmations
+                # FIXED: Semantics-based confirmation waiting with deadline
                 confirmations = 0
-                for _ in range(5):  # Try to get all confirmations
-                    msg = pubsub.get_message(timeout=1.0)
+                deadline = time.time() + 2.0
+                while confirmations < expected_confirmations and time.time() < deadline:
+                    msg = pubsub.get_message(timeout=0.5)
                     if msg and msg.get('type') in ['subscribe', 'psubscribe']:
                         confirmations += 1
-                    elif msg is None:
-                        break
                 
                 pubsub.close()
-                return worker_id, 'MIXED_SUCCESS', confirmations >= 2
+                return worker_id, 'MIXED_SUCCESS', confirmations == expected_confirmations
             except Exception as e:
                 return worker_id, 'MIXED_FAILED', str(e)
         
@@ -191,15 +256,18 @@ class PubSubConcurrencyTester:
             futures = [executor.submit(mixed_worker, i) for i in range(12)]
             
             results = []
-            for future in as_completed(futures, timeout=20):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    results.append((None, 'MIXED_TIMEOUT', str(e)))
+            try:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=15.0)
+                        results.append(result)
+                    except Exception as e:
+                        results.append((None, 'MIXED_TIMEOUT', str(e)))
+            except Exception as e:
+                results.append((None, 'ITERATOR_ERROR', str(e)))
         
-        # Analyze mixed pattern results
-        mixed_success = len([r for r in results if 'MIXED_SUCCESS' in r[1]])
+        # FIXED: Defensive tuple checking before accessing elements 
+        mixed_success = len([r for r in results if len(r) >= 3 and 'MIXED_SUCCESS' in r[1] and r[2] == True])
         
         print(f"  Mixed pattern operations: {mixed_success}/12 successful")
         
@@ -219,35 +287,47 @@ class PubSubConcurrencyTester:
         
         publisher_results = []
         subscriber_results = []
-        ready_semaphore = threading.Semaphore(0)
+        
+        # FIX: Replace broken semaphore with Event/counter coordination
+        ready_event = threading.Event()
+        ready_count = 0
+        ready_lock = threading.Lock()
+        
+        # Use namespaced channel names to prevent cross-process collisions
+        load_test_channel = f'{self.test_id}_load_test'
+        dynamic_test_pattern = f'{self.test_id}_dynamic_test'
         
         def publisher_worker():
             try:
                 print("  Publisher waiting for ALL subscribers to be ready...")
                 
-                # Wait for all 5 subscribers to signal ready by acquiring 5 permits
-                for i in range(5): 
-                    ready_semaphore.acquire(timeout=5.0)
+                # FIX: Wait for Event signal instead of consuming permits
+                if not ready_event.wait(timeout=10.0):
+                    return 'PUB_FAILED', 'Subscribers not ready in time'
                 
                 print("  Publisher starting after all subscribers confirmed ready")
                 r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
                 
-                # Verify all subscribers are registered before publishing (Redis requirement)
-                test_count_load = r.publish('load_test', 'setup_test')
-                test_count_dynamic = r.publish('dynamic_test:0', 'setup_test')
+                # FIX: Don't count setup publishes in main total since they're drained
+                # These are just for verification - subscribers will drain them before counting starts
+                test_count_load = r.publish(load_test_channel, 'setup_test')
+                test_count_dynamic = r.publish(f'{dynamic_test_pattern}:0', 'setup_test')
                 
                 print(f"  Publisher verified {test_count_load} load_test subscribers")
                 print(f"  Publisher verified {test_count_dynamic} dynamic_test subscribers")
                 
                 total_expected = test_count_load + test_count_dynamic
                 if total_expected == 0:
-                    print("  ⚠️ No subscribers found - messages will be discarded (correct Redis behavior)")
+                    print("  ⚠️ No subscribers found - messages will be discarded")
                     return 'PUB_NO_SUBSCRIBERS', 0
                 
+                # Small delay to let subscribers drain setup messages
+                time.sleep(0.1)
+                
                 messages_published = 0
-                for i in range(15):  # Publish test messages  
-                    count1 = r.publish('load_test', f'message_{i}')
-                    count2 = r.publish(f'dynamic_test:{i % 3}', f'dynamic_msg_{i}')
+                for i in range(15):  # Publish test messages with sequence ordering
+                    count1 = r.publish(load_test_channel, f'{i:06d}')  # FIXED: Add ordering sequence
+                    count2 = r.publish(f'{dynamic_test_pattern}:{i % 3}', f'{i:06d}')
                     messages_published += count1 + count2
                     time.sleep(0.02)  # Reasonable delay for concurrent processing
                 
@@ -261,30 +341,44 @@ class PubSubConcurrencyTester:
                 pubsub = r.pubsub()
                 
                 # Establish subscriptions with confirmation (correct Redis behavior)
-                pubsub.subscribe('load_test')
-                pubsub.psubscribe('dynamic_test:*')
+                pubsub.subscribe(load_test_channel)
+                pubsub.psubscribe(f'{dynamic_test_pattern}:*')
                 
-                # Wait for ALL subscription confirmations before signaling ready
-                confirmations_received = 0
-                for _ in range(4):  # Get both confirmations
-                    msg = pubsub.get_message(timeout=1.5)
+                # FIXED: Semantics-based confirmation waiting with deadline
+                confirmations = 0
+                deadline = time.time() + 3.0
+                while confirmations < 2 and time.time() < deadline:
+                    msg = pubsub.get_message(timeout=0.5)
                     if msg and msg.get('type') in ['subscribe', 'psubscribe']:
-                        confirmations_received += 1
+                        confirmations += 1
                 
-                if confirmations_received >= 2:
-                    # Signal that THIS subscriber is ready (count-based coordination)
-                    ready_semaphore.release()  # Increment the semaphore count
-                    print(f"  Subscriber {worker_id}: Ready with {confirmations_received} confirmations")
+                if confirmations == 2:
+                    # Signal readiness using Event/counter pattern
+                    nonlocal ready_count
+                    with ready_lock:
+                        ready_count += 1
+                        if ready_count == 5:  # All 5 subscribers ready
+                            ready_event.set()  # Signal once for ALL publishers
+                    
+                    print(f"  Subscriber {worker_id}: Ready with {confirmations} confirmations")
                 else:
-                    print(f"  Subscriber {worker_id}: Only {confirmations_received}/2 confirmations")
+                    print(f"  Subscriber {worker_id}: Only {confirmations}/2 confirmations")
                     pubsub.close()
-                    return worker_id, 'SUB_SETUP_FAILED', confirmations_received
+                    return worker_id, 'SUB_SETUP_FAILED', confirmations
                 
-                # Wait for messages with appropriate timeout for concurrent scenarios
+                # FIX: Drain setup messages first (2 setup publishes) 
+                for _ in range(2):
+                    pubsub.get_message(timeout=0.2)  # Drain setup messages
+                
+                # FIXED: Read expected message count instead of capping at 20
+                # Expected: 2 publishers × 15 iterations × 2 streams (channel + pattern) = 60 messages
+                expected_per_sub = 2 * 15 * 2  # 60 messages per subscriber
                 messages_received = 0
-                for _ in range(20):  # Try to get messages
-                    msg = pubsub.get_message(timeout=0.4)  # Reasonable timeout for concurrent load
-                    if msg and msg.get('type') == 'message':
+                deadline = time.time() + 5.0
+                
+                while messages_received < expected_per_sub and time.time() < deadline:
+                    msg = pubsub.get_message(timeout=0.2)
+                    if msg and msg.get('type') in ['message', 'pmessage']:  # Count both types
                         messages_received += 1
                 
                 pubsub.close()
@@ -292,43 +386,63 @@ class PubSubConcurrencyTester:
             except Exception as e:
                 return worker_id, 'SUB_FAILED', str(e)
         
-        # Run with proper multi-subscriber coordination using semaphore
+        # Run with proper Event-based coordination
         with ThreadPoolExecutor(max_workers=10) as executor:
-            # Start subscribers first - each will signal when ready via semaphore.release()
-            print("  Starting 5 subscribers with semaphore-based coordination...")
+            # Start subscribers first - they will signal when ALL are ready via Event
+            print("  Starting 5 subscribers with Event/counter coordination...")
             sub_futures = [executor.submit(subscriber_worker, i) for i in range(5)]
             
-            # Give subscribers time to establish and ALL signal readiness
+            # Give subscribers time to establish subscriptions
             time.sleep(0.5)
             
-            # Start publishers only after ALL subscribers are ready (via semaphore.acquire()*5)
-            print("  Starting publishers after all subscribers are ready...")
-            pub_futures = [executor.submit(publisher_worker) for _ in range(2)]
+            # Start publishers - both will wait for the SAME Event signal
+            print("  Starting 2 publishers that wait for Event signal...")
+            pub_futures = []
+            for _ in range(2):
+                pub_futures.append(executor.submit(publisher_worker))
             
-            # Collect results with sufficient time for concurrent processing
-            for future in as_completed(pub_futures + sub_futures, timeout=20):
-                try:
-                    result = future.result()
-                    if len(result) == 2 and 'PUB' in result[0]:
-                        publisher_results.append(result)
-                    elif len(result) == 3:
-                        subscriber_results.append(result)
-                except Exception as e:
-                    publisher_results.append(('PUB_TIMEOUT', str(e)))
+            # FIXED: Collect results without timeout on as_completed
+            try:
+                for future in as_completed(pub_futures + sub_futures):
+                    try:
+                        result = future.result(timeout=30.0)  # Per-future timeout
+                        if len(result) == 2 and 'PUB' in result[0]:
+                            publisher_results.append(result)
+                        elif len(result) == 3:
+                            subscriber_results.append(result)
+                    except Exception as e:
+                        publisher_results.append(('PUB_TIMEOUT', str(e)))
+            except Exception as e:
+                publisher_results.append(('PUB_ITERATOR_ERROR', str(e)))
         
-        # Analyze results with correct Redis expectations
-        pub_success = len([r for r in publisher_results if 'PUB_SUCCESS' in r[0]])
-        sub_success = len([r for r in subscriber_results if 'SUB_SUCCESS' in r[1]])
+        # Analyze results with proper message count validation
+        pub_success = len([r for r in publisher_results if len(r) >= 2 and 'PUB_SUCCESS' in r[0]])
+        sub_success = len([r for r in subscriber_results if len(r) >= 3 and 'SUB_SUCCESS' in r[1]])
         
         print(f"  Publishers: {pub_success}/2 successful")  
         print(f"  Subscribers: {sub_success}/5 successful")
         
-        # If ALL subscribers are established before publishing, they should receive messages
-        if pub_success >= 1 and sub_success >= 4:  # Allow small margin for timing
+        # FIXED: Validate message count consistency between publishers and subscribers
+        if pub_success >= 1:  # At least one publisher succeeded
+            total_published = sum([r[1] for r in publisher_results if len(r) >= 2 and isinstance(r[1], int)])
+            total_received = sum([r[2] for r in subscriber_results if len(r) >= 3 and isinstance(r[2], int)])
+            
+            print(f"  Messages published: {total_published}, total received across subscribers: {total_received}")
+            
+            # Validate: total received should be >= published (duplicates across subs are expected)
+            if total_received > 0 and total_published > 0:
+                if total_received < total_published:
+                    print(f"  ❌ Message loss detected: received {total_received} < published {total_published}")
+                    return False
+                else:
+                    print(f"  ✅ Message delivery validated: no message loss detected")
+        
+        # Both publishers should succeed with fixed Event coordination
+        if pub_success == 2 and sub_success >= 4:  
             print("  ✅ Publish/subscribe working correctly with Redis semantics")
             return True
         else:
-            print("  ❌ Message delivery issues remain with proper coordination")
+            print(f"  ❌ Publisher or subscriber failures detected")
             return False
     
     def test_subscription_cleanup_concurrency(self):
@@ -341,22 +455,21 @@ class PubSubConcurrencyTester:
                 pubsub = r.pubsub()
                 
                 # Subscribe to multiple channels/patterns
-                channels = [f'cleanup_chan_{worker_id}_{i}' for i in range(3)]
-                patterns = [f'cleanup_pat_{worker_id}_{i}:*' for i in range(3)]
+                channels = [f'{self.test_id}_cleanup_chan_{worker_id}_{i}' for i in range(3)]
+                patterns = [f'{self.test_id}_cleanup_pat_{worker_id}_{i}:*' for i in range(3)]
                 
                 for chan in channels:
                     pubsub.subscribe(chan)
                 for pat in patterns:
                     pubsub.psubscribe(pat)
                 
-                # Get initial confirmations
+                # Get initial confirmations with semantics-based waiting
                 confirmations = 0
-                for _ in range(10):
+                deadline = time.time() + 2.0
+                while confirmations < 6 and time.time() < deadline:  # Expect 3 channels + 3 patterns
                     msg = pubsub.get_message(timeout=0.5)
                     if msg and msg.get('type') in ['subscribe', 'psubscribe']:
                         confirmations += 1
-                    elif msg is None:
-                        break
                 
                 # Cleanup by closing (tests unsubscribe_all)
                 pubsub.close()
@@ -369,15 +482,18 @@ class PubSubConcurrencyTester:
             futures = [executor.submit(cleanup_worker, i) for i in range(8)]
             
             results = []
-            for future in as_completed(futures, timeout=15):
-                try:
-                    result = future.result()
-                    results.append(result)
-                except Exception as e:
-                    results.append((None, 'CLEANUP_TIMEOUT', str(e)))
+            try:
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=10.0)
+                        results.append(result)
+                    except Exception as e:
+                        results.append((None, 'CLEANUP_TIMEOUT', str(e)))
+            except Exception as e:
+                results.append((None, 'ITERATOR_ERROR', str(e)))
         
         # Analyze cleanup results
-        cleanup_success = len([r for r in results if 'CLEANUP_SUCCESS' in r[1]])
+        cleanup_success = len([r for r in results if len(r) >= 2 and 'CLEANUP_SUCCESS' in r[1]])
         
         print(f"  Cleanup operations: {cleanup_success}/8 successful")
         
@@ -396,39 +512,39 @@ class PubSubConcurrencyTester:
             r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
             pubsub = r.pubsub()
             
-            # Test complex pattern matching scenarios
+            # Test complex pattern matching scenarios with namespaced patterns
+            base_pattern = self.test_id
             patterns = [
-                'news.*',      # Suffix wildcard
-                '*.sports',    # Prefix wildcard  
-                'user.*.alert', # Middle wildcard
-                'exact_match',  # No wildcards
-                '*',           # Match everything
-                'a?c',         # Single char wildcard
+                f'{base_pattern}_news.*',      # Suffix wildcard
+                f'*.{base_pattern}_sports',    # Prefix wildcard  
+                f'{base_pattern}_user.*.alert', # Middle wildcard
+                f'{base_pattern}_exact_match',  # No wildcards
+                f'{base_pattern}_*',           # Match everything with prefix
+                f'{base_pattern}_a?c',         # Single char wildcard
             ]
             
             for pattern in patterns:
                 pubsub.psubscribe(pattern)
                 
-            # Get all confirmations
+            # Get all confirmations with semantics-based waiting
             confirmations = 0
-            for _ in range(len(patterns) + 2):
+            deadline = time.time() + 2.0
+            while confirmations < len(patterns) and time.time() < deadline:
                 msg = pubsub.get_message(timeout=0.5)
                 if msg and msg.get('type') == 'psubscribe':
                     confirmations += 1
-                elif msg is None:
-                    break
             
             print(f"  Pattern subscriptions: {confirmations}/{len(patterns)} confirmed")
             
             # Test messages that should match various patterns
             test_channels = [
-                ('news.breaking', 1),    # Should match news.*
-                ('football.sports', 1),  # Should match *.sports
-                ('user.123.alert', 1),   # Should match user.*.alert
-                ('exact_match', 1),      # Should match exact_match
-                ('anything', 1),         # Should match *
-                ('axc', 1),             # Should match a?c
-                ('nomatch', 0),         # Should match none specifically
+                (f'{base_pattern}_news.breaking', 1),    # Should match news.*
+                (f'football.{base_pattern}_sports', 1),  # Should match *.sports
+                (f'{base_pattern}_user.123.alert', 1),   # Should match user.*.alert
+                (f'{base_pattern}_exact_match', 1),      # Should match exact_match
+                (f'{base_pattern}_anything', 1),         # Should match *
+                (f'{base_pattern}_axc', 1),             # Should match a?c
+                ('nomatch', 0),                         # Should match none
             ]
             
             received_messages = 0
@@ -436,13 +552,18 @@ class PubSubConcurrencyTester:
                 # Publish and count actual message deliveries
                 actual_deliveries = r.publish(channel, f'test_{channel}')
                 
+                # FIXED: Assert that deliveries match expectations
+                if actual_deliveries != expected_pattern_matches:
+                    print(f"    Channel '{channel}': {actual_deliveries} deliveries (expected {expected_pattern_matches}) ❌")
+                    return False
+                else:
+                    print(f"    Channel '{channel}': {actual_deliveries} deliveries ✅")
+                
                 # Try to receive messages
                 for _ in range(expected_pattern_matches):
                     msg = pubsub.get_message(timeout=0.2)
                     if msg and msg.get('type') in ['message', 'pmessage']:
                         received_messages += 1
-                
-                print(f"    Channel '{channel}': {actual_deliveries} deliveries")
             
             pubsub.close()
             
@@ -465,7 +586,8 @@ class PubSubConcurrencyTester:
             # Setup subscriber first (correct Redis timing)
             r_sub = redis.Redis(host=self.host, port=self.port, decode_responses=False)
             pubsub = r_sub.pubsub()
-            pubsub.subscribe('ordering_test')
+            channel_name = f'{self.test_id}_ordering_test'
+            pubsub.subscribe(channel_name)
             
             # Wait for subscription confirmation
             confirm = pubsub.get_message(timeout=1.0)
@@ -473,12 +595,14 @@ class PubSubConcurrencyTester:
                 print("  ❌ Subscription setup failed")
                 return False
             
-            # Multiple publishers sending messages rapidly
+            # FIXED: Actual ordering validation with per-publisher monotonic sequences
             def rapid_publisher(publisher_id, message_count):
                 r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
                 for i in range(message_count):
-                    r.publish('ordering_test', f'pub{publisher_id}_msg{i}')
-                    # No delay - test rapid publishing
+                    # Encode sequence number for ordering verification
+                    seq_id = publisher_id * 100 + i  # Unique sequence per publisher
+                    r.publish(channel_name, f'{seq_id:06d}')
+                    time.sleep(0.001)  # Minimal delay
                 
             # Start concurrent publishers
             threads = []
@@ -487,7 +611,7 @@ class PubSubConcurrencyTester:
                 threads.append(t)
                 t.start()
             
-            # Collect messages to test ordering preservation
+            # Collect messages for ordering analysis
             messages_received = []
             start_time = time.time()
             
@@ -504,12 +628,36 @@ class PubSubConcurrencyTester:
             
             print(f"  Messages received: {len(messages_received)}/15")
             
-            if len(messages_received) >= 12:  # Allow some margin for rapid concurrent publishing
-                print("  ✅ Concurrent message ordering working correctly")
-                return True
+            # FIXED: Verify per-publisher ordering
+            if len(messages_received) >= 12:
+                # Parse and validate ordering per publisher
+                last_seq = {0: -1, 1: -1, 2: -1}  # Track last sequence per publisher
+                ordering_valid = True
+                
+                for data in messages_received:
+                    try:
+                        seq_num = int(data)  # Parse sequence number
+                        publisher_id, seq = divmod(seq_num, 100)  # Extract publisher and sequence
+                        
+                        if seq <= last_seq.get(publisher_id, -1):
+                            ordering_valid = False
+                            print(f"    ❌ Ordering violation: Publisher {publisher_id} seq {seq} <= last {last_seq.get(publisher_id, -1)}")
+                            break
+                        
+                        last_seq[publisher_id] = seq
+                    except (ValueError, TypeError):
+                        # Skip malformed messages for ordering check
+                        continue
+                
+                if ordering_valid:
+                    print("  ✅ Concurrent message ordering working correctly")
+                    return True
+                else:
+                    print("  ❌ Message ordering violations detected")
+                    return False
             else:
-                print(f"  ⚠️ Some messages lost under rapid concurrent publishing")
-                return len(messages_received) >= 8  # Partial success acceptable
+                print(f"  ❌ Message loss in ordering test: {len(messages_received)}/15")
+                return False
                 
         except Exception as e:
             print(f"  ❌ Message ordering test failed: {e}")
@@ -531,8 +679,8 @@ class PubSubConcurrencyTester:
                         
                         try:
                             # Subscribe to multiple channels/patterns
-                            channels = [f'stress_{worker_id}_{cycle}_{i}' for i in range(3)]
-                            patterns = [f'pattern_{worker_id}_{cycle}_{i}:*' for i in range(2)]
+                            channels = [f'{self.test_id}_stress_{worker_id}_{cycle}_{i}' for i in range(3)]
+                            patterns = [f'{self.test_id}_pattern_{worker_id}_{cycle}_{i}:*' for i in range(2)]
                             
                             for chan in channels:
                                 pubsub.subscribe(chan)
@@ -565,17 +713,20 @@ class PubSubConcurrencyTester:
                 futures = [executor.submit(stress_worker, i) for i in range(8)]
                 
                 results = []
-                for future in as_completed(futures, timeout=20):
-                    try:
-                        result = future.result()
-                        results.append(result)
-                    except Exception as e:
-                        results.append((None, {'errors': 1, 'exception': str(e)}))
+                try:
+                    for future in as_completed(futures):
+                        try:
+                            result = future.result(timeout=15.0)
+                            results.append(result)
+                        except Exception as e:
+                            results.append((None, {'errors': 1, 'exception': str(e)}))
+                except Exception as e:
+                    results.append((None, {'errors': 1, 'exception': str(e)}))
             
             # Analyze stress test results
-            total_subscribe_ops = sum(r[1].get('subscribe_ops', 0) for r in results)
-            total_unsubscribe_ops = sum(r[1].get('unsubscribe_ops', 0) for r in results)
-            total_errors = sum(r[1].get('errors', 0) for r in results)
+            total_subscribe_ops = sum(r[1].get('subscribe_ops', 0) for r in results if len(r) >= 2)
+            total_unsubscribe_ops = sum(r[1].get('unsubscribe_ops', 0) for r in results if len(r) >= 2)
+            total_errors = sum(r[1].get('errors', 0) for r in results if len(r) >= 2)
             
             print(f"  Subscribe operations: {total_subscribe_ops}")
             print(f"  Unsubscribe operations: {total_unsubscribe_ops}")
@@ -604,34 +755,39 @@ class PubSubConcurrencyTester:
             r = redis.Redis(host=self.host, port=self.port, decode_responses=True)
             pubsub = r.pubsub()
             
+            # Use namespaced channel names to prevent cross-process interference
+            duplicate_test_channel = f'{self.test_id}_duplicate_test'
+            nonexistent_channel = f'{self.test_id}_never_subscribed_channel'
+            temp_pattern = f'{self.test_id}_temp_pattern:*'
+            
             # Subscribe to same channel multiple times
             print("  Testing duplicate subscriptions...")
-            pubsub.subscribe('duplicate_test')
-            pubsub.subscribe('duplicate_test')  # Should be idempotent
+            pubsub.subscribe(duplicate_test_channel)
+            pubsub.subscribe(duplicate_test_channel)  # Should be idempotent
             
+            # FIXED: Semantics-based confirmation waiting
             confirmations = 0
-            for _ in range(3):
+            deadline = time.time() + 2.0
+            while confirmations < 2 and time.time() < deadline:
                 msg = pubsub.get_message(timeout=0.5)
                 if msg and msg.get('type') == 'subscribe':
                     confirmations += 1
-                elif msg is None:
-                    break
             
             # Test publishing to duplicated subscription
             pub = redis.Redis(host=self.host, port=self.port)
-            subscriber_count = pub.publish('duplicate_test', 'duplicate_message')
+            subscriber_count = pub.publish(duplicate_test_channel, 'duplicate_message')
             
             print(f"  Duplicate subscription: {confirmations} confirmations, {subscriber_count} found")
             
             # Unsubscribe from non-existent channels
             print("  Testing unsubscribe from non-existent channels...")
-            pubsub.unsubscribe('never_subscribed_channel')
+            pubsub.unsubscribe(nonexistent_channel)
             
             # Pattern unsubscribe
             print("  Testing pattern unsubscribe...")
-            pubsub.psubscribe('temp_pattern:*')
+            pubsub.psubscribe(temp_pattern)
             temp_confirm = pubsub.get_message(timeout=0.5)
-            pubsub.punsubscribe('temp_pattern:*')
+            pubsub.punsubscribe(temp_pattern)
             temp_unsubscribe = pubsub.get_message(timeout=0.5)
             
             pubsub.close()
