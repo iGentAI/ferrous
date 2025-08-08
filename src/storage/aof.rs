@@ -3,10 +3,10 @@
 //! Provides append-only file logging for command persistence and replay.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write, BufWriter, BufReader, BufRead};
-use std::path::{Path, PathBuf};
+use std::io::{Write, BufWriter, BufReader, BufRead};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use std::thread;
 
 use crate::error::{FerrousError, Result};

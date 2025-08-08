@@ -4,12 +4,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::{Instant, Duration};
+use std::time::Duration;
 use std::thread;
 use crate::error::{FerrousError, Result};
 use crate::protocol::RespFrame;
 use crate::storage::StorageEngine;
-use crate::network::Connection;
 use super::{ReplicaInfo, ReplicationConfig, ReplicationBacklog, generate_repl_id};
 use super::client::{start_background_replication, ReplicationClientConfig};
 

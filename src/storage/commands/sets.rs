@@ -3,10 +3,9 @@
 //! Provides Redis-compatible set operations including add, remove, membership testing,
 //! and set operations like union, intersection, and difference.
 
-use crate::error::{FerrousError, Result, CommandError, StorageError};
+use crate::error::{FerrousError, Result, StorageError};
 use crate::protocol::RespFrame;
-use crate::storage::{StorageEngine, Value};
-use std::collections::HashSet;
+use crate::storage::StorageEngine;
 use std::sync::Arc;
 
 /// Handle SADD command - Add members to a set

@@ -3,6 +3,12 @@
 Comprehensive expiry operations tests for Ferrous
 Tests SETEX, PSETEX, EXPIRE, PEXPIRE, TTL, PTTL, PERSIST 
 and focuses on timing edge cases and race conditions
+
+IMPORTANT: The race condition test verifies that Ferrous correctly handles
+the Redis-compliant behavior where EXPIRE on a non-existent key returns false.
+In a concurrent environment where SET and EXPIRE are called on the same key
+from different threads, EXPIRE may execute before SET completes, resulting in
+EXPIRE returning false. This is EXPECTED behavior, not a bug.
 """
 
 import redis
@@ -130,18 +136,25 @@ def test_expiry_race_conditions():
     try:
         r = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
         
-        # Test 1: SET vs EXPIRE race
+        # Test: SET vs EXPIRE race - FIXED VERSION
+        # The test creates a race condition between SET and EXPIRE operations.
+        # This is expected behavior: if EXPIRE runs before SET completes,
+        # it will return 0 (False) since the key doesn't exist yet.
         race_issues = 0
+        expire_before_set = 0  # Count how many times EXPIRE ran before SET completed
+        
         for i in range(50):
             key = f'race_test_{i}'
+            expire_result = [None]  # Shared state to capture EXPIRE result
             
-            def set_value():
-                r.set(key, f'value_{i}')
+            def set_value(key=key, value=f'value_{i}'):
+                r.set(key, value)
                 
-            def expire_value():
+            def expire_value(key=key):
                 time.sleep(0.001)  # Small delay
                 try:
-                    r.expire(key, 1)
+                    result = r.expire(key, 1)
+                    expire_result[0] = result
                 except:
                     pass
                     
@@ -156,13 +169,27 @@ def test_expiry_race_conditions():
             # Check if key exists and has TTL
             if r.exists(key):
                 ttl = r.ttl(key)
-                if ttl == -1:
-                    # Key exists but no TTL set - might indicate race condition
-                    race_issues += 1
+                
+                # Redis returns True/False booleans (or 1/0 integers in some cases)
+                # If EXPIRE returned False, it means the key didn't exist when EXPIRE ran
+                # This is EXPECTED behavior in a race condition, not an error
+                if expire_result[0] == False or expire_result[0] == 0:
+                    expire_before_set += 1
+                    # Key should have no TTL since EXPIRE failed
+                    if ttl != -1:
+                        # This would be a real issue - EXPIRE failed but key has TTL
+                        race_issues += 1
+                        print(f"  Real issue: Key {key} has TTL {ttl} despite EXPIRE returning {expire_result[0]}")
+                elif expire_result[0] == True or expire_result[0] == 1:
+                    # EXPIRE succeeded, so key should have TTL
+                    if ttl == -1:
+                        # This is a real race condition issue
+                        race_issues += 1
+                        print(f"  Real issue: Key {key} has no TTL despite EXPIRE returning {expire_result[0]}")
         
-        if race_issues > 10:  # Allow some tolerance
-            print(f"❌ Too many race condition issues: {race_issues}/50")
-            return False
+        print(f"\nRace condition analysis:")
+        print(f"  EXPIRE operations that ran before SET completed: {expire_before_set}/50")
+        print(f"  Actual race condition issues found: {race_issues}/50")
         
         # Test 2: Expiry vs access race
         r.setex('access_race', 1, 'value')
@@ -182,9 +209,15 @@ def test_expiry_race_conditions():
         if not (has_value or has_none):
             print("❌ Expiry behavior inconsistent during race")
             return False
-            
-        print("✅ Expiry race conditions handled reasonably")
-        return True
+        
+        # The test should only fail if there are real inconsistencies,
+        # not just because EXPIRE ran before SET
+        if race_issues > 10:  # Allow some tolerance for actual race issues
+            print(f"❌ Too many real race condition issues: {race_issues}/50")
+            return False
+        else:
+            print("✅ Expiry race conditions handled reasonably")
+            return True
         
     except Exception as e:
         print(f"❌ Race condition test failed: {e}")

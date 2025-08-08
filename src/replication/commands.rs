@@ -6,7 +6,7 @@ use crate::error::{FerrousError, Result, CommandError};
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, RdbEngine};
 use crate::network::Connection;
-use super::{ReplicationManager, ReplicaInfo};
+use super::ReplicationManager;
 
 /// Handle REPLICAOF command (modern version of SLAVEOF)
 pub fn handle_replicaof(

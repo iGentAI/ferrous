@@ -5,8 +5,8 @@
 //! 
 //! Uses dual indexing: skiplist for score-based range operations and HashMap for key-based lookups.
 
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::cmp::{Ordering, min};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::cmp::Ordering;
 use std::fmt::{self, Debug};
 use std::collections::HashMap;
 use std::borrow::Borrow;
@@ -308,7 +308,7 @@ where
         
         // Deallocate all nodes
         unsafe {
-            let mut current = inner.head;
+            let current = inner.head;
             while let Some(next) = (*current).forward[0] {
                 (*current).forward[0] = (*next).forward[0];
                 let _ = Box::from_raw(next);
@@ -535,7 +535,7 @@ impl<K, V> Drop for SkipList<K, V> {
             
             // Deallocate all nodes
             unsafe {
-                let mut current = inner.head;
+                let current = inner.head;
                 while let Some(next) = (*current).forward[0] {
                     (*current).forward[0] = (*next).forward[0];
                     let _ = Box::from_raw(next);

@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use crate::error::{FerrousError, Result};
+use crate::error::Result;
 use crate::protocol::RespFrame;
 
 /// A subscription pattern or channel name
@@ -90,19 +90,33 @@ impl PubSubManager {
         });
         
         for channel in channels {
-            // Check if already subscribed
-            let is_new = conn_info.channels.insert(channel.clone());
+            // Check if this connection is already subscribed to this channel
+            let already_subscribed = conn_info.channels.contains(&channel);
             
-            // Add to channel subscribers
-            if is_new {
-                channel_subs
+            // Only add to data structures if not already subscribed
+            let is_new = if !already_subscribed {
+                // Add to connection's channel set
+                conn_info.channels.insert(channel.clone());
+                
+                // Add to global channel->connections mapping
+                let subscribers = channel_subs
                     .entry(channel.clone())
-                    .or_insert_with(HashSet::new)
-                    .insert(connection_id);
-            }
+                    .or_insert_with(HashSet::new);
+                
+                // Ensure connection is added to subscribers
+                if !subscribers.contains(&connection_id) {
+                    subscribers.insert(connection_id);
+                }
+                
+                true
+            } else {
+                false
+            };
             
             let total_subs = conn_info.channels.len() + conn_info.patterns.len();
             
+            // Generate SubResult for all SUBSCRIBE commands (including duplicates)
+            // This ensures Redis-compatible behavior where every SUBSCRIBE gets a confirmation
             results.push(SubResult {
                 subscription: Subscription::Channel(channel),
                 num_subscriptions: total_subs,

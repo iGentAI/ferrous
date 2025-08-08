@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use rand;
 use crate::error::{FerrousError, Result};
 use crate::protocol::RespFrame;
-use crate::storage::{StorageEngine, GetResult, RdbEngine, StorageMonitor, RdbConfig};
-use crate::storage::commands::{transactions, aof};
-use crate::storage::{aof::AofEngine, AofConfig};
+use crate::storage::{StorageEngine, RdbEngine, StorageMonitor};
+use crate::storage::commands::transactions;
+use crate::storage::aof::AofEngine;
 use crate::storage::commands::slowlog::Slowlog;
 use crate::storage::lua_cache::{GlobalScriptCache, ScriptCaching};
 
@@ -21,7 +21,7 @@ use crate::pubsub::{PubSubManager, format_message, format_pmessage,
                     format_unsubscribe_response, format_punsubscribe_response};
 use crate::replication::{ReplicationManager, ReplicationConfig};
 use super::{Listener, Connection, ConnectionState, NetworkConfig};
-use super::monitoring::{PerformanceMonitoring, MonitoringConfig};
+use super::monitoring::PerformanceMonitoring;
 use super::blocking::{BlockingManager, WakeupRequest};
 use super::connection::{BlockedState, BlockingOp};
 use crate::Config as FerrousConfig;
@@ -721,6 +721,7 @@ impl Server {
         
         // Second phase: process frames without the lock
         let mut responses = Vec::new();
+        let mut needs_immediate_flush = false; // Track if any command needs immediate response
         for frame in frames_to_process {
             // Process each frame and increment command counter
             self.stats.total_commands_processed.fetch_add(1, Ordering::Relaxed);
@@ -731,6 +732,27 @@ impl Server {
                 if !parts.is_empty() {
                     if let RespFrame::BulkString(Some(bytes)) = &parts[0] {
                         let command = String::from_utf8_lossy(bytes).to_uppercase();
+                        
+                        // Track commands that require immediate flush for correct Redis semantics
+                        match command.as_str() {
+                            // Transaction commands need immediate response
+                            "EXEC" | "MULTI" | "DISCARD" | "WATCH" | "UNWATCH" => {
+                                needs_immediate_flush = true;
+                            }
+                            // Connection state commands need immediate response  
+                            "AUTH" | "SELECT" | "QUIT" => {
+                                needs_immediate_flush = true;
+                            }
+                            // Real-time/administrative commands need immediate response
+                            "MONITOR" | "SAVE" | "BGSAVE" | "SHUTDOWN" => {
+                                needs_immediate_flush = true;
+                            }
+                            // Pub/sub commands need immediate response for proper timing coordination
+                            "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" => {
+                                needs_immediate_flush = true;
+                            }
+                            _ => {}
+                        }
                         
                         // Handle QUIT command
                         if command == "QUIT" {
@@ -753,39 +775,63 @@ impl Server {
             responses.push(response);
         }
         
-        // Third phase: send responses and handle state changes with proper response separation
-        let frames_processed_count = responses.len(); // Track for timeout logic without borrowing moved value
+        // Third phase: send responses with special handling for commands needing immediate delivery
+        let frames_processed_count = responses.len();
         let has_pending_writes = self.connections.with_connection(id, |conn| -> Result<bool> {
-            // For pipelining: Send and flush each response individually to prevent batching
-            for response in responses {
-                // Skip NoResponse markers (internal markers for blocking operations)
-                // but allow null bulk strings and null arrays (valid Redis responses)
-                if let RespFrame::NoResponse = &response {
-                    continue; // Skip only NoResponse markers
+            // For transaction/connection integrity: Commands needing immediate response get individual flush
+            // For performance: All other commands use efficient batching
+            if needs_immediate_flush {
+                // Transaction and connection commands need immediate flush for semantic correctness
+                for response in responses {
+                    if let RespFrame::NoResponse = &response {
+                        continue;
+                    }
+                    
+                    if let Err(e) = conn.send_frame(&response) {
+                        eprintln!("Send error for connection {}: {}", id, e);
+                        continue;
+                    }
+                    
+                    // Immediate flush for semantic correctness (EXEC, AUTH, MULTI, etc.)
+                    if let Err(e) = conn.flush() {
+                        match e {
+                            FerrousError::Connection(ref msg) if msg.contains("Broken pipe") 
+                                || msg.contains("Connection reset") => {
+                                conn.state = ConnectionState::Closing;
+                                return Err(e);
+                            },
+                            _ => {
+                                eprintln!("Immediate flush warning for connection {}: {}", id, e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // For pipelining optimization: Send all responses then flush once for efficient batching
+                for response in responses {
+                    if let RespFrame::NoResponse = &response {
+                        continue;
+                    }
+                    
+                    if let Err(e) = conn.send_frame(&response) {
+                        eprintln!("Send error for connection {}: {}", id, e);
+                        continue;
+                    }
                 }
                 
-                // Critical fix for pipelining: Send and flush each response individually
-                // This prevents responses from being batched together which breaks client parsing
-                if let Err(e) = conn.send_frame(&response) {
-                    eprintln!("Send error for connection {}: {}", id, e);
-                    continue;
-                }
-                
-                // Flush immediately after each response to ensure proper separation
+                // Single flush at end for efficient pipelined response batching
                 match conn.flush() {
                     Ok(_) => {
-                        // Response sent successfully
+                        // All responses sent successfully
                     },
                     Err(e) => {
                         match e {
                             FerrousError::Connection(ref msg) if msg.contains("Broken pipe") 
                                 || msg.contains("Connection reset") => {
-                                // Hard connection error - mark for closing and stop processing
                                 conn.state = ConnectionState::Closing;
                                 return Err(e);
                             },
                             FerrousError::Connection(_) => {
-                                // Soft error - log but continue with remaining responses
                                 eprintln!("Flush warning for connection {}: {}", id, e);
                             },
                             _ => {
@@ -836,7 +882,7 @@ impl Server {
         }
         
         let mut still_pending = Vec::new();
-        let mut did_work = !pending_ids.is_empty();
+        let did_work = !pending_ids.is_empty();
         
         for id in &pending_ids {
             let result = self.connections.with_connection(*id, |conn| -> Result<bool> {

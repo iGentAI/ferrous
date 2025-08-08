@@ -1,6 +1,6 @@
 //! Storage monitoring for auto-save functionality
 
-use std::sync::{Arc, RwLock, Mutex};
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, Duration};
 use std::thread;

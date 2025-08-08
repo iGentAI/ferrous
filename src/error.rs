@@ -171,7 +171,14 @@ impl fmt::Display for FerrousError {
             FerrousError::Config(msg) => write!(f, "Configuration error: {}", msg),
             FerrousError::Connection(msg) => write!(f, "Connection error: {}", msg),
             FerrousError::Script(err) => write!(f, "{}", err),
-            FerrousError::LuaError(msg) => write!(f, "Lua error: {}", msg),
+            FerrousError::LuaError(msg) => {
+                // Preserve ERR prefix for Redis protocol compliance
+                if msg.starts_with("ERR ") {
+                    write!(f, "{}", msg)
+                } else {
+                    write!(f, "ERR {}", msg)
+                }
+            },
             FerrousError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }
     }

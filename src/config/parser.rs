@@ -4,16 +4,13 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
-use crate::network::NetworkConfig;
-use crate::storage::{RdbConfig, AofConfig};
 use crate::storage::memory::EvictionPolicy;
 use crate::storage::aof::FsyncPolicy;
-use crate::replication::ReplicationConfig;
 
-use super::{Config, ServerConfig, MemoryConfig, LogLevel};
+use super::{Config, LogLevel};
 
 /// Error type for configuration parsing
 #[derive(Debug, thiserror::Error)]

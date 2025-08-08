@@ -271,9 +271,12 @@ impl StorageEngine {
             shard_guard.expiring_keys.insert(key.clone(), expires_at);
         }
         
+        // CRITICAL FIX: Mark as modified BEFORE data change to fix WATCH race condition
+        // This ensures any concurrent EXEC operations see the modification
+        shard_guard.mark_modified(&key);
+        
         // Store the value - direct HashMap access for maximum performance
         shard_guard.data.insert(key.clone(), stored_value);
-        shard_guard.mark_modified(&key);
         
         Ok(())
     }
@@ -396,7 +399,7 @@ impl StorageEngine {
                     match current.checked_add(increment) {
                         Some(new_val) => {
                             stored_value.value = Value::integer(new_val);
-                            // NO touch() call - matches Valkey's noeviction config
+                            drop(stored_value); // Release mutable borrow
                             shard_guard.mark_modified(&key);
                             new_val
                         }
@@ -497,7 +500,7 @@ impl StorageEngine {
             }
             None => {
                 // Create new stream
-                let mut new_stream = Stream::new();
+                let new_stream = Stream::new();
                 let id = new_stream.add_auto(fields);
                 
                 let memory_size = self.calculate_value_size(&key, &Value::empty_stream()) +
@@ -537,7 +540,7 @@ impl StorageEngine {
             }
             None => {
                 // Create new stream
-                let mut stream = Stream::new();
+                let stream = Stream::new();
                 stream.add_with_id(id.clone(), fields)
                     .map_err(|e| FerrousError::Command(CommandError::Generic(e.to_string())))?;
                 

@@ -7,12 +7,10 @@ pub mod resp;
 pub mod parser;
 pub mod serializer;
 
-pub use resp::{RespFrame, RespValue};
+pub use resp::RespFrame;
 pub use parser::RespParser;
-pub use serializer::RespSerializer;
 
 // Re-export commonly used items
-pub use parser::parse_resp_frame;
 pub use serializer::serialize_resp_frame;
 
 /// Extract a string from a RESP frame

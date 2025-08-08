@@ -2,10 +2,9 @@
 //! 
 //! Provides Redis-compatible list operations including push, pop, range, and more.
 
-use crate::error::{FerrousError, Result, CommandError, StorageError};
+use crate::error::{FerrousError, Result, StorageError};
 use crate::protocol::RespFrame;
-use crate::storage::{StorageEngine, Value};
-use std::collections::VecDeque;
+use crate::storage::StorageEngine;
 use std::sync::Arc;
 
 /// Handle LPUSH command - Insert elements at the head of the list

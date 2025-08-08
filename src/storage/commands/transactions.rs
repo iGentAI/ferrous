@@ -2,7 +2,7 @@
 //! 
 //! Provides Redis-compatible transaction support with MULTI/EXEC/DISCARD/WATCH.
 
-use crate::error::{FerrousError, Result, CommandError};
+use crate::error::Result;
 use crate::protocol::RespFrame;
 use crate::storage::StorageEngine;
 use crate::network::Connection;

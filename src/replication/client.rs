@@ -2,14 +2,13 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, SocketAddr};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::error::{FerrousError, Result};
 use crate::protocol::{RespFrame, RespParser, serialize_resp_frame};
 use crate::storage::StorageEngine;
-use crate::storage::rdb::RdbEngine;
 
 use super::{ReplicationManager, MasterLinkStatus};
 
@@ -184,9 +183,9 @@ impl ReplicationClient {
     
     /// Perform replication handshake
     fn perform_handshake(&self, stream: &mut TcpStream) -> Result<()> {
-        // Check if authentication is required (we know it is for our test setup)
+        // Send AUTH command if password is required (we know it is for our test setup)
         if let Some(password) = self.get_master_password() {
-            println!("Replication client: Authenticating with master using password");
+            println!("Replication client: Authenticating with master");
             self.send_command(stream, &["AUTH", &password])?;
             
             let auth_response = self.read_response(stream)?;

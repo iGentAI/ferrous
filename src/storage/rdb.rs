@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::thread;
 
 use crate::error::{FerrousError, Result};
-use crate::storage::{StorageEngine, Value, GetResult, DatabaseIndex, Key};
+use crate::storage::{StorageEngine, Value, GetResult};
 
 /// RDB file version (Redis 9 compatible)
 const RDB_VERSION: u16 = 9;

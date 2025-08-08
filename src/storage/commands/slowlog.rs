@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
-use crate::error::{FerrousError, Result, CommandError};
+use crate::error::Result;
 use crate::protocol::RespFrame;
 
 /// Maximum length of the slowlog (can be configured)

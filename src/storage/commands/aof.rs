@@ -2,7 +2,7 @@
 //! 
 //! Provides Redis-compatible AOF persistence commands.
 
-use crate::error::{FerrousError, Result};
+use crate::error::Result;
 use crate::protocol::RespFrame;
 use crate::storage::aof::AofEngine;
 use std::sync::Arc;

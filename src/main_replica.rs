@@ -32,7 +32,7 @@ fn run() -> Result<()> {
     // For testing authentication, enable password protection
     network_config.password = Some("mysecretpassword".to_string());
     
-    println!("Authentication enabled with password: 'mysecretpassword'");
+    println!("Authentication enabled");
     println!("Listening on port: {}", network_config.port);
     
     // Create replication configuration

@@ -86,13 +86,13 @@ pub fn handle_shutdown(parts: &[RespFrame], storage: &Arc<crate::storage::Storag
     
     println!("SHUTDOWN: Initiating graceful server termination");
     
-    // Send OK response then exit after brief delay
+    // Send no response then exit after brief delay - Redis compliant behavior
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(100));
         std::process::exit(0);
     });
     
-    Ok(RespFrame::ok())
+    Ok(RespFrame::NoResponse)
 }
 
 /// Build essential commands response for COMMAND command
@@ -131,11 +131,11 @@ fn build_essential_commands_response() -> RespFrame {
 /// Helper to build command info array
 fn cmd_info(name: &str, arity: i64, flags: &[&str], first: i64, last: i64, step: i64) -> RespFrame {
     let flag_frames: Vec<RespFrame> = flags.iter()
-        .map(|&f| RespFrame::from_string(f))
+        .map(|&f| RespFrame::SimpleString(Arc::new(f.as_bytes().to_vec())))
         .collect();
         
     RespFrame::Array(Some(vec![
-        RespFrame::from_string(name),
+        RespFrame::BulkString(Some(Arc::new(name.as_bytes().to_vec()))),
         RespFrame::Integer(arity),
         RespFrame::Array(Some(flag_frames)),
         RespFrame::Integer(first),

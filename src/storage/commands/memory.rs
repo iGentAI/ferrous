@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use crate::error::{Result, CommandError};
+use crate::error::Result;
 use crate::protocol::RespFrame;
 use crate::storage::{StorageEngine, Value};
 use crate::storage::memory::MemoryManager;

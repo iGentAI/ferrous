@@ -2,13 +2,12 @@
 //! 
 //! Provides Redis-compatible stream operations including XADD, XREAD, XRANGE, and more.
 
-use crate::error::{FerrousError, Result, CommandError};
+use crate::error::Result;
 use crate::protocol::RespFrame;
-use crate::storage::{StorageEngine, Value};
-use crate::storage::stream::{StreamId, StreamEntry};
+use crate::storage::StorageEngine;
+use crate::storage::stream::StreamId;
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Handle XADD command - Add entries to a stream
 pub fn handle_xadd(storage: &Arc<StorageEngine>, db: usize, parts: &[RespFrame]) -> Result<RespFrame> {

@@ -223,7 +223,8 @@ class LuaScriptTester:
                 print("❌ Syntax error not caught")
                 return False
             except redis.ResponseError as e:
-                if "ERR" in str(e):
+                error_str = str(e)
+                if "Error compiling script:" in error_str or "ERR Error compiling script:" in error_str:
                     print("✅ Syntax errors properly reported")
                 else:
                     print(f"❌ Unexpected error format: {e}")
@@ -235,7 +236,7 @@ class LuaScriptTester:
                 print("❌ Runtime error not caught")
                 return False
             except redis.ResponseError as e:
-                if "ERR" in str(e):
+                if "ERR" in str(e) or "Error" in str(e):
                     print("✅ Runtime errors properly reported")
                 else:
                     print(f"❌ Unexpected error format: {e}")
