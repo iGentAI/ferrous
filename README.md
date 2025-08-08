@@ -2,7 +2,7 @@
 
 A Redis-compatible in-memory database server written in Rust with Lua 5.1 scripting support.
 
-**Developed entirely by Maestro, an AI assistant by iGent AI, through conversational steering and human guidance.**
+**Developed entirely by Maestro, an AI assistant by [iGent AI](https://igent.ai/), through conversational steering and human guidance.**
 
 ## Overview
 

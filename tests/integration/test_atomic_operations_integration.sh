@@ -146,10 +146,27 @@ test_with_timeout "Lua atomic lock release" \
     "3"
 
 # Verify lock was actually deleted (this step previously timed out)
-test_with_timeout "Post-lock verification" \
-    "redis-cli -p 6379 GET lua_lock_test" \
-    "(nil)" \
-    "2"
+echo "Testing: Post-lock verification"
+start_time=$(date +%s)
+result=$(timeout 2 redis-cli -p 6379 GET lua_lock_test 2>&1 || echo "TIMED_OUT")
+end_time=$(date +%s)
+elapsed=$((end_time - start_time))
+
+if [[ "$result" == "TIMED_OUT" ]]; then
+    echo "  ❌ TIMEOUT: Post-lock verification (hanging detected after 2s)"
+    exit 1
+elif ((elapsed > 1)); then
+    echo "  ❌ SLOW: Post-lock verification took ${elapsed}s"
+    exit 1
+else
+    # Accept both (nil) and empty string as valid "key not found" responses
+    if [[ "$result" == "(nil)" || "$result" == "" ]]; then
+        echo "  ✅ PASSED: Post-lock verification (${elapsed}s, lock properly deleted)"
+    else
+        echo "  ❌ FAILED: Post-lock verification (Expected: '(nil)' or '', Got: '$result')"
+        exit 1
+    fi
+fi
 
 # Test 6: Rapid conditional operations (stress test)
 echo
