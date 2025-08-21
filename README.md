@@ -11,14 +11,15 @@ Ferrous is a high-performance, Redis-compatible server that provides in-memory d
 ## Features
 
 ### Core Data Storage
-- **Data Structures**: Strings, Lists, Sets, Hashes, Sorted Sets, Streams
+- **Data Structures**: Strings, Lists, Sets, Hashes, Sorted Sets, **Streams**
 - **Persistence**: RDB snapshots and AOF (Append-Only File) support
 - **Memory Management**: Efficient sharded storage with configurable limits
 - **Expiration**: Key TTL support with background cleanup
 
 ### Redis Compatibility
 - **Protocol**: Full RESP2 specification compliance
-- **Commands**: 114+ Redis commands implemented
+- **Commands**: 140+ Redis commands implemented including complete Streams support
+- **Streams**: Full Redis 5.0+ Streams with consumer groups, XADD, XREADGROUP, XACK, XPENDING
 - **Clients**: Compatible with redis-cli, redis-py, and other Redis client libraries
 - **Lua Scripting**: Lua 5.1 execution with Redis-compatible API (EVAL, EVALSHA, SCRIPT commands)
 
@@ -26,6 +27,7 @@ Ferrous is a high-performance, Redis-compatible server that provides in-memory d
 - **Concurrent Connections**: Multi-threaded handling of thousands of simultaneous clients
 - **Pipelining**: Full command pipelining support
 - **Pub/Sub**: Real-time messaging with pattern matching
+- **Streams**: Event sourcing, distributed message processing, and job queues
 - **Transactions**: MULTI/EXEC/WATCH for atomic operations
 - **Blocking Operations**: BLPOP/BRPOP for queue processing patterns
 
@@ -106,6 +108,12 @@ redis-cli -p 6379
 # Pub/Sub messaging
 > SUBSCRIBE news
 > PUBLISH news "Breaking: Ferrous works great!"
+
+# Stream operations
+> XADD events * user alice action login
+"1234567890123-0"
+> XGROUP CREATE events mygroup 0
+> XREADGROUP GROUP mygroup consumer1 STREAMS events >
 ```
 
 ## Configuration
@@ -151,6 +159,19 @@ Ferrous delivers competitive performance with established Redis implementations 
 | LPOP      | 79,365           | 74,074                 | Ferrous 7% faster |
 | SADD      | 71,942           | 71,942                 | Equal performance |
 | HSET      | 78,125           | 74,627                 | Ferrous 5% faster |
+
+### Redis Streams Performance (NEW)
+
+**Full Redis 5.0+ Streams Implementation:**
+
+| Stream Operation | Ferrous Performance | Target Performance | Status |
+|------------------|---------------------|-------------------|---------|
+| **XADD**         | **24,818 ops/sec** | >20,000 ops/sec   | ✅ **Exceeds target** |
+| **XLEN**         | **30,581 ops/sec** | >25,000 ops/sec   | ✅ **Exceeds target** |
+| **XRANGE**       | **19,011 ops/sec** | >15,000 ops/sec   | ✅ **Exceeds target** |
+| **XTRIM**        | **30,303 ops/sec** | >25,000 ops/sec   | ✅ **Exceeds target** |
+
+**Complete Consumer Groups Support**: XGROUP, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM, XINFO
 
 **Pipelining Performance** (10 commands per pipeline):
 - PING: 833,333 ops/sec (Valkey: 666,667 ops/sec - Ferrous 25% faster)

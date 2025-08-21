@@ -44,9 +44,15 @@ def test_basic_stream_operations():
     
     # Read from the beginning
     streams = r.xread({'test:stream': '0-0'})
-    assert 'test:stream' in streams
-    assert len(streams['test:stream']) == 2
-    print(f"✅ XREAD: {len(streams['test:stream'])} entries")
+    if isinstance(streams, list) and streams:
+        stream_data = {stream[0]: stream[1] for stream in streams}
+        assert 'test:stream' in stream_data
+        assert len(stream_data['test:stream']) == 2
+        print(f"✅ XREAD: {len(stream_data['test:stream'])} entries")
+    else:
+        assert 'test:stream' in streams
+        assert len(streams['test:stream']) == 2
+        print(f"✅ XREAD: {len(streams['test:stream'])} entries")
     
     print("✅ Basic stream operations test completed\n")
 

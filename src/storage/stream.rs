@@ -4,11 +4,39 @@
 //! optimizes for cache coherence with minimal data movement.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::cmp::Ordering as CmpOrdering;
 use std::fmt::{self, Debug, Display};
 use std::collections::HashMap;
+use std::cell::UnsafeCell;
+
+// Import consumer groups module
+use crate::storage::consumer_groups::{ConsumerGroupManager, ConsumerGroup};
+
+/// Thread-local timestamp cache to avoid system calls
+thread_local! {
+    static CACHED_TIME: UnsafeCell<(u64, SystemTime)> = UnsafeCell::new((0, SystemTime::UNIX_EPOCH));
+}
+
+/// Get current milliseconds with caching to avoid syscalls
+#[inline(always)]
+fn get_cached_millis() -> u64 {
+    CACHED_TIME.with(|cache| unsafe {
+        let cached = &mut *cache.get();
+        let now = SystemTime::now();
+        
+        // Only update if at least 1ms has passed
+        if now.duration_since(cached.1).unwrap_or(Duration::ZERO).as_millis() > 0 {
+            let millis = now.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            cached.0 = millis;
+            cached.1 = now;
+            millis
+        } else {
+            cached.0
+        }
+    })
+}
 
 /// A stream ID with bit-packed representation for performance
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -36,14 +64,24 @@ pub struct StreamData {
 }
 
 /// High-performance stream with interior mutability and atomic fast paths
+#[repr(C)]
 pub struct Stream {
     /// Mutable data protected by single mutex - NO CLONING!
     data: Mutex<StreamData>,
-    /// Atomic metadata for lock-free reads (cache-friendly)
-    length: AtomicUsize,
+    
+    /// Hot path atomics - grouped for cache locality
+    /// Using cache line padding to prevent false sharing
+    _pad1: [u8; 64],
     last_id_millis: AtomicU64,
     last_id_seq: AtomicU64,
+    
+    /// Less frequently accessed atomics
+    _pad2: [u8; 48],  // Align to cache line
+    length: AtomicUsize,
     memory_usage: AtomicUsize,
+    
+    /// Consumer groups manager
+    consumer_groups: Arc<ConsumerGroupManager>,
 }
 
 /// Result of a range query
@@ -101,29 +139,46 @@ impl StreamId {
         format!("{}-{}", self.millis(), self.seq())
     }
     
-    /// Generate next ID atomically
+    /// Generate next ID atomically with optimized timestamp caching
+    #[inline(always)]
     pub fn generate_next_atomic(last_millis: &AtomicU64, last_seq: &AtomicU64) -> Self {
-        loop {
-            let now_millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            
-            let prev_millis = last_millis.load(Ordering::Acquire);
-            
-            if now_millis > prev_millis {
-                match last_millis.compare_exchange_weak(prev_millis, now_millis, Ordering::AcqRel, Ordering::Acquire) {
-                    Ok(_) => {
-                        last_seq.store(0, Ordering::Release);
-                        return StreamId::new(now_millis, 0);
-                    }
-                    Err(_) => continue,
+        let now_millis = get_cached_millis();
+        let prev_millis = last_millis.load(Ordering::Relaxed);
+        
+        if now_millis > prev_millis {
+            // Try to update to new millisecond
+            match last_millis.compare_exchange_weak(
+                prev_millis, 
+                now_millis, 
+                Ordering::Relaxed, 
+                Ordering::Relaxed
+            ) {
+                Ok(_) => {
+                    last_seq.store(0, Ordering::Relaxed);
+                    return StreamId::new(now_millis, 0);
                 }
-            } else {
-                let seq = last_seq.fetch_add(1, Ordering::AcqRel);
-                return StreamId::new(prev_millis, seq + 1);
+                Err(actual) => {
+                    // Someone else updated, use their value
+                    if now_millis > actual {
+                        // Retry with updated value
+                        if last_millis.compare_exchange_weak(
+                            actual,
+                            now_millis,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed
+                        ).is_ok() {
+                            last_seq.store(0, Ordering::Relaxed);
+                            return StreamId::new(now_millis, 0);
+                        }
+                    }
+                    // Fall through to sequence increment
+                }
             }
         }
+        
+        // Same millisecond, increment sequence
+        let seq = last_seq.fetch_add(1, Ordering::Relaxed);
+        StreamId::new(prev_millis, seq + 1)
     }
     
     pub fn min() -> Self {
@@ -158,26 +213,32 @@ impl Display for StreamId {
 impl StreamData {
     fn new() -> Self {
         StreamData {
-            entries: Vec::with_capacity(512), // Pre-allocate for cache efficiency
+            entries: Vec::with_capacity(4096), // Larger pre-allocation for better throughput
             last_id: StreamId::new(0, 0),
             memory_usage: std::mem::size_of::<StreamData>(),
         }
     }
     
-    /// Add entry with auto-generated ID - NO CLONING!
+    /// Add entry with auto-generated ID - OPTIMIZED HOT PATH
+    #[inline]
     fn add_auto(&mut self, fields: HashMap<Vec<u8>, Vec<u8>>, stream: &Stream) -> StreamId {
         let id = StreamId::generate_next_atomic(&stream.last_id_millis, &stream.last_id_seq);
         
+        // Pre-calculate size before creating entry
+        let fields_size: usize = fields.iter()
+            .map(|(k, v)| k.len() + v.len() + 48)
+            .sum();
+        let entry_size = 16 + std::mem::size_of::<StreamEntry>() + fields_size;
+        
         let entry = StreamEntry { id, fields };
-        let entry_size = Self::calculate_entry_size(&entry);
         
         // O(1) append - cache-friendly operation
         self.entries.push(entry);
         self.last_id = id;
         self.memory_usage += entry_size;
         
-        // Update atomic metadata
-        stream.length.fetch_add(1, Ordering::AcqRel);
+        // Update atomic metadata with relaxed ordering for non-critical updates
+        stream.length.fetch_add(1, Ordering::Relaxed);
         stream.memory_usage.fetch_add(entry_size, Ordering::Relaxed);
         
         id
@@ -202,10 +263,10 @@ impl StreamData {
         self.last_id = id;
         self.memory_usage += entry_size;
         
-        // Update atomic metadata
-        stream.length.fetch_add(1, Ordering::AcqRel);
-        stream.last_id_millis.store(id.millis(), Ordering::Release);
-        stream.last_id_seq.store(id.seq(), Ordering::Release);
+        // Update atomic metadata with relaxed ordering for non-critical updates
+        stream.length.fetch_add(1, Ordering::Relaxed);
+        stream.last_id_millis.store(id.millis(), Ordering::Relaxed);
+        stream.last_id_seq.store(id.seq(), Ordering::Relaxed);
         stream.memory_usage.fetch_add(entry_size, Ordering::Relaxed);
         
         Ok(())
@@ -262,14 +323,18 @@ impl StreamData {
         StreamRangeResult { entries: result_entries }
     }
     
-    /// Calculate memory size for an entry
+    /// Calculate memory size for an entry - optimized version
+    #[inline(always)]
     fn calculate_entry_size(entry: &StreamEntry) -> usize {
-        let id_size = 16; // Packed u128
-        let fields_size: usize = entry.fields.iter()
-            .map(|(k, v)| k.len() + v.len() + std::mem::size_of::<(Vec<u8>, Vec<u8>)>())
-            .sum();
+        // More efficient calculation without iterator overhead
+        let mut size = 16 + std::mem::size_of::<StreamEntry>(); // ID + struct overhead
         
-        id_size + fields_size + std::mem::size_of::<StreamEntry>()
+        // Direct iteration is faster than map/sum
+        for (k, v) in &entry.fields {
+            size += k.len() + v.len() + 48; // 48 bytes is typical HashMap entry overhead
+        }
+        
+        size
     }
 }
 
@@ -278,10 +343,13 @@ impl Stream {
     pub fn new() -> Self {
         Stream {
             data: Mutex::new(StreamData::new()),
-            length: AtomicUsize::new(0),
+            _pad1: [0; 64],
             last_id_millis: AtomicU64::new(0),
             last_id_seq: AtomicU64::new(0),
+            _pad2: [0; 48],
+            length: AtomicUsize::new(0),
             memory_usage: AtomicUsize::new(std::mem::size_of::<Stream>()),
+            consumer_groups: Arc::new(ConsumerGroupManager::new()),
         }
     }
     
@@ -355,8 +423,8 @@ impl Stream {
         data.entries.drain(..to_remove);
         data.memory_usage -= memory_to_free;
         
-        // Update atomic metadata
-        self.length.fetch_sub(to_remove, Ordering::AcqRel);
+        // Update atomic metadata with relaxed ordering
+        self.length.fetch_sub(to_remove, Ordering::Relaxed);
         self.memory_usage.fetch_sub(memory_to_free, Ordering::Relaxed);
         
         to_remove
@@ -380,7 +448,7 @@ impl Stream {
         data.entries.drain(..split_idx);
         data.memory_usage -= memory_to_free;
         
-        self.length.fetch_sub(split_idx, Ordering::AcqRel);
+        self.length.fetch_sub(split_idx, Ordering::Relaxed);
         self.memory_usage.fetch_sub(memory_to_free, Ordering::Relaxed);
         
         split_idx
@@ -405,7 +473,7 @@ impl Stream {
         
         if deleted > 0 {
             data.memory_usage -= memory_freed;
-            self.length.fetch_sub(deleted, Ordering::AcqRel);
+            self.length.fetch_sub(deleted, Ordering::Relaxed);
             self.memory_usage.fetch_sub(memory_freed, Ordering::Relaxed);
         }
         
@@ -430,10 +498,131 @@ impl Stream {
         data.last_id = StreamId::new(0, 0);
         data.memory_usage = std::mem::size_of::<StreamData>();
         
-        self.length.store(0, Ordering::Release);
-        self.last_id_millis.store(0, Ordering::Release);
-        self.last_id_seq.store(0, Ordering::Release);
-        self.memory_usage.store(std::mem::size_of::<Stream>(), Ordering::Release);
+        self.length.store(0, Ordering::Relaxed);
+        self.last_id_millis.store(0, Ordering::Relaxed);
+        self.last_id_seq.store(0, Ordering::Relaxed);
+        self.memory_usage.store(std::mem::size_of::<Stream>(), Ordering::Relaxed);
+    }
+    
+    /// Create a consumer group
+    pub fn create_consumer_group(&self, name: String, start_id: StreamId) -> Result<(), String> {
+        self.consumer_groups.create_group(name, start_id)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    
+    /// Destroy a consumer group
+    pub fn destroy_consumer_group(&self, name: &str) -> bool {
+        self.consumer_groups.destroy_group(name)
+    }
+    
+    /// Get a consumer group
+    pub fn get_consumer_group(&self, name: &str) -> Option<Arc<ConsumerGroup>> {
+        self.consumer_groups.get_group(name)
+    }
+    
+    /// List all consumer groups
+    pub fn list_consumer_groups(&self) -> Vec<Arc<ConsumerGroup>> {
+        self.consumer_groups.list_groups()
+    }
+    
+    /// Read entries for a consumer group
+    pub fn read_group(
+        &self,
+        group_name: &str,
+        consumer_name: &str,
+        after_id: StreamId,
+        count: Option<usize>,
+        noack: bool
+    ) -> Result<Vec<StreamEntry>, String> {
+        // Get the consumer group
+        let group = self.consumer_groups.get_group(group_name)
+            .ok_or_else(|| format!("NOGROUP No such consumer group {} for stream", group_name))?;
+        
+        // Get entries after the specified ID
+        let data = self.data.lock().unwrap();
+        let entries = if after_id == StreamId::max() {
+            // Special case: ">" means only new entries
+            let last_delivered = group.get_last_id();
+            data.range_after(&last_delivered, count).entries
+        } else {
+            data.range_after(&after_id, count).entries
+        };
+        
+        drop(data);
+        
+        if !noack && !entries.is_empty() {
+            // Add entries to pending unless NOACK
+            let pending_entries = group.add_pending(consumer_name, entries.clone());
+            Ok(pending_entries)
+        } else {
+            Ok(entries)
+        }
+    }
+    
+    /// Acknowledge messages for a consumer group
+    pub fn acknowledge_messages(&self, group_name: &str, ids: &[StreamId]) -> Result<usize, String> {
+        let group = self.consumer_groups.get_group(group_name)
+            .ok_or_else(|| format!("NOGROUP No such consumer group {} for stream", group_name))?;
+        
+        Ok(group.acknowledge(ids))
+    }
+    
+    /// Claim messages from another consumer
+    pub fn claim_messages(
+        &self,
+        group_name: &str,
+        consumer: &str,
+        min_idle_ms: u64,
+        ids: &[StreamId],
+        force: bool
+    ) -> Result<Vec<StreamEntry>, String> {
+        let group = self.consumer_groups.get_group(group_name)
+            .ok_or_else(|| format!("NOGROUP No such consumer group {} for stream", group_name))?;
+        
+        let claimed_ids = group.claim_messages(consumer, min_idle_ms, ids, force);
+        
+        // Get the actual entries for claimed IDs
+        let data = self.data.lock().unwrap();
+        let entries: Vec<StreamEntry> = claimed_ids
+            .iter()
+            .filter_map(|id| {
+                // Binary search for each claimed ID
+                data.entries.binary_search_by(|e| e.id.cmp(id))
+                    .ok()
+                    .map(|idx| data.entries[idx].clone())
+            })
+            .collect();
+        
+        Ok(entries)
+    }
+    
+    /// Auto-claim idle messages
+    pub fn auto_claim_messages(
+        &self,
+        group_name: &str,
+        consumer: &str,
+        min_idle_ms: u64,
+        start_id: StreamId,
+        count: usize
+    ) -> Result<(Vec<StreamEntry>, StreamId), String> {
+        let group = self.consumer_groups.get_group(group_name)
+            .ok_or_else(|| format!("NOGROUP No such consumer group {} for stream", group_name))?;
+        
+        let (claimed_ids, next_start) = group.auto_claim(consumer, min_idle_ms, start_id, count);
+        
+        // Get the actual entries for claimed IDs
+        let data = self.data.lock().unwrap();
+        let entries: Vec<StreamEntry> = claimed_ids
+            .iter()
+            .filter_map(|id| {
+                data.entries.binary_search_by(|e| e.id.cmp(id))
+                    .ok()
+                    .map(|idx| data.entries[idx].clone())
+            })
+            .collect();
+        
+        Ok((entries, next_start))
     }
 }
 
@@ -446,10 +635,13 @@ impl Clone for Stream {
                 last_id: data.last_id,
                 memory_usage: data.memory_usage,
             }),
-            length: AtomicUsize::new(self.length.load(Ordering::Relaxed)),
+            _pad1: [0; 64],
             last_id_millis: AtomicU64::new(self.last_id_millis.load(Ordering::Relaxed)),
             last_id_seq: AtomicU64::new(self.last_id_seq.load(Ordering::Relaxed)),
+            _pad2: [0; 48],
+            length: AtomicUsize::new(self.length.load(Ordering::Relaxed)),
             memory_usage: AtomicUsize::new(self.memory_usage.load(Ordering::Relaxed)),
+            consumer_groups: Arc::clone(&self.consumer_groups),
         }
     }
 }

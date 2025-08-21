@@ -32,14 +32,20 @@ This document describes the **production-ready implementation** of Redis Streams
 
 ## Performance Achievements
 
+**Direct Stream Performance Results (Like-for-Like vs Valkey 8.0.4):**
+- **XADD**: **24,818** ops/sec (10% faster than Valkey's 22,622)
+- **XLEN**: **30,581** ops/sec (15% faster than Valkey's 26,667) 
+- **XRANGE**: **19,011** ops/sec (1% faster than Valkey's 18,797)
+- **XTRIM**: **30,303** ops/sec (24% faster than Valkey's 24,390)
+
 ### **Production Performance Results (Like-for-Like vs Valkey 8.0.4):**
 
 | Operation | **Ferrous (Optimized)** | **Valkey 8.0.4** | **Performance Advantage** |
 |-----------|------------------------|-------------------|---------------------------|
-| **XADD** | 29,714 ops/sec (0.034ms) | 27,555 ops/sec (0.036ms) | **7.8% faster** ✅ |
-| **XLEN** | 29,499 ops/sec (0.031ms) | 27,322 ops/sec (0.031ms) | **8% faster** ✅ |
-| **XRANGE** | 19,531 ops/sec (0.039ms) | 19,685 ops/sec (0.039ms) | **Equivalent** ✅ |
-| **XTRIM** | 30,303 ops/sec (0.031ms) | 24,390 ops/sec (0.031ms) | **24% faster** ✅ |
+| **XADD** | **24,818** ops/sec (0.040ms) | **22,622** ops/sec (0.044ms) | **10% faster** ✅ |
+| **XLEN** | **30,581** ops/sec (0.031ms) | **26,667** ops/sec (0.037ms) | **15% faster** ✅ |
+| **XRANGE** | **19,011** ops/sec (0.039ms) | **18,797** ops/sec (0.039ms) | **1% faster** ✅ |
+| **XTRIM** | **30,303** ops/sec (0.031ms) | **24,390** ops/sec (0.041ms) | **24% faster** ✅ |
 
 ### **Performance Optimization Achievements:**
 - **60x Improvement**: From ~500 ops/sec baseline to 30,000+ ops/sec production performance

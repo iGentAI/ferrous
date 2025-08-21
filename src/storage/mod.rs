@@ -9,15 +9,13 @@ pub mod memory;
 pub mod skiplist;
 pub mod stream;
 pub mod consumer_groups;
+pub mod stream_integration_tests;
 pub mod rdb;
 pub mod monitor;
 pub mod aof;
 pub mod commands;
 pub mod lua_cache;
 pub mod lua_engine;  // Single-threaded Lua execution engine
-
-#[cfg(test)]
-mod stream_integration_tests;
 
 pub use engine::{StorageEngine, GetResult};
 pub use value::Value;

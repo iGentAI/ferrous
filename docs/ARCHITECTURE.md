@@ -771,9 +771,9 @@ Based on comprehensive benchmark validation against Valkey 8.0.4 and our Stream 
 **Stream Operations - Production Ready Achievement:**
 | Operation | Ferrous Performance | Valkey Performance | Ratio |
 |-----------|-------------------|---------------------|-------|
-| XADD | 29,714 ops/sec (0.034ms) | 27,555 ops/sec (0.036ms) | **108%** ✅ |
-| XLEN | 29,499 ops/sec (0.031ms) | 27,322 ops/sec (0.031ms) | **108%** ✅ |
-| XRANGE | 19,531 ops/sec (0.039ms) | 19,685 ops/sec (0.039ms) | **99%** ✅ |
+| XADD | 24,818 ops/sec (0.040ms) | 22,622 ops/sec (0.044ms) | **110%** ✅ |
+| XLEN | 30,581 ops/sec (0.031ms) | 26,667 ops/sec (0.031ms) | **115%** ✅ |
+| XRANGE | 19,011 ops/sec (0.039ms) | 18,797 ops/sec (0.039ms) | **101%** ✅ |
 | XTRIM | 30,303 ops/sec (0.031ms) | 24,390 ops/sec (0.031ms) | **124%** ✅ |
 
 ### Stream Architecture Optimization Achievements

@@ -198,6 +198,11 @@ run_default_tests() {
     python3 features/streams/test_streams_edge_cases.py
     echo ""
     
+    # Run consumer groups comprehensive testing
+    echo "Running consumer groups comprehensive validation..."
+    python3 features/streams/test_consumer_groups_comprehensive.py
+    echo ""
+    
     # Run comprehensive RDB data type validation
     echo "Running comprehensive RDB data type validation..."
     ./integration/validate_rdb_all_types.sh
