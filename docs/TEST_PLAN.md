@@ -130,10 +130,10 @@ Comprehensive Stream optimization work completed in August 2025 has achieved pro
 - ✅ **Critical Issue Resolution**: All race conditions and regressions fixed
 
 **Direct Stream Performance Results (Like-for-Like vs Valkey 8.0.4):**
-- **XADD**: 29,714 ops/sec (7.8% faster than Valkey)
-- **XLEN**: 29,499 ops/sec (8% faster than Valkey) 
-- **XRANGE**: 19,531 ops/sec (equivalent to Valkey)
-- **XTRIM**: 30,303 ops/sec (24% faster than Valkey)
+- **XADD**: **24,818** ops/sec (10% faster than Valkey's 22,622)
+- **XLEN**: **30,581** ops/sec (15% faster than Valkey's 26,667) 
+- **XRANGE**: **19,011** ops/sec (1% faster than Valkey's 18,797)
+- **XTRIM**: **30,303** ops/sec (24% faster than Valkey's 24,390)
 
 **Architecture Optimization Achievements:**
 - **Integrated Cache-Coherent Design**: Eliminated double-locking bottlenecks and expensive cloning
