@@ -161,7 +161,7 @@ where
         
         unsafe {
             // Traverse the skiplist counting elements with lower (score, key) values
-            while let Some(next) = (*current).forward[0] {
+            while let Some(next) = (&(*current).forward)[0] {
                 match self.compare_with_query(&(*next).value, &(*next).key, score, key) {
                     Ordering::Less => {
                         rank += 1;
@@ -194,7 +194,7 @@ where
         unsafe {
             // Skip to the target rank
             while traversed <= rank {
-                if let Some(next) = (*current).forward[0] {
+                if let Some(next) = (&(*current).forward)[0] {
                     if traversed == rank {
                         return Some(((*next).key.clone(), (*next).value.clone()));
                     }
@@ -224,7 +224,7 @@ where
         unsafe {
             // Skip to start rank using skiplist traversal
             while rank < start_rank {
-                if let Some(next) = (*current).forward[0] {
+                if let Some(next) = (&(*current).forward)[0] {
                     current = next;
                     rank += 1;
                 } else {
@@ -234,7 +234,7 @@ where
 
             // Collect elements in range
             while rank <= end_rank && rank < inner.length {
-                if let Some(next) = (*current).forward[0] {
+                if let Some(next) = (&(*current).forward)[0] {
                     items.push(((*next).key.clone(), (*next).value.clone()));
                     current = next;
                     rank += 1;
@@ -256,7 +256,7 @@ where
         unsafe {
             // Skip to first element >= min_score using skiplist traversal
             for i in (0..=inner.level).rev() {
-                while let Some(next) = (*current).forward[i] {
+                while let Some(next) = (&(*current).forward)[i] {
                     if (*next).value < min_score {
                         current = next;
                     } else {
@@ -266,7 +266,7 @@ where
             }
 
             // Collect elements in score range
-            if let Some(next) = (*current).forward[0] {
+            if let Some(next) = (&(*current).forward)[0] {
                 current = next;
             } else {
                 return RangeResult { items };
@@ -276,7 +276,7 @@ where
                 items.push(((*current).key.clone(), (*current).value.clone()));
                 
                 // Advance to next
-                if let Some(next) = (*current).forward[0] {
+                if let Some(next) = (&(*current).forward)[0] {
                     current = next;
                 } else {
                     break;
@@ -309,8 +309,8 @@ where
         // Deallocate all nodes
         unsafe {
             let current = inner.head;
-            while let Some(next) = (*current).forward[0] {
-                (*current).forward[0] = (*next).forward[0];
+            while let Some(next) = (&(*current).forward)[0] {
+                (&mut (*current).forward)[0] = (&(*next).forward)[0];
                 let _ = Box::from_raw(next);
             }
         }
@@ -324,7 +324,7 @@ where
         // Clear forward pointers in head
         unsafe {
             for i in 0..MAX_LEVEL {
-                (*inner.head).forward[i] = None;
+                (&mut (*inner.head).forward)[i] = None;
             }
         }
     }
@@ -338,7 +338,7 @@ where
         
         unsafe {
             // Start with the first element
-            if let Some(next) = (*current).forward[0] {
+            if let Some(next) = (&(*current).forward)[0] {
                 current = next;
             } else {
                 return items; // Empty list
@@ -348,7 +348,7 @@ where
             while !current.is_null() {
                 items.push(((*current).key.clone(), (*current).value.clone()));
                 
-                current = match (*current).forward[0] {
+                current = match (&(*current).forward)[0] {
                     Some(next) => next,
                     None => break,
                 };
@@ -413,7 +413,7 @@ where
         let mut current = inner.head;
         for i in (0..=inner.level).rev() {
             unsafe {
-                while let Some(next) = (*current).forward[i] {
+                while let Some(next) = (&(*current).forward)[i] {
                     match self.compare_nodes(&(*next).value, &(*next).key, &value, &key) {
                         Ordering::Less => current = next,
                         _ => break,
@@ -444,8 +444,8 @@ where
         // Insert node at each level
         unsafe {
             for i in 0..=new_level {
-                (*new_node).forward[i] = (*update[i]).forward[i];
-                (*update[i]).forward[i] = Some(new_node);
+                (&mut (*new_node).forward)[i] = (&(*update[i]).forward)[i];
+                (&mut (*update[i]).forward)[i] = Some(new_node);
             }
         }
 
@@ -465,7 +465,7 @@ where
         let mut current = inner.head;
         unsafe {
             for i in (0..=inner.level).rev() {
-                while let Some(next) = (*current).forward[i] {
+                while let Some(next) = (&(*current).forward)[i] {
                     match self.compare_with_query(&(*next).value, &(*next).key, score, key) {
                         Ordering::Less => current = next,
                         Ordering::Equal => {
@@ -479,13 +479,13 @@ where
             }
 
             // Find the exact node to remove
-            if let Some(target) = (*current).forward[0] {
+            if let Some(target) = (&(*current).forward)[0] {
                 if (*target).key.borrow() == key && (*target).value == *score {
                     // Remove from each level
                     for i in 0..=inner.level {
-                        if let Some(next) = (*update[i]).forward[i] {
+                        if let Some(next) = (&(*update[i]).forward)[i] {
                             if next == target {
-                                (*update[i]).forward[i] = (*target).forward[i];
+                                (&mut (*update[i]).forward)[i] = (&(*target).forward)[i];
                             } else {
                                 break;
                             }
@@ -493,7 +493,7 @@ where
                     }
 
                     // Update list level
-                    while inner.level > 0 && (*inner.head).forward[inner.level].is_none() {
+                    while inner.level > 0 && (&(*inner.head).forward)[inner.level].is_none() {
                         inner.level -= 1;
                     }
 
@@ -536,8 +536,8 @@ impl<K, V> Drop for SkipList<K, V> {
             // Deallocate all nodes
             unsafe {
                 let current = inner.head;
-                while let Some(next) = (*current).forward[0] {
-                    (*current).forward[0] = (*next).forward[0];
+                while let Some(next) = (&(*current).forward)[0] {
+                    (&mut (*current).forward)[0] = (&(*next).forward)[0];
                     let _ = Box::from_raw(next);
                 }
                 
