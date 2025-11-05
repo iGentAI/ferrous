@@ -4,7 +4,7 @@
 //! commands through the unified command executor, ensuring atomic operations
 //! and complete Redis compatibility.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use mlua::{Lua, Result as LuaResult, MultiValue, Value as LuaValue};
 use sha1::{Sha1, Digest};
@@ -411,22 +411,19 @@ impl LuaEngine {
     }
 }
 
-/// Global singleton Lua engine
-static mut LUA_ENGINE: Option<Arc<LuaEngine>> = None;
-static INIT: std::sync::Once = std::sync::Once::new();
+/// Global singleton Lua engine - initialized once per process
+static LUA_ENGINE: OnceLock<std::result::Result<Arc<LuaEngine>, String>> = OnceLock::new();
 
 /// Get the global singleton Lua engine instance
 pub fn get_lua_engine(storage: Arc<StorageEngine>) -> Result<Arc<LuaEngine>> {
-    unsafe {
-        INIT.call_once(|| {
-            match LuaEngine::new(storage.clone()) {
-                Ok(engine) => LUA_ENGINE = Some(Arc::new(engine)),
-                Err(e) => eprintln!("Failed to initialize Lua engine: {}", e),
-            }
-        });
-        
-        LUA_ENGINE.clone().ok_or_else(|| {
-            FerrousError::LuaError("Lua engine not initialized".to_string())
-        })
+    let result = LUA_ENGINE.get_or_init(|| {
+        LuaEngine::new(storage.clone())
+            .map(Arc::new)
+            .map_err(|e| e.to_string())
+    });
+    
+    match result {
+        Ok(engine) => Ok(engine.clone()),
+        Err(e) => Err(FerrousError::LuaError(e.clone())),
     }
 }
