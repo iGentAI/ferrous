@@ -12,6 +12,7 @@ Ferrous is a high-performance, Redis-compatible server that provides in-memory d
 
 ### Core Data Storage
 - **Data Structures**: Strings, Lists, Sets, Hashes, Sorted Sets, **Streams**
+- **Bit Operations**: SETBIT, GETBIT, BITCOUNT, BITOP, BITPOS for memory-efficient boolean storage
 - **Persistence**: RDB snapshots and AOF (Append-Only File) support
 - **Memory Management**: Efficient sharded storage with configurable limits
 - **Expiration**: Key TTL support with background cleanup
@@ -44,6 +45,7 @@ Ferrous is a high-performance, Redis-compatible server that provides in-memory d
 - **Advanced Replication**: Limited to basic master-slave setup
 - **Monitoring**: Some INFO sections and SLOWLOG features incomplete
 - **HyperLogLog**: Not implemented
+- **GEO commands**: Not implemented
 - **Modules**: No Redis module system support
 
 ## Quick Start

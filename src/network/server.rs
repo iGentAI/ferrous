@@ -1397,6 +1397,12 @@ impl Server {
             "HSCAN" => crate::storage::commands::scan::handle_hscan(&self.storage, db, parts),
             "SSCAN" => crate::storage::commands::scan::handle_sscan(&self.storage, db, parts),
             "ZSCAN" => crate::storage::commands::scan::handle_zscan(&self.storage, db, parts),
+            // Bit operations
+            "SETBIT" => crate::storage::commands::bits::handle_setbit(&self.storage, db, parts),
+            "GETBIT" => crate::storage::commands::bits::handle_getbit(&self.storage, db, parts),
+            "BITCOUNT" => crate::storage::commands::bits::handle_bitcount(&self.storage, db, parts),
+            "BITOP" => crate::storage::commands::bits::handle_bitop(&self.storage, db, parts),
+            "BITPOS" => crate::storage::commands::bits::handle_bitpos(&self.storage, db, parts),
             // AOF commands
             "BGREWRITEAOF" => crate::storage::commands::aof::handle_bgrewriteaof(self.aof_engine.as_ref()),
             // Monitoring commands
@@ -1577,9 +1583,10 @@ impl Server {
                 "SADD" | "SREM" | "SPOP" | 
                 "HSET" | "HDEL" | "HINCRBY" |
                 "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" |
-                "XADD" | "XTRIM" | "XDEL" |  // Stream write commands
-                "XGROUP" | "XACK" | "XCLAIM" |  // Consumer group write commands
-                "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "RENAMENX" | "PERSIST" | "EVAL" | "EVALSHA"
+                "XADD" | "XTRIM" | "XDEL" |
+                "XGROUP" | "XACK" | "XCLAIM" |
+                "MSET" | "APPEND" | "SETRANGE" | "RENAME" | "RENAMENX" | "PERSIST" | "EVAL" | "EVALSHA" |
+                "SETBIT" | "BITOP"
             )
         }
     }

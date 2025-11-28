@@ -6,6 +6,7 @@ pub mod lists;
 pub mod sets;
 pub mod hashes;
 pub mod strings;
+pub mod bits;
 pub mod transactions;
 pub mod aof;
 pub mod monitor;
